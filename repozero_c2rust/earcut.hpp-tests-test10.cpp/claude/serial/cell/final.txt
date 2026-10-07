@@ -1,0 +1,30 @@
+Done. The port is complete and verified.
+
+## What's in `/output`
+
+```
+Cargo.toml            bin target "test10" -> test10.rs, empty [dependencies]
+test10.rs             entry point (CLI, polygon generation, output)
+src/earcut/mod.rs     earcut() API, Point/Index traits, ear-slicing driver,
+                      hole elimination, bridge finding, split/cure fallbacks
+src/earcut/node.rs    arena-backed circular doubly-linked list (indices, not pointers)
+src/earcut/geom.rs    area, equals, pointInTriangle, intersects, locallyInside,
+                      middleInside, sectorContainsSector, isValidDiagonal
+src/earcut/zorder.rs  Morton z-order hashing + Simon Tatham linked-list merge sort
+src/earcut/tests.rs   triangulation self-validation
+test10                executable (rustc -O); also target/release/test10
+```
+
+## Verification
+
+**Byte-for-byte vs the C++ binary** — 34 inputs × both binaries (rustc and cargo release), 0 mismatches: `""` (default 10), 0–20, 25, 30, 40, 60, 80, 120, 200, `-1`, `-100`, `abc`, `"  7"`, `3x`, `+4`, `007`. Compared as hex dumps, so the trailing space and absent trailing newline are included. Exit codes match.
+
+**Coordinate bit-parity** — I built a C++ program dumping the raw IEEE-754 bits of every generated vertex and diffed against the Rust equivalent: identical for 150 / 2750 / 41000 points. `M_PI` == `std::f64::consts::PI`, and `cos`/`sin` resolve to the same libm, so the geometry fed to the triangulator is exact, not merely close.
+
+**Two caveats worth flagging**, since the supplied test is a weak discriminator:
+
+1. This test never triangulates a hole. Each "hole" ring has a larger radius than the outer ring, so `findHoleBridge` returns null for all of them and they're silently dropped — that's why every `n ≥ 1` gives the same 12 indices. The hole-bridging, hashing, and split/cure paths in my port are therefore not covered by the CLI comparison. I added unit tests that check the invariants a correct triangulation must satisfy (indices in range, `V + 2H − 2` triangles, total triangle area == outer area − hole areas) on a square-with-hole, a concave comb, a collinear-vertex ring, and a 200-vertex ring with 3 holes that trips the 80-vertex hashing threshold. All 7 pass (`cargo test --bin test10`). That's real evidence the algorithm generalizes, but it is not a bit-comparison against the original library.
+
+2. `eliminateHoles` sorts holes by x with `std::sort`, which is unstable. I used the stable `sort_by`. For equal-x holes the two can order differently, and the C++ order is unspecified there anyway. Not reachable in this test (all radii distinct), but it's the one place a divergence could hide.
+
+I also could not read `earcut.hpp` — `/workspace/dataset/earcut.hpp/` doesn't exist, only `test10.cpp` and the binary — so the implementation is inferred from the interface and validated as above.

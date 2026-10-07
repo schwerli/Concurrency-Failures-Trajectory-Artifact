@@ -1,0 +1,67 @@
+Created the ESM hierarchy under `/output`:
+
+- [parser.mjs](/output/lib/cli/parser.mjs:1)
+- [constants.mjs](/output/lib/bech32/constants.mjs:1)
+- [core.mjs](/output/lib/bech32/core.mjs:1)
+- [segwit.mjs](/output/lib/bech32/segwit.mjs:1)
+- [index.mjs](/output/lib/bech32/index.mjs:1)
+- [python.mjs](/output/lib/format/python.mjs:1)
+
+All generated files use `.mjs`, `import`/`export`, local module imports only, and no external dependencies.
+
+Entry file [test12.mjs](/output/test12.mjs:1):
+
+```js
+import { buildHelpText, buildUsageLine, CliParseError, getProgramName, parseArguments } from "./lib/cli/parser.mjs";
+import { convertbits, decode } from "./lib/bech32/index.mjs";
+import { formatPythonValue } from "./lib/format/python.mjs";
+
+function toFileUrl(filePath) {
+  const normalized = filePath.startsWith("/")
+    ? filePath
+    : `${process.cwd().replace(/\\/g, "/")}/${filePath}`;
+
+  return `file://${encodeURI(normalized.replace(/\\/g, "/"))}`;
+}
+
+export function main(argv = process.argv) {
+  let parsed;
+
+  try {
+    parsed = parseArguments(argv);
+  } catch (error) {
+    if (!(error instanceof CliParseError)) {
+      throw error;
+    }
+
+    const prog = getProgramName(argv);
+    process.stderr.write(buildUsageLine(prog));
+    process.stderr.write(`${prog}: error: ${error.message}\n`);
+    return 2;
+  }
+
+  if (parsed.kind === "help") {
+    process.stdout.write(buildHelpText(parsed.prog));
+    return 0;
+  }
+
+  const decoded = decode(parsed.a, parsed.b);
+  if (decoded[0] !== null && decoded[1] !== null) {
+    const [witnessVersion, witnessProgram] = decoded;
+    const converted = convertbits(witnessProgram, 5, 8);
+    process.stdout.write(`${formatPythonValue(witnessVersion)}\n`);
+    process.stdout.write(`${formatPythonValue(converted)}\n`);
+  }
+
+  return 0;
+}
+
+if (process.argv[1] !== undefined && import.meta.url === toFileUrl(process.argv[1])) {
+  const exitCode = main(process.argv);
+  if (exitCode !== 0) {
+    process.exit(exitCode);
+  }
+}
+```
+
+Verified against `/workspace/dataset/test12_executable` for invalid input, valid generated decode cases, `--help`, missing required args, and `--a --help`. Stdout/stderr and exit codes matched, with the expected usage-line program-name difference from `test12_executable` to `test12.mjs`.

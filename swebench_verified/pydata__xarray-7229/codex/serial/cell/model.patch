@@ -1,0 +1,83 @@
+diff --git a/xarray/core/computation.py b/xarray/core/computation.py
+index 3f7e8f74..e388d851 100644
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -1860,7 +1860,24 @@ def where(cond, x, y, keep_attrs=None):
+     if keep_attrs is True:
+         # keep the attributes of x, the second parameter, by default to
+         # be consistent with the `where` method of `DataArray` and `Dataset`
+-        keep_attrs = lambda attrs, context: getattr(x, "attrs", {})
++        def _where_keep_attrs(x_data, cond_data, y_data):
++            return duck_array_ops.where(cond_data, x_data, y_data)
++
++        # Pass x first so apply_ufunc's default keep_attrs=True behavior also
++        # preserves coordinate attrs from x.
++        result = apply_ufunc(
++            _where_keep_attrs,
++            x,
++            cond,
++            y,
++            join="exact",
++            dataset_join="exact",
++            dask="allowed",
++            keep_attrs=True,
++        )
++        if hasattr(result, "attrs"):
++            result.attrs = dict(getattr(x, "attrs", {}))
++        return result
+ 
+     # alignment for three arguments is complicated, so don't support it yet
+     return apply_ufunc(
+diff --git a/xarray/tests/test_computation.py b/xarray/tests/test_computation.py
+index da1bd014..bf579515 100644
+--- a/xarray/tests/test_computation.py
++++ b/xarray/tests/test_computation.py
+@@ -1925,11 +1925,44 @@ def test_where() -> None:
+ 
+ 
+ def test_where_attrs() -> None:
+-    cond = xr.DataArray([True, False], dims="x", attrs={"attr": "cond"})
+-    x = xr.DataArray([1, 1], dims="x", attrs={"attr": "x"})
+-    y = xr.DataArray([0, 0], dims="x", attrs={"attr": "y"})
++    cond = xr.DataArray(
++        [True, False],
++        dims="x",
++        coords={"x": ("x", [0, 1], {"coord": "cond"})},
++        attrs={"attr": "cond"},
++        name="mask",
++    )
++    x = xr.DataArray(
++        [1, 1],
++        dims="x",
++        coords={
++            "x": ("x", [0, 1], {"coord": "x"}),
++            "u": ("x", [10, 20], {"coord": "x_aux"}),
++        },
++        attrs={"attr": "x"},
++        name="data",
++    )
++    y = xr.DataArray(
++        [0, 0],
++        dims="x",
++        coords={
++            "x": ("x", [0, 1], {"coord": "y"}),
++            "u": ("x", [10, 20], {"coord": "y_aux"}),
++        },
++        attrs={"attr": "y"},
++        name="other",
++    )
+     actual = xr.where(cond, x, y, keep_attrs=True)
+-    expected = xr.DataArray([1, 0], dims="x", attrs={"attr": "x"})
++    expected = xr.DataArray(
++        [1, 0],
++        dims="x",
++        coords={
++            "x": ("x", [0, 1], {"coord": "x"}),
++            "u": ("x", [10, 20], {"coord": "x_aux"}),
++        },
++        attrs={"attr": "x"},
++        name="data",
++    )
+     assert_identical(expected, actual)
+ 
+     # ensure keep_attrs can handle scalar values

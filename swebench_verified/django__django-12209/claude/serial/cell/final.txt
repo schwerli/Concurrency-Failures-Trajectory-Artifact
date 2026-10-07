@@ -1,0 +1,29 @@
+Fixed. The regression came from `85458e94e3` (#29260), which skips the UPDATE for any new instance whose pk has a default — including deserialized instances, where `_state.adding` is always `True`.
+
+**The fix** — `django/db/models/base.py:850`:
+
+```python
+ if (
++    not raw and
+     not force_insert and
+     self._state.adding and
+-    self._meta.pk.default and
+-    self._meta.pk.default is not NOT_PROVIDED
++    meta.pk.default and
++    meta.pk.default is not NOT_PROVIDED
+ ):
+```
+
+- `not raw` — `loaddata` saves via `save_base(raw=True)` (`django/core/serializers/base.py:223`), so fixtures with explicit pks now UPDATE existing rows again, as in 2.2.
+- `self._meta.pk` → `meta.pk` — `_save_table` is also called per-parent-table in MTI, where `meta = cls._meta` is the parent. The old code checked the child's pk (a `parent_ptr` with no default), so the optimization never applied to inherited pks; it now costs 2 queries instead of 3.
+
+**Verification** (env: `/opt/miniconda3/envs/testbed/bin/python`)
+- Reproduced first with a standalone UUID-pk app: loading the same fixture twice raised `IntegrityError: UNIQUE constraint failed`. After the fix it loads cleanly and leaves one row.
+- 3 new tests (`basic.tests`: parent-pk and raw-save; `fixtures.tests`: loaddata-twice, plus fixture `tests/fixtures/fixtures/fixture_with_uuid_pk.json`). I confirmed all 3 fail with the fix stashed and pass with it.
+- Full suite: 13408 tests, and the failure set is byte-identical to the pre-change baseline (36 failures / 19 errors, all pre-existing ASCII-locale, `admin_scripts` subprocess, and timezone-serialization issues in this container).
+
+**Two things to flag:**
+
+1. **The direct-save case in your report still INSERTs.** `Sample(pk=s0.pk, name='Test 1').save()` raises `IntegrityError` — that part is the intended #29260 optimization, and reverting it would reintroduce a SELECT/UPDATE on every create. It was undocumented, so I added a "backwards incompatible changes" section to `docs/releases/3.0.txt:483` with the working alternatives (`QuerySet.update()`, or fetch-then-save — both verified).
+
+2. **Unfixed, adjacent bug:** the heuristic also overrides *explicit* update requests. On a new instance with a pk default, both `save(force_update=True)` and `save(update_fields=['name'])` silently perform an INSERT instead of an UPDATE (I confirmed both raise `IntegrityError` rather than the documented `DatabaseError`). Guarding with `not force_update and not update_fields` would fix it, but that's a semantics change beyond your report, so I left it alone — say the word and I'll add it with tests.

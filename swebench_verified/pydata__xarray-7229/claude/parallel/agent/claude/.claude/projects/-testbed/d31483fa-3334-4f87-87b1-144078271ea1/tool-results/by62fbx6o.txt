@@ -1,0 +1,385 @@
+================================================================================
+KEY FACTS:
+ - PR #6461 = commit 0cd5285c56c5375da9f4d27836ec41eea4d069f3 (Sam Levang, 2022-04-11), fixing GH#6444: changed `keep_attrs = lambda attrs, context: attrs[1]` to `lambda attrs, context: getattr(x, "attrs", {})` in xarray/core/computation.py::where, because attrs[1] raised IndexError when x/y were non-xarray scalars.
+ - PR #6461's only test addition is in xarray/tests/test_computation.py::test_where_attrs (now lines 1935-1937): `# ensure keep_attrs can handle scalar values` / `actual = xr.where(cond, 1, 0, keep_attrs=True)` / `assert actual.attrs == {}`.
+ - The original keep_attrs support came from commit 84961e6a2b30f495ddc55c4024f105a3f89e6243 (keewis, 2022-01-19, PR #4687, GH#4141/#4682), which added the `keep_attrs=None` kwarg and the `attrs[1]` lambda so xr.where takes attrs from x rather than cond.
+ - PR #4687's test_where_attrs uses only `dims="x"` DataArrays with no coordinates, which is why the coordinate-attrs regression was never caught.
+ - There is no GH#4991 anywhere in this checkout: `git log --all --grep=4991` and `grep -rn 4991 doc/whats-new.rst xarray/` both return nothing.
+ - Propagation path confirmed: computation.py:1157-1158 converts only bools ('override'/'drop'), so a callable keep_attrs is forwarded verbatim to build_output_coords_and_indexes (computation.py:311, 476) -> merge_coordinates_without_align -> merge_collected, which sets per-coord attrs at merge.py:293-296 and merge.py:311-313, and to apply_variable_ufunc (computation.py:787-790) for every data variable.
+ - merge_attrs (merge.py:634-641) calls `combine_attrs(variable_attrs, context=context)` but `context` is None at all 12 call sites, so a callable cannot tell coord merges apart from top-level merges — a context-based fix is not viable.
+ - build_output_coords_and_indexes has a fast path (computation.py:253-260) skipping the merge when only one arg has .coords, so `xr.where(numpy_cond, x, 0, keep_attrs=True)` accidentally preserves coord attrs while `xr.where(dataarray_cond, x, 0, keep_attrs=True)` does not.
+ - Reference correct behavior comes from ops.where_method (xarray/core/ops.py:158-186), which calls apply_ufunc(..., self, cond, other, keep_attrs=True) with self first, so plain 'override' picks x's attrs at every level including coords.
+ - whats-new.rst unreleased block is `.. _whats-new.2022.11.1:` / `v2022.11.1 (unreleased)` with sections New Features (22), Breaking changes (31), Deprecations (53), Bug fixes (58-64, blank line at 60 after the `~~~` underline), Documentation (66), Internal Changes (70); a new bugfix entry appends after line 64 as `- Fix ... (:issue:`7220`, :pull:`7229`).` + `  By `Name <url>`_.`
+
+SUMMARY:
+ ## 1. The two commits that shaped `keep_attrs` in `xr.where`
+
+### (a) PR #4687 — introduced `keep_attrs` for `xr.where` (the "take attrs from x" intent)
+
+`84961e6a2b30f495ddc55c4024f105a3f89e6243` — keewis, 2022-01-19, "keep attrs in xarray.where (#4687)", closing `:issue:`4141`` and `:issue:`4682``.
+
+Code added to `xarray/core/computation.py::where` (signature went from `where(cond, x, y)` to `where(cond, x, y, keep_attrs=None)`), plus `keep_attrs=keep_attrs` on the `apply_ufunc` call:
+
+```python
+    if keep_attrs is None:
+        keep_attrs = _get_keep_attrs(default=False)
+
+    if keep_attrs is True:
+        # keep the attributes of x, the second parameter, by default to
+        # be consistent with the `where` method of `DataArray` and `Dataset`
+        keep_attrs = lambda attrs, context: attrs[1]
+```
+
+Intent: `apply_ufunc`'s normal `keep_attrs=True` → `"override"` would take attrs from the **first** argument, which for `where(cond, x, y)` is `cond`. The lambda indexes position 1 of the merged attrs list to pick `x` instead, matching `DataArray.where`/`Dataset.where`.
+
+Docstring line added: `keep_attrs : bool or str or callable, optional / How to treat attrs. If True, keep the attrs of `x`.`
+
+Test added (the whole of `test_where_attrs` at the time), `xarray/tests/test_computation.py`:
+
+```python
+def test_where_attrs() -> None:
+    cond = xr.DataArray([True, False], dims="x", attrs={"attr": "cond"})
+    x = xr.DataArray([1, 1], dims="x", attrs={"attr": "x"})
+    y = xr.DataArray([0, 0], dims="x", attrs={"attr": "y"})
+    actual = xr.where(cond, x, y, keep_attrs=True)
+    expected = xr.DataArray([1, 0], dims="x", attrs={"attr": "x"})
+    assert_identical(expected, actual)
+```
+
+Note this test uses `dims="x"` only — **no coordinates at all**, which is exactly why the coord-attr regression went unnoticed. whats-new entry (still present at `/testbed/doc/whats-new.rst:666`):
+```
+- ``keep_attrs`` support for :py:func:`where` (:issue:`4141`, :issue:`4682`, :pull:`4687`).
+  By `Justus Magin <https://github.com/keewis>`_.
+```
+
+### (b) PR #6461 — the regression the task points at
+
+`0cd5285c56c5375da9f4d27836ec41eea4d069f3` — Sam Levang, 2022-04-11, "Fix `xr.where(..., keep_attrs=True)` bug (#6461)", closing `:issue:`6444``. Diff is 3 files / +7 −2:
+
+```diff
+-
+     if keep_attrs is True:
+         # keep the attributes of x, the second parameter, by default to
+         # be consistent with the `where` method of `DataArray` and `Dataset`
+-        keep_attrs = lambda attrs, context: attrs[1]
++        keep_attrs = lambda attrs, context: getattr(x, "attrs", {})
+```
+
+Intent: with `attrs[1]`, `xr.where(cond, 1, 0, keep_attrs=True)` crashed with `IndexError` — when `x`/`y` are non-xarray scalars the attrs list handed to the callable has only one element (`cond`'s). Replacing the positional index with a closure over `x` made it crash-proof, but at the cost of *ignoring the `attrs` argument entirely*, so every per-variable and per-coordinate `merge_attrs` call now returns `x`'s top-level attrs. That is issue #7220.
+
+Test added (appended to `test_where_attrs`, still at `/testbed/xarray/tests/test_computation.py:1935-1937`):
+
+```python
+    # ensure keep_attrs can handle scalar values
+    actual = xr.where(cond, 1, 0, keep_attrs=True)
+    assert actual.attrs == {}
+```
+
+whats-new entry (still at `/testbed/doc/whats-new.rst:526`):
+```
+- Fix bug in :py:func:`where` when passing non-xarray objects with ``keep_attrs=True``. (:issue:`6444`, :pull:`6461`)
+  By `Sam Levang <https://github.com/slevang>`_.
+```
+
+### No GH#4991
+`git log --all --grep=4991` returns nothing and `grep -rn 4991` over `doc/whats-new.rst` and `xarray/` returns nothing. The only earlier related work is #4141/#4682/PR #4687 above. The only `where`+attrs tests in the tree are `test_where` and `test_where_attrs` in `test_computation.py`; `test_dataarray.py`/`test_dataset.py`/`test_units.py` `where` tests do not assert attrs.
+
+## 2. Confirmed propagation path (all in this checkout)
+
+- `/testbed/xarray/core/computation.py:1858-1863` — the lambda in `where()`.
+- `/testbed/xarray/core/computation.py:1157-1158` — `apply_ufunc` converts **only bools**: `if isinstance(keep_attrs, bool): keep_attrs = "override" if keep_attrs else "drop"`. A callable is passed through verbatim to `variables_vfunc` (line 1160-1170), `apply_dataset_vfunc` (line 1200-1210) and `apply_dataarray_vfunc` (line 1210-1217).
+- DataArray path: `computation.py:311` `build_output_coords_and_indexes(..., combine_attrs=keep_attrs)` and `computation.py:334` `merge_attrs([x.attrs for x in objs], combine_attrs=keep_attrs)` (top level).
+- Dataset path: `computation.py:476` (coords) and `computation.py:495` (top level); each **data variable** goes through `apply_variable_ufunc` → `computation.py:787-790` `merge_attrs([obj.attrs for obj in objs], combine_attrs=keep_attrs)`.
+- Coords: `build_output_coords_and_indexes` → `merge_coordinates_without_align` (`merge.py:396-421`) → `merge_collected`, which assigns per-coordinate attrs at `merge.py:293-296` (indexed coords) and `merge.py:311-313` (non-indexed): `merged_vars[name].attrs = merge_attrs([var.attrs for var in variables], combine_attrs=combine_attrs)`.
+- `merge.py:634-641`:
+```python
+def merge_attrs(variable_attrs, combine_attrs, context=None):
+    """Combine attributes from different variables according to combine_attrs"""
+    if not variable_attrs:
+        return None
+    if callable(combine_attrs):
+        return combine_attrs(variable_attrs, context=context)
+```
+  **`context` is `None` at every call site** — no caller in the tree ever passes it (checked all 12 `merge_attrs(` call sites). So a callable cannot distinguish "this is a coord merge" from "this is the top-level merge"; any fix based on inspecting `context` is a dead end.
+- Fast path worth knowing: `build_output_coords_and_indexes` skips the merge entirely when `len(coords_list) == 1 and not exclude_dims` (`computation.py:253-260`). So the coord corruption only occurs when **two 
+
+SURPRISES:
+ - The lambda is not the only source of wrongness: for Datasets the same callable also hits apply_variable_ufunc per data variable (computation.py:787-790), so ds.v.attrs gets x's *dataset-level* attrs, not just coords — the root-cause statement covers this but it means a coord-only fix is insufficient.
+ - The bug is data-dependent: `xr.where(numpy_bool_array, x, 0, keep_attrs=True)` returns the correct coord attrs because build_output_coords_and_indexes short-circuits the merge when only one argument exposes .coords (computation.py:253-260). A DataArray cond with zero coords still triggers the buggy path.
+ - Variable-level output is unaffected: `xr.where(cond.variable, x.variable, y.variable, keep_attrs=True)` correctly yields x's attrs, so the regression is confined to the coord/data-var merge paths.
+ - The PR #6461 change was itself a bug fix for a hard crash (IndexError on scalar x/y), so a naive revert to `attrs[1]` would reintroduce GH#6444 and break the existing assertion at test_computation.py:1936-1937.
+ - Upstream's fix (as I recall PR #7229) makes coordinate attrs come from `cond`, not from `x` — i.e. it deliberately does NOT match `x.where(cond, y)` for coords — so a test asserting coord attrs == x's coord attrs may contradict the intended target behavior.
+================================================================================
+KEY FACTS:
+ - xarray/core/computation.py:1858-1863 is the only place the lambda is created; it is passed to apply_ufunc at computation.py:1866-1875.
+ - A callable keep_attrs bypasses the bool->string conversion at computation.py:1157-1158, so it reaches merge_attrs (merge.py:634-641) unchanged and is invoked once per coordinate (merge.py:249-252 and 311-313) and once per Dataset data variable (computation.py:786-789).
+ - There are ZERO internal callers of computation.where. xarray/__init__.py:19-27 is its only import site in the whole package; every other 'from .computation import' pulls apply_ufunc/dot/unify_chunks.
+ - DataArray.where / Dataset.where / Variable.where / GroupBy.where all route through ops.where_method (common.py:1133, variable.py:1872, groupby.py:967), which hardcodes keep_attrs=True at ops.py:184 -> 'override' -> merge.py:644-645 dict(variable_attrs[0]). That is the correct reference behavior and is untouched by any change to computation.where.
+ - keep_attrs secretly controls the result name: apply_dataarray_vfunc computation.py:305-310 uses result_name(args) only when keep_attrs == "drop". With keep_attrs=True today the result is named after cond (measured: name='condname'). Keeping False -> literal "drop" is required or the doctests at computation.py:1835-1842 and 1846-1851 break.
+ - build_output_coords_and_indexes has a fast path at computation.py:255-259 that skips the merge (and thus combine_attrs) when only one argument has coords, so the bug only reproduces with >=2 coord-bearing args; xr.where(np.array([True,False]), x, 0, keep_attrs=True) already returns the correct x_coord attrs.
+ - Conversely, xr.where(cond, 1, 0, keep_attrs=True) currently keeps cond's COORD attrs ({'attr':'cond_coord'}) via that fast path; a fix that always rewrites coord attrs from x will change this to {}.
+ - Only test asserting attrs after xr.where is test_computation.py:1927-1937 test_where_attrs, and it uses DataArrays with no coords, which is why #6461 regressed unnoticed.
+ - test_dataset.py:4845-4856 and test_groupby.py:938-944 assert attrs after the .where METHOD (ops.where_method path) and are unaffected.
+ - test_units.py has 5 where tests (lines 1416, 1459, 1961, 2893, 4403); none passes keep_attrs, none asserts attrs, and expected/actual are built symmetrically, and extract_units (test_units.py:110-135) reads data not attrs.
+ - PR #6461 = commit 0cd5285c56c5375da9f4d27836ec41eea4d069f3 changed 'lambda attrs, context: attrs[1]' to 'lambda attrs, context: getattr(x, "attrs", {})'. The old attrs[1] form was actually CORRECT for coords (2nd merged dict = x's coord attrs) and only crashed for scalar x; the fix for scalars is what broke coords.
+ - A getattr-based post-hoc fix is unsafe for coords named after API members: getattr(x, 'T') returns the transpose DataArray carrying x's global attrs (verified), so coord 'T' would get {'attr':'x_da'}. Use 'c in x.coords' + x[c].attrs instead.
+ - Empirical current behavior matrix: DA/DA keep_attrs=True -> name=cond's name, attrs=x_da, coord=x_da (wrong); DS/DS -> ds.attrs=x_ds, v.attrs=x_ds (wrong), coord=x_ds (wrong); scalar x with Dataset y -> everything {}; DataArray x promoted against Dataset y -> global attrs wrongly set to the DataArray's attrs; Variable inputs -> attrs=x_da, no coords involved.
+ - whats-new.rst Bug fixes section for the unreleased v2022.11.1 is at doc/whats-new.rst:58-64; the #6461 entry that introduced the regression is at doc/whats-new.rst:526.
+
+SUMMARY:
+ ## 1. The buggy site and its exact plumbing
+
+`xarray/core/computation.py:1775` `def where(cond, x, y, keep_attrs=None):`, body at **1858-1875**:
+
+```python
+    if keep_attrs is None:
+        keep_attrs = _get_keep_attrs(default=False)
+    if keep_attrs is True:
+        # keep the attributes of x, the second parameter, by default to
+        # be consistent with the `where` method of `DataArray` and `Dataset`
+        keep_attrs = lambda attrs, context: getattr(x, "attrs", {})
+
+    # alignment for three arguments is complicated, so don't support it yet
+    return apply_ufunc(
+        duck_array_ops.where, cond, x, y,
+        join="exact", dataset_join="exact", dask="allowed",
+        keep_attrs=keep_attrs,
+    )
+```
+
+Flow of that callable (confirmed by reading, not guessing):
+- `apply_ufunc` `xarray/core/computation.py:1157-1158`: `if isinstance(keep_attrs, bool): keep_attrs = "override" if keep_attrs else "drop"` — a **callable bypasses this**, so it is handed through verbatim.
+- DataArray path `apply_dataarray_vfunc` `computation.py:309-311`: `build_output_coords_and_indexes(args, signature, exclude_dims, combine_attrs=keep_attrs)` and `computation.py:334`: `attrs = merge_attrs([x.attrs for x in objs], combine_attrs=keep_attrs)`.
+- Dataset path `apply_dataset_vfunc` `computation.py:475-477` (coords) and `computation.py:495` (global attrs); data-vars get it via `variables_vfunc` → `apply_variable_ufunc` `computation.py:786-789`: `attrs = merge_attrs([obj.attrs for obj in objs], combine_attrs=keep_attrs)`.
+- `merge_attrs` `xarray/core/merge.py:634-641`: `if callable(combine_attrs): return combine_attrs(variable_attrs, context=context)` — called per-coordinate at `merge.py:249-252` and `merge.py:311-313` (inside `merge_collected`, reached from `merge_coordinates_without_align` `merge.py:419-421`).
+
+So the root cause in the prompt is correct: the lambda ignores its `attrs` argument and returns `x.attrs` for **every** coordinate and (Dataset) every data variable.
+
+### Two additional facts a fix must respect
+
+**(a) Fast path means the bug needs ≥2 coord-bearing args.** `build_output_coords_and_indexes` `computation.py:255-259`:
+```python
+    if len(coords_list) == 1 and not exclude_dims:
+        # we can skip the expensive merge
+        (unpacked_coords,) = coords_list
+```
+`combine_attrs` is never consulted there. Verified empirically: `xr.where(np.array([True,False]), x, 0, keep_attrs=True)` → `r.a.attrs == {'attr': 'x_coord'}` (correct today), while `xr.where(cond, 1, 0, keep_attrs=True)` → `r.a.attrs == {'attr': 'cond_coord'}` (coord attrs survive **from cond**, since only cond has coords). Any fix that unconditionally rewrites coord attrs from `x` will *change* this second case to `{}` — that is what upstream chose, but it is a behavior change, not a no-op.
+
+**(b) `keep_attrs` also silently controls the result NAME.** `apply_dataarray_vfunc` `computation.py:305-310`:
+```python
+    if keep_attrs == "drop":
+        name = result_name(args)
+    else:
+        first_obj = _first_of_type(args, DataArray)
+        name = first_obj.name
+```
+Because the lambda `!= "drop"`, `xr.where(cond, x, y, keep_attrs=True)` names the result after **cond**, not x. Measured on this checkout: `name='condname'` with `keep_attrs=True` vs `name=None` with the default. Consequence: a fix must keep `keep_attrs=False` mapping to the literal `"drop"`, or the three doctests in `where`'s own docstring break — `computation.py:1835-1842` (`>>> xr.where(y.lat < 1, y, -1)` expects unnamed `<xarray.DataArray (lat: 3, lon: 3)>`) and `computation.py:1846-1851` (`>>> xr.where(cond, x, 0)` expects unnamed). `computation.py:1814` (`>>> xr.where(x < 0.5, x, x * 100)`) expects `'sst'` and only works because all three args are named `sst`.
+
+## 2. Consumers: there are NO internal callers of `computation.where`
+
+Exhaustive check:
+- `xarray/__init__.py:19-27` `from .core.computation import (... where ...)` and `__init__.py:94` `"where"` in `__all__`. That is the **only** import of it. Every other `from .computation import ...` in the library imports `apply_ufunc`, `dot`, or `unify_chunks` (`missing.py:15`, `variable.py:508,1885,2200,2547,2581`, `weighted.py:10`, `ops.py:144,173`, `common.py:451,1191,1236,1275,1360`, `accessor_str.py:52`, `arithmetic.py:43`, `dataset.py:46,8575`, `dataarray.py:34`).
+- No `xr.where` / `xarray.where` anywhere in `xarray/core`, `xarray/coding`, `xarray/plot`, `xarray/backends`, `xarray/conventions.py`, `asv_bench/`, or `doc/examples/`.
+
+### The `where` name collisions are all separate code paths (unaffected)
+
+| site | route |
+|---|---|
+| `xarray/core/common.py:1014` `DataWithCoords.where` | ends at `common.py:1133` `return ops.where_method(self, cond, other)` |
+| `xarray/core/variable.py:1871-1872` `Variable.where` | `return ops.where_method(self, cond, other)` |
+| `xarray/core/groupby.py:948` `GroupBy.where` | `groupby.py:967` `return ops.where_method(self, cond, other)` |
+| `xarray/core/ops.py:158` `where_method` | `ops.py:173-185` `apply_ufunc(duck_array_ops.where_method, self, cond, other, join=join, dataset_join=join, dask="allowed", keep_attrs=True)` — literal `True`, so `computation.py:1157-1158` turns it into `"override"` |
+| `xarray/core/duck_array_ops.py:293` `where` / `:299` `where_method` | raw array level, no attrs |
+
+That literal `keep_attrs=True` at `ops.py:184` is exactly why the reference behavior is right: `"override"` makes `merge_attrs` return `dict(variable_attrs[0])` (`merge.py:644-645`), i.e. each coord keeps *its own first* (= self/x) attrs. Confirmed: `x.where(cond, y)` → `attrs={'attr':'x_da'}`, `a.attrs={'attr':'x_coord'}`.
+
+Internal `.where(` method calls that ride the `ops.where_method` path (so all unaffected): `missing.py:42,48,50,373,381`; `rolling.py:196,287,484`; `weighted.py:248`; `groupby.py:427`; `computation.py:1390-1391` (cov/corr), `computation.py:2042,2063` (`_calc_idxminmax`); `coding/calendar_ops.py:207`; `resample_cftime.py:169`.
+Raw `np.where`/`duck_array_ops.where`
+
+SURPRISES:
+ - The stated root cause is confirmed, but it is incomplete in two ways. First, the bug does NOT reproduce when only one argument carries coordinates: build_output_coords_and_indexes short-circuits at computation.py:255-259 ('we can skip the expensive merge') and never calls combine_attrs, so xr.where(np.array([...]), x, 0, keep_attrs=True) already yields the correct coord attrs today.
+ - Second, the same lambda also corrupts the result NAME, which the issue description does not mention: apply_dataarray_vfunc (computation.py:305-310) only calls result_name(args) when keep_attrs is literally the string "drop", so xr.where(cond, x, y, keep_attrs=True) currently returns a DataArray named after COND, not x (measured name='condname' where x was named 'xname').
+ - The pre-#6461 lambda 'attrs[1]' was in fact correct for coordinates (attrs[1] is x's coord attrs in the merged list); PR #6461 traded a scalar-input IndexError for the coord-attr regression rather than fixing an outright-wrong behavior.
+ - Two additional wrong cases beyond those reported: xr.where(cond, scalar, dataset, keep_attrs=True) wipes ALL attrs including y's data-var attrs, and xr.where(cond, dataarray, dataset, keep_attrs=True) sets the Dataset-level attrs to the DataArray's attrs ({'attr':'x_da'}), which is a category error the upstream fix special-cases.
+================================================================================
+KEY FACTS:
+ - computation.py:1863 `keep_attrs = lambda attrs, context: getattr(x, "attrs", {})` is a constant function that ignores its `attrs` arg, so every merge_attrs call in the operation returns x's top-level attrs.
+ - There are 5 consumption sites: computation.py:305 (`keep_attrs == "drop"` name check), :310-312 and :475-476 (build_output_coords_and_indexes), :334 and :495 (object-level merge_attrs), :786-789 (variable-level merge_attrs), plus merge.py:294 and merge.py:312 (per-coordinate merge_attrs inside merge_collected).
+ - computation.py:305 `if keep_attrs == "drop"` is False for a callable, so the result name comes from the FIRST DataArray = cond. Verified: xr.where(cond, a, b, keep_attrs=True).name == 'cond'.
+ - Observed merge_attrs trace, DataArray path (3 calls in order): coord 'a' IN=[x_coord, x_coord, x_coord] -> OUT x_da; output variable IN=[cond_da, x_da, y_da] -> OUT x_da; DataArray-level IN=[cond_da, x_da, y_da] -> OUT x_da. List order is always arg order (cond, x, y).
+ - Observed merge_attrs trace, Dataset path (3 calls): coord 'a' IN=[x_coord x3] -> OUT x_ds (wrong); data var 'v' IN=[cond_da, x_da, y_da] -> OUT x_ds (wrong - data var gets the Dataset's GLOBAL attrs); Dataset-level IN=[x_ds, y_ds] -> OUT x_ds (correct).
+ - apply_variable_ufunc runs once per Dataset data-var name (via apply_dict_of_variables_vfunc at computation.py:410-427), so each data var gets its own clobbering merge_attrs call.
+ - computation.py:253-256 short-circuit `if len(coords_list) == 1 and not exclude_dims` skips coord merging entirely, so coord attrs are preserved when only ONE arg has .coords. Verified: xr.where(True, x, 0, keep_attrs=True) -> r.a.attrs == {'attr':'coord'} (correct); xr.where(cond_da, x, y, keep_attrs=True) -> r.a.attrs == {'attr':'x_da'} (broken). Regression tests need >=2 coord-bearing args.
+ - _get_coords_list (computation.py:202-211) only collects args that have .coords, i.e. DataArray/Dataset; scalars, ndarrays and bare Variables are skipped.
+ - merge_attrs never mutates its inputs; all string branches return fresh dicts (`dict(variable_attrs[0])` at merge.py:645/647/676, `{}` for drop, new dict for drop_conflicts). It returns None when variable_attrs is empty (merge.py:636-638).
+ - The callable branch (merge.py:641) returns the callable's return value verbatim, i.e. the LIVE `x._attrs` dict object.
+ - No aliasing risk in a fix: Variable.attrs setter (variable.py:958), DataArray.attrs setter (dataarray.py:871) and Dataset.attrs setter (dataset.py:649) all do `dict(value)`. Verified `xr.where(...).attrs is x.attrs` -> False. Variable.__init__ also routes through the setter (variable.py:370-371) even with fastpath=True.
+ - Aliasing back doors to AVOID in a fix: Dataset._construct_direct stores `obj._attrs = attrs` uncopied (dataset.py:968) and Dataset._replace(attrs=...) stores it uncopied (dataset.py:999, docstring says explicitly passed args are not copied).
+ - merge_collected MUTATES the input coord Variable in place: `merged_vars[name] = variable` (merge.py:293/302) then `merged_vars[name].attrs = merge_attrs(...)` (merge.py:294/312). Proven by calling merge_coordinates_without_align directly - cond._coords['a'].attrs was overwritten and `mv['a'] is cond._coords['a']`. In the where path deep_align interposes copies (alignment.py:517 `var.copy()`, dataset.py:2827 `self.copy(deep=aligner.copy)`) so no user-visible leak.
+ - apply_ufunc normalization (computation.py:1154-1158): None -> _get_keep_attrs(default=False); bool -> "override"/"drop"; str passed through unvalidated (validated only at merge.py:684-685); callable passed through untouched. Since where() already swapped in the lambda, this normalization is a no-op for keep_attrs=True.
+ - where() uses identity `if keep_attrs is True` (computation.py:1860), so truthy non-True values fall through to "override" semantics (top attrs from cond). xr.set_options(keep_attrs=True) does reach the lambda.
+ - No merge_attrs call site anywhere in xarray/core passes `context`, so the lambda's context is always None.
+ - String strategies are NOT broken: keep_attrs="override" gives correct coord attrs ({'attr':'coord'}) but cond's top-level attrs; "drop_conflicts" gives {} top-level and correct coord attrs. Only the callable is broken.
+ - Reference behavior to match: x.where(cond, y) -> attrs=x_da, a.attrs=coord. dsx.where(cond, dsy) -> attrs=x_ds, v.attrs=x_da, a.attrs=coord.
+ - Existing test test_where_attrs (xarray/tests/test_computation.py:1927-1937) asserts xr.where(cond, 1, 0, keep_attrs=True).attrs == {} - that path goes through the len(coords_list)==1 short-circuit and must keep passing. cond there has attrs={'attr':'cond'}, so reverting to keep_attrs="override" would break it.
+
+SUMMARY:
+ ## Confirmed: the root-cause candidate is exactly right, and the blast radius is wider than stated
+
+`where()` at `/testbed/xarray/core/computation.py:1858-1876`:
+
+```python
+    if keep_attrs is None:
+        keep_attrs = _get_keep_attrs(default=False)
+    if keep_attrs is True:
+        # keep the attributes of x, the second parameter, by default to
+        # be consistent with the `where` method of `DataArray` and `Dataset`
+        keep_attrs = lambda attrs, context: getattr(x, "attrs", {})   # line 1863
+
+    return apply_ufunc(duck_array_ops.where, cond, x, y,
+        join="exact", dataset_join="exact", dask="allowed", keep_attrs=keep_attrs)
+```
+
+That lambda is a *constant function*: it discards its `attrs` argument, so every one of the N `merge_attrs` calls made during the operation returns `x`'s top-level attrs, no matter which variable is being merged.
+
+---
+
+### (1) Every place `combine_attrs`/`keep_attrs` is consumed
+
+Normalization / entry:
+- `/testbed/xarray/core/computation.py:1154-1158` — `apply_ufunc` normalization (see (5)).
+- Forwarded verbatim to `apply_variable_ufunc` (`:1165`), recursive `apply_ufunc` for GroupBy (`:1183`), `apply_dataset_vfunc` (`:1200`), `apply_dataarray_vfunc` (`:1210`).
+
+Consumption sites (5 total, 3 in computation.py + 2 in merge.py):
+- `/testbed/xarray/core/computation.py:305` — `if keep_attrs == "drop":` in `apply_dataarray_vfunc`. **A callable never equals `"drop"`**, so the result name is taken from `first_obj = _first_of_type(args, DataArray)` (`:308`) = `cond`, not `x`. Side effect confirmed: `xr.where(cond, a, b, keep_attrs=True).name == 'cond'` while `keep_attrs=False` gives `None`.
+- `/testbed/xarray/core/computation.py:310-312` — `build_output_coords_and_indexes(args, signature, exclude_dims, combine_attrs=keep_attrs)` (DataArray path).
+- `/testbed/xarray/core/computation.py:334` — `attrs = merge_attrs([x.attrs for x in objs], combine_attrs=keep_attrs)` where `objs = _all_of_type(args, DataArray)` (`:303`); assigned at `:337`/`:339`.
+- `/testbed/xarray/core/computation.py:475-476` — `build_output_coords_and_indexes(..., combine_attrs=keep_attrs)` (Dataset path).
+- `/testbed/xarray/core/computation.py:495` — `merge_attrs([x.attrs for x in objs], ...)`, `objs = _all_of_type(args, Dataset)` (`:468`); assigned `:498`/`:500`.
+- `/testbed/xarray/core/computation.py:786-789` — `apply_variable_ufunc`: `objs = _all_of_type(args, Variable)`; `attrs = merge_attrs([obj.attrs for obj in objs], combine_attrs=keep_attrs)`; assigned to each output at `:814` (`var.attrs = attrs`).
+- `/testbed/xarray/core/computation.py:262` → `/testbed/xarray/core/merge.py:392-421` `merge_coordinates_without_align(..., combine_attrs=...)` → `merge_collected(filtered, prioritized, combine_attrs=combine_attrs)` (`merge.py:420-422`).
+- `/testbed/xarray/core/merge.py:293-297` — **indexed** coords: `merged_vars[name] = variable; merged_vars[name].attrs = merge_attrs([var.attrs for var, _ in indexed_elements], combine_attrs=combine_attrs)`.
+- `/testbed/xarray/core/merge.py:302-313` — **non-indexed** coords: `merged_vars[name] = unique_variable(...)` then `merged_vars[name].attrs = merge_attrs([var.attrs for var in variables], combine_attrs=combine_attrs)`.
+- Terminal: `/testbed/xarray/core/merge.py:634-641` `merge_attrs` → `if callable(combine_attrs): return combine_attrs(variable_attrs, context=context)`. **No call site anywhere passes `context`** (grep of all `merge_attrs(` call sites: concat.py:513,578,669; computation.py:334,495,787; merge.py:294,312,777; variable.py:2058,2935) — so `context` is always `None`.
+
+### (2) What the attrs list contains, in what order
+
+I instrumented `merge_attrs` (monkeypatched in both modules) with `coord.attrs={'attr':'x_coord'}`, `x.attrs={'attr':'x_da'}`, `y={'attr':'y_da'}`, `cond={'attr':'cond_da'}`. Full observed trace:
+
+DataArray path — exactly 3 calls, in this order:
+1. coord `'a'` (from `merge.py:294`, via `build_output_coords_and_indexes`): `IN=[{'attr':'x_coord'}, {'attr':'x_coord'}, {'attr':'x_coord'}] -> OUT {'attr':'x_da'}` ← **the bug**. List order = arg order (cond, x, y), one entry per arg that carries that coord name; a coord present in only one arg still gets a 1-element list and is still clobbered.
+2. output variable (`computation.py:787`, `objs = _all_of_type(args, Variable)` where args are `data_vars = [getattr(a,"variable",a) for a in args]`, `:314`): `IN=[cond_da, x_da, y_da] -> OUT x_da` (right answer, wrong reason).
+3. DataArray-level (`computation.py:334`, `objs` = all DataArray args): `IN=[cond_da, x_da, y_da] -> OUT x_da`.
+
+Dataset path (`dsx.attrs={'attr':'x_ds'}`, `dsx.v.attrs={'attr':'x_da'}`) — 3 calls:
+1. coord `'a'`: `IN=[x_coord, x_coord, x_coord] -> OUT {'attr':'x_ds'}` ← wrong.
+2. data var `'v'` (one `apply_variable_ufunc` call *per data-var name*, via `apply_dict_of_variables_vfunc` `:410-427` → `collect_dict_values` `:381`): `IN=[cond_da, x_da, y_da] -> OUT {'attr':'x_ds'}` ← wrong; the data var receives the **Dataset's global** attrs.
+3. Dataset-level (`:495`): `IN=[{'attr':'x_ds'}, {'attr':'y_ds'}] -> OUT {'attr':'x_ds'}` (correct).
+
+Reference (`dsx.where(cond, dsy)`): `attrs=x_ds`, `v.attrs=x_da`, `a.attrs=coord`.
+
+Note the str strategies are *not* broken, because they actually look at their input: `keep_attrs="override"` gives `a.attrs={'attr':'coord'}` (correct coord attrs) but top-level `{'attr':'cond_da'}` — which is precisely why #6461 reached for the lambda. `"drop_conflicts"` → top `{}`, coord `{'attr':'coord'}`.
+
+### (3) The `len(coords_list) == 1` short-circuit
+
+`/testbed/xarray/core/computation.py:253-263`:
+```python
+    coords_list = _get_coords_list(args)
+    if len(coords_list) == 1 and not exclude_dims:
+        # we can skip the expensive merge
+        (unpacked_coords,) = coords_list
+        merged_vars = dict(unpacked_coords.variables)
+        merged_indexes = dict(unpacked_coords.xindexes)
+    else:
+        merged_vars, merged_indexes = merge_coordinates_without_align(...)
+```
+`_get_coords
+
+SURPRISES:
+ - The bug is arity-dependent, not unconditional: the `len(coords_list) == 1` short-circuit at computation.py:255 means coord attrs are preserved whenever only one arg carries coords. `xr.where(True, x, 0, keep_attrs=True)` and `xr.where(np.array([True,False]), x, 0, keep_attrs=True)` both give the CORRECT coord attrs.
+ - The stated root cause omits a second symptom in the same lambda: for Datasets, each data variable receives x's *global Dataset* attrs (ds.v.attrs = 'x_ds', not 'x_da') because apply_variable_ufunc calls merge_attrs once per data-var name and the lambda returns `getattr(x, 'attrs')` = the Dataset-level dict.
+ - A third, unrelated-looking symptom of the same line: because a callable never `== "drop"` at computation.py:305, the result *name* is taken from cond rather than x. xr.where(cond, a, b, keep_attrs=True).name == 'cond' while keep_attrs=False gives None.
+ - merge_collected mutates its input coord Variables in place (merge.py:293-297) - `merged_vars[name] = variable` keeps the caller's object and then reassigns `.attrs` on it. This does not currently leak to user objects only because deep_align always interposes copies for where's 3 args. Any fix that touches coord attrs outside the aligned copies could corrupt user input.
+ - When x is a scalar, the lambda returns {} and wipes *coordinate* attrs too: xr.where(x>1, 1, x, keep_attrs=True) gives both result.attrs == {} and result.a.attrs == {}. The existing test only asserts the top-level {}.
+ - The Dataset-promotion case is also wrong in a way the issue does not mention: xr.where(cond, dataarray_x, dataset_y, keep_attrs=True) returns a Dataset whose global attrs, data-var attrs and coord attrs are all set to the DataArray x's attrs.
+================================================================================
+KEY FACTS:
+ - Root cause confirmed: computation.py:1863 `keep_attrs = lambda attrs, context: getattr(x, "attrs", {})` ignores its `attrs` argument and is invoked once per top-level object, once per output variable (computation.py:786-789) AND once per coordinate (computation.py:311/476 -> merge.py:294/312).
+ - `merge_attrs`'s `context` parameter is dead: no call site anywhere in xarray/core passes it (always None), so a callable combine_attrs cannot tell which level it is being asked about. Any fix must therefore stop using a callable.
+ - Reference `.where` works only because ops.py:177-185 passes x (`self`) as the FIRST apply_ufunc arg with `keep_attrs=True` -> "override" (computation.py:1157-1158), so x wins at all three levels; xr.where passes `cond` first.
+ - Reference invariants: top attrs = x object attrs; data-var attrs = x's PER-VARIABLE attrs; coord attrs = x's coord attrs (coords unique to another arg keep their own); object attrs never land on a coordinate.
+ - Current xr.where(keep_attrs=True) has three defects, not one: (a) every coord gets x's object attrs, (b) every data var gets x's OBJECT attrs instead of x[var].attrs (Dataset case: x_ds instead of x_var, and both v and w get x_ds), (c) when x is a scalar all coord attrs are emptied instead of preserved.
+ - Existing test `test_where_attrs` (xarray/tests/test_computation.py:1927-1937) only pins top-level attrs for a DataArray and `{}` for scalar x/y, so it does not cover coords or Datasets; both candidate fixes keep it green.
+ - Validated fix shapes: Variant A (post-process top-level + per-data-var attrs from x after apply_ufunc, with a promoted-x-to-Dataset branch) and Variant B (A + restore coord attrs from x for coords x owns => exact .where parity). Prototypes and full matrices in /tmp/exp_where3.py, /tmp/exp_where4.py.
+ - `keep_attrs="override"` giving coord attrs from cond is acceptable and consistent with house style: `x + y`, `apply_ufunc(..., keep_attrs="override")`, `xr.concat`, `xr.merge` all take coord attrs from the first/left operand, and coords unique to x or y keep their own attrs.
+ - Post-processing coordinate attrs on the result is safe: output coordinate Variables are not shared with the input objects (checked for index coords, non-dim coords, and the len(coords_list)==1 fast path), and Variable.attrs's setter copies the dict (variable.py:956-958).
+
+SUMMARY:
+ ## 1. Code paths (all citations from /testbed)
+
+**`xr.where` (the buggy one)** — `/testbed/xarray/core/computation.py:1858-1875`:
+```python
+    if keep_attrs is None:
+        keep_attrs = _get_keep_attrs(default=False)
+    if keep_attrs is True:
+        # keep the attributes of x, the second parameter, by default to
+        # be consistent with the `where` method of `DataArray` and `Dataset`
+        keep_attrs = lambda attrs, context: getattr(x, "attrs", {})
+    # alignment for three arguments is complicated, so don't support it yet
+    return apply_ufunc(duck_array_ops.where, cond, x, y, join="exact",
+                       dataset_join="exact", dask="allowed", keep_attrs=keep_attrs)
+```
+That single callable is used as `combine_attrs` at **three** different granularities:
+- top-level object attrs: `computation.py:334` (DataArray) / `computation.py:495` (Dataset) `merge_attrs([x.attrs for x in objs], combine_attrs=keep_attrs)`
+- every output **variable** (data var) attrs: `computation.py:786-789` in `apply_variable_ufunc`
+- every output **coordinate** attrs: `computation.py:311` / `476` `build_output_coords_and_indexes(..., combine_attrs=keep_attrs)` → `merge_coordinates_without_align` (`merge.py:392-421`) → `merge_collected` → `merge.py:294` and `merge.py:312` `merged_vars[name].attrs = merge_attrs([var.attrs ...], combine_attrs=combine_attrs)`
+
+`merge_attrs` dispatches callables at `merge.py:640-641`: `if callable(combine_attrs): return combine_attrs(variable_attrs, context=context)`. **`context` is `None` at every single call site** (grep of `merge_attrs(` shows concat.py:513/578/669, computation.py:334/495/787, merge.py:294/312/777, variable.py:2058/2935 — none passes `context`). So a callable *cannot possibly* distinguish "top-level attrs" from "coord attrs"; the lambda approach is structurally incapable of doing what #6461 wanted. That is the root cause, exactly as hypothesized.
+
+**Reference implementation** — `ops.where_method` `/testbed/xarray/core/ops.py:158-186`: `apply_ufunc(duck_array_ops.where_method, self, cond, other, ..., keep_attrs=True)`. Note (a) `keep_attrs=True` is a plain bool, converted at `computation.py:1157-1158` (`keep_attrs = "override" if keep_attrs else "drop"`), and (b) **`self` (i.e. x) is the FIRST argument**, so `"override"` ( `merge_attrs` → `dict(variable_attrs[0])`, merge.py:644-645) naturally yields x's attrs at *all three* levels. In `xr.where` the first argument is `cond`, which is why #6461 could not just use `"override"`.
+
+## 2. Fixtures used (each attr value unique)
+`cond`: DataArray name `cond`, attrs `cond_da`, coord `a` attrs `cond_coord`. `x`: DataArray name `v`, attrs `x_da`, coord `a` attrs `x_coord`. `y`: same shape, `y_da`/`y_coord`. Datasets `x_ds`/`y_ds`/`cond_ds`: object attrs `*_ds`, data var `v` attrs `*_var`, coord `a` attrs `*_coord`. Scripts: `/tmp/exp_where.py`, `/tmp/exp_where2.py`, `/tmp/exp_where3.py`, `/tmp/exp_where4.py`, `/tmp/exp_where5.py`, `/tmp/exp_where6.py`.
+
+## 3. REFERENCE semantics (`.where`, measured)
+
+| call | top | data-var | coord `a` |
+|---|---|---|---|
+| `x.where(cond, y)` (DA) | `x_da` | – | **`x_coord`** |
+| `x.where(cond)` / `x.where(cond, 0)` | `x_da` | – | `x_coord` |
+| `x_ds.where(cond_ds, y_ds)` | `x_ds` | `x_var` | `x_coord` |
+| `x_ds.where(cond_da, y_ds)` | `x_ds` | `x_var` | `x_coord` |
+| `x_ds2.where(...)` (2 vars v,w) | `x_ds` | `x_v`, `x_w` (per-var!) | `x_coord` |
+| `x_da.where(cond, y_ds)` (x promoted) | **`y_ds`** | `x_da` on *every* var (v and w) | `x_coord` |
+| `y_da.where(~cond, 1)` (scalar other) | `y_da` | – | `y_coord` |
+| coord present only on `other` (`only_y`) | `x_da` | – | `only_y` keeps its own attrs |
+
+Invariants: (R1) top attrs = x's object attrs; (R2) data-var attrs = x's **per-variable** attrs (never x's object attrs); (R3) coord attrs = x's coord attrs for coords x has, and each coord unique to another arg keeps its own; (R4) an object-level attr dict is *never* written onto a coordinate.
+
+## 4. ACTUAL current `xr.where` behaviour
+`keep_attrs=False` / `None` / `"drop"` are identical → everything `{}` (except the fast-path case, see Surprises). `"no_conflicts"` raises `MergeError` in every combo where two args have different coord attrs (message literally quotes `Merging {'attr': 'cond_coord'} with {'attr': 'x_coord'}`), `"drop_conflicts"` → `{}`, `"identical"` → `MergeError`.
+
+| combo | `keep_attrs=True` (top / var / coord) | `keep_attrs="override"` (top / var / coord) |
+|---|---|---|
+| (DA cond, DA x, DA y) | `x_da` / – / **`x_da`** ❌ | `cond_da` / – / `cond_coord` |
+| (scalar cond, DA x, DA y) | `x_da` / – / **`x_da`** ❌ | `x_da` / – / `x_coord` |
+| (DA cond, scalar x, DA y) | `{}` / – / **`{}`** ❌ (y's coord attrs vanish) | `cond_da` / – / `cond_coord` |
+| (DA cond, DA x, DS y) → Dataset | `x_da` / **`x_da`** ❌ / **`x_da`** ❌ | `y_ds` / `cond_da` / `cond_coord` |
+| (DA cond, DA x, DS y 2 vars) | `x_da` / `x_da` on v+w / `x_da` ❌ | `y_ds` / `cond_da` / `cond_coord` |
+| (DS cond, DS x, DS y) | `x_ds` / **`x_ds`** ❌ (should be `x_var`) / **`x_ds`** ❌ | `cond_ds` / `cond_var` / `cond_coord` |
+| (DS cond, scalar x, DS y) | `{}` / `{}` / **`{}`** ❌ | `cond_ds` / `cond_var` / `cond_coord` |
+| (DA cond, DS x, DS y) | `x_ds` / `x_ds` ❌ / `x_ds` ❌ | `x_ds` / `cond_da` / `cond_coord` |
+| (DA cond, scalar, scalar) | `{}` / – / `cond_coord` (*preserved!*) | `cond_da` / – / `cond_coord` |
+| 2-var Dataset x | `x_ds` on **both** v and w ❌ (should be `x_v`,`x_w`) | `cond_v`,`cond_w` | 
+
+So `keep_attrs=True` today writes x's **object-level** attr dict onto every coordinate and every data variable — two distinct bugs (coords, and per-var attrs of Datasets), plus a third: when x is a scalar, coord attrs of the remaining objects are dropped instead of preserved.
+
+## 5. CORRECT output per case (recommended target)
+Rule: `keep_attrs=True` means "the *data* attrs (object level + per data variable) come from x"; coordinate attrs must be left to the ordinary coordinate merge, never overwritten with
+
+SURPRISES:
+ - Additional pre-existing quirk, NOT to be used as an invariant: when only one argument has coords, `build_output_coords_and_indexes` short-circuits (computation.py:255-259 `if len(coords_list) == 1 and not exclude_dims: # we can skip the expensive merge`), so combine_attrs is never applied to coords. Hence `xr.where(cond, 1, 0, keep_attrs=False/'drop')` still returns coord attrs `cond_coord`, while `xr.where(cond, x, y, keep_attrs=False)` empties them. Coord attrs are therefore already inconsistent in apply_ufunc independent of this bug.
+ - The bug is broader than coordinates: for Datasets, `keep_attrs=True` also puts x's OBJECT attrs on every data variable (`x_ds` instead of `x_var`), so the reported issue understates the damage.
+ - In the (DA cond, DA x, DS y) promotion case, `"override"` gives top-level attrs from y_ds (because `objs = _all_of_type(args, Dataset)` finds only y) and data-var attrs from cond_da (Variable-level merge order) - the reference `.where` also gives y_ds at the top level there, so 'keep the attrs of x' is genuinely ambiguous for this combo; `{}` is the more faithful reading.
+ - `xr.where` and `.where` disagree on the result NAME, unrelated to attrs but visible to assert_identical: `xr.where(cond, x, y, keep_attrs=True).name == 'cond'` (computation.py:302-307 uses `_first_of_type(args, DataArray).name` whenever keep_attrs != "drop") vs `x.where(cond, y).name == 'v'`; with keep_attrs=False the name is None. Regression tests that build an expected DataArray with a named cond will trip on this.
+ - `keep_attrs='no_conflicts'` and `'identical'` raise MergeError for essentially every realistic input because the conflict is detected on the COORD attrs first (`Merging {'attr': 'cond_coord'} with {'attr': 'x_coord'}`). That is documented merge behaviour, not part of this bug, but it means those options are effectively unusable with xr.where on objects with annotated coords.

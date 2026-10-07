@@ -1,0 +1,1126 @@
+All 34 differential cases and 120 fuzz cases are byte-identical to the executable. Here is the code.
+
+## Architecture
+
+```
+/output
+├── lib/
+│   ├── pytuple.mjs    tuple type (so items() reprs as ('k','v') not ['k','v'])
+│   ├── pyrepr.mjs     CPython repr()/str() — quote choice + escape rules
+│   ├── pyprint.mjs    print() → stdout with sep/end
+│   ├── dictutils.mjs  OrderedMultiDict / OMD
+│   ├── argparse.mjs   ArgumentParser (usage, help, errors, exit codes)
+│   └── index.mjs      barrel
+└── test6.mjs          entry point
+```
+
+### `/output/lib/pytuple.mjs`
+
+```js
+/**
+ * pytuple.mjs
+ * -----------
+ * A minimal stand-in for Python's immutable `tuple`.
+ *
+ * JavaScript has no distinct tuple type, so `dict.items()`-style pairs would
+ * otherwise be indistinguishable from lists and would render as `['k', 'v']`
+ * instead of Python's `('k', 'v')`. This wrapper carries that type
+ * information so the repr layer can format it correctly.
+ */
+
+/**
+ * An ordered, fixed-length sequence that reprs with parentheses.
+ */
+export class PyTuple {
+  /**
+   * @param {Iterable<any>} items values held by the tuple
+   */
+  constructor(items = []) {
+    /** @type {any[]} */
+    this._items = [...items];
+    Object.freeze(this._items);
+    Object.freeze(this);
+  }
+
+  /** Number of elements (Python `len(t)`). */
+  get length() {
+    return this._items.length;
+  }
+
+  /** Positional access (Python `t[i]`, negative indexes supported). */
+  at(index) {
+    const i = index < 0 ? this._items.length + index : index;
+    if (i < 0 || i >= this._items.length) {
+      throw new RangeError('tuple index out of range');
+    }
+    return this._items[i];
+  }
+
+  /** Plain-array view of the contents. */
+  toArray() {
+    return [...this._items];
+  }
+
+  [Symbol.iterator]() {
+    return this._items[Symbol.iterator]();
+  }
+}
+
+/**
+ * Convenience factory: `tuple('a', 'b')` -> PyTuple('a', 'b').
+ * @param {...any} items
+ */
+export function tuple(...items) {
+  return new PyTuple(items);
+}
+
+/**
+ * @param {any} value
+ * @returns {boolean} true when `value` is a PyTuple instance
+ */
+export function isTuple(value) {
+  return value instanceof PyTuple;
+}
+```
+
+### `/output/lib/pyrepr.mjs`
+
+```js
+/**
+ * pyrepr.mjs
+ * ----------
+ * Re-implementation of CPython's `repr()` / `str()` rendering for the value
+ * kinds this project needs (str, list, tuple, int, float, bool, None).
+ *
+ * The string rules mirror CPython's `unicode_repr`:
+ *   - single quotes are preferred; double quotes are used only when the text
+ *     contains a `'` but no `"`,
+ *   - the quote character and backslash are backslash-escaped,
+ *   - \t \n \r have short forms,
+ *   - anything Python considers non-printable becomes \xXX / \uXXXX / \UXXXXXXXX.
+ */
+
+import { isTuple } from './pytuple.mjs';
+
+/**
+ * Python's `str.isprintable()` is false for the Unicode general categories
+ * Cc, Cf, Cs, Co, Cn, Zl, Zp and Zs -- with the sole exception of the ASCII
+ * space (U+0020), which is printable. These are engine-native Unicode
+ * property escapes, not an external dependency.
+ */
+const NON_PRINTABLE = /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]/u;
+
+/**
+ * @param {string} ch a single code point
+ * @returns {boolean} whether Python would treat `ch` as printable
+ */
+function isPrintable(ch) {
+  if (ch === ' ') return true;
+  return !NON_PRINTABLE.test(ch);
+}
+
+/**
+ * Zero-padded lowercase hex, as used by Python's escape sequences.
+ * @param {number} cp code point
+ * @param {number} width digits to pad to
+ */
+function hex(cp, width) {
+  return cp.toString(16).padStart(width, '0');
+}
+
+/**
+ * Escape a non-printable code point the way CPython does.
+ * @param {number} cp code point
+ */
+function escapeCodePoint(cp) {
+  if (cp < 0x100) return `\\x${hex(cp, 2)}`;
+  if (cp < 0x10000) return `\\u${hex(cp, 4)}`;
+  return `\\U${hex(cp, 8)}`;
+}
+
+/**
+ * Render a JS string exactly as Python's `repr()` would.
+ * @param {string} s
+ * @returns {string}
+ */
+export function reprStr(s) {
+  // Quote selection: prefer ', switch to " when that avoids escaping.
+  const quote = s.includes("'") && !s.includes('"') ? '"' : "'";
+
+  let out = quote;
+  // Iterating with the spread operator walks code points, so astral
+  // characters (surrogate pairs) are handled as single characters.
+  for (const ch of s) {
+    if (ch === quote || ch === '\\') {
+      out += '\\' + ch;
+      continue;
+    }
+    if (ch === '\t') {
+      out += '\\t';
+      continue;
+    }
+    if (ch === '\n') {
+      out += '\\n';
+      continue;
+    }
+    if (ch === '\r') {
+      out += '\\r';
+      continue;
+    }
+    const cp = ch.codePointAt(0);
+    if (cp < 0x20 || cp === 0x7f) {
+      out += escapeCodePoint(cp);
+      continue;
+    }
+    if (cp < 0x7f) {
+      out += ch;
+      continue;
+    }
+    out += isPrintable(ch) ? ch : escapeCodePoint(cp);
+  }
+  return out + quote;
+}
+
+/**
+ * Render a number the way Python renders ints and floats.
+ * @param {number} n
+ */
+function reprNumber(n) {
+  if (Number.isInteger(n) && Object.is(n, Math.trunc(n)) && !Object.is(n, -0)) {
+    // Integral values coming from int-typed data print without a fraction.
+    return String(n);
+  }
+  if (Number.isNaN(n)) return 'nan';
+  if (n === Infinity) return 'inf';
+  if (n === -Infinity) return '-inf';
+  const s = String(n);
+  // Python always shows a decimal point or exponent for floats.
+  return /[.e]/i.test(s) ? s.replace('e+', 'e+').replace('Infinity', 'inf') : `${s}.0`;
+}
+
+/**
+ * Python `repr()` for the supported value kinds.
+ * @param {any} value
+ * @returns {string}
+ */
+export function pyRepr(value) {
+  if (value === null || value === undefined) return 'None';
+  if (typeof value === 'boolean') return value ? 'True' : 'False';
+  if (typeof value === 'string') return reprStr(value);
+  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'number') return reprNumber(value);
+
+  if (isTuple(value)) {
+    const parts = value.toArray().map(pyRepr);
+    // A one-element tuple keeps its trailing comma: ('a',)
+    if (parts.length === 1) return `(${parts[0]},)`;
+    return `(${parts.join(', ')})`;
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map(pyRepr).join(', ')}]`;
+  }
+
+  // Objects may define their own repr, mirroring Python's __repr__ protocol.
+  if (typeof value.__repr__ === 'function') return value.__repr__();
+
+  return String(value);
+}
+
+/**
+ * Python `str()`: strings pass through untouched, everything else falls back
+ * to `__str__` when present and otherwise to `repr()`.
+ * @param {any} value
+ * @returns {string}
+ */
+export function pyStr(value) {
+  if (typeof value === 'string') return value;
+  if (value !== null && value !== undefined && typeof value.__str__ === 'function') {
+    return value.__str__();
+  }
+  return pyRepr(value);
+}
+```
+
+### `/output/lib/pyprint.mjs`
+
+```js
+/**
+ * pyprint.mjs
+ * -----------
+ * Python's `print()` semantics on top of stdout: values are rendered with
+ * `str()`, joined by `sep`, and terminated with `end`.
+ */
+
+import { pyStr } from './pyrepr.mjs';
+
+/**
+ * @param {any[]} values objects to render
+ * @param {{sep?: string, end?: string}} [options]
+ */
+export function print(...values) {
+  let sep = ' ';
+  let end = '\n';
+
+  // Python takes sep/end as keyword-only arguments; emulate with a trailing
+  // options object that is not itself a printable value.
+  const last = values[values.length - 1];
+  if (
+    values.length > 0 &&
+    last !== null &&
+    typeof last === 'object' &&
+    last.constructor === Object &&
+    ('sep' in last || 'end' in last)
+  ) {
+    if (typeof last.sep === 'string') sep = last.sep;
+    if (typeof last.end === 'string') end = last.end;
+    values = values.slice(0, -1);
+  }
+
+  process.stdout.write(values.map(pyStr).join(sep) + end);
+}
+
+/** Write to stderr with the same rendering rules. */
+export function printErr(...values) {
+  process.stderr.write(values.map(pyStr).join(' ') + '\n');
+}
+```
+
+### `/output/lib/dictutils.mjs`
+
+```js
+/**
+ * dictutils.mjs
+ * -------------
+ * `OrderedMultiDict` (alias `OMD`): an insertion-ordered mapping that keeps
+ * every value ever added under a key, while still behaving like a plain
+ * ordered dict for single-value access.
+ *
+ * Behaviour reproduced from the reference implementation:
+ *   - `add(k, v)` appends a value and returns undefined (Python `None`),
+ *   - `getlist(k)` returns every value for `k` in insertion order,
+ *   - single-value views (`get`, `keys`, `values`, `items`) collapse a key to
+ *     its LAST added value, and keys appear in FIRST-insertion order,
+ *   - `len()` counts distinct keys, not stored pairs,
+ *   - `repr()` renders every stored pair: OrderedMultiDict([('k', 'v'), ...]).
+ */
+
+import { pyRepr } from './pyrepr.mjs';
+import { PyTuple } from './pytuple.mjs';
+
+/**
+ * Build a lookup token with Python's dict key semantics for the scalar types
+ * we support. Notably `True`/`1` and `1`/`1.0` share a slot, as in Python.
+ * @param {any} key
+ * @returns {string}
+ */
+function keyToken(key) {
+  if (key === null || key === undefined) return 'None';
+  const t = typeof key;
+  if (t === 'string') return `s:${key}`;
+  if (t === 'boolean') return `n:${key ? 1 : 0}`;
+  if (t === 'number' || t === 'bigint') return `n:${Number(key)}`;
+  return key; // objects fall back to identity, like Python's default __hash__
+}
+
+/** Raised where Python would raise `KeyError`. */
+export class KeyError extends Error {
+  constructor(key) {
+    super(pyRepr(key));
+    this.name = 'KeyError';
+    this.key = key;
+  }
+}
+
+export class OrderedMultiDict {
+  /**
+   * @param {Iterable<[any, any]>|OrderedMultiDict|null} initial pairs to seed with
+   */
+  constructor(initial = null) {
+    /**
+     * Every stored pair, in insertion order.
+     * @type {{key: any, value: any}[]}
+     */
+    this._items = [];
+    /**
+     * token -> { key, values } where `values` mirrors insertion order.
+     * A Map keeps first-insertion ordering of the distinct keys for free.
+     * @type {Map<any, {key: any, values: any[]}>}
+     */
+    this._map = new Map();
+
+    if (initial !== null && initial !== undefined) {
+      this.addMany(initial);
+    }
+  }
+
+  // ---------------------------------------------------------------- writing
+
+  /**
+   * Append `value` under `key`, keeping any values already stored there.
+   * Returns undefined, matching Python's `add()` which yields None.
+   * @param {any} key
+   * @param {any} value
+   */
+  add(key, value) {
+    const token = keyToken(key);
+    let slot = this._map.get(token);
+    if (slot === undefined) {
+      slot = { key, values: [] };
+      this._map.set(token, slot);
+    }
+    slot.values.push(value);
+    this._items.push({ key, value });
+  }
+
+  /**
+   * Append several values under one key.
+   * @param {any} key
+   * @param {Iterable<any>} values
+   */
+  addlist(key, values) {
+    for (const value of values) this.add(key, value);
+  }
+
+  /**
+   * Seed from an iterable of [key, value] pairs or another multidict.
+   * @param {Iterable<[any, any]>|OrderedMultiDict} source
+   */
+  addMany(source) {
+    const pairs = source instanceof OrderedMultiDict ? source.items(true) : source;
+    for (const pair of pairs) {
+      const [key, value] = pair instanceof PyTuple ? pair.toArray() : pair;
+      this.add(key, value);
+    }
+  }
+
+  /**
+   * Replace every value stored under `key` with the single `value`
+   * (Python's `omd[key] = value`).
+   * @param {any} key
+   * @param {any} value
+   */
+  set(key, value) {
+    const token = keyToken(key);
+    if (this._map.has(token)) {
+      this._map.get(token).values = [value];
+      let seen = false;
+      this._items = this._items.filter((item) => {
+        if (keyToken(item.key) !== token) return true;
+        if (seen) return false;
+        seen = true;
+        item.value = value; // keep the key's original position
+        return true;
+      });
+      return;
+    }
+    this.add(key, value);
+  }
+
+  /**
+   * Remove `key` and all of its values, returning the last one.
+   * @param {any} key
+   * @param {any} [fallback] returned instead of raising when absent
+   */
+  popall(key, fallback) {
+    const token = keyToken(key);
+    const slot = this._map.get(token);
+    if (slot === undefined) {
+      if (arguments.length > 1) return fallback;
+      throw new KeyError(key);
+    }
+    this._map.delete(token);
+    this._items = this._items.filter((item) => keyToken(item.key) !== token);
+    return slot.values;
+  }
+
+  /**
+   * Remove the key's most recent value; drops the key when it was the last.
+   * @param {any} key
+   * @param {any} [fallback]
+   */
+  pop(key, fallback) {
+    const token = keyToken(key);
+    const slot = this._map.get(token);
+    if (slot === undefined) {
+      if (arguments.length > 1) return fallback;
+      throw new KeyError(key);
+    }
+    const value = slot.values.pop();
+    if (slot.values.length === 0) this._map.delete(token);
+    for (let i = this._items.length - 1; i >= 0; i -= 1) {
+      if (keyToken(this._items[i].key) === token) {
+        this._items.splice(i, 1);
+        break;
+      }
+    }
+    return value;
+  }
+
+  /** Drop every pair. */
+  clear() {
+    this._items = [];
+    this._map.clear();
+  }
+
+  // ---------------------------------------------------------------- reading
+
+  /**
+   * The most recently added value for `key`; raises KeyError when absent.
+   * @param {any} key
+   */
+  getitem(key) {
+    const slot = this._map.get(keyToken(key));
+    if (slot === undefined) throw new KeyError(key);
+    return slot.values[slot.values.length - 1];
+  }
+
+  /**
+   * The most recently added value for `key`, or `fallback` (default None).
+   * @param {any} key
+   * @param {any} [fallback]
+   */
+  get(key, fallback = null) {
+    const slot = this._map.get(keyToken(key));
+    if (slot === undefined) return fallback;
+    return slot.values[slot.values.length - 1];
+  }
+
+  /**
+   * Every value stored under `key`, in insertion order. Missing keys yield an
+   * empty list unless an explicit `fallback` is supplied.
+   * @param {any} key
+   * @param {any} [fallback]
+   * @returns {any[]}
+   */
+  getlist(key, fallback) {
+    const slot = this._map.get(keyToken(key));
+    if (slot === undefined) return arguments.length > 1 ? fallback : [];
+    return [...slot.values];
+  }
+
+  /**
+   * @param {any} key
+   * @returns {boolean} Python's `key in omd`
+   */
+  has(key) {
+    return this._map.has(keyToken(key));
+  }
+
+  /**
+   * Distinct keys in first-insertion order, or every key occurrence when
+   * `multi` is true.
+   * @param {boolean} [multi=false]
+   * @returns {any[]}
+   */
+  keys(multi = false) {
+    if (multi) return this._items.map((item) => item.key);
+    return [...this._map.values()].map((slot) => slot.key);
+  }
+
+  /**
+   * One value per distinct key (the last added), or every stored value when
+   * `multi` is true.
+   * @param {boolean} [multi=false]
+   * @returns {any[]}
+   */
+  values(multi = false) {
+    if (multi) return this._items.map((item) => item.value);
+    return [...this._map.values()].map((slot) => slot.values[slot.values.length - 1]);
+  }
+
+  /**
+   * Key/value pairs as tuples. Single-value mode gives one pair per distinct
+   * key holding that key's LAST value; multi mode gives every stored pair.
+   * @param {boolean} [multi=false]
+   * @returns {PyTuple[]}
+   */
+  items(multi = false) {
+    if (multi) {
+      return this._items.map((item) => new PyTuple([item.key, item.value]));
+    }
+    return [...this._map.values()].map(
+      (slot) => new PyTuple([slot.key, slot.values[slot.values.length - 1]]),
+    );
+  }
+
+  /** Number of distinct keys (Python `len(omd)`). */
+  get length() {
+    return this._map.size;
+  }
+
+  /** Number of distinct keys, as a method for call-site convenience. */
+  size() {
+    return this._map.size;
+  }
+
+  /** A plain object keyed by the last value of each key. */
+  todict() {
+    const out = {};
+    for (const slot of this._map.values()) {
+      out[String(slot.key)] = slot.values[slot.values.length - 1];
+    }
+    return out;
+  }
+
+  /** An independent copy holding the same pairs. */
+  copy() {
+    const clone = new OrderedMultiDict();
+    for (const item of this._items) clone.add(item.key, item.value);
+    return clone;
+  }
+
+  /** Iterating a multidict walks its distinct keys, as in Python. */
+  [Symbol.iterator]() {
+    return this.keys()[Symbol.iterator]();
+  }
+
+  // ---------------------------------------------------------------- display
+
+  /** Python `__repr__`: shows every stored pair. */
+  __repr__() {
+    return `OrderedMultiDict(${pyRepr(this.items(true))})`;
+  }
+
+  /** Python has no separate `__str__` here, so `str()` reuses `repr()`. */
+  __str__() {
+    return this.__repr__();
+  }
+
+  toString() {
+    return this.__repr__();
+  }
+}
+
+/** Short alias exposed by the source library. */
+export const OMD = OrderedMultiDict;
+```
+
+### `/output/lib/argparse.mjs`
+
+```js
+/**
+ * argparse.mjs
+ * ------------
+ * A dependency-free re-implementation of the slice of Python's `argparse`
+ * needed here: long/short optional arguments with `store` and `help` actions,
+ * `required=True`, `type` coercion, auto-generated usage/help text, and the
+ * same error messages and exit codes.
+ *
+ * Behaviours verified against the reference implementation:
+ *   - `--opt value` and `--opt=value` are both accepted,
+ *   - unique prefixes abbreviate long options (`--h` -> `--help`),
+ *   - a token starting with `-` is treated as a value only when it is a bare
+ *     `-`, a negative number, or contains a space,
+ *   - `--` ends option parsing and is itself left over as an extra argument,
+ *   - missing-required errors are reported before unrecognized-argument ones,
+ *   - `--help` prints to stdout and exits 0; errors print usage + message to
+ *     stderr and exit 2.
+ */
+
+import { basename } from 'node:path';
+import { pyRepr } from './pyrepr.mjs';
+
+/** Matches tokens argparse is willing to read as negative numbers. */
+const NEGATIVE_NUMBER = /^-\d+$|^-\d*\.\d+$/;
+
+/** argparse's HelpFormatter constants. */
+const INDENT = 2;
+const MAX_HELP_POSITION = 24;
+
+/**
+ * Terminal width argparse would use: COLUMNS (or 80) minus two.
+ * @returns {number}
+ */
+function displayWidth() {
+  const columns = Number.parseInt(process.env.COLUMNS ?? '', 10);
+  const total = Number.isInteger(columns) && columns > 0 ? columns : 80;
+  return Math.max(total - 2, 11);
+}
+
+/**
+ * Greedy word wrap, matching textwrap's behaviour for simple help strings.
+ * @param {string} text
+ * @param {number} width
+ * @returns {string[]}
+ */
+function wrap(text, width) {
+  const words = text.split(/\s+/).filter((w) => w.length > 0);
+  if (words.length === 0) return [];
+  const lines = [];
+  let line = words[0];
+  for (const word of words.slice(1)) {
+    if (line.length + 1 + word.length <= width) {
+      line += ` ${word}`;
+    } else {
+      lines.push(line);
+      line = word;
+    }
+  }
+  lines.push(line);
+  return lines;
+}
+
+/**
+ * The name argparse uses when talking about an action in an error message.
+ * @param {object} action
+ * @returns {string}
+ */
+function actionName(action) {
+  if (action.optionStrings.length > 0) return action.optionStrings.join('/');
+  return action.metavar ?? action.dest;
+}
+
+export class ArgumentError extends Error {}
+
+export class ArgumentParser {
+  /**
+   * @param {{prog?: string, addHelp?: boolean, prefixChars?: string,
+   *          description?: string, epilog?: string, exitOnError?: boolean}} [options]
+   */
+  constructor(options = {}) {
+    const {
+      prog = null,
+      addHelp = true,
+      prefixChars = '-',
+      description = null,
+      epilog = null,
+      exitOnError = true,
+    } = options;
+
+    // Python uses basename(sys.argv[0]); the ESM equivalent is the script path.
+    this.prog = prog ?? basename(process.argv[1] ?? 'program');
+    this.prefixChars = prefixChars;
+    this.description = description;
+    this.epilog = epilog;
+    this.exitOnError = exitOnError;
+
+    /** @type {object[]} */
+    this._actions = [];
+    /** @type {Map<string, object>} */
+    this._optionStringActions = new Map();
+    this._actionMaxLength = 0;
+
+    if (addHelp) {
+      this.addArgument('-h', '--help', {
+        action: 'help',
+        default: undefined,
+        help: 'show this help message and exit',
+      });
+    }
+  }
+
+  /**
+   * Register an optional argument.
+   * `addArgument('--a', { type: String, required: true })`
+   * @param {...(string|object)} args option strings, then an options object
+   */
+  addArgument(...args) {
+    const options = typeof args[args.length - 1] === 'object' && args[args.length - 1] !== null
+      ? args.pop()
+      : {};
+    /** @type {string[]} */
+    const optionStrings = args;
+
+    if (optionStrings.length === 0) {
+      throw new ArgumentError('positional arguments are not supported');
+    }
+
+    const actionType = options.action ?? 'store';
+    const isFlag = actionType === 'store_true' || actionType === 'store_false' || actionType === 'help';
+
+    // dest comes from the first long option, else the first short one.
+    let dest = options.dest;
+    if (dest === undefined) {
+      const longOption = optionStrings.find((s) => s.slice(0, 2) === '--');
+      const source = longOption ?? optionStrings[0];
+      dest = source.replace(/^-+/, '').replace(/-/g, '_');
+    }
+
+    const action = {
+      optionStrings,
+      dest,
+      action: actionType,
+      nargs: isFlag ? 0 : 1,
+      type: options.type ?? null,
+      required: options.required ?? false,
+      default: 'default' in options
+        ? options.default
+        : (actionType === 'store_true' ? false : (actionType === 'store_false' ? true : null)),
+      help: options.help ?? null,
+      metavar: options.metavar ?? (isFlag ? null : dest.toUpperCase()),
+    };
+
+    this._actions.push(action);
+    for (const optionString of optionStrings) {
+      this._optionStringActions.set(optionString, action);
+    }
+
+    const length = this._formatActionInvocation(action).length + INDENT;
+    this._actionMaxLength = Math.max(this._actionMaxLength, length);
+
+    return action;
+  }
+
+  // -------------------------------------------------------------- formatting
+
+  /**
+   * `--a A` / `-h` -- how an action's arguments appear in usage text.
+   * @param {object} action
+   */
+  _formatActionArgs(action) {
+    if (action.nargs === 0) return '';
+    return action.metavar ?? action.dest.toUpperCase();
+  }
+
+  /**
+   * How an action is introduced in the options list: `-h, --help`, `--a A`.
+   * @param {object} action
+   */
+  _formatActionInvocation(action) {
+    if (action.nargs === 0) return action.optionStrings.join(', ');
+    const args = this._formatActionArgs(action);
+    return action.optionStrings.map((option) => `${option} ${args}`).join(', ');
+  }
+
+  /**
+   * The bracketed/bare fragment an action contributes to the usage line.
+   * @param {object} action
+   */
+  _formatUsagePart(action) {
+    const args = this._formatActionArgs(action);
+    const body = args === '' ? action.optionStrings[0] : `${action.optionStrings[0]} ${args}`;
+    return action.required ? body : `[${body}]`;
+  }
+
+  /** `usage: prog [-h] --a A ...` including its trailing newline. */
+  formatUsage() {
+    const parts = this._actions.map((action) => this._formatUsagePart(action));
+    const prefix = `usage: ${this.prog}`;
+    const width = displayWidth();
+
+    const oneLine = [prefix, ...parts].join(' ');
+    if (oneLine.length <= width || parts.length === 0) return `${oneLine}\n`;
+
+    // Too long for one line: continue under a hanging indent, as argparse does.
+    const indent = ' '.repeat(prefix.length + 1);
+    const lines = [];
+    let current = prefix;
+    for (const part of parts) {
+      if (current.length + 1 + part.length <= width) {
+        current += ` ${part}`;
+      } else {
+        lines.push(current);
+        current = indent + part;
+      }
+    }
+    lines.push(current);
+    return `${lines.join('\n')}\n`;
+  }
+
+  /** Full `--help` text, including its trailing newline. */
+  formatHelp() {
+    const width = displayWidth();
+    const helpPosition = Math.min(this._actionMaxLength + 2, MAX_HELP_POSITION);
+    // Only the help column has a minimum width in argparse; the invocation
+    // column is exactly whatever is left of the help position.
+    const helpWidth = Math.max(width - helpPosition, 11);
+    const actionWidth = helpPosition - INDENT - 2;
+
+    let out = this.formatUsage();
+    if (this.description) out += `\n${wrap(this.description, width).join('\n')}\n`;
+    out += '\noptions:\n';
+
+    for (const action of this._actions) {
+      const invocation = this._formatActionInvocation(action);
+      const pad = ' '.repeat(INDENT);
+
+      if (!action.help) {
+        // No help text: just the header line, with no trailing padding.
+        out += `${pad}${invocation}\n`;
+        continue;
+      }
+
+      const helpLines = wrap(action.help, helpWidth);
+      if (invocation.length <= actionWidth) {
+        out += `${pad}${invocation.padEnd(actionWidth)}  ${helpLines[0]}\n`;
+      } else {
+        // Header overflows its column, so help starts on the next line.
+        out += `${pad}${invocation}\n`;
+        out += `${' '.repeat(helpPosition)}${helpLines[0]}\n`;
+      }
+      for (const line of helpLines.slice(1)) {
+        out += `${' '.repeat(helpPosition)}${line}\n`;
+      }
+    }
+
+    if (this.epilog) out += `\n${wrap(this.epilog, width).join('\n')}\n`;
+    return out;
+  }
+
+  printUsage(stream = process.stderr) {
+    stream.write(this.formatUsage());
+  }
+
+  printHelp(stream = process.stdout) {
+    stream.write(this.formatHelp());
+  }
+
+  /**
+   * Report a usage error exactly as argparse does, then exit with status 2.
+   * @param {string} message
+   * @returns {never}
+   */
+  error(message) {
+    this.printUsage(process.stderr);
+    process.stderr.write(`${this.prog}: error: ${message}\n`);
+    process.exit(2);
+  }
+
+  // ----------------------------------------------------------------- parsing
+
+  /**
+   * Classify a token. Returns null when argparse would treat it as a
+   * positional value, otherwise a descriptor whose `action` is null for an
+   * unrecognized option.
+   * @param {string} token
+   * @returns {{action: object|null, optionString: string, explicitArg: string|null}|null}
+   */
+  _parseOptional(token) {
+    if (token.length === 0) return null;
+    if (!this.prefixChars.includes(token[0])) return null;
+
+    // An exact match always wins over abbreviation.
+    if (this._optionStringActions.has(token)) {
+      return { action: this._optionStringActions.get(token), optionString: token, explicitArg: null };
+    }
+    if (token.length === 1) return null; // a lone '-' is a value
+
+    const eq = token.indexOf('=');
+    if (eq !== -1) {
+      const optionString = token.slice(0, eq);
+      const explicitArg = token.slice(eq + 1);
+      if (this._optionStringActions.has(optionString)) {
+        return { action: this._optionStringActions.get(optionString), optionString, explicitArg };
+      }
+    }
+
+    // Unique-prefix abbreviation, over the part before any '='.
+    const prefix = eq === -1 ? token : token.slice(0, eq);
+    const explicitArg = eq === -1 ? null : token.slice(eq + 1);
+    const matches = [...this._optionStringActions.keys()].filter(
+      (option) => option.startsWith(prefix) && option.length > 1,
+    );
+    if (matches.length > 1) {
+      this.error(`ambiguous option: ${prefix} could match ${matches.join(', ')}`);
+    }
+    if (matches.length === 1) {
+      return {
+        action: this._optionStringActions.get(matches[0]),
+        optionString: matches[0],
+        explicitArg,
+      };
+    }
+
+    // Negative numbers are values while no option looks like one.
+    if (NEGATIVE_NUMBER.test(token) && !this._hasNegativeNumberOptions()) return null;
+    if (token.includes(' ')) return null;
+
+    return { action: null, optionString: token, explicitArg: null };
+  }
+
+  /** True when any registered option string itself looks like a negative number. */
+  _hasNegativeNumberOptions() {
+    for (const option of this._optionStringActions.keys()) {
+      if (NEGATIVE_NUMBER.test(option)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Coerce a raw string through the action's `type`.
+   * @param {object} action
+   * @param {string} raw
+   */
+  _convert(action, raw) {
+    const converter = action.type;
+    if (converter === null || converter === String) return raw;
+    let typeName = converter.name || 'value';
+    if (converter === Number) typeName = 'float';
+    try {
+      const value = converter(raw);
+      if (converter === Number && Number.isNaN(value)) throw new Error('not a number');
+      return value;
+    } catch {
+      this.error(`argument ${actionName(action)}: invalid ${typeName} value: ${pyRepr(raw)}`);
+    }
+    return undefined;
+  }
+
+  /**
+   * Parse, tolerating unknown arguments.
+   * @param {string[]} [argv] defaults to process.argv.slice(2)
+   * @returns {[Record<string, any>, string[]]} namespace and leftover args
+   */
+  parseKnownArgs(argv = process.argv.slice(2)) {
+    /** @type {Record<string, any>} */
+    const namespace = {};
+    for (const action of this._actions) {
+      if (action.action === 'help') continue;
+      namespace[action.dest] = action.default;
+    }
+
+    /** @type {string[]} */
+    const extras = [];
+    const seen = new Set();
+    let optionsEnded = false;
+    let i = 0;
+
+    while (i < argv.length) {
+      const token = argv[i];
+
+      if (optionsEnded) {
+        extras.push(token);
+        i += 1;
+        continue;
+      }
+      if (token === '--') {
+        // Everything from here on is positional; '--' itself is left over.
+        optionsEnded = true;
+        extras.push(token);
+        i += 1;
+        continue;
+      }
+
+      const parsed = this._parseOptional(token);
+      if (parsed === null || parsed.action === null) {
+        extras.push(token); // positional value or unknown option
+        i += 1;
+        continue;
+      }
+
+      const { action, explicitArg } = parsed;
+      i += 1;
+
+      if (action.action === 'help') {
+        this.printHelp(process.stdout);
+        process.exit(0);
+      }
+
+      if (action.nargs === 0) {
+        if (explicitArg !== null) {
+          this.error(`argument ${actionName(action)}: ignored explicit argument ${pyRepr(explicitArg)}`);
+        }
+        namespace[action.dest] = action.action === 'store_false' ? false : true;
+        seen.add(action);
+        continue;
+      }
+
+      let raw;
+      if (explicitArg !== null) {
+        raw = explicitArg;
+      } else {
+        const next = argv[i];
+        // A missing value, an option-looking token, or '--' all count as absent.
+        if (next === undefined || next === '--' || this._parseOptional(next) !== null) {
+          this.error(`argument ${actionName(action)}: expected one argument`);
+        }
+        raw = next;
+        i += 1;
+      }
+
+      namespace[action.dest] = this._convert(action, raw);
+      seen.add(action);
+    }
+
+    // Required arguments are checked before leftover arguments are reported.
+    const missing = this._actions
+      .filter((action) => action.required && !seen.has(action))
+      .map(actionName);
+    if (missing.length > 0) {
+      this.error(`the following arguments are required: ${missing.join(', ')}`);
+    }
+
+    return [namespace, extras];
+  }
+
+  /**
+   * Parse, rejecting unknown arguments.
+   * @param {string[]} [argv] defaults to process.argv.slice(2)
+   * @returns {Record<string, any>}
+   */
+  parseArgs(argv = process.argv.slice(2)) {
+    const [namespace, extras] = this.parseKnownArgs(argv);
+    if (extras.length > 0) {
+      this.error(`unrecognized arguments: ${extras.join(' ')}`);
+    }
+    return namespace;
+  }
+}
+```
+
+### `/output/lib/index.mjs`
+
+```js
+/**
+ * index.mjs
+ * ---------
+ * Barrel module: a single import surface for the local library.
+ */
+
+export { ArgumentParser, ArgumentError } from './argparse.mjs';
+export { OrderedMultiDict, OMD, KeyError } from './dictutils.mjs';
+export { print, printErr } from './pyprint.mjs';
+export { pyRepr, pyStr, reprStr } from './pyrepr.mjs';
+export { PyTuple, tuple, isTuple } from './pytuple.mjs';
+```
+
+### `/output/test6.mjs` (entry point)
+
+```js
+/**
+ * test6.mjs
+ * ---------
+ * Node.js (ESM) port of /workspace/dataset/test6.py.
+ *
+ * Usage: node test6.mjs --a A --b B --c C
+ */
+
+import { ArgumentParser } from './lib/argparse.mjs';
+import { OMD } from './lib/dictutils.mjs';
+import { print } from './lib/pyprint.mjs';
+
+const parser = new ArgumentParser();
+parser.addArgument('--a', { type: String, required: true });
+parser.addArgument('--b', { type: String, required: true });
+parser.addArgument('--c', { type: String, required: true });
+const args = parser.parseArgs();
+
+const omd = new OMD(); // 创建有序多值字典
+print(omd);
+omd.add(args.a, args.b); // 添加键值对（add方法返回None）
+print(omd);
+omd.add(args.a, args.c); // 添加相同键的第二个值
+print(omd);
+const result1 = omd.getlist(args.a); // 获取键的所有值
+print(result1);
+const result2 = omd.keys(); // 获取所有键
+print(result2);
+const result3 = omd.items(); // 获取所有键值对
+print(result3);
+```
+
+## Verification
+
+Differential harness against `/workspace/dataset/test6_executable`, comparing stdout, stderr, and exit code:
+
+- **34 hand-picked cases: all pass** — normal input, duplicate values, empty strings, quote-selection (`"it's"`, `'say "hi"'`), tabs/newlines, CJK/emoji/astral chars, non-printables (`\xa0`, `\u200b`, `\ue000`, `\x85`), `--a=v`, repeated options, `-1`/`-1.5`/`-`/`"-x y"` as values, `-h`/`--help`/`--h`, missing-required, unrecognized args, `--` placement, `--a -x`.
+- **120 randomized fuzz cases: all byte-identical** (base64-compared output).
+- `--help` output is byte-identical (the 10-wide invocation column came out one space wide at first; argparse clamps `help_width` to ≥11 but not `action_width` — fixed at `argparse.mjs:238`).
+
+Two behaviors worth flagging, both confirmed against the executable rather than assumed:
+
+1. `items()` collapses each key to its **last** value (`[('key1', 'val2')]`), while `repr()` shows all pairs — that asymmetry is the heart of `OMD`.
+2. A trailing `--` is reported as an unrecognized argument rather than being swallowed, and required-argument errors are emitted *before* unrecognized-argument errors.
+
+One intentional difference: `prog` follows Python's own rule, `basename(argv[0])`, so diagnostics read `test6.mjs: error: ...` instead of `test6_executable: error: ...`. My harness normalized that name; everything else matches character for character.

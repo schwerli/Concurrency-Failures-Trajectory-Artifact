@@ -1,0 +1,132 @@
+All 2,159 differential cases pass (959 structured + 1,200 fuzzed), byte-for-byte including stderr and exit codes. Here is the code.
+
+## Module hierarchy
+
+```
+/output
+├── lib/
+│   ├── pystr.mjs        # Python str semantics: strip() / title() / lower() / upper()
+│   ├── irregulars.mjs   # irregular singular→plural table + plural-form set
+│   ├── casematch.mjs    # capitalization-pattern transfer  (→ pystr)
+│   ├── inflection.mjs   # pluralize / cardinalize          (→ irregulars, casematch, pystr)
+│   ├── unitlen.mjs      # unit_len                         (→ inflection)
+│   ├── strutils.mjs     # public façade (re-exports)
+│   └── argparse.mjs     # argparse subset                  (→ node:path)
+└── test12.mjs           # entry point
+```
+
+### `lib/pystr.mjs`
+```javascript
+const PY_WHITESPACE = new Set([
+  0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+  0x85, 0xa0, 0x1680,
+  0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007,
+  0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000,
+]);
+
+export function pyStrip(text) { /* trims exactly what str.strip() trims */ }
+
+function isCased(ch) { return ch.toLowerCase() !== ch.toUpperCase(); }
+
+export function pyTitle(text) {          // first cased char of each run upper,
+  let out = '', previousCased = false;   // rest lower — digits/apostrophes reset
+  for (const ch of text) {
+    out += previousCased ? ch.toLowerCase() : ch.toUpperCase();
+    previousCased = isCased(ch);
+  }
+  return out;
+}
+export function pyLower(text) { return text.toLowerCase(); }
+export function pyUpper(text) { return text.toUpperCase(); }
+```
+
+### `lib/irregulars.mjs` (100 entries, abbreviated here)
+```javascript
+export const IRREGULAR_S2P = {
+  addendum: 'addenda', alga: 'algae', /* … */ formula: 'formulas', /* … */
+  index: 'indices', millennium: 'milennia', person: 'people', sheep: 'sheep',
+  /* … */ woman: 'women',
+};
+export const IRREGULAR_PLURALS = new Set(Object.values(IRREGULAR_S2P));
+export function irregularPluralOf(word) { /* own-property lookup */ }
+export function isIrregularPlural(word) { return IRREGULAR_PLURALS.has(word); }
+```
+Two quirks of the reference table are reproduced deliberately, both observable through the interface: `formula → formulas` (so `formulae` is *not* a known plural and becomes `formulaes`), and the misspelled `millennium → milennia` (so `millenia → millenias`).
+
+### `lib/casematch.mjs`
+```javascript
+export function matchCase(master, disciple) {
+  if (!pyStrip(master)) return disciple;
+  if (pyLower(master) === master) return pyLower(disciple);
+  if (pyUpper(master) === master) return pyUpper(disciple);
+  if (pyTitle(master) === master) return pyTitle(disciple);
+  return disciple;
+}
+```
+
+### `lib/inflection.mjs`
+```javascript
+export function pluralize(word) {
+  const originalWord = word;
+  const normalized = pyLower(pyStrip(word));
+  if (!normalized || isIrregularPlural(normalized)) return originalWord;   // verbatim
+
+  const irregularPlural = irregularPluralOf(normalized);
+  if (irregularPlural) return matchCase(originalWord, irregularPlural);
+
+  const beforeLast = normalized.slice(-2, -1);
+  let pluralized;
+  if (normalized.endsWith('y') && !VOWELS.includes(beforeLast)) {
+    pluralized = `${normalized.slice(0, -1)}ies`;
+  } else if (normalized.endsWith('s') || normalized.endsWith('ch') || normalized.endsWith('sh')) {
+    pluralized = normalized.endsWith('es') ? normalized : `${normalized}es`;
+  } else {
+    pluralized = `${normalized}s`;
+  }
+  return matchCase(originalWord, pluralized);
+}
+
+export function cardinalize(unit, count) {
+  if (count === 1) return unit;
+  return pluralize(unit);
+}
+```
+Two subtleties worth flagging, both confirmed against the executable: there is **no** `x`/`z` → `es` rule (`box → boxs`, `quiz → quizs`), and for a one-character word `slice(-2,-1)` is `''` — `'aeiou'.includes('')` is `true` in JS exactly as `'' in 'aeiou'` is in Python, so `y → ys` while `by → bies`.
+
+### `lib/unitlen.mjs`
+```javascript
+export function unitLen(sizedIterable, unitNoun = 'item') {
+  const count = sizedIterable.length;
+  const units = cardinalize(unitNoun, count);
+  if (count) return `${count} ${units}`;
+  return `no ${units}`;
+}
+```
+
+### `lib/argparse.mjs`
+`ArgumentParser` with `addArgument`/`parseArgs`, replicating: `[-h]` usage line and help layout (help column at `min(longest + 4, 24)`), `--opt=value`, unambiguous prefix abbreviation (`--h` → `--help`), the negative-number matcher `/^-\d+$|^-\d*\.\d+$/` and the "token contains a space" rule that let `--a -1` and `--a "-x y"` be values while `--a -1e5` errors, `--` and trailing junk becoming unrecognized arguments, error ordering (**required-check fires before the unrecognized-check**, which is why `-a x --b y` reports `--a` missing), `-h` exiting 0 mid-parse even with required args absent, and exit code 2 with `usage` + `prog: error: …` on stderr.
+
+## Entry point — `/output/test12.mjs`
+```javascript
+import { ArgumentParser } from './lib/argparse.mjs';
+import { unitLen, cardinalize } from './lib/strutils.mjs';
+
+const parser = new ArgumentParser();
+parser.addArgument('--a', { required: true, help: 'Comma-separated items' });
+parser.addArgument('--b', { required: true, help: 'Unit name' });
+const args = parser.parseArgs();
+
+const items = args.a.split(',');
+const result1 = unitLen(items, args.b); // 获取长度描述
+console.log(result1);
+const result2 = cardinalize(args.b, items.length); // 获取复数形式
+console.log(result2);
+const result3 = unitLen(items.slice(0, 3), args.b); // 获取前3个的长度描述
+console.log(result3);
+const result4 = cardinalize(args.b, 1); // 获取单数形式
+console.log(result4);
+const result5 = unitLen(items.slice(0, 1), args.b); // 获取单个的长度描述
+console.log(result5);
+```
+
+Verification: `/workspace/difftest.sh` diffs both programs (stdout+stderr+exit code) over ~320 unit-noun forms × 3 list sizes plus 40 argument-parsing edge cases; a second pass fuzzed 400 generated words × 3 sizes. `node:path` is the only non-relative import, and it's a Node built-in. The `no <units>` branch of `unitLen` is unreachable from this entry point — `''.split(',')` yields `['']`, so the count is always ≥ 1 — but it's implemented for interface fidelity.

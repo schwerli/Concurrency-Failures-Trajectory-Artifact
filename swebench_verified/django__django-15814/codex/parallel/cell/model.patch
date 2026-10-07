@@ -1,0 +1,59 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 33cc636b22..9f2815803e 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -753,8 +753,8 @@ class Query(BaseExpression):
+                 # both the current model's pk and the related reference field
+                 # (if it's not a reverse relation) to the things we select.
+                 if not is_reverse_o2o(source):
+-                    must_include[old_model].add(source)
+-                add_to_dict(must_include, cur_model, opts.pk)
++                    add_to_dict(must_include, old_model._meta.concrete_model, source)
++                add_to_dict(must_include, cur_model._meta.concrete_model, opts.pk)
+             field = opts.get_field(parts[-1])
+             is_reverse_object = field.auto_created and not field.concrete
+             model = field.related_model if is_reverse_object else field.model
+diff --git a/tests/defer_regress/models.py b/tests/defer_regress/models.py
+index dd492993b7..d7e2382a15 100644
+--- a/tests/defer_regress/models.py
++++ b/tests/defer_regress/models.py
+@@ -45,6 +45,10 @@ class Proxy(Item):
+         proxy = True
+ 
+ 
++class ItemToProxy(models.Model):
++    item = models.ForeignKey(Proxy, models.CASCADE)
++
++
+ class SimpleItem(models.Model):
+     name = models.CharField(max_length=15)
+     value = models.IntegerField()
+diff --git a/tests/defer_regress/tests.py b/tests/defer_regress/tests.py
+index c7a61f53a3..f25b97940c 100644
+--- a/tests/defer_regress/tests.py
++++ b/tests/defer_regress/tests.py
+@@ -12,6 +12,7 @@ from .models import (
+     Child,
+     Derived,
+     Feature,
++    ItemToProxy,
+     Item,
+     ItemAndSimpleItem,
+     Leaf,
+@@ -232,6 +233,16 @@ class DeferRegressionTest(TestCase):
+         with self.assertNumQueries(1):
+             self.assertEqual(obj.item.value, 47)
+ 
++    def test_foreign_key_to_proxy_model_with_select_related_only(self):
++        item = Proxy.objects.create(name="first", value=47)
++        ItemToProxy.objects.create(item=item)
++        obj = ItemToProxy.objects.select_related("item").only("item__name").get()
++        self.assertIsInstance(obj.item, Proxy)
++        with self.assertNumQueries(0):
++            self.assertEqual(obj.item.name, "first")
++        with self.assertNumQueries(1):
++            self.assertEqual(obj.item.value, 47)
++
+     def test_only_with_select_related(self):
+         # Test for #17485.
+         item = SimpleItem.objects.create(name="first", value=47)

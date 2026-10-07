@@ -1,0 +1,26 @@
+Lint isn't available in this env, but the changes follow the surrounding style. Summary:
+
+## Cause
+
+`Model._check_default_pk()` (`django/db/models/base.py:1299`) warned whenever `cls._meta.pk.auto_created` was true. In multi-table inheritance, a child model's pk is the auto-generated `<parent>_ptr` `OneToOneField` created in `ModelBase.__new__` with `auto_created=True` (`django/db/models/base.py:241-249`). So every MTI child tripped W042 even though its pk is really the parent's — exactly the `accounts.User` / `accounts.ReservedUsername` inheriting from `Entity` case in the report.
+
+## Fix
+
+`django/db/models/base.py:1299` — skip the warning when the pk is a parent link, since the pk type is determined (and checked) on the parent model:
+
+```python
+cls._meta.pk.auto_created and
+# Inherited PKs are checked in parents models.
+not (
+    isinstance(cls._meta.pk, OneToOneField) and
+    cls._meta.pk.remote_field.parent_link
+) and
+```
+
+This deliberately keys off `parent_link` rather than the parent's own pk, so a parent with a genuinely auto-created pk still gets exactly one warning — reported against the parent, where the user can act on it — instead of one per subclass.
+
+## Verification
+
+- Added four tests to `tests/check_framework/test_model_checks.py` covering explicit inherited pk, explicit inherited pk with a hand-declared `parent_ptr`, and both auto-created-parent variants (warning attributed to `Parent` only). Ran them against the unpatched tree first: `test_explicit_inherited_pk` and `test_auto_created_inherited_pk` failed with the spurious `Child` warning, confirming the reproduction; all 26 pass with the fix.
+- Drove the real flow end-to-end with a scratch project (`Entity` with a `CharField` pk, two MTI children, plus one model with no pk): `django check` now reports only the genuine `NoPkModel` warning; the two children are silent.
+- Full suite: 13907 tests, 8 failures — all 8 reproduce identically with the fix stashed (root-user filesystem perms, ASGI thread signals, inspectdb, URLValidator newline handling), so none are from this change.

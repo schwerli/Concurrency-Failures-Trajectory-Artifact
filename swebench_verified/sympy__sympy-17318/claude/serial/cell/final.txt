@@ -1,0 +1,20 @@
+Fixed. Root cause and change:
+
+**Root cause** — `_sqrt_match` took a `split_surds` fast path whenever every addend's square was rational: `if all((x**2).is_Rational for x in pargs)`. For `4 + 3*I` that test passes, since `(3*I)**2 == -9` is rational. But `split_surds` only works on surds of *positive* rationals — `3*I` is not a `Pow`, so its `surds` list came out empty and `_split_gcd(*[])` hit `g = a[0]` on an empty tuple.
+
+**Fix** (`sympy/simplify/sqrtdenest.py:158`) — require the squares to be *positive* rationals, which is what `split_surds` actually assumes:
+
+```python
+sqargs = [x**2 for x in pargs]
+if all(sq.is_Rational and sq.is_positive for sq in sqargs):
+```
+
+`4 + 3*I` now falls through to the general path, where max sqrt-depth is 0, so `_sqrt_match` returns `[]` and the caller leaves the term alone.
+
+I also made `_split_gcd()` return `(S.One, [], [])` for no arguments (`sympy/simplify/radsimp.py:1116`) so this class of `IndexError` can't resurface via another caller.
+
+**Verified** (`/opt/miniconda3/envs/testbed/bin/python`):
+- `_sqrt_match(4 + I)` → `[]`, `_sqrt_match(4 + 3*I)` → `[]`, no exception.
+- `sqrtdenest((3 - sqrt(2)*sqrt(4 + 3*I) + 3*I)/2)` → `I`. Note this differs from the PR description's "returned unchanged": on this codebase `sqrt(4 + 3*I)` *does* denest to `3*sqrt(2)/2 + sqrt(2)*I/2`, so the expression collapses to `I`, which I confirmed numerically matches the input (`1.0*I`). A genuinely non-denestable case like `sqrt(4 + I)` is returned unchanged.
+- Added `test_issue_12420` to `sympy/simplify/tests/test_sqrtdenest.py`.
+- `sympy/simplify/`, `sympy/solvers/`, `test_numberfields.py`, `test_miscellaneous.py`: 654 passed. Two anomalies (`test_base_0_exp_0` raising a Python 3.9 `parse_expr` `ValueError`, and `test_collect_respecting_exponentials` xpassing) reproduce identically on a stashed clean tree, so they're pre-existing and unrelated. Doctests for both modified modules pass.

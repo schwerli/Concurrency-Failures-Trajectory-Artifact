@@ -1,0 +1,122 @@
+diff --git a/changelog/7560.bugfix.rst b/changelog/7560.bugfix.rst
+new file mode 100644
+index 000000000..bef44c856
+--- /dev/null
++++ b/changelog/7560.bugfix.rst
+@@ -0,0 +1,4 @@
++Restored the ``xfail`` behavior for tests that add an ``xfail`` marker
++dynamically during execution using ``request.node.add_marker`` or
++``request.applymarker`` when no ``xfail`` marker existed earlier in the test
++lifecycle.
+diff --git a/src/_pytest/skipping.py b/src/_pytest/skipping.py
+index 335e10996..f7ebaa933 100644
+--- a/src/_pytest/skipping.py
++++ b/src/_pytest/skipping.py
+@@ -198,8 +198,14 @@ class Xfail:
+ 
+ 
+ def evaluate_xfail_marks(item: Item) -> Optional[Xfail]:
++    return _evaluate_xfail_marks(item)[0]
++
++
++def _evaluate_xfail_marks(item: Item) -> Tuple[Optional[Xfail], bool]:
+     """Evaluate xfail marks on item, returning Xfail if triggered."""
++    mark_found = False
+     for mark in item.iter_markers(name="xfail"):
++        mark_found = True
+         run = mark.kwargs.get("run", True)
+         strict = mark.kwargs.get("strict", item.config.getini("xfail_strict"))
+         raises = mark.kwargs.get("raises", None)
+@@ -211,21 +217,36 @@ def evaluate_xfail_marks(item: Item) -> Optional[Xfail]:
+         # Unconditional.
+         if not conditions:
+             reason = mark.kwargs.get("reason", "")
+-            return Xfail(reason, run, strict, raises)
++            return Xfail(reason, run, strict, raises), mark_found
+ 
+         # If any of the conditions are true.
+         for condition in conditions:
+             result, reason = evaluate_condition(item, mark, condition)
+             if result:
+-                return Xfail(reason, run, strict, raises)
++                return Xfail(reason, run, strict, raises), mark_found
++
++    return None, mark_found
+ 
+-    return None
++
++def _store_xfailed(item: Item) -> Optional[Xfail]:
++    xfailed, marks_present = _evaluate_xfail_marks(item)
++    item._store[xfailed_key] = xfailed
++    item._store[xfailed_marks_present_key] = marks_present
++    return xfailed
++
++
++def _refresh_xfailed(item: Item) -> Optional[Xfail]:
++    if not item._store.get(xfailed_marks_present_key, False):
++        return _store_xfailed(item)
++    return item._store.get(xfailed_key, None)
+ 
+ 
+ # Whether skipped due to skip or skipif marks.
+ skipped_by_mark_key = StoreKey[bool]()
+-# Saves the xfail mark evaluation. Can be refreshed during call if None.
++# Saves the xfail mark evaluation. Refresh when no xfail marks existed yet so
++# dynamically-added markers are visible in later phases.
+ xfailed_key = StoreKey[Optional[Xfail]]()
++xfailed_marks_present_key = StoreKey[bool]()
+ unexpectedsuccess_key = StoreKey[str]()
+ 
+ 
+@@ -239,16 +260,14 @@ def pytest_runtest_setup(item: Item) -> None:
+         skip(skipped.reason)
+ 
+     if not item.config.option.runxfail:
+-        item._store[xfailed_key] = xfailed = evaluate_xfail_marks(item)
++        xfailed = _store_xfailed(item)
+         if xfailed and not xfailed.run:
+             xfail("[NOTRUN] " + xfailed.reason)
+ 
+ 
+ @hookimpl(hookwrapper=True)
+ def pytest_runtest_call(item: Item) -> Generator[None, None, None]:
+-    xfailed = item._store.get(xfailed_key, None)
+-    if xfailed is None:
+-        item._store[xfailed_key] = xfailed = evaluate_xfail_marks(item)
++    xfailed = _refresh_xfailed(item)
+ 
+     if not item.config.option.runxfail:
+         if xfailed and not xfailed.run:
+@@ -262,6 +281,8 @@ def pytest_runtest_makereport(item: Item, call: CallInfo[None]):
+     outcome = yield
+     rep = outcome.get_result()
+     xfailed = item._store.get(xfailed_key, None)
++    if call.when == "call":
++        xfailed = _refresh_xfailed(item)
+     # unittest special case, see setting of unexpectedsuccess_key
+     if unexpectedsuccess_key in item._store and rep.when == "call":
+         reason = item._store[unexpectedsuccess_key]
+diff --git a/testing/test_skipping.py b/testing/test_skipping.py
+index 8fceb37aa..d7efd820b 100644
+--- a/testing/test_skipping.py
++++ b/testing/test_skipping.py
+@@ -425,6 +425,19 @@ class TestXFail:
+         result = testdir.runpytest(p)
+         result.stdout.fnmatch_lines(["*1 xfailed*"])
+ 
++    def test_dynamic_xfail_set_during_test(self, testdir):
++        p = testdir.makepyfile(
++            """
++            import pytest
++
++            def test_this(request):
++                request.node.add_marker(pytest.mark.xfail(reason="xfail"))
++                assert 0
++        """
++        )
++        result = testdir.runpytest(p, "-rx")
++        result.stdout.fnmatch_lines(["*XFAIL*test_this*", "*xfail*"])
++
+     @pytest.mark.parametrize(
+         "expected, actual, matchline",
+         [

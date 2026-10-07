@@ -1,0 +1,124 @@
+diff --git a/ChangeLog b/ChangeLog
+index 97af302a..238bef68 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -24,6 +24,11 @@ Release date: TBA
+ * Added ``py-version`` config key (if ``[MASTER]`` section). Used for version dependant checks.
+   Will default to whatever Python version pylint is executed with.
+ 
++* Setting ``min-similarity-lines`` to 0 now disables the ``duplicate-code`` check
++  instead of treating every line of code as a duplicate.
++
++  Closes #4901
++
+ * ``CodeStyleChecker``
+ 
+   * Added ``consider-using-assignment-expr``: Emitted when an assignment is directly followed by an if statement
+diff --git a/doc/whatsnew/2.11.rst b/doc/whatsnew/2.11.rst
+index 72dc75e7..c3e9c6dd 100644
+--- a/doc/whatsnew/2.11.rst
++++ b/doc/whatsnew/2.11.rst
+@@ -44,6 +44,11 @@ Other Changes
+ * Added ``py-version`` config key (if ``[MASTER]`` section). Used for version dependant checks.
+   Will default to whatever Python version pylint is executed with.
+ 
++* Setting ``min-similarity-lines`` to 0 now disables the ``duplicate-code`` check
++  instead of treating every line of code as a duplicate.
++
++  Closes #4901
++
+ * The ``invalid-name`` message is now more detailed when using multiple naming style regexes.
+ 
+ * Fix false positive for ``consider-using-with`` if a context manager is assigned to a
+diff --git a/pylint/checkers/similar.py b/pylint/checkers/similar.py
+index c65b1c89..b4ba8c48 100644
+--- a/pylint/checkers/similar.py
++++ b/pylint/checkers/similar.py
+@@ -370,6 +370,9 @@ class Similar:
+ 
+     def append_stream(self, streamid: str, stream: TextIO, encoding=None) -> None:
+         """append a file to search for similarities"""
++        if self.min_lines == 0:
++            # 0 means that the similarities check is disabled
++            return
+         if encoding is None:
+             readlines = stream.readlines
+         else:
+@@ -455,7 +458,12 @@ class Similar:
+                     report += f"   {line.rstrip()}\n" if line.rstrip() else "\n"
+             duplicated_line_number += number * (len(couples_l) - 1)
+         total_line_number: int = sum(len(lineset) for lineset in self.linesets)
+-        report += f"TOTAL lines={total_line_number} duplicates={duplicated_line_number} percent={duplicated_line_number * 100.0 / total_line_number:.2f}\n"
++        percent: float = (
++            duplicated_line_number * 100.0 / total_line_number
++            if total_line_number
++            else 0.0
++        )
++        report += f"TOTAL lines={total_line_number} duplicates={duplicated_line_number} percent={percent:.2f}\n"
+         return report
+ 
+     def _find_common(
+@@ -739,7 +747,8 @@ class SimilarChecker(BaseChecker, Similar, MapReduceMixin):
+                 "default": DEFAULT_MIN_SIMILARITY_LINE,
+                 "type": "int",
+                 "metavar": "<int>",
+-                "help": "Minimum lines number of a similarity.",
++                "help": "Minimum lines number of a similarity. "
++                "Setting this option to 0 disables the check.",
+             },
+         ),
+         (
+diff --git a/tests/checkers/unittest_similar.py b/tests/checkers/unittest_similar.py
+index 4ddf2029..b4876eab 100644
+--- a/tests/checkers/unittest_similar.py
++++ b/tests/checkers/unittest_similar.py
+@@ -26,6 +26,7 @@ from pathlib import Path
+ 
+ import pytest
+ 
++from pylint import lint
+ from pylint.checkers import similar
+ from pylint.lint import PyLinter
+ from pylint.testutils import GenericTestReporter as Reporter
+@@ -502,3 +503,41 @@ def test_get_map_data() -> None:
+         # There doesn't seem to be a faster way of doing this, yet.
+         lines = (linespec.text for linespec in lineset_obj.stripped_lines)
+         assert tuple(expected_lines) == tuple(lines)
++
++
++def test_min_similarity_lines_0_disables_check_with_similar_run() -> None:
++    """Test that symilar does not report anything when min-similarity-lines is 0"""
++    output = StringIO()
++    with redirect_stdout(output), pytest.raises(SystemExit) as ex:
++        similar.Run(["--duplicates", "0", SIMILAR1, SIMILAR2])
++    assert ex.value.code == 0
++    assert (
++        output.getvalue().strip()
++        == """
++TOTAL lines=0 duplicates=0 percent=0.00
++""".strip()
++    )
++
++
++def test_min_similarity_lines_0_disables_check_with_pylint_run() -> None:
++    """Test that pylint does not emit duplicate-code when min-similarity-lines is 0
++
++    See https://github.com/PyCQA/pylint/issues/4901
++    """
++    args = [
++        "--disable=all",
++        "--enable=duplicate-code",
++        SIMILAR_CLS_A,
++        SIMILAR_CLS_B,
++    ]
++    reporter_enabled = Reporter()
++    lint.Run(args, reporter=reporter_enabled, exit=False)
++    assert len(reporter_enabled.messages) > 0
++
++    reporter_disabled = Reporter()
++    lint.Run(
++        ["--min-similarity-lines=0"] + args,
++        reporter=reporter_disabled,
++        exit=False,
++    )
++    assert len(reporter_disabled.messages) == 0

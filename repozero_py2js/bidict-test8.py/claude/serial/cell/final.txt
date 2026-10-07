@@ -1,0 +1,82 @@
+The migration is complete and verified against the reference binary. Here's the result.
+
+## Module hierarchy in `/output`
+
+| File | Role |
+|---|---|
+| `lib/py/stdio.mjs` | CPython stream buffering (block-buffered stdout on a pipe, write-through stderr) + `pyPrint`/`pyExit` |
+| `lib/py/repr.mjs` | `repr()`/`str()` for `str`, `int`, tuple, dict — quote selection, `\x`/`\u` escaping, Unicode printability |
+| `lib/py/int.mjs` | `int()` semantics: Unicode whitespace strip, sign, `_` separators, Nd digits, arbitrary precision (BigInt) |
+| `lib/py/textwrap.mjs` | `textwrap.wrap()` subset used by help rendering |
+| `lib/py/terminal.mjs` | `shutil.get_terminal_size()` (COLUMNS → tty → 80) |
+| `lib/py/linecache.mjs` | Resolves a frame's source line relative to CWD, as `linecache` does |
+| `lib/py/traceback.mjs` | Traceback rendering: frame headers, source line, `~^^^` caret anchors, exit 1 |
+| `lib/argparse/formatter.mjs` | `HelpFormatter`: usage line + its wrapping algorithm, options section, help column |
+| `lib/argparse/parser.mjs` | `ArgumentParser`: `--opt=v`, prefix abbreviation + ambiguity, `--`, required check, error strings, exit 2 |
+| `lib/argparse/types.mjs` | `type=int` / `type=str` callables carrying Python's `__name__` |
+| `lib/argparse/index.mjs` | Public argparse surface |
+| `lib/bidict/pydict.mjs` | Insertion-ordered dict (null-prototype index + slot array; no `Map`), Python key/value equality |
+| `lib/bidict/exceptions.mjs` | `ValueDuplicationError`, `KeyAndValueDuplicationError`, `KeyError`, … with traceback metadata |
+| `lib/bidict/frames.mjs` | Internal bidict frame chains that appear in tracebacks |
+| `lib/bidict/bidict.mjs` | The bidirectional mapping, `.inv` live view, `ON_DUP` de-duplication, `repr` |
+| `lib/bidict/index.mjs` | `from bidict import bidict` equivalent |
+| `test8.mjs` | Entry point |
+
+## Entry file — `/output/test8.mjs`
+
+```js
+import { ArgumentParser, intType, strType } from './lib/argparse/index.mjs';
+import { bidict } from './lib/bidict/index.mjs';
+import { PyException } from './lib/bidict/exceptions.mjs';
+import { pyPrint, pyExit } from './lib/py/stdio.mjs';
+import { pyStr } from './lib/py/repr.mjs';
+import { abortWithTraceback } from './lib/py/traceback.mjs';
+
+const PROG = 'test8_executable';
+const SOURCE_FILE = 'test8.py';
+
+const site = (line, colno, endColno) => ({ file: SOURCE_FILE, line, name: '<module>', colno, endColno });
+
+const SITES = {
+  setK1: site(15, 0, 10),    setK2: site(16, 0, 10),    setK3: site(17, 0, 10),
+  getK1: site(21, 6, 16),    getInvV2: site(22, 6, 20), getInvV3: site(23, 6, 20),
+  updateK1: site(26, 0, 10),
+};
+
+function at(where, statement) {
+  try { return statement(); }
+  catch (err) {
+    if (err instanceof PyException) abortWithTraceback([where, ...err.pyFrames], err);
+    throw err;
+  }
+}
+
+function main() {
+  const args = buildParser().parseArgs(process.argv.slice(2));
+  const b = bidict();
+  at(SITES.setK1, () => b.setItem(args.k1, args.v1));
+  at(SITES.setK2, () => b.setItem(args.k2, args.v2));
+  at(SITES.setK3, () => b.setItem(args.k3, args.v3));
+  pyPrint(b.toString());
+  pyPrint(pyStr(at(SITES.getK1, () => b.getItem(args.k1))));
+  pyPrint(pyStr(at(SITES.getInvV2, () => b.inv.getItem(args.v2))));
+  pyPrint(pyStr(at(SITES.getInvV3, () => b.inv.getItem(args.v3))));
+  at(SITES.updateK1, () => b.setItem(args.k1, 999n));
+  pyPrint(b.toString());
+}
+```
+
+## Verification
+
+I built a differential harness (`/workspace/difftest.sh`, `/workspace/fuzz.sh`) that compares **stdout, stderr and exit status** against `/workspace/dataset/test8_executable` (filtering only the PyInstaller `[PYI-<pid>:ERROR]` trailer, whose PID is nondeterministic):
+
+- **80 hand-picked cases: 0 failures** — the 4 documented samples, duplicate-key overwrite (position preserved), `ValueDuplicationError`, `KeyAndValueDuplicationError`, `KeyError` from `b.inv[v2]`, same-pair no-ops, int edge cases (`+7`, `-0`, `007`, `1_0`, 23-digit bignums, `٣`, `１２`, `1__0`), repr escaping (`"it's"`, `'say "hi"'`, `\t`, `\n`, empty, CJK), and the full argparse surface (`--help`, `-h`, `-hx`, `--he`, `--help=x`, `--k1=a`, abbreviation ambiguity, `--`, negative-number args, missing/unknown/duplicate options).
+- **400 randomized fuzz cases: 0 failures.**
+- **COLUMNS sweep (6→120): 0 failures** for both help and usage wrapping.
+- Verified in **4 working-directory scenarios**, because the reference's traceback source lines come from `linecache` reading `test8.py` out of the CWD — with the real file present, absent, and with a decoy file, all byte-identical.
+- Stream ordering matches in a combined `2>&1` capture and under a real TTY (`script`), which required emulating Python's stdout buffering.
+
+Two caveats worth stating plainly:
+
+1. `PROG` is hardcoded to `test8_executable` so usage/error text matches the reference binary byte-for-byte; if you'd rather it self-name as `test8.mjs`, that's a one-line change.
+2. The only divergence I found is in the artificial decoy scenario: a *different* `test8.py` in the CWD containing multibyte characters on a raising line produces a caret-count difference (9 vs 7). Reproducing that needs CPython's full AST-based anchor extraction against foreign source text; it cannot occur with the real `test8.py` (present or absent), which is exact.

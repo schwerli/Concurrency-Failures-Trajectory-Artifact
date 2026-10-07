@@ -1,0 +1,36 @@
+Migration complete and differentially verified. Here's the structure written to `/output`:
+
+```
+/output
+├── lib/
+│   ├── charset.mjs      — Bech32 alphabet, HRP/checksum limits, ASCII + case guards
+│   ├── checksum.mjs     — GF(32) polymod, HRP expansion, checksum verification
+│   ├── convertbits.mjs  — power-of-2 base regrouping (5↔8 bits)
+│   ├── bech32.mjs       — string-level decode → { hrp, data }
+│   ├── segwit.mjs       — SegWit address decode → [version, program]
+│   ├── pyrepr.mjs       — Python `repr`/`print` rendering (tuples, lists, None)
+│   ├── argparser.mjs    — argparse subset (usage/help/errors/exit codes)
+│   └── index.mjs        — public barrel
+└── test5.mjs            — entry point
+```
+
+## What black-box probing revealed
+
+The bundled `bech32` is **not** the stock reference implementation. Two behaviors I had to discover empirically rather than assume:
+
+1. **BIP173 only — no bech32m.** Every witness version 0–16 requires the plain bech32 checksum constant (1). Taproot-style bech32m addresses all decode to `(None, None)`, while a v1 address with a *bech32* checksum decodes successfully — the opposite of BIP350 libraries.
+2. **The 90-character total-length cap does not exist.** Instead the constraint is `1 ≤ len(hrp) ≤ 83`, independent of payload size. I bisected this: hrp 83 passes and 84 fails at *any* data length, and a valid 155-char address (hrp 83 + 40-byte program) decodes fine.
+
+Remaining rules confirmed: printable-ASCII 33–126 over the whole string, no mixed case, case-sensitive HRP comparison (so `--a BC` never matches a `bc1…` address), program 2–40 bytes, and exactly 20 or 32 bytes for v0.
+
+## Verification
+
+| Suite | Cases | Result |
+|---|---|---|
+| Deterministic corpus (BIP vectors, hrp/version/length boundaries, single-char mutations, padding failures) | 762 | byte-identical |
+| Randomized fuzz via CLI, stdout+stderr+exit code | 1600 | byte-identical |
+| argparse edge cases (`=` form, `--h` abbreviation, `--` separator, negative-number values, missing/duplicate/unknown args) | 41 | byte-identical |
+
+Fuzzing caught one real bug, now fixed: I had initially dropped the `--` separator, but CPython only strips it when a positional consumes it — with no positionals it surfaces as `unrecognized arguments: --` (exit 2). The related subtlety that `--a -- bc` errors with `expected one argument` (argparse strips `-*` from the nargs pattern for optionals) also matches now.
+
+Two intentional, unavoidable differences: the program name in usage/error text is `test5.mjs` rather than `test5_executable` (argparse derives it from `argv[0]`; I normalized this when diffing), and `argparse` version-specific wording for ambiguous-abbreviation errors is unreachable with only `-h/--help/--a/--b` registered.

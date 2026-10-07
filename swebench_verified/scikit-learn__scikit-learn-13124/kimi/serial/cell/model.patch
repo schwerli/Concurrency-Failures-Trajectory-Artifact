@@ -1,0 +1,141 @@
+diff --git a/sklearn/model_selection/_split.py b/sklearn/model_selection/_split.py
+index 24394f869..7746f892b 100644
+--- a/sklearn/model_selection/_split.py
++++ b/sklearn/model_selection/_split.py
+@@ -630,9 +630,11 @@ class StratifiedKFold(_BaseKFold):
+                     allowed_target_types, type_of_target_y))
+ 
+         y = column_or_1d(y)
++        y_encoded = np.unique(y, return_inverse=True)[1]
++
+         n_samples = y.shape[0]
+-        unique_y, y_inversed = np.unique(y, return_inverse=True)
+-        y_counts = np.bincount(y_inversed)
++        n_classes = max(y_encoded) + 1
++        y_counts = np.bincount(y_encoded)
+         min_groups = np.min(y_counts)
+         if np.all(self.n_splits > y_counts):
+             raise ValueError("n_splits=%d cannot be greater than the"
+@@ -645,30 +647,23 @@ class StratifiedKFold(_BaseKFold):
+                            " be less than n_splits=%d."
+                            % (min_groups, self.n_splits)), Warning)
+ 
+-        # pre-assign each sample to a test fold index using individual KFold
+-        # splitting strategies for each class so as to respect the balance of
+-        # classes
+-        # NOTE: Passing the data corresponding to ith class say X[y==class_i]
+-        # will break when the data is not 100% stratifiable for all classes.
+-        # So we pass np.zeroes(max(c, n_splits)) as data to the KFold
+-        per_cls_cvs = [
+-            KFold(self.n_splits, shuffle=self.shuffle,
+-                  random_state=rng).split(np.zeros(max(count, self.n_splits)))
+-            for count in y_counts]
+-
+-        test_folds = np.zeros(n_samples, dtype=np.int)
+-        for test_fold_indices, per_cls_splits in enumerate(zip(*per_cls_cvs)):
+-            for cls, (_, test_split) in zip(unique_y, per_cls_splits):
+-                cls_test_folds = test_folds[y == cls]
+-                # the test split can be too big because we used
+-                # KFold(...).split(X[:max(c, n_splits)]) when data is not 100%
+-                # stratifiable for all the classes
+-                # (we use a warning instead of raising an exception)
+-                # If this is the case, let's trim it:
+-                test_split = test_split[test_split < len(cls_test_folds)]
+-                cls_test_folds[test_split] = test_fold_indices
+-                test_folds[y == cls] = cls_test_folds
+-
++        # Find the sorted list of indices for each class:
++        # (np.argsort(indices) would pick first element of each class)
++        y_order = np.sort(y_encoded)
++        allocation = np.asarray(
++            [np.bincount(y_order[i::self.n_splits], minlength=n_classes)
++             for i in range(self.n_splits)])
++
++        test_folds = np.empty(len(y), dtype='i')
++        for k in range(n_classes):
++            # since the kth column of allocation stores the number of samples
++            # of class k in each test set, this generates blocks of fold
++            # indices corresponding to the allocation for class k
++            folds_for_class = np.arange(self.n_splits).repeat(allocation[:, k])
++            if self.shuffle:
++                rng = check_random_state(rng)
++                rng.shuffle(folds_for_class)
++            test_folds[y_encoded == k] = folds_for_class
+         return test_folds
+ 
+     def _iter_test_masks(self, X, y=None, groups=None):
+diff --git a/sklearn/model_selection/tests/test_search.py b/sklearn/model_selection/tests/test_search.py
+index 521ba9228..bc0dcf7d9 100644
+--- a/sklearn/model_selection/tests/test_search.py
++++ b/sklearn/model_selection/tests/test_search.py
+@@ -214,7 +214,7 @@ def check_hyperparameter_searcher_with_fit_params(klass, **klass_kwargs):
+                          "Expected fit parameter(s) ['eggs'] not seen.",
+                          searcher.fit, X, y, spam=np.ones(10))
+     assert_raise_message(AssertionError,
+-                         "Fit parameter spam has length 1; expected 4.",
++                         "Fit parameter spam has length 1; expected 5.",
+                          searcher.fit, X, y, spam=np.ones(1),
+                          eggs=np.zeros(10))
+     searcher.fit(X, y, spam=np.ones(10), eggs=np.zeros(10))
+@@ -1719,8 +1719,8 @@ def test_deprecated_grid_search_iid():
+     assert_warns_message(DeprecationWarning, depr_message, grid.fit, X, y)
+ 
+     grid = GridSearchCV(SVC(gamma='scale'), param_grid={'C': [1]}, cv=2)
+-    # warning because stratification into two classes and 27 % 2 != 0
+-    assert_warns_message(DeprecationWarning, depr_message, grid.fit, X, y)
++    # no warning because stratification achieves equally sized test sets
++    assert_no_warnings(grid.fit, X, y)
+ 
+     grid = GridSearchCV(SVC(gamma='scale'), param_grid={'C': [1]}, cv=KFold(2))
+     # no warning because no stratification and 54 % 2 == 0
+diff --git a/sklearn/model_selection/tests/test_split.py b/sklearn/model_selection/tests/test_split.py
+index 5981df285..cd34290e0 100644
+--- a/sklearn/model_selection/tests/test_split.py
++++ b/sklearn/model_selection/tests/test_split.py
+@@ -493,6 +493,19 @@ def test_shuffle_stratifiedkfold():
+         assert_not_equal(set(test0), set(test1))
+     check_cv_coverage(kf0, X_40, y, groups=None, expected_n_splits=5)
+ 
++    # Check that shuffling actually shuffles the samples within each class
++    # and does not merely permute the order of the folds: different random
++    # states must yield different test sets, not just differently ordered
++    # ones. See https://github.com/scikit-learn/scikit-learn/issues/13124
++    folds0 = [set(test) for _, test in kf0.split(X_40, y)]
++    folds1 = [set(test) for _, test in kf1.split(X_40, y)]
++    assert_not_equal(folds0, folds1)
++
++    kf_unshuffled = StratifiedKFold(5, shuffle=False)
++    folds_unshuffled = [set(test) for _, test in kf_unshuffled.split(X_40, y)]
++    assert_not_equal(set(map(frozenset, folds0)),
++                     set(map(frozenset, folds_unshuffled)))
++
+ 
+ def test_kfold_can_detect_dependent_samples_on_digits():  # see #2372
+     # The digits samples are dependent: they are apparently grouped by authors
+diff --git a/sklearn/tests/test_calibration.py b/sklearn/tests/test_calibration.py
+index a99a9a9a9..70ea68f52 100644
+--- a/sklearn/tests/test_calibration.py
++++ b/sklearn/tests/test_calibration.py
+@@ -78,15 +78,13 @@ def test_calibration():
+                        sample_weight=sw_train)
+             prob_pos_pc_clf_relabeled = \
+                 pc_clf.predict_proba(this_X_test)[:, 1]
+-            if method == "sigmoid":
+-                assert_array_almost_equal(prob_pos_pc_clf,
+-                                          1 - prob_pos_pc_clf_relabeled)
+-            else:
+-                # Isotonic calibration is not invariant against relabeling
+-                # but should improve in both cases
+-                assert_greater(brier_score_loss(y_test, prob_pos_clf),
+-                               brier_score_loss((y_test + 1) % 2,
+-                                                prob_pos_pc_clf_relabeled))
++            # StratifiedKFold does not guarantee identical folds when the
++            # labels are permuted, so sigmoid calibration is not exactly
++            # invariant against relabeling, but it should improve in both
++            # cases
++            assert_greater(brier_score_loss(y_test, prob_pos_clf),
++                           brier_score_loss((y_test + 1) % 2,
++                                            prob_pos_pc_clf_relabeled))
+ 
+         # Check failure cases:
+         # only "isotonic" and "sigmoid" should be accepted as methods

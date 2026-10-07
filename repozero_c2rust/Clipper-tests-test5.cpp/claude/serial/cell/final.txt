@@ -1,0 +1,30 @@
+The migration is complete and verified.
+
+## What I built
+
+`/output` is a zero-dependency Cargo project (edition 2021, `std` only — `Cargo.lock` contains just the package itself):
+
+```
+/output
+├── Cargo.toml            # [[bin]] test5 -> test5.rs, no dependencies
+├── test5.rs              # entry file (package root), port of test5.cpp
+├── test5                 # compiled executable
+├── src/
+│   ├── lib.rs            # library target (enables cargo test)
+│   └── clipper2/
+│       ├── mod.rs
+│       ├── core.rs       # Point64, Path64/Paths64, FillRule, ClipType, area, exact predicates
+│       ├── engine.rs     # the clipping engine
+│       └── clipper.rs    # Intersect / Union / Difference / Xor facade
+└── tests/boolean_ops.rs  # 10 regression tests
+```
+
+Since the Clipper2 source wasn't present (only the binary), the engine is a from-scratch black-box re-implementation. Rather than recreating Clipper2's Vatti sweep, I used an equivalent and more verifiable planar-arrangement approach: split every edge at all intersections and interior vertices (exact `i128` predicates, intersection points rounded to the integer grid as Clipper2 does), collapse duplicate/shared segments, keep only segments where the result region is filled on one side and not the other, orient them interior-on-left, then stitch loops picking the clockwise-most turn at junctions. Output loops are tidied like Clipper2 solutions: duplicate and collinear vertices removed, degenerate loops discarded, holes coming back negatively oriented.
+
+## Verification
+
+- **Byte-exact output**: `1\n` (2 bytes, `310a`) from both binaries, matching exit codes, across 5 argument sets — the C++ program ignores `argv`, so the port does too.
+- **The engine, not just the printed count**: I checked all four operations against hand-computed geometry. For the test5 inputs: intersect = 1 path/area 2500, union = 1 path/8 vertices/17500, difference = 1 path/7500, xor = 2 paths/15000 — all consistent (`union − intersect = xor`).
+- **10 `cargo test` tests pass**, covering disjoint, nested (hole with negative area), shared-edge, identical, non-grid intersections needing rounding, self-intersecting bowtie, empty operands, degenerate paths, and coordinates at ±1e9 (no `i128` overflow). Notably, EvenOdd vs NonZero genuinely diverge where they should: two overlapping subject rectangles intersected with a centre square give 4 paths/area 800 under EvenOdd (unfilled overlap) and 1 path/area 2400 under NonZero.
+
+One judgement call worth flagging: requirement 7 asks for "an executable at `/output/test5.rs`". I read that as the standard `rustc test5.rs` result and left the source intact, placing the executable at `/output/test5` (also at `/output/target/release/test5`) rather than overwriting the source file with a binary. Say the word if you actually want the binary written over that path.

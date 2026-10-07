@@ -1,0 +1,31 @@
+The bug is real, and it's in the code, not the docs.
+
+## Root cause
+
+`sklearn/model_selection/_split.py:634` — `StratifiedKFold._make_test_folds` did `rng = self.random_state` and then handed that *same* value to a separate `KFold` per class. When `random_state` is an int, every class's `KFold` seeds an identical permutation, so class 0's *n*-th sample always lands in the same fold as class 1's *n*-th sample — hence `1` forever paired with `11`. And because each `KFold` shuffles indices then cuts contiguous blocks, when `n_splits == samples_per_class` the partition is fixed and only the fold *labels* move around, exactly as reported.
+
+## Fix
+
+Rewrote `_make_test_folds` to allocate fold indices directly instead of delegating to per-class `KFold`s:
+
+- `check_random_state(self.random_state)` once, and `rng.shuffle` is called per class — so the RNG advances between classes and each class is shuffled independently.
+- Fold sizes come from a round-robin allocation over the sorted labels, which also fixes a balance defect: test-set sizes now differ by at most one sample instead of up to `n_classes`.
+- Classes are encoded by order of appearance rather than lexicographic label order, preserving the old implementation's invariance to relabelling (`["Happy","Sad"]` vs `[1,0]` gives identical indices).
+- With `shuffle=False`, each class's samples still go to folds in contiguous blocks, so data-order dependencies are preserved.
+
+I verified all four invariants on 300 randomized class-count/`n_splits` combinations plus all 6 relabellings of a 2-class set, and confirmed the appearance-encoding is load-bearing (without it, relabelling changes the splits).
+
+I also corrected the `shuffle` docstring the issue flagged, and replaced the stale "difference of at most `n_classes`" note with the four guarantees.
+
+## Two existing tests needed updating
+
+Both were asserting the *old, worse* balance, and both are in `test_search.py`:
+
+- `check_hyperparameter_searcher_with_fit_params`: `y = [0]*5 + [1]*5, cv=2` used to give 6/4 folds (train size 4); it now gives 5/5, so the expected message is `expected 5.`
+- `test_deprecated_grid_search_iid`: the `cv=2` case existed *because* stratifying 27+27 samples produced unequal test sets (28/26). Now both test sets are 27, so no `iid` deprecation warning fires — I switched it to `assert_no_warnings` with a comment. Note this means stratification no longer causes unequal test sizes on its own; that path is now only reachable when `n_samples % n_splits != 0`.
+
+## Tests added
+
+In `test_split.py`: a partition-level check inside `test_shuffle_stratifiedkfold` (sorting test tuples so fold *order* can't mask the bug — this fails on the old code with `[(0,5),(1,6),(2,7),(3,8),(4,9)]` for both seeds), and a parametrized `test_stratified_kfold_label_invariance`.
+
+Test results: `sklearn/model_selection` 193 passed; the wider sweep over `StratifiedKFold` consumers (calibration, RFE, logistic/ridge/coordinate-descent CV, scorers, voting, multiclass, metaestimators, svm) 430 passed; doctests for `_split.py` and `cross_validation.rst` pass, with the documented 3-fold example output unchanged. The full suite has 8 failures — `test_pls.py::test_scale_and_stability`, two network-dependent tests, three matplotlib `plot_partial_dependence` tests, a Huber doctest, and `test_type_of_target` — all of which I confirmed fail identically on a clean checkout.

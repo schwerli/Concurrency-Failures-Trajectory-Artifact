@@ -1,0 +1,83 @@
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..cc2031cadd 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -147,6 +147,20 @@ class ServerHandler(simple_server.ServerHandler):
+         self.get_stdin().read()
+         super().close()
+ 
++    def finish_response(self):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            # RFC 7230 Section 3.3 forbids a message body in a response to
++            # HEAD, so send the headers a GET would have sent and stop there.
++            # Upstream servers such as gunicorn and mod_wsgi do the same.
++            # finish_content() isn't used because it defaults Content-Length to
++            # "0" if the application didn't set it, which would misreport the
++            # length of streaming responses.
++            if not self.headers_sent:
++                self.send_headers()
++            self.close()
++        else:
++            super().finish_response()
++
+ 
+ class WSGIRequestHandler(simple_server.WSGIRequestHandler):
+     protocol_version = "HTTP/1.1"
+diff --git a/tests/servers/tests.py b/tests/servers/tests.py
+index 8796db9749..5227054994 100644
+--- a/tests/servers/tests.py
++++ b/tests/servers/tests.py
+@@ -192,6 +192,53 @@ class LiveServerViews(LiveServerBase):
+         with self.urlopen("/example_view/") as f:
+             self.assertEqual(f.version, 11)
+ 
++    def test_no_body_for_head_request(self):
++        """
++        A response to HEAD carries the headers a GET would return but no
++        message body (RFC 7230 Section 3.3). A body left behind would also
++        desynchronize the next response on a keep-alive connection.
++        """
++        conn = HTTPConnection(
++            LiveServerViews.server_thread.host, LiveServerViews.server_thread.port
++        )
++        try:
++            conn.request("HEAD", "/example_view/", headers={"Connection": "keep-alive"})
++            response = conn.getresponse()
++            self.assertFalse(response.will_close)
++            self.assertEqual(response.status, 200)
++            self.assertEqual(response.read(), b"")
++            self.assertEqual(response.getheader("Content-Length"), "12")
++
++            # Nothing was left in the socket buffer, so the connection is
++            # still usable.
++            conn.request("GET", "/example_view/", headers={"Connection": "close"})
++            response = conn.getresponse()
++            self.assertEqual(response.status, 200)
++            self.assertEqual(response.read(), b"example view")
++        finally:
++            conn.close()
++
++    def test_no_body_for_head_request_to_streaming_view(self):
++        """
++        Streaming responses have no Content-Length to report, so the raw
++        response to a HEAD request must stop at the end of the headers.
++        """
++        host = LiveServerViews.server_thread.host
++        with socket.create_connection(
++            (host, LiveServerViews.server_thread.port), timeout=5
++        ) as sock:
++            sock.sendall(
++                b"HEAD /streaming_example_view/ HTTP/1.1\r\nHost: %s\r\n\r\n"
++                % host.encode()
++            )
++            raw_response = b""
++            while chunk := sock.recv(1024):
++                raw_response += chunk
++        self.assertTrue(raw_response.startswith(b"HTTP/1.1 200 OK\r\n"))
++        self.assertTrue(raw_response.endswith(b"\r\n\r\n"))
++        self.assertNotIn(b"Iamastream", raw_response)
++        self.assertIn(b"Connection: close\r\n", raw_response)
++
+     def test_closes_connection_without_content_length(self):
+         """
+         An HTTP 1.1 server is supposed to support keep-alive. Since our

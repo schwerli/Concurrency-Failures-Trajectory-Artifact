@@ -1,0 +1,13 @@
+Done. `Avg` and `Sum` now accept `distinct=True`.
+
+**Source** (`django/db/models/aggregates.py:99,143`) — one line each: `allow_distinct = True`. The base `Aggregate` already renders the `%(distinct)s` placeholder and validates the flag, so no other machinery was needed. Verified SQL: `AVG(DISTINCT "rating")`, `SUM(DISTINCT "rating")`.
+
+**Min/Max**: deliberately left unchanged. The ticket calls it out as pointless (`MIN`/`MAX` over a set are identical with or without dedup), so enabling it would only add a way to write misleading queries. Say the word if you want them flipped too.
+
+**Docs**: added the `distinct` argument to the `Avg`/`Sum` signatures and descriptions in `docs/ref/models/querysets.txt` (mirroring the existing `Count.distinct` wording, plus `.. versionchanged:: 3.0`), and a 3.0 release-notes entry under *Models*.
+
+**Tests** (`tests/aggregation/tests.py`): `test_aggregation_allow_distinct` checks `Avg`/`Count`/`Sum` over the six book ratings (3.0, 4.0×3, 4.5, 5.0 → 4 distinct: avg 4.125, sum 16.5), and `test_aggregation_disallow_distinct` pins the `TypeError` for `Max`/`Min`.
+
+Results: the new tests fail on the pre-change source with `TypeError: Avg does not allow distinct.` / `Sum does not allow distinct.` and pass after. Full run of `aggregation aggregation_regress annotations expressions expressions_window queries db_functions` — 1016 tests, OK (31 skipped, 2 expected failures), on SQLite only; I did not exercise the PostgreSQL/MySQL/Oracle backends, though `AVG/SUM(DISTINCT …)` is standard SQL on all of them.
+
+One note I left alone: `docs/topics/db/aggregation.txt:217` still says "For most aggregates, there is no way to avoid this problem, however, the `Count` aggregate has a `distinct` parameter that may help." That passage is about join multiplication, where `Count(distinct=True)` remains the canonical fix, so it reads fine — but it is now slightly narrower than reality if you'd like it broadened.

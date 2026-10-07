@@ -1,0 +1,71 @@
+**Files**
+- Active module hierarchy used by the entrypoint: `lib/cli` -> [python_int.mjs](/output/lib/cli/python_int.mjs), [arg_parser.mjs](/output/lib/cli/arg_parser.mjs)
+- Active module hierarchy used by the entrypoint: `lib/bech32` -> [constants.mjs](/output/lib/bech32/constants.mjs), [checksum.mjs](/output/lib/bech32/checksum.mjs), [convert_bits.mjs](/output/lib/bech32/convert_bits.mjs), [core.mjs](/output/lib/bech32/core.mjs), [segwit.mjs](/output/lib/bech32/segwit.mjs), [index.mjs](/output/lib/bech32/index.mjs)
+- Entry file: [test4.mjs](/output/test4.mjs)
+
+**test4.mjs**
+```js
+import { pathToFileURL } from 'node:url';
+
+import { ArgumentParseExit, parseTest4Arguments } from './lib/cli/arg_parser.mjs';
+import {
+  formatPythonValueErrorTraceback,
+  parseCommaSeparatedIntegers,
+  PythonValueError,
+} from './lib/cli/python_int.mjs';
+import { Bech32IndexError, encodeSegwitAddress } from './lib/bech32/index.mjs';
+
+function formatBech32IndexErrorTraceback(error) {
+  return [
+    'Traceback (most recent call last):',
+    '  File "test4.py", line 16, in <module>',
+    '  File "test4.py", line 12, in main',
+    '  File "bech32/__init__.py", line 127, in encode',
+    '  File "bech32/__init__.py", line 61, in bech32_encode',
+    `${error.name}: ${error.message}`,
+    '',
+  ].join('\n');
+}
+
+function writeExitText(streamName, text, exitCode) {
+  process[streamName].write(text);
+  process.exit(exitCode);
+}
+
+export function main(argv = process.argv) {
+  const args = parseTest4Arguments(argv);
+  const witnessProgram = parseCommaSeparatedIntegers(args.c);
+  const result = encodeSegwitAddress(args.a, args.b, witnessProgram);
+
+  console.log(result === null ? 'None' : result);
+}
+
+export function runCli(argv = process.argv) {
+  try {
+    main(argv);
+  } catch (error) {
+    if (error instanceof ArgumentParseExit) {
+      writeExitText(error.streamName, error.text, error.exitCode);
+      return;
+    }
+
+    if (error instanceof PythonValueError) {
+      writeExitText('stderr', formatPythonValueErrorTraceback(error), 1);
+      return;
+    }
+
+    if (error instanceof Bech32IndexError) {
+      writeExitText('stderr', formatBech32IndexErrorTraceback(error), 1);
+      return;
+    }
+
+    throw error;
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  runCli(process.argv);
+}
+```
+
+Verified with all 4 sample cases and with CLI edge cases like `--help`, missing required args, invalid `--b`, duplicate flags, `None` outputs, and classic Bech32 behavior matching the reference executable.

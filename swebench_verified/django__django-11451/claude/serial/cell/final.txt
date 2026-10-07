@@ -1,0 +1,23 @@
+Done. The change:
+
+**`django/contrib/auth/backends.py:39-43`**
+```python
+def authenticate(self, request, username=None, password=None, **kwargs):
+    if username is None:
+        username = kwargs.get(UserModel.USERNAME_FIELD)
+    if username is None or password is None:
+        return
+    try:
+        ...
+```
+
+**`tests/auth_tests/test_auth_backends.py`** — added `test_authentication_without_credentials` to `BaseModelBackendTest` (so it runs for all user-model variants), asserting zero queries for missing username, missing password, and both missing.
+
+Verification:
+- Full `auth_tests`: 513 tests, OK (was 510 before; 3 new since the base class has 3 subclasses).
+- Stashing the backend fix makes the new test fail with exactly the query from the report (`WHERE "auth_user"."username" IS NULL`), confirming it's a real regression guard.
+- `auth_tests test_client test_client_regress admin_views.test_forms`: 713 tests, OK.
+
+On the timing concern you raised: the existing `#20760` protection is unaffected — `test_authentication_timing` still passes, since the hasher is still run once for a nonexistent-but-supplied username. The short-circuit only skips the hasher when there are no credentials for this backend at all, where there was nothing to mask anyway.
+
+I did not add a release note; the behavior isn't documented in `docs/ref/contrib/auth.txt`, and this is an internal optimization rather than an API change. Say the word if you'd like one in `docs/releases/3.0.txt`.

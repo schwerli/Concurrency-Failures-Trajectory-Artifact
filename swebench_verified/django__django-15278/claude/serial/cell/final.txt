@@ -1,0 +1,26 @@
+Fixed. The regression was introduced by `2f73e5406d` ("Avoided table rebuild when adding fields with no default on SQLite"), which routed nullable, default-less fields through `ALTER TABLE ADD COLUMN`. SQLite forbids adding `UNIQUE` (and `PRIMARY KEY`) columns that way, and `OneToOneField` implies `unique=True` — so the previously-working table-rebuild path was bypassed.
+
+**`django/db/backends/sqlite3/schema.py`** — `add_field` now also rebuilds the table for `primary_key` or `unique` fields:
+
+```python
+elif (
+    # Primary keys and unique fields are not supported in ALTER TABLE
+    # ADD COLUMN.
+    field.primary_key or field.unique or
+    # Fields with default values cannot by handled by ALTER TABLE ADD
+    # COLUMN statement because DROP DEFAULT is not supported in
+    # ALTER TABLE.
+    not field.null or self.effective_default(field) is not None
+):
+```
+
+I also added the implicit-M2M special case that the base class has. Previously an auto-created M2M fell through to `not field.null` (M2M defaults to `null=False`) and got its through table created only incidentally, via the `create_model` inside a full table rebuild. Now it's created directly — same result, without rebuilding the table. Explicit `through=` M2M behavior is unchanged.
+
+Verification:
+- Reproduced the exact `OperationalError: Cannot add a UNIQUE column` first, then confirmed it resolved.
+- Drove the reported `migrations.AddField` operation through the migration executor — applies and reverses cleanly.
+- Checked the resulting schema is genuinely correct, not just non-crashing: pre-existing rows survive the rebuild, the FK and UNIQUE constraint both exist, uniqueness is actually enforced (`IntegrityError` on duplicate), and multiple NULLs are still allowed.
+- New test `test_add_field_o2o_nullable` fails without the fix, passes with it.
+- Suites green: `schema` (174), `migrations` (630), `backends`/`introspection`/`inspectdb` (311), plus `model_fields`/`indexes`/`constraints`/`m2m_*`/`one_to_one` (639).
+
+One note on process: while inserting the test I made a bad edit that joined two lines of `tests/schema/tests.py` together. I caught it, restored the line, and the final `git diff` shows the only change to that file is the added test.

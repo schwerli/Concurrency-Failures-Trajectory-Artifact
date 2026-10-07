@@ -1,0 +1,27 @@
+Fixed.
+
+## Root cause
+
+`SubFigure._redo_transform_rel_fig()` (`lib/matplotlib/figure.py:2260`) computed each subfigure's relative bbox purely from the parent gridspec's width/height *ratios*:
+
+```python
+dx = wr[colspan].sum() / wr.sum()
+x0 = wr[:colspan.start].sum() / wr.sum()
+```
+
+`Figure.subfigures` does pass `wspace`/`hspace` into the `GridSpec` it creates, but nothing ever read them back when placing the subfigures — so the cells always tiled the parent edge-to-edge regardless of the values.
+
+## Fix
+
+The placement now mirrors `GridSpecBase.get_grid_positions`: cells tile the parent with no margins (subfigures fill their parent, as before), and `wspace`/`hspace` reserve space between them as a fraction of the average subfigure width/height — the same convention as for Axes. A spanning subfigure also spans the gaps it crosses, and edges are measured from left/bottom so flush subfigures land on exactly `0` (the old formula did too, and `test_subfigure_spanning` compares against `0` with zero tolerance).
+
+Unset spacing (`None`) means zero, not the rcParams fallback, so the default layout is byte-identical to before — I verified the existing subfigure baseline-image tests still pass. Constrained layout was already honoring the spacing via its own layoutgrid path and is untouched.
+
+## Verification
+
+- Reproduction from the report: subfigure extents now change with `wspace`/`hspace` (e.g. `wspace=0.5`, 2 cols → `[0, 0.4]` and `[0.6, 1]`); previously all values gave `[0, 0.5]`/`[0.5, 1]`.
+- Cross-checked that `fig.subfigures(1, 3, wspace=0.4, width_ratios=[1, 2, 1])` lands on exactly the positions of `fig.subplots` with the same gridspec params and zero margins.
+- Nested `subgridspec` (`GridSpecFromSubplotSpec`, which stores `_wspace`) and spanning slices both work; figures still render/save.
+- Full test suite: `8240 passed`. 7 failures are pre-existing and environmental (missing `jupyter`, missing font glyphs, sphinx-gallery docs) — I confirmed the same failures on a stashed clean tree.
+
+Added `test_subfigure_spacing` in `lib/matplotlib/tests/test_figure.py` and a behavior note in `doc/api/next_api_changes/behavior/26210-OG.rst` (I guessed the PR number for the filename — worth correcting before submitting upstream).

@@ -1,0 +1,103 @@
+diff --git a/examples/pylintrc b/examples/pylintrc
+index 0bfe9593..154ccbbc 100644
+--- a/examples/pylintrc
++++ b/examples/pylintrc
+@@ -297,7 +297,7 @@ ignore-docstrings=yes
+ # Ignore imports when computing similarities.
+ ignore-imports=no
+ 
+-# Minimum lines number of a similarity.
++# Minimum lines number of a similarity. Set to 0 to disable duplicate-code checking.
+ min-similarity-lines=4
+ 
+ 
+diff --git a/pylint/checkers/similar.py b/pylint/checkers/similar.py
+index c65b1c89..a5bda955 100644
+--- a/pylint/checkers/similar.py
++++ b/pylint/checkers/similar.py
+@@ -394,6 +394,9 @@ class Similar:
+ 
+     def _compute_sims(self) -> List[Tuple[int, Set[LinesChunkLimits_T]]]:
+         """compute similarities in appended files"""
++        if self.min_lines <= 0:
++            return []
++
+         no_duplicates: Dict[int, List[Set[LinesChunkLimits_T]]] = defaultdict(list)
+ 
+         for commonality in self._iter_sims():
+@@ -739,7 +742,7 @@ class SimilarChecker(BaseChecker, Similar, MapReduceMixin):
+                 "default": DEFAULT_MIN_SIMILARITY_LINE,
+                 "type": "int",
+                 "metavar": "<int>",
+-                "help": "Minimum lines number of a similarity.",
++                "help": "Minimum lines number of a similarity. Use 0 to disable duplicate-code checking.",
+             },
+         ),
+         (
+diff --git a/pylintrc b/pylintrc
+index 6acebfbf..19d9336c 100644
+--- a/pylintrc
++++ b/pylintrc
+@@ -117,7 +117,7 @@ notes=FIXME,XXX,TODO
+ 
+ [SIMILARITIES]
+ 
+-# Minimum lines number of a similarity.
++# Minimum lines number of a similarity. Set to 0 to disable duplicate-code checking.
+ min-similarity-lines=4
+ 
+ # Ignore comments when computing similarities.
+diff --git a/tests/checkers/unittest_similar.py b/tests/checkers/unittest_similar.py
+index 4ddf2029..4bdc621d 100644
+--- a/tests/checkers/unittest_similar.py
++++ b/tests/checkers/unittest_similar.py
+@@ -339,6 +339,19 @@ TOTAL lines=62 duplicates=5 percent=8.06
+     )
+ 
+ 
++def test_zero_min_lines_disables_similarity() -> None:
++    output = StringIO()
++    with redirect_stdout(output), pytest.raises(SystemExit) as ex:
++        similar.Run(["--duplicates=0", SIMILAR1, SIMILAR2])
++    assert ex.value.code == 0
++    assert (
++        output.getvalue().strip()
++        == """
++TOTAL lines=62 duplicates=0 percent=0.00
++""".strip()
++    )
++
++
+ def test_lines_without_meaningful_content_do_not_trigger_similarity() -> None:
+     output = StringIO()
+     with redirect_stdout(output), pytest.raises(SystemExit) as ex:
+diff --git a/tests/test_self.py b/tests/test_self.py
+index 9c044415..9bba7416 100644
+--- a/tests/test_self.py
++++ b/tests/test_self.py
+@@ -1112,6 +1112,25 @@ class TestRunTC:
+             expected_output=expected_output,
+         )
+ 
++    def test_duplicate_code_disabled_by_zero_min_similarity_lines_in_rcfile(
++        self, tmpdir: LocalPath
++    ) -> None:
++        rcfile = tmpdir / "pylintrc"
++        rcfile.write("[SIMILARITIES]\nmin-similarity-lines=0\n")
++        out = StringIO()
++        self._runtest(
++            [
++                f"--rcfile={rcfile}",
++                join(HERE, "input", "func_w0801.py"),
++                join(HERE, "input", "w0801_same.py"),
++                "--disable=all",
++                "--enable=duplicate-code",
++            ],
++            out=out,
++            code=0,
++        )
++        assert "Similar lines in 2 files" not in self._clean_paths(out.getvalue())
++
+     def test_regression_parallel_mode_without_filepath(self) -> None:
+         # Test that parallel mode properly passes filepath
+         # https://github.com/PyCQA/pylint/issues/3564

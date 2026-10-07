@@ -1,0 +1,79 @@
+diff --git a/django/core/management/base.py b/django/core/management/base.py
+index abc6f79a15..7c86f62e72 100644
+--- a/django/core/management/base.py
++++ b/django/core/management/base.py
+@@ -6,6 +6,7 @@ import argparse
+ import os
+ import sys
+ from argparse import ArgumentParser, HelpFormatter
++from functools import partial
+ from io import TextIOBase
+ 
+ import django
+@@ -71,6 +72,16 @@ class CommandParser(ArgumentParser):
+         else:
+             raise CommandError("Error: %s" % message)
+ 
++    def add_subparsers(self, **kwargs):
++        parser_class = kwargs.get("parser_class", type(self))
++        if issubclass(parser_class, CommandParser):
++            kwargs["parser_class"] = partial(
++                parser_class,
++                called_from_command_line=self.called_from_command_line,
++                missing_args_message=self.missing_args_message,
++            )
++        return super().add_subparsers(**kwargs)
++
+ 
+ def handle_default_options(options):
+     """
+diff --git a/tests/user_commands/tests.py b/tests/user_commands/tests.py
+index e40632385c..685f24ecd1 100644
+--- a/tests/user_commands/tests.py
++++ b/tests/user_commands/tests.py
+@@ -1,5 +1,5 @@
+ import os
+-from argparse import ArgumentDefaultsHelpFormatter
++from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+ from io import StringIO
+ from unittest import mock
+ 
+@@ -8,7 +8,12 @@ from admin_scripts.tests import AdminScriptTestCase
+ from django.apps import apps
+ from django.core import management
+ from django.core.checks import Tags
+-from django.core.management import BaseCommand, CommandError, find_commands
++from django.core.management import (
++    BaseCommand,
++    CommandError,
++    CommandParser,
++    find_commands,
++)
+ from django.core.management.utils import (
+     find_command,
+     get_random_secret_key,
+@@ -418,6 +423,24 @@ class CommandTests(SimpleTestCase):
+         self.assertEqual(parser.epilog, epilog)
+         self.assertEqual(parser.formatter_class, ArgumentDefaultsHelpFormatter)
+ 
++    def test_add_subparsers_kwargs(self):
++        """CommandParser.add_subparsers() passes kwargs to subparsers."""
++        parser = CommandParser(
++            called_from_command_line=True,
++            missing_args_message="missing args",
++        )
++        subparser = parser.add_subparsers().add_parser("spam")
++        self.assertEqual(subparser.missing_args_message, "missing args")
++        self.assertIs(subparser.called_from_command_line, True)
++
++    def test_add_subparsers_parser_class(self):
++        """Custom parser classes are used as-is, without extra kwargs."""
++        parser = CommandParser()
++        subparser = parser.add_subparsers(parser_class=ArgumentParser).add_parser(
++            "spam"
++        )
++        self.assertIs(type(subparser), ArgumentParser)
++
+     def test_outputwrapper_flush(self):
+         out = StringIO()
+         with mock.patch.object(out, "flush") as mocked_flush:

@@ -1,0 +1,362 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index d913658291..8a114f5c67 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -1,5 +1,6 @@
+ import copy
+ import datetime
++import functools
+ import inspect
+ from decimal import Decimal
+ 
+@@ -422,6 +423,38 @@ class Expression(BaseExpression, Combinable):
+     pass
+ 
+ 
++# Combinations of source types whose combined type can be inferred, of the
++# form {connector: [(lhs_type, rhs_type, combined_type), ...]}. Only temporal
++# arithmetic is listed because e.g. IntegerField / IntegerField is ambiguous.
++_connector_combinations = {
++    Combinable.ADD: [
++        (fields.DateField, fields.DurationField, fields.DateTimeField),
++        (fields.DateTimeField, fields.DurationField, fields.DateTimeField),
++        (fields.TimeField, fields.DurationField, fields.TimeField),
++        (fields.DurationField, fields.DateField, fields.DateTimeField),
++        (fields.DurationField, fields.DateTimeField, fields.DateTimeField),
++        (fields.DurationField, fields.TimeField, fields.TimeField),
++        (fields.DurationField, fields.DurationField, fields.DurationField),
++    ],
++    Combinable.SUB: [
++        (fields.DateField, fields.DurationField, fields.DateTimeField),
++        (fields.DateTimeField, fields.DurationField, fields.DateTimeField),
++        (fields.TimeField, fields.DurationField, fields.TimeField),
++        (fields.DateField, fields.DateField, fields.DurationField),
++        (fields.DateTimeField, fields.DateTimeField, fields.DurationField),
++        (fields.TimeField, fields.TimeField, fields.DurationField),
++        (fields.DurationField, fields.DurationField, fields.DurationField),
++    ],
++}
++
++
++@functools.lru_cache(maxsize=128)
++def _resolve_combined_type(connector, lhs_type, rhs_type):
++    for combined_lhs_type, combined_rhs_type, combined_type in _connector_combinations.get(connector, ()):
++        if issubclass(lhs_type, combined_lhs_type) and issubclass(rhs_type, combined_rhs_type):
++            return combined_type
++
++
+ class CombinedExpression(SQLiteNumericMixin, Expression):
+ 
+     def __init__(self, lhs, connector, rhs, output_field=None):
+@@ -442,24 +475,17 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
+     def set_source_expressions(self, exprs):
+         self.lhs, self.rhs = exprs
+ 
++    def _resolve_output_field(self):
++        combined_type = _resolve_combined_type(
++            self.connector,
++            type(self.lhs._output_field_or_none),
++            type(self.rhs._output_field_or_none),
++        )
++        if combined_type is None:
++            return super()._resolve_output_field()
++        return combined_type()
++
+     def as_sql(self, compiler, connection):
+-        try:
+-            lhs_type = self.lhs.output_field.get_internal_type()
+-        except FieldError:
+-            lhs_type = None
+-        try:
+-            rhs_type = self.rhs.output_field.get_internal_type()
+-        except FieldError:
+-            rhs_type = None
+-        if (
+-            not connection.features.has_native_duration_field and
+-            'DurationField' in {lhs_type, rhs_type} and
+-            lhs_type != rhs_type
+-        ):
+-            return DurationExpression(self.lhs, self.connector, self.rhs).as_sql(compiler, connection)
+-        datetime_fields = {'DateField', 'DateTimeField', 'TimeField'}
+-        if self.connector == self.SUB and lhs_type in datetime_fields and lhs_type == rhs_type:
+-            return TemporalSubtraction(self.lhs, self.rhs).as_sql(compiler, connection)
+         expressions = []
+         expression_params = []
+         sql, params = compiler.compile(self.lhs)
+@@ -474,10 +500,30 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
+         return expression_wrapper % sql, expression_params
+ 
+     def resolve_expression(self, query=None, allow_joins=True, reuse=None, summarize=False, for_save=False):
++        lhs = self.lhs.resolve_expression(query, allow_joins, reuse, summarize, for_save)
++        rhs = self.rhs.resolve_expression(query, allow_joins, reuse, summarize, for_save)
++        if not isinstance(self, (DurationExpression, TemporalSubtraction)):
++            try:
++                lhs_type = lhs.output_field.get_internal_type()
++            except (AttributeError, FieldError):
++                lhs_type = None
++            try:
++                rhs_type = rhs.output_field.get_internal_type()
++            except (AttributeError, FieldError):
++                rhs_type = None
++            if 'DurationField' in {lhs_type, rhs_type} and lhs_type != rhs_type:
++                return DurationExpression(self.lhs, self.connector, self.rhs).resolve_expression(
++                    query, allow_joins, reuse, summarize, for_save,
++                )
++            datetime_fields = {'DateField', 'DateTimeField', 'TimeField'}
++            if self.connector == self.SUB and lhs_type in datetime_fields and lhs_type == rhs_type:
++                return TemporalSubtraction(self.lhs, self.rhs).resolve_expression(
++                    query, allow_joins, reuse, summarize, for_save,
++                )
+         c = self.copy()
+         c.is_summary = summarize
+-        c.lhs = c.lhs.resolve_expression(query, allow_joins, reuse, summarize, for_save)
+-        c.rhs = c.rhs.resolve_expression(query, allow_joins, reuse, summarize, for_save)
++        c.lhs = lhs
++        c.rhs = rhs
+         return c
+ 
+ 
+@@ -494,6 +540,8 @@ class DurationExpression(CombinedExpression):
+         return compiler.compile(side)
+ 
+     def as_sql(self, compiler, connection):
++        if connection.features.has_native_duration_field:
++            return super().as_sql(compiler, connection)
+         connection.ops.check_expression_support(self)
+         expressions = []
+         expression_params = []
+diff --git a/docs/ref/models/expressions.txt b/docs/ref/models/expressions.txt
+index 252966bb6c..914fa63913 100644
+--- a/docs/ref/models/expressions.txt
++++ b/docs/ref/models/expressions.txt
+@@ -217,11 +217,23 @@ to tell Django what kind of field will be returned. Since ``F()`` does not
+ directly support ``output_field`` you will need to wrap the expression with
+ :class:`ExpressionWrapper`::
+ 
+-    from django.db.models import DateTimeField, ExpressionWrapper, F
++    from django.db.models import DecimalField, ExpressionWrapper, F
+ 
+-    Ticket.objects.annotate(
+-        expires=ExpressionWrapper(
+-            F('active_at') + F('duration'), output_field=DateTimeField()))
++    Company.objects.annotate(
++        chairs_needed=ExpressionWrapper(
++            F('num_employees') - F('num_chairs'), output_field=DecimalField()))
++
++Date and time fields are an exception, as the resulting type of arithmetic on
++them can be determined, e.g. adding a :class:`~django.db.models.DurationField`
++to a :class:`~django.db.models.DateTimeField` results in a ``DateTimeField``
++and subtracting two ``DateTimeField``\s results in a ``DurationField``::
++
++    Ticket.objects.annotate(expires=F('active_at') + F('duration'))
++
++.. versionchanged:: 3.2
++
++    Arithmetic on date and time fields no longer requires
++    :class:`ExpressionWrapper`.
+ 
+ When referencing relational fields such as ``ForeignKey``, ``F()`` returns the
+ primary key value rather than a model instance::
+diff --git a/docs/releases/3.2.txt b/docs/releases/3.2.txt
+index 9f1d785934..5b7856e9d3 100644
+--- a/docs/releases/3.2.txt
++++ b/docs/releases/3.2.txt
+@@ -223,6 +223,11 @@ Models
+ * The new :attr:`.UniqueConstraint.opclasses` attribute allows setting
+   PostgreSQL operator classes.
+ 
++* Date and time arithmetic on expressions no longer requires wrapping them in
++  :class:`~django.db.models.ExpressionWrapper`, as the ``output_field`` of such
++  expressions is now resolved automatically, e.g. subtracting two
++  ``DateTimeField`` expressions results in a ``DurationField``.
++
+ Requests and Responses
+ ~~~~~~~~~~~~~~~~~~~~~~
+ 
+diff --git a/tests/expressions/tests.py b/tests/expressions/tests.py
+index 72f95f0194..d547648eff 100644
+--- a/tests/expressions/tests.py
++++ b/tests/expressions/tests.py
+@@ -13,7 +13,9 @@ from django.db.models import (
+     Func, IntegerField, Max, Min, Model, OrderBy, OuterRef, Q, StdDev,
+     Subquery, Sum, TimeField, UUIDField, Value, Variance, When,
+ )
+-from django.db.models.expressions import Col, Combinable, Random, RawSQL, Ref
++from django.db.models.expressions import (
++    Col, Combinable, CombinedExpression, Random, RawSQL, Ref,
++)
+ from django.db.models.functions import (
+     Coalesce, Concat, Left, Length, Lower, Substr, Upper,
+ )
+@@ -1493,9 +1495,7 @@ class FTimeDeltaTests(TestCase):
+     @skipUnlessDBFeature('supports_temporal_subtraction')
+     def test_date_subtraction(self):
+         queryset = Experiment.objects.annotate(
+-            completion_duration=ExpressionWrapper(
+-                F('completed') - F('assigned'), output_field=DurationField()
+-            )
++            completion_duration=F('completed') - F('assigned'),
+         )
+ 
+         at_least_5_days = {e.name for e in queryset.filter(completion_duration__gte=datetime.timedelta(days=5))}
+@@ -1507,10 +1507,9 @@ class FTimeDeltaTests(TestCase):
+         less_than_5_days = {e.name for e in queryset.filter(completion_duration__lt=datetime.timedelta(days=5))}
+         self.assertEqual(less_than_5_days, {'e0', 'e1', 'e2'})
+ 
+-        queryset = Experiment.objects.annotate(difference=ExpressionWrapper(
+-            F('completed') - Value(None, output_field=DateField()),
+-            output_field=DurationField(),
+-        ))
++        queryset = Experiment.objects.annotate(
++            difference=F('completed') - Value(None, output_field=DateField()),
++        )
+         self.assertIsNone(queryset.first().difference)
+ 
+         queryset = Experiment.objects.annotate(shifted=ExpressionWrapper(
+@@ -1523,9 +1522,7 @@ class FTimeDeltaTests(TestCase):
+     def test_date_subquery_subtraction(self):
+         subquery = Experiment.objects.filter(pk=OuterRef('pk')).values('completed')
+         queryset = Experiment.objects.annotate(
+-            difference=ExpressionWrapper(
+-                subquery - F('completed'), output_field=DurationField(),
+-            ),
++            difference=subquery - F('completed'),
+         ).filter(difference=datetime.timedelta())
+         self.assertTrue(queryset.exists())
+ 
+@@ -1540,9 +1537,7 @@ class FTimeDeltaTests(TestCase):
+                 self.e0.completed,
+                 output_field=DateField(),
+             ),
+-            difference=ExpressionWrapper(
+-                F('date_case') - F('completed_value'), output_field=DurationField(),
+-            ),
++            difference=F('date_case') - F('completed_value'),
+         ).filter(difference=datetime.timedelta())
+         self.assertEqual(queryset.get(), self.e0)
+ 
+@@ -1550,20 +1545,16 @@ class FTimeDeltaTests(TestCase):
+     def test_time_subtraction(self):
+         Time.objects.create(time=datetime.time(12, 30, 15, 2345))
+         queryset = Time.objects.annotate(
+-            difference=ExpressionWrapper(
+-                F('time') - Value(datetime.time(11, 15, 0), output_field=TimeField()),
+-                output_field=DurationField(),
+-            )
++            difference=F('time') - Value(datetime.time(11, 15, 0), output_field=TimeField()),
+         )
+         self.assertEqual(
+             queryset.get().difference,
+             datetime.timedelta(hours=1, minutes=15, seconds=15, microseconds=2345)
+         )
+ 
+-        queryset = Time.objects.annotate(difference=ExpressionWrapper(
+-            F('time') - Value(None, output_field=TimeField()),
+-            output_field=DurationField(),
+-        ))
++        queryset = Time.objects.annotate(
++            difference=F('time') - Value(None, output_field=TimeField()),
++        )
+         self.assertIsNone(queryset.first().difference)
+ 
+         queryset = Time.objects.annotate(shifted=ExpressionWrapper(
+@@ -1577,9 +1568,7 @@ class FTimeDeltaTests(TestCase):
+         Time.objects.create(time=datetime.time(12, 30, 15, 2345))
+         subquery = Time.objects.filter(pk=OuterRef('pk')).values('time')
+         queryset = Time.objects.annotate(
+-            difference=ExpressionWrapper(
+-                subquery - F('time'), output_field=DurationField(),
+-            ),
++            difference=subquery - F('time'),
+         ).filter(difference=datetime.timedelta())
+         self.assertTrue(queryset.exists())
+ 
+@@ -1595,10 +1584,9 @@ class FTimeDeltaTests(TestCase):
+         ]
+         self.assertEqual(over_estimate, ['e4'])
+ 
+-        queryset = Experiment.objects.annotate(difference=ExpressionWrapper(
+-            F('start') - Value(None, output_field=DateTimeField()),
+-            output_field=DurationField(),
+-        ))
++        queryset = Experiment.objects.annotate(
++            difference=F('start') - Value(None, output_field=DateTimeField()),
++        )
+         self.assertIsNone(queryset.first().difference)
+ 
+         queryset = Experiment.objects.annotate(shifted=ExpressionWrapper(
+@@ -1611,9 +1599,7 @@ class FTimeDeltaTests(TestCase):
+     def test_datetime_subquery_subtraction(self):
+         subquery = Experiment.objects.filter(pk=OuterRef('pk')).values('start')
+         queryset = Experiment.objects.annotate(
+-            difference=ExpressionWrapper(
+-                subquery - F('start'), output_field=DurationField(),
+-            ),
++            difference=subquery - F('start'),
+         ).filter(difference=datetime.timedelta())
+         self.assertTrue(queryset.exists())
+ 
+@@ -1621,12 +1607,18 @@ class FTimeDeltaTests(TestCase):
+     def test_datetime_subtraction_microseconds(self):
+         delta = datetime.timedelta(microseconds=8999999999999999)
+         Experiment.objects.update(end=F('start') + delta)
+-        qs = Experiment.objects.annotate(
+-            delta=ExpressionWrapper(F('end') - F('start'), output_field=DurationField())
+-        )
++        qs = Experiment.objects.annotate(delta=F('end') - F('start'))
+         for e in qs:
+             self.assertEqual(e.delta, delta)
+ 
++    @skipUnlessDBFeature('supports_temporal_subtraction')
++    def test_temporal_subtraction_with_duration(self):
++        queryset = Experiment.objects.annotate(
++            delta=F('end') - F('start') + Value(datetime.timedelta(), output_field=DurationField()),
++        )
++        for e in queryset:
++            self.assertEqual(e.delta, e.end - e.start)
++
+     def test_duration_with_datetime(self):
+         # Exclude e1 which has very high precision so we can test this on all
+         # backends regardless of whether or not it supports
+@@ -1828,6 +1820,41 @@ class ReprTests(SimpleTestCase):
+         )
+ 
+ 
++class CombinedExpressionTests(SimpleTestCase):
++    def test_resolve_output_field_temporal(self):
++        tests = [
++            (DateField, Combinable.ADD, DurationField, DateTimeField),
++            (DateTimeField, Combinable.ADD, DurationField, DateTimeField),
++            (TimeField, Combinable.ADD, DurationField, TimeField),
++            (DurationField, Combinable.ADD, DateField, DateTimeField),
++            (DurationField, Combinable.ADD, DurationField, DurationField),
++            (DateField, Combinable.SUB, DateField, DurationField),
++            (DateTimeField, Combinable.SUB, DateTimeField, DurationField),
++            (DateTimeField, Combinable.SUB, DateField, DurationField),
++            (TimeField, Combinable.SUB, TimeField, DurationField),
++            (DateTimeField, Combinable.SUB, DurationField, DateTimeField),
++            (DurationField, Combinable.SUB, DurationField, DurationField),
++        ]
++        for lhs, connector, rhs, expected in tests:
++            with self.subTest(lhs=lhs, connector=connector, rhs=rhs):
++                expr = CombinedExpression(
++                    Value(None, output_field=lhs()),
++                    connector,
++                    Value(None, output_field=rhs()),
++                )
++                self.assertIsInstance(expr.output_field, expected)
++
++    def test_resolve_output_field_unsupported_types(self):
++        expr = CombinedExpression(
++            Value(None, output_field=DateTimeField()),
++            Combinable.ADD,
++            Value(None, output_field=IntegerField()),
++        )
++        msg = 'Expression contains mixed types: DateTimeField, IntegerField.'
++        with self.assertRaisesMessage(FieldError, msg):
++            expr.output_field
++
++
+ class CombinableTests(SimpleTestCase):
+     bitwise_msg = 'Use .bitand() and .bitor() for bitwise logical operations.'
+ 

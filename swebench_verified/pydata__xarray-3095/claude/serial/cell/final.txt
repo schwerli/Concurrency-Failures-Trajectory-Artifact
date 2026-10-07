@@ -1,0 +1,14 @@
+Fixed. Root cause and change:
+
+**Cause** — `IndexVariable.copy(deep=True)` rebuilt the wrapper as `PandasIndexAdapter(self._data.array.copy(deep=True))` without passing the original dtype. `PandasIndexAdapter` only stores the *numpy* dtype separately from the underlying `pandas.Index` (pandas stores unicode as `object`), so re-deriving it from the index turned `<U3` into `object`. Shallow copies were unaffected because they reuse the existing adapter.
+
+**Fix** (`xarray/core/indexing.py`, `xarray/core/variable.py`):
+- Added `PandasIndexAdapter.copy(deep=True)`, which copies the index and carries `self._dtype` over to the new adapter. It deliberately does `self.array.copy(deep=True)` only for deep copies — a shallow `pd.Index.copy()` would still duplicate the buffer on pickling.
+- `IndexVariable.copy` now delegates to `self._data.copy(deep=deep)` (`_data` is always a `PandasIndexAdapter` there, enforced in `__init__` and the `data` setter).
+- `PandasIndexAdapter.__init__` normalizes an explicitly-passed `dtype` through `np.dtype(...)`.
+
+**Verification** — every path in the report now round-trips `<U3`: `Dataset.copy(deep=True/False)`, `DataArray.copy(deep=True/False)`, `copy.copy`, `copy.deepcopy`; datetime64, MultiIndex, PeriodIndex and CategoricalIndex coords keep their previous dtypes, and deep copies are still independent objects while shallow ones still share the index.
+
+Tests: parametrized `test_copy` in `test_variable.py` over `float/int/str`, plus new `test_copy_index_dtypes` in `test_dataset.py:2110` and `test_dataarray.py:3483`. On the unpatched core these fail (`TestIndexVariable::test_copy[str-True]` and both new tests) and pass with the fix. This environment has many pre-existing failures (cftime/numpy version issues) — I diffed the FAILED/ERROR sets before and after across variable/indexing/dataset/dataarray/coding_times/utils and dask/backends/concat/merge/groupby/combine/computation/cftimeindex/accessor_dt: identical both times, so nothing regressed.
+
+One thing to fill in: the `doc/whats-new.rst` entry has no `:issue:` reference or `By <author>` line, unlike its neighbors — I didn't know the real issue number or who should be credited, and guessing either would put false metadata in the changelog.

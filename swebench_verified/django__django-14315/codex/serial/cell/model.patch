@@ -1,0 +1,70 @@
+diff --git a/django/db/backends/postgresql/client.py b/django/db/backends/postgresql/client.py
+index 3effab65a8..d4539bb71c 100644
+--- a/django/db/backends/postgresql/client.py
++++ b/django/db/backends/postgresql/client.py
+@@ -36,21 +36,20 @@ class DatabaseClient(BaseDatabaseClient):
+             args += [dbname]
+         args.extend(parameters)
+ 
+-        env = {}
+-        if passwd:
+-            env['PGPASSWORD'] = str(passwd)
+-        if service:
+-            env['PGSERVICE'] = str(service)
+-        if sslmode:
+-            env['PGSSLMODE'] = str(sslmode)
+-        if sslrootcert:
+-            env['PGSSLROOTCERT'] = str(sslrootcert)
+-        if sslcert:
+-            env['PGSSLCERT'] = str(sslcert)
+-        if sslkey:
+-            env['PGSSLKEY'] = str(sslkey)
+-        if passfile:
+-            env['PGPASSFILE'] = str(passfile)
++        env = None
++        for env_name, value in (
++            ('PGPASSWORD', passwd),
++            ('PGSERVICE', service),
++            ('PGSSLMODE', sslmode),
++            ('PGSSLROOTCERT', sslrootcert),
++            ('PGSSLCERT', sslcert),
++            ('PGSSLKEY', sslkey),
++            ('PGPASSFILE', passfile),
++        ):
++            if value:
++                if env is None:
++                    env = {}
++                env[env_name] = str(value)
+         return args, env
+ 
+     def runshell(self, parameters):
+diff --git a/tests/dbshell/test_postgresql.py b/tests/dbshell/test_postgresql.py
+index a96acac6f1..9688d6b208 100644
+--- a/tests/dbshell/test_postgresql.py
++++ b/tests/dbshell/test_postgresql.py
+@@ -39,7 +39,7 @@ class PostgreSqlDbshellCommandTestCase(SimpleTestCase):
+                 'PORT': '444',
+             }), (
+                 ['psql', '-U', 'someuser', '-h', 'somehost', '-p', '444', 'dbname'],
+-                {},
++                None,
+             )
+         )
+ 
+@@ -134,9 +134,15 @@ class PostgreSqlDbshellCommandTestCase(SimpleTestCase):
+     def test_parameters(self):
+         self.assertEqual(
+             self.settings_to_cmd_args_env({'NAME': 'dbname'}, ['--help']),
+-            (['psql', 'dbname', '--help'], {}),
++            (['psql', 'dbname', '--help'], None),
+         )
+ 
++    def test_runshell_does_not_clear_inherited_environment(self):
++        client = DatabaseClient(connection=mock.Mock(settings_dict={'NAME': 'dbname'}))
++        with mock.patch('subprocess.run') as mock_run:
++            client.runshell([])
++        mock_run.assert_called_once_with(['psql', 'dbname'], env=None, check=True)
++
+     @skipUnless(connection.vendor == 'postgresql', 'Requires a PostgreSQL connection')
+     def test_sigint_handler(self):
+         """SIGINT is ignored in Python and passed to psql to abort queries."""

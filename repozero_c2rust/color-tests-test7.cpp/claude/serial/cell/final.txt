@@ -1,0 +1,34 @@
+Done. The port is at `/output`, verified byte-for-byte against the reference binary.
+
+## Structure
+
+```
+/output/Cargo.toml            bin target "test7" -> test7.rs
+/output/test7.rs              entry point (pulls in modules via #[path])
+/output/test7                 compiled executable
+/output/src/color/mod.rs      module root
+        ├── rgb.rs            ColorSpace::RGB
+        ├── converter.rs      ColorConverter::blend
+        ├── cxx_fmt.rs        std::cout float formatting
+        └── cxx_parse.rs      std::stof
+```
+
+Builds cleanly and identically both ways: `rustc test7.rs` and `cargo build --release`. Zero dependencies (`Cargo.lock` has only the package itself).
+
+## What the black-box probing established
+
+**`blend` is `a*(1-ratio) + b*ratio` in `f32`**, with no clamping of colors or ratio. The associativity is not cosmetic — the algebraically identical `a + (b-a)*ratio` disagrees by 1 ULP, normally invisible under 6-digit printing but exposed when the terms cancel: `1 0 0 -9 0 0.1` must print `-5.96046e-08`, not `0`. That case also ruled out `f64` math, which would give `-1.48601e-08`.
+
+**Two argument-handling quirks in the C++**, both preserved: `b2` is declared `0.1f` and never read from `argv`, so the 6th argument is the *ratio* and a 7th is silently ignored — despite the example inputs naming their 6th key `b2` and 7th `ratio`. And `argc > 5` means all five values parse together or not at all (`./test7 1 2 3 abc` never throws).
+
+**Output is `printf("%g")` with 6 significant digits**, plus glibc's `nan`/`-nan`/`inf` spellings — Rust's native float formatting matches on none of these.
+
+**`std::stof` needed a real `strtof`**: whitespace skipping, tail-ignoring (`0.5xyz` → `0.5`), hex, `infinity`, `nan(123)`. Its range rules are asymmetric, which is where the fuzzer earned its keep — it caught that `1.1754943e-38` must throw `out_of_range` even though it correctly rounds to `FLT_MIN`. glibc detects underflow by IEEE tininess *after rounding to 24 bits with an unbounded exponent*, not by asking whether the result is subnormal; the neighbouring `1.17549435e-38` is accepted. Overflow, conversely, is judged on the rounded result. Uncaught exceptions reproduce the `terminate called after throwing…` stderr text and SIGABRT (status 134).
+
+## Verification
+
+- 5/5 documented examples byte-exact.
+- **4443/4443 differential-fuzz cases** match on stdout, stderr, *and* exit code — randomized colors, cancellation-solved inputs, extreme magnitudes, 6-digit rounding boundaries, dense sweeps across `FLT_MIN`/`FLT_MAX` at digit counts 7–20, subnormals, all argc boundaries, and malformed args. Fuzzer at `/workspace/difffuzz.rs` (written in Rust — no python in this image).
+- 5 unit tests covering the formatter and parser boundary cases.
+
+One residual limit worth naming: hex-float significands longer than ~13 digits round through an `f64` intermediate, so a double-rounding disagreement is theoretically possible there. It's unreachable from decimal input and I found no case; I left it documented in `scaled_to_f64` rather than writing a bignum path.

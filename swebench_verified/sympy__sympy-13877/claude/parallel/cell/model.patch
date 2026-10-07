@@ -1,0 +1,437 @@
+diff --git a/detstress.py b/detstress.py
+new file mode 100644
+index 000000000..9336e7542
+--- /dev/null
++++ b/detstress.py
+@@ -0,0 +1,156 @@
++"""Stress harness: det(method=bareiss|berkowitz|lu) vs exact Leibniz expansion."""
++import itertools, random, traceback
++from sympy import (Matrix, det, sqrt, Rational, S, simplify, expand, nan, zoo, oo,
++                   symbols, cancel, Integer)
++from sympy.abc import a, b
++from sympy.combinatorics import Permutation
++
++METHODS = ('bareiss', 'berkowitz', 'lu')
++
++
++def leibniz_det(M):
++    """Exact, division-free determinant: sum over permutations. Ground truth."""
++    n = M.rows
++    if n == 0:
++        return S.One
++    tot = S.Zero
++    for perm in itertools.permutations(range(n)):
++        sgn = Permutation(list(perm)).signature()
++        term = S.One
++        for i in range(n):
++            term *= M[i, perm[i]]
++        tot += sgn * term
++    return expand(tot)
++
++
++def norm(x):
++    """Canonicalise for comparison; return ('EXC', msg) style markers verbatim."""
++    if isinstance(x, tuple):
++        return x
++    try:
++        s = simplify(expand(x))
++        return s
++    except Exception as e:
++        return ('SIMPFAIL', type(e).__name__)
++
++
++def same(x, y):
++    if isinstance(x, tuple) or isinstance(y, tuple):
++        return False
++    if x.has(nan) or y.has(nan) or x.has(zoo) or y.has(zoo):
++        return x == y
++    try:
++        d = simplify(expand(x - y))
++        return d == 0
++    except Exception:
++        return False
++
++
++def run_one(name, M):
++    """Returns (name, n, truth, {method: value_or_exc}, verdict_list)."""
++    res = {}
++    for m in METHODS:
++        try:
++            v = det(M, method=m)
++            res[m] = norm(v)
++            res[m + '_raw'] = v
++        except Exception as e:
++            res[m] = ('EXC', type(e).__name__ + ': ' + str(e)[:60])
++            res[m + '_raw'] = res[m]
++    try:
++        truth = leibniz_det(M)
++    except Exception as e:
++        truth = ('EXC', type(e).__name__)
++    bad = []
++    for m in METHODS:
++        if not same_or_eq(res[m], truth):
++            bad.append(m)
++    return dict(name=name, n=M.rows, truth=truth, res=res, bad=bad, M=M)
++
++
++def same_or_eq(v, truth):
++    if isinstance(v, tuple) or isinstance(truth, tuple):
++        return False
++    return same(v, truth)
++
++
++CASES = []
++
++# 1. reporter's family
++for n in range(1, 9):
++    CASES.append(("reporter i+a*j n=%d" % n,
++                  Matrix([[i + a * j for i in range(n)] for j in range(n)])))
++
++# 2. random small integer matrices
++random.seed(1234)
++for k in range(60):
++    n = random.randint(1, 5)
++    M = Matrix(n, n, lambda i, j: Integer(random.randint(-3, 3)))
++    CASES.append(("rand int n=%d #%d" % (n, k), M))
++
++# 3. random symbolic matrices, entries from a pool
++pool = [a, b, a * b, a ** 2, Rational(1, 3) * a, sqrt(2), sqrt(2) * a,
++        S.Zero, S.One, Integer(2), -a, a + b, a - b, 2 * a + 1]
++for k in range(60):
++    n = random.randint(1, 4)
++    M = Matrix(n, n, lambda i, j: random.choice(pool))
++    CASES.append(("rand sym n=%d #%d" % (n, k), M))
++
++# 4. singular by construction: rank<=2 outer-sum families
++for n in range(2, 7):
++    CASES.append(("rank2 outer n=%d" % n,
++                  Matrix(n, n, lambda i, j: i * a + j * b)))
++    CASES.append(("rank1 outer n=%d" % n,
++                  Matrix(n, n, lambda i, j: (i + 1) * (j + 2) * a)))
++    CASES.append(("dup row n=%d" % n,
++                  Matrix(n, n, lambda i, j: (a ** (j + 1) + j) if i % 2 == 0
++                         else (a ** (j + 1) + j))))
++    # rank deficient with sqrt entries
++    CASES.append(("rank2 sqrt n=%d" % n,
++                  Matrix(n, n, lambda i, j: i * sqrt(2) + j * a)))
++
++# 5. non-simplified zeros
++Z = [(a + 1) ** 2 - a ** 2 - 2 * a - 1,
++     (a + b) ** 2 - a ** 2 - 2 * a * b - b ** 2,
++     sqrt(2) * sqrt(2) - 2 if (sqrt(2) * sqrt(2) - 2) != 0 else S.Zero,
++     (a ** 2 - 1) / (a - 1) - a - 1,
++     cancel(0) + ((a - 1) * (a + 1) - a ** 2 + 1)]
++Z = [z for z in Z if z != 0]
++for zi, z in enumerate(Z):
++    for n in (2, 3, 4):
++        CASES.append(("nonsimp-zero z%d col0 n=%d" % (zi, n),
++                      Matrix(n, n, lambda i, j: z if j == 0 else a ** i + j + 1)))
++        CASES.append(("nonsimp-zero z%d diag n=%d" % (zi, n),
++                      Matrix(n, n, lambda i, j: z if i == j else a + i + j)))
++
++if __name__ == '__main__':
++    rows = []
++    for name, M in CASES:
++        try:
++            rows.append(run_one(name, M))
++        except Exception as e:
++            print("HARNESS FAIL", name, e)
++            traceback.print_exc()
++    import pickle
++    with open('/workspace/results.pkl', 'wb') as f:
++        pickle.dump([(r['name'], r['n'], str(r['truth']),
++                      {m: str(r['res'][m]) for m in METHODS},
++                      r['bad'], str(r['M'])) for r in rows], f)
++
++    fails = [r for r in rows if r['bad']]
++    print("total cases: %d   cases with >=1 wrong method: %d" % (len(rows), len(fails)))
++    per = {m: 0 for m in METHODS}
++    exc = {m: 0 for m in METHODS}
++    for r in rows:
++        for m in r['bad']:
++            per[m] += 1
++        for m in METHODS:
++            if isinstance(r['res'][m], tuple):
++                exc[m] += 1
++    print("wrong-by-method:", per)
++    print("exception-by-method:", exc)
++    print()
++    print("%-30s %-3s %-22s %s" % ("case", "n", "truth", "bad methods -> value"))
++    for r in fails:
++        vals = "; ".join("%s=%s" % (m, str(r['res'][m])[:50]) for m in r['bad'])
++        print("%-30s %-3d %-22s %s" % (r['name'][:30], r['n'], str(r['truth'])[:22], vals))
+diff --git a/fixes.py b/fixes.py
+new file mode 100644
+index 000000000..5f4823db0
+--- /dev/null
++++ b/fixes.py
+@@ -0,0 +1,80 @@
++from sympy import *
++from sympy.abc import a
++
++def make(n):
++    return Matrix([[i + a*j for i in range(n)] for j in range(n)])
++
++def _find_pivot(l):
++    for pos, val in enumerate(l):
++        if val:
++            return (pos, val, None, None)
++    return (None, None, None, None)
++
++# ---------- FIX A: honour cancel's return value (line 211) ------------------
++def bareiss_A(mat, cumm=1):
++    if mat.rows == 0: return S.One
++    if mat.rows == 1: return mat[0, 0]
++    pp, pv, _, _ = _find_pivot(mat[:, 0])
++    if pp is None: return S.Zero
++    sign = (-1) ** (pp % 2)
++    tmp = mat.extract([i for i in range(mat.rows) if i != pp], list(range(mat.cols)))
++    def entry(i, j):
++        ret = (pv*tmp[i, j + 1] - mat[pp, j + 1]*tmp[i, 0]) / cumm
++        if not ret.is_Atom:
++            ret = cancel(ret)          # <-- assignment added
++        return ret
++    return sign*bareiss_A(mat._new(mat.rows - 1, mat.cols - 1, entry), pv)
++
++# ---------- FIX B: zero-test the pivot candidate properly ------------------
++def _find_pivot_B(l):
++    for pos, val in enumerate(l):
++        if cancel(val):
++            return (pos, val, None, None)
++    return (None, None, None, None)
++
++def bareiss_B(mat, cumm=1):
++    if mat.rows == 0: return S.One
++    if mat.rows == 1: return mat[0, 0]
++    pp, pv, _, _ = _find_pivot_B(mat[:, 0])
++    if pp is None: return S.Zero
++    sign = (-1) ** (pp % 2)
++    tmp = mat.extract([i for i in range(mat.rows) if i != pp], list(range(mat.cols)))
++    def entry(i, j):
++        ret = (pv*tmp[i, j + 1] - mat[pp, j + 1]*tmp[i, 0]) / cumm
++        if not ret.is_Atom:
++            cancel(ret)
++        return ret
++    return sign*bareiss_B(mat._new(mat.rows - 1, mat.cols - 1, entry), pv)
++
++for n in range(1, 8):
++    m = make(n)
++    row = ["n=%d" % n]
++    for label, fn in (("bareissA", bareiss_A), ("bareissB", bareiss_B)):
++        try:
++            row.append("%s=%s" % (label, cancel(fn(m))))
++        except Exception as e:
++            row.append("%s=%s(%s)" % (label, type(e).__name__, e))
++    try:
++        row.append("berkowitz=%s" % m.det(method='berkowitz'))
++    except Exception as e:
++        row.append("berkowitz=%s" % type(e).__name__)
++    try:
++        row.append("lu=%s" % m.det(method='lu'))
++    except Exception as e:
++        row.append("lu=%s" % type(e).__name__)
++    print("  ".join(row))
++
++# ---------- where does the TypeError come from? ----------------------------
++print()
++bad = cancel(Rational(0))  # placeholder
++import traceback
++num = Symbol('x')
++# reproduce raise site directly
++e = (0*a)/(-2*a*(-2*a*(a+1)+a*(2*a+1)) + a*(-2*a*(a+2)+a*(2*a+2)))
++try:
++    # build a genuine nan-carrying expression like depth=4 does
++    z = (a - a)  # 0
++    q = nan*a + 1
++    factor_terms(q)
++except Exception as ex:
++    traceback.print_exc()
+diff --git a/pinpoint.py b/pinpoint.py
+new file mode 100644
+index 000000000..88cbf2f2c
+--- /dev/null
++++ b/pinpoint.py
+@@ -0,0 +1,57 @@
++import traceback
++from sympy import *
++from sympy.abc import a
++
++def make(n):
++    return Matrix([[i + a*j for i in range(n)] for j in range(n)])
++
++def _find_pivot(l):
++    for pos, val in enumerate(l):
++        if val:
++            return (pos, val, None, None)
++    return (None, None, None, None)
++
++# ---- 1. Confirm the level-2 pivot is mathematically zero -------------------
++p2 = (-2*a*(-2*a*(a + 1) + a*(2*a + 1)) + a*(-2*a*(a + 2) + a*(2*a + 2)))/a
++print("level-2 pivot expr      :", p2)
++print("  bool()                :", bool(p2))
++print("  .is_zero              :", p2.is_zero)
++print("  expand()              :", expand(p2))
++print("  cancel()              :", cancel(p2))
++print("  simplify()            :", simplify(p2))
++print("  numerator expand      :", expand(-2*a*(-2*a*(a+1)+a*(2*a+1)) + a*(-2*a*(a+2)+a*(2*a+2))))
++print("  subs(a,3)             :", p2.subs(a, 3))
++print()
++
++# ---- 2. exact op that raises, n=6 -----------------------------------------
++def bareiss(mat, cumm=1, depth=0):
++    if mat.rows == 0: return S.One
++    if mat.rows == 1: return mat[0, 0]
++    pivot_pos, pivot_val, _, _ = _find_pivot(mat[:, 0])
++    if pivot_pos is None: return S.Zero
++    sign = (-1) ** (pivot_pos % 2)
++    rows = list(i for i in range(mat.rows) if i != pivot_pos)
++    tmp_mat = mat.extract(rows, list(range(mat.cols)))
++    def entry(i, j):
++        num = pivot_val*tmp_mat[i, j + 1] - mat[pivot_pos, j + 1]*tmp_mat[i, 0]
++        print("      depth=%d entry(%d,%d): num has nan=%s zoo=%s" %
++              (depth, i, j, num.has(S.NaN), num.has(S.ComplexInfinity)))
++        ret = num / cumm
++        print("        after /cumm : nan=%s zoo=%s  (denominator mathematically zero: %s)" %
++              (ret.has(S.NaN), ret.has(S.ComplexInfinity), simplify(cumm) == 0))
++        if not ret.is_Atom:
++            try:
++                c = cancel(ret)
++                print("        cancel(ret) = %s   <-- RETURN VALUE DISCARDED by line 211" % c)
++            except Exception as e:
++                print("        *** cancel(ret) RAISED %s: %s" % (type(e).__name__, e))
++                traceback.print_exc()
++                raise
++        return ret
++    return sign*bareiss(mat._new(mat.rows - 1, mat.cols - 1, entry), pivot_val, depth + 1)
++
++print("=== n=6, watching only the deepest levels ===")
++try:
++    bareiss(make(6))
++except Exception as e:
++    print("TOP-LEVEL: %s: %s" % (type(e).__name__, e))
+diff --git a/trace1.py b/trace1.py
+new file mode 100644
+index 000000000..39985fb1a
+--- /dev/null
++++ b/trace1.py
+@@ -0,0 +1,45 @@
++from sympy import *
++from sympy.abc import a
++from sympy.matrices.matrices import MatrixDeterminant
++
++def bareiss_trace(self):
++    def _find_pivot(l):
++        for pos,val in enumerate(l):
++            if val:
++                return (pos, val, None, None)
++        return (None, None, None, None)
++    depth = [0]
++    def bareiss(mat, cumm=1):
++        d = depth[0]; depth[0]+=1
++        if mat.rows == 0: return S.One
++        elif mat.rows == 1:
++            print("  "*d + "LEAF %s" % (mat[0,0],))
++            return mat[0, 0]
++        pivot_pos, pivot_val, _, _ = _find_pivot(mat[:, 0])
++        print("  "*d + "rows=%d cumm=%s pivot_pos=%s pivot_val=%s pivot_is_zero=%s" % (
++            mat.rows, cumm, pivot_pos, pivot_val, getattr(pivot_val,'is_zero',None)))
++        if pivot_pos == None: return S.Zero
++        sign = (-1) ** (pivot_pos % 2)
++        rows = list(i for i in range(mat.rows) if i != pivot_pos)
++        cols = list(range(mat.cols))
++        tmp_mat = mat.extract(rows, cols)
++        def entry(i, j):
++            ret = (pivot_val*tmp_mat[i, j + 1] - mat[pivot_pos, j + 1]*tmp_mat[i, 0]) / cumm
++            if not ret.is_Atom:
++                cancel(ret)      # <-- result DISCARDED (bug)
++            return ret
++        nm = self._new(mat.rows - 1, mat.cols - 1, entry)
++        print("  "*d + "-> next mat: %s" % (list(nm),))
++        r = sign*bareiss(nm, pivot_val)
++        depth[0]-=1
++        return r
++    return cancel(bareiss(self))
++
++for n in (3,4,5):
++    print("="*70); print("n =", n)
++    M = Matrix([[i + a*j for i in range(n)] for j in range(n)])
++    print(M.tolist())
++    try:
++        print("RESULT:", bareiss_trace(M))
++    except Exception as e:
++        print("EXC:", type(e).__name__, e)
+diff --git a/trace_bareiss.py b/trace_bareiss.py
+new file mode 100644
+index 000000000..f5eba843a
+--- /dev/null
++++ b/trace_bareiss.py
+@@ -0,0 +1,69 @@
++import sys
++from sympy import *
++from sympy.abc import a
++from sympy.matrices.matrices import MatrixBase
++
++LOG = []
++
++def make(n):
++    return Matrix([[i + a*j for i in range(n)] for j in range(n)])
++
++def _find_pivot(l):
++    for pos, val in enumerate(l):
++        if val:
++            return (pos, val, None, None)
++    return (None, None, None, None)
++
++def bareiss(mat, cumm=1, depth=0):
++    pad = '  ' * depth
++    print("%s--- level %d: %dx%d  cumm = %s" % (pad, depth, mat.rows, mat.cols, cumm))
++    print("%s    cumm.simplify -> %s   is_zero=%s" % (pad, simplify(cumm), simplify(cumm) == 0))
++    for i in range(mat.rows):
++        print("%s    row %d: %s" % (pad, i, [mat[i, j] for j in range(mat.cols)]))
++
++    if mat.rows == 0:
++        return S.One
++    elif mat.rows == 1:
++        return mat[0, 0]
++
++    pivot_pos, pivot_val, _, _ = _find_pivot(mat[:, 0])
++    print("%s    pivot_pos=%s pivot_val=%s  (bool(pivot_val)=%s, simplify=%s)"
++          % (pad, pivot_pos, pivot_val, bool(pivot_val) if pivot_val is not None else None,
++             simplify(pivot_val) if pivot_val is not None else None))
++    if pivot_pos is None:
++        return S.Zero
++
++    sign = (-1) ** (pivot_pos % 2)
++    rows = list(i for i in range(mat.rows) if i != pivot_pos)
++    cols = list(range(mat.cols))
++    tmp_mat = mat.extract(rows, cols)
++
++    def entry(i, j):
++        num = pivot_val * tmp_mat[i, j + 1] - mat[pivot_pos, j + 1] * tmp_mat[i, 0]
++        ret = num / cumm
++        if ret.has(S.NaN) or ret.has(S.ComplexInfinity):
++            print("%s    !!! entry(%d,%d): num=%s  cumm=%s  ->  ret=%s"
++                  % (pad, i, j, num, cumm, ret))
++            LOG.append((depth, i, j, num, cumm, ret))
++        if not ret.is_Atom:
++            cancel(ret)
++        return ret
++
++    newmat = mat._new(mat.rows - 1, mat.cols - 1, entry)
++    return sign * bareiss(newmat, pivot_val, depth + 1)
++
++for n in (5, 6):
++    print("=" * 78)
++    print("n = %d" % n)
++    print("=" * 78)
++    try:
++        r = bareiss(make(n))
++        print("RAW bareiss result: %s" % (r,))
++        print("cancel(...) = %s" % cancel(r))
++    except Exception as e:
++        print("EXCEPTION: %s: %s" % (type(e).__name__, e))
++    print()
++
++print("### first nan/zoo births:")
++for rec in LOG:
++    print(rec)

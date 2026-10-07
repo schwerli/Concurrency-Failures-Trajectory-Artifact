@@ -1,0 +1,980 @@
+=== programs/disks/CommandCopy.cpp ===
+     1	#pragma once
+     2	
+     3	#include "ICommand.h"
+     4	#include <Interpreters/Context.h>
+     5	
+     6	namespace DB
+     7	{
+     8	
+     9	namespace ErrorCodes
+    10	{
+    11	    extern const int BAD_ARGUMENTS;
+    12	}
+    13	
+    14	class CommandCopy : public ICommand
+    15	{
+    16	public:
+    17	    CommandCopy()
+    18	    {
+    19	        command_name = "copy";
+    20	        command_option_description.emplace(createOptionsDescription("Allowed options", getTerminalWidth()));
+    21	        description = "Recursively copy data containing at `from_path` to `to_path`\nPath should be in format './' or './path' or 'path'";
+    22	        usage = "copy [OPTION]... <FROM_PATH> <TO_PATH>";
+    23	        command_option_description->add_options()
+    24	            ("diskFrom", po::value<String>(), "set name for disk from which we do operations")
+    25	            ("diskTo", po::value<String>(), "set name for disk to which we do operations")
+    26	            ;
+    27	
+    28	    }
+    29	
+    30	    void processOptions(
+    31	        Poco::Util::LayeredConfiguration & config,
+    32	        po::variables_map & options) const override
+    33	    {
+    34	        if (options.count("diskFrom"))
+    35	            config.setString("diskFrom", options["diskFrom"].as<String>());
+    36	        if (options.count("diskTo"))
+    37	            config.setString("diskTo", options["diskTo"].as<String>());
+    38	    }
+    39	
+    40	    void execute(
+    41	        const std::vector<String> & command_arguments,
+    42	        DB::ContextMutablePtr & global_context,
+    43	        Poco::Util::LayeredConfiguration & config) override
+    44	    {
+    45	        if (command_arguments.size() != 2)
+    46	        {
+    47	            printHelpMessage();
+    48	            throw DB::Exception("Bad Arguments", DB::ErrorCodes::BAD_ARGUMENTS);
+    49	        }
+    50	
+    51	        String disk_name_from = config.getString("diskFrom", config.getString("disk", "default"));
+    52	        String disk_name_to = config.getString("diskTo", config.getString("disk", "default"));
+    53	
+    54	        String path_from = command_arguments[0];
+    55	        String path_to =  command_arguments[1];
+    56	
+    57	        DiskPtr disk_from = global_context->getDisk(disk_name_from);
+    58	        DiskPtr disk_to = global_context->getDisk(disk_name_to);
+    59	
+    60	        String full_path_from = fullPathWithValidate(disk_from, path_from);
+    61	        String full_path_to = fullPathWithValidate(disk_to, path_to);
+    62	
+    63	        disk_from->copy(full_path_from, disk_to, full_path_to);
+    64	    }
+    65	};
+    66	}
+    67	
+    68	std::unique_ptr <DB::ICommand> makeCommandCopy()
+    69	{
+    70	    return std::make_unique<DB::CommandCopy>();
+    71	}
+=== programs/disks/CommandLink.cpp ===
+     1	#pragma once
+     2	
+     3	#include "ICommand.h"
+     4	#include <Interpreters/Context.h>
+     5	
+     6	namespace DB
+     7	{
+     8	
+     9	namespace ErrorCodes
+    10	{
+    11	    extern const int BAD_ARGUMENTS;
+    12	}
+    13	
+    14	class CommandLink : public ICommand
+    15	{
+    16	public:
+    17	    CommandLink()
+    18	    {
+    19	        command_name = "link";
+    20	        description = "Create hardlink from `from_path` to `to_path`\nPath should be in format './' or './path' or 'path'";
+    21	        usage = "link [OPTION]... <FROM_PATH> <TO_PATH>";
+    22	    }
+    23	
+    24	    void processOptions(
+    25	        Poco::Util::LayeredConfiguration &,
+    26	        po::variables_map &) const override
+    27	    {
+    28	    }
+    29	
+    30	    void execute(
+    31	        const std::vector<String> & command_arguments,
+    32	        DB::ContextMutablePtr & global_context,
+    33	        Poco::Util::LayeredConfiguration & config) override
+    34	    {
+    35	        if (command_arguments.size() != 2)
+    36	        {
+    37	            printHelpMessage();
+    38	            throw DB::Exception("Bad Arguments", DB::ErrorCodes::BAD_ARGUMENTS);
+    39	        }
+    40	
+    41	        String disk_name = config.getString("disk", "default");
+    42	
+    43	        String path_from = command_arguments[0];
+    44	        String path_to = command_arguments[1];
+    45	
+    46	        DiskPtr disk = global_context->getDisk(disk_name);
+    47	
+    48	        String full_path_from = fullPathWithValidate(disk, path_from);
+    49	        String full_path_to = fullPathWithValidate(disk, path_to);
+    50	
+    51	        disk->createHardLink(full_path_from, full_path_to);
+    52	    }
+    53	};
+    54	}
+    55	
+    56	std::unique_ptr <DB::ICommand> makeCommandLink()
+    57	{
+    58	    return std::make_unique<DB::CommandLink>();
+    59	}
+=== programs/disks/CommandList.cpp ===
+     1	#pragma once
+     2	
+     3	#include "ICommand.h"
+     4	#include <Interpreters/Context.h>
+     5	
+     6	namespace DB
+     7	{
+     8	
+     9	namespace ErrorCodes
+    10	{
+    11	    extern const int BAD_ARGUMENTS;
+    12	}
+    13	
+    14	class CommandList : public ICommand
+    15	{
+    16	public:
+    17	    CommandList()
+    18	    {
+    19	        command_name = "list";
+    20	        command_option_description.emplace(createOptionsDescription("Allowed options", getTerminalWidth()));
+    21	        description = "List files (the default disk is used by default)\nPath should be in format './' or './path' or 'path'";
+    22	        usage = "list [OPTION]... <PATH>...";
+    23	        command_option_description->add_options()
+    24	            ("recursive", "recursively list all directories")
+    25	            ;
+    26	    }
+    27	
+    28	    void processOptions(
+    29	        Poco::Util::LayeredConfiguration & config,
+    30	        po::variables_map & options) const override
+    31	    {
+    32	        if (options.count("recursive"))
+    33	            config.setBool("recursive", true);
+    34	    }
+    35	
+    36	    void execute(
+    37	        const std::vector<String> & command_arguments,
+    38	        DB::ContextMutablePtr & global_context,
+    39	        Poco::Util::LayeredConfiguration & config) override
+    40	    {
+    41	        if (command_arguments.size() != 1)
+    42	        {
+    43	            printHelpMessage();
+    44	            throw DB::Exception("Bad Arguments", DB::ErrorCodes::BAD_ARGUMENTS);
+    45	        }
+    46	
+    47	        String disk_name = config.getString("disk", "default");
+    48	
+    49	        String path =  command_arguments[0];
+    50	
+    51	        DiskPtr disk = global_context->getDisk(disk_name);
+    52	
+    53	        String full_path = fullPathWithValidate(disk, path);
+    54	
+    55	        bool recursive = config.getBool("recursive", false);
+    56	
+    57	        if (recursive)
+    58	            listRecursive(disk, full_path);
+    59	        else
+    60	            list(disk, full_path);
+    61	    }
+    62	
+    63	private:
+    64	    static void list(const DiskPtr & disk, const std::string & full_path)
+    65	    {
+    66	        std::vector<String> file_names;
+    67	        disk->listFiles(full_path, file_names);
+    68	
+    69	        for (const auto & file_name : file_names)
+    70	            std::cout << file_name << '\n';
+    71	    }
+    72	
+    73	    static void listRecursive(const DiskPtr & disk, const std::string & full_path)
+    74	    {
+    75	        std::vector<String> file_names;
+    76	        disk->listFiles(full_path, file_names);
+    77	
+    78	        std::cout << full_path << ":\n";
+    79	        for (const auto & file_name : file_names)
+    80	            std::cout << file_name << '\n';
+    81	        std::cout << "\n";
+    82	
+    83	        for (const auto & file_name : file_names)
+    84	        {
+    85	            auto path = full_path + "/" + file_name;
+    86	            if (disk->isDirectory(path))
+    87	                listRecursive(disk, path);
+    88	        }
+    89	    }
+    90	};
+    91	}
+    92	
+    93	std::unique_ptr <DB::ICommand> makeCommandList()
+    94	{
+    95	    return std::make_unique<DB::CommandList>();
+    96	}
+=== programs/disks/CommandListDisks.cpp ===
+     1	#pragma once
+     2	
+     3	#include "ICommand.h"
+     4	#include <Interpreters/Context.h>
+     5	
+     6	namespace DB
+     7	{
+     8	
+     9	namespace ErrorCodes
+    10	{
+    11	    extern const int BAD_ARGUMENTS;
+    12	}
+    13	
+    14	class CommandListDisks : public ICommand
+    15	{
+    16	public:
+    17	    CommandListDisks()
+    18	    {
+    19	        command_name = "list-disks";
+    20	        description = "List disks names";
+    21	        usage = "list-disks [OPTION]";
+    22	    }
+    23	
+    24	    void processOptions(
+    25	        Poco::Util::LayeredConfiguration &,
+    26	        po::variables_map &) const override
+    27	    {}
+    28	
+    29	    void execute(
+    30	        const std::vector<String> & command_arguments,
+    31	        DB::ContextMutablePtr & global_context,
+    32	        Poco::Util::LayeredConfiguration &) override
+    33	    {
+    34	        if (!command_arguments.empty())
+    35	        {
+    36	            printHelpMessage();
+    37	            throw DB::Exception("Bad Arguments", DB::ErrorCodes::BAD_ARGUMENTS);
+    38	        }
+    39	
+    40	        for (const auto & [disk_name, _] : global_context->getDisksMap())
+    41	            std::cout << disk_name << '\n';
+    42	    }
+    43	};
+    44	}
+    45	
+    46	std::unique_ptr <DB::ICommand> makeCommandListDisks()
+    47	{
+    48	    return std::make_unique<DB::CommandListDisks>();
+    49	}
+=== programs/disks/CommandMove.cpp ===
+     1	#pragma once
+     2	
+     3	#include "ICommand.h"
+     4	#include <Interpreters/Context.h>
+     5	
+     6	namespace DB
+     7	{
+     8	
+     9	namespace ErrorCodes
+    10	{
+    11	    extern const int BAD_ARGUMENTS;
+    12	}
+    13	
+    14	class CommandMove : public ICommand
+    15	{
+    16	public:
+    17	    CommandMove()
+    18	    {
+    19	        command_name = "move";
+    20	        description = "Move file or directory from `from_path` to `to_path`\nPath should be in format './' or './path' or 'path'";
+    21	        usage = "move [OPTION]... <FROM_PATH> <TO_PATH>";
+    22	    }
+    23	
+    24	    void processOptions(
+    25	        Poco::Util::LayeredConfiguration &,
+    26	        po::variables_map &) const override
+    27	    {}
+    28	
+    29	    void execute(
+    30	        const std::vector<String> & command_arguments,
+    31	        DB::ContextMutablePtr & global_context,
+    32	        Poco::Util::LayeredConfiguration & config) override
+    33	    {
+    34	        if (command_arguments.size() != 2)
+    35	        {
+    36	            printHelpMessage();
+    37	            throw DB::Exception("Bad Arguments", DB::ErrorCodes::BAD_ARGUMENTS);
+    38	        }
+    39	
+    40	        String disk_name = config.getString("disk", "default");
+    41	
+    42	        String path_from = command_arguments[0];
+    43	        String path_to = command_arguments[1];
+    44	
+    45	        DiskPtr disk = global_context->getDisk(disk_name);
+    46	
+    47	        String full_path_from = fullPathWithValidate(disk, path_from);
+    48	        String full_path_to = fullPathWithValidate(disk, path_to);
+    49	
+    50	        if (disk->isFile(full_path_from))
+    51	            disk->moveFile(full_path_from, full_path_to);
+    52	        else
+    53	            disk->moveDirectory(full_path_from, full_path_to);
+    54	    }
+    55	};
+    56	}
+    57	
+    58	std::unique_ptr <DB::ICommand> makeCommandMove()
+    59	{
+    60	    return std::make_unique<DB::CommandMove>();
+    61	}
+=== programs/disks/CommandRead.cpp ===
+     1	#pragma once
+     2	
+     3	#include "ICommand.h"
+     4	#include <Interpreters/Context.h>
+     5	
+     6	namespace DB
+     7	{
+     8	
+     9	namespace ErrorCodes
+    10	{
+    11	    extern const int BAD_ARGUMENTS;
+    12	}
+    13	
+    14	class CommandRead : public ICommand
+    15	{
+    16	public:
+    17	    CommandRead()
+    18	    {
+    19	        command_name = "read";
+    20	        command_option_description.emplace(createOptionsDescription("Allowed options", getTerminalWidth()));
+    21	        description = "read File `from_path` to `to_path` or to stdout\nPath should be in format './' or './path' or 'path'";
+    22	        usage = "read [OPTION]... <FROM_PATH> <TO_PATH>\nor\nread [OPTION]... <FROM_PATH>";
+    23	        command_option_description->add_options()
+    24	            ("output", po::value<String>(), "set path to file to which we are read")
+    25	            ;
+    26	    }
+    27	
+    28	    void processOptions(
+    29	        Poco::Util::LayeredConfiguration & config,
+    30	        po::variables_map & options) const override
+    31	    {
+    32	        if (options.count("output"))
+    33	            config.setString("output", options["output"].as<String>());
+    34	    }
+    35	
+    36	    void execute(
+    37	        const std::vector<String> & command_arguments,
+    38	        DB::ContextMutablePtr & global_context,
+    39	        Poco::Util::LayeredConfiguration & config) override
+    40	    {
+    41	        if (command_arguments.size() != 1)
+    42	        {
+    43	            printHelpMessage();
+    44	            throw DB::Exception("Bad Arguments", DB::ErrorCodes::BAD_ARGUMENTS);
+    45	        }
+    46	
+    47	        String disk_name = config.getString("disk", "default");
+    48	
+    49	        String path = command_arguments[0];
+    50	
+    51	        DiskPtr disk = global_context->getDisk(disk_name);
+    52	
+    53	        String full_path = fullPathWithValidate(disk, path);
+    54	
+    55	        String path_output = config.getString("output", "");
+    56	
+    57	        if (!path_output.empty())
+    58	        {
+    59	            String full_path_output = fullPathWithValidate(disk, path_output);
+    60	
+    61	            auto in = disk->readFile(full_path);
+    62	            auto out = disk->writeFile(full_path_output);
+    63	            copyData(*in, *out);
+    64	            out->finalize();
+    65	            return;
+    66	        }
+    67	        else
+    68	        {
+    69	            auto in = disk->readFile(full_path);
+    70	            std::unique_ptr<WriteBufferFromFileBase> out = std::make_unique<WriteBufferFromFileDescriptor>(STDOUT_FILENO);
+    71	            copyData(*in, *out);
+    72	        }
+    73	    }
+    74	};
+    75	}
+    76	
+    77	std::unique_ptr <DB::ICommand> makeCommandRead()
+    78	{
+    79	    return std::make_unique<DB::CommandRead>();
+    80	}
+=== programs/disks/CommandRemove.cpp ===
+     1	#pragma once
+     2	
+     3	#include "ICommand.h"
+     4	#include <Interpreters/Context.h>
+     5	
+     6	namespace DB
+     7	{
+     8	
+     9	namespace ErrorCodes
+    10	{
+    11	    extern const int BAD_ARGUMENTS;
+    12	}
+    13	
+    14	class CommandRemove : public ICommand
+    15	{
+    16	public:
+    17	    CommandRemove()
+    18	    {
+    19	        command_name = "remove";
+    20	        description = "Remove file or directory with all children. Throws exception if file doesn't exists.\nPath should be in format './' or './path' or 'path'";
+    21	        usage = "remove [OPTION]... <PATH>";
+    22	    }
+    23	
+    24	    void processOptions(
+    25	        Poco::Util::LayeredConfiguration &,
+    26	        po::variables_map &) const override
+    27	    {}
+    28	
+    29	    void execute(
+    30	        const std::vector<String> & command_arguments,
+    31	        DB::ContextMutablePtr & global_context,
+    32	        Poco::Util::LayeredConfiguration & config) override
+    33	    {
+    34	        if (command_arguments.size() != 1)
+    35	        {
+    36	            printHelpMessage();
+    37	            throw DB::Exception("Bad Arguments", DB::ErrorCodes::BAD_ARGUMENTS);
+    38	        }
+    39	
+    40	        String disk_name = config.getString("disk", "default");
+    41	
+    42	        String path = command_arguments[0];
+    43	
+    44	        DiskPtr disk = global_context->getDisk(disk_name);
+    45	
+    46	        String full_path = fullPathWithValidate(disk, path);
+    47	
+    48	        disk->removeRecursive(full_path);
+    49	    }
+    50	};
+    51	}
+    52	
+    53	std::unique_ptr <DB::ICommand> makeCommandRemove()
+    54	{
+    55	    return std::make_unique<DB::CommandRemove>();
+    56	}
+=== programs/disks/CommandWrite.cpp ===
+     1	#pragma once
+     2	
+     3	#include "ICommand.h"
+     4	#include <Interpreters/Context.h>
+     5	
+     6	namespace DB
+     7	{
+     8	
+     9	namespace ErrorCodes
+    10	{
+    11	    extern const int BAD_ARGUMENTS;
+    12	}
+    13	
+    14	class CommandWrite : public ICommand
+    15	{
+    16	public:
+    17	    CommandWrite()
+    18	    {
+    19	        command_name = "write";
+    20	        command_option_description.emplace(createOptionsDescription("Allowed options", getTerminalWidth()));
+    21	        description = "Write File `from_path` or stdin to `to_path`";
+    22	        usage = "write [OPTION]... <FROM_PATH> <TO_PATH>\nor\nstdin | write [OPTION]... <TO_PATH>\nPath should be in format './' or './path' or 'path'";
+    23	        command_option_description->add_options()
+    24	            ("input", po::value<String>(), "set path to file to which we are write")
+    25	            ;
+    26	    }
+    27	
+    28	    void processOptions(
+    29	        Poco::Util::LayeredConfiguration & config,
+    30	        po::variables_map & options) const override
+    31	    {
+    32	        if (options.count("input"))
+    33	            config.setString("input", options["input"].as<String>());
+    34	    }
+    35	
+    36	    void execute(
+    37	        const std::vector<String> & command_arguments,
+    38	        DB::ContextMutablePtr & global_context,
+    39	        Poco::Util::LayeredConfiguration & config) override
+    40	    {
+    41	        if (command_arguments.size() != 1)
+    42	        {
+    43	            printHelpMessage();
+    44	            throw DB::Exception("Bad Arguments", DB::ErrorCodes::BAD_ARGUMENTS);
+    45	        }
+    46	
+    47	        String disk_name = config.getString("disk", "default");
+    48	
+    49	        String path = command_arguments[0];
+    50	
+    51	        DiskPtr disk = global_context->getDisk(disk_name);
+    52	
+    53	        String full_path = fullPathWithValidate(disk, path);
+    54	
+    55	        String path_input = config.getString("input", "");
+    56	        std::unique_ptr<ReadBufferFromFileBase> in;
+    57	        if (path_input.empty())
+    58	        {
+    59	            in = std::make_unique<ReadBufferFromFileDescriptor>(STDIN_FILENO);
+    60	        }
+    61	        else
+    62	        {
+    63	            String full_path_input = fullPathWithValidate(disk, path_input);
+    64	            in = disk->readFile(full_path_input);
+    65	        }
+    66	
+    67	        auto out = disk->writeFile(full_path);
+    68	        copyData(*in, *out);
+    69	        out->finalize();
+    70	    }
+    71	};
+    72	}
+    73	
+    74	std::unique_ptr <DB::ICommand> makeCommandWrite()
+    75	{
+    76	    return std::make_unique<DB::CommandWrite>();
+    77	}
+=== programs/disks/DisksApp.cpp ===
+     1	#include "DisksApp.h"
+     2	
+     3	#include <Disks/registerDisks.h>
+     4	
+     5	#include <base/argsToConfig.h>
+     6	
+     7	#include <Formats/registerFormats.h>
+     8	
+     9	namespace DB
+    10	{
+    11	
+    12	namespace ErrorCodes
+    13	{
+    14	    extern const int BAD_ARGUMENTS;
+    15	}
+    16	
+    17	size_t DisksApp::findCommandPos(std::vector<String> & common_arguments)
+    18	{
+    19	    for (size_t i = 0; i < common_arguments.size(); i++)
+    20	        if (supported_commands.contains(common_arguments[i]))
+    21	            return i + 1;
+    22	    return common_arguments.size();
+    23	}
+    24	
+    25	void DisksApp::printHelpMessage(ProgramOptionsDescription & command_option_description)
+    26	{
+    27	    std::optional<ProgramOptionsDescription> help_description =
+    28	        createOptionsDescription("Help Message for clickhouse-disks", getTerminalWidth());
+    29	
+    30	    help_description->add(command_option_description);
+    31	
+    32	    std::cout << "ClickHouse disk management tool\n";
+    33	    std::cout << "Usage: ./clickhouse-disks [OPTION]\n";
+    34	    std::cout << "clickhouse-disks\n\n";
+    35	
+    36	    for (const auto & current_command : supported_commands)
+    37	        std::cout << command_descriptions[current_command]->command_name
+    38	                  << "\t"
+    39	                  << command_descriptions[current_command]->description
+    40	                  << "\n\n";
+    41	
+    42	    std::cout << command_option_description << '\n';
+    43	}
+    44	
+    45	String DisksApp::getDefaultConfigFileName()
+    46	{
+    47	    return "/etc/clickhouse-server/config.xml";
+    48	}
+    49	
+    50	void DisksApp::addOptions(
+    51	    ProgramOptionsDescription & options_description_,
+    52	    boost::program_options::positional_options_description & positional_options_description
+    53	)
+    54	{
+    55	    options_description_.add_options()
+    56	        ("help,h", "Print common help message")
+    57	        ("config-file,C", po::value<String>(), "Set config file")
+    58	        ("disk", po::value<String>(), "Set disk name")
+    59	        ("command_name", po::value<String>(), "Name for command to do")
+    60	        ("send-logs", "Send logs")
+    61	        ("log-level", "Logging level")
+    62	        ;
+    63	
+    64	    positional_options_description.add("command_name", 1);
+    65	
+    66	    supported_commands = {"list-disks", "list", "move", "remove", "link", "copy", "write", "read"};
+    67	
+    68	    command_descriptions.emplace("list-disks", makeCommandListDisks());
+    69	    command_descriptions.emplace("list", makeCommandList());
+    70	    command_descriptions.emplace("move", makeCommandMove());
+    71	    command_descriptions.emplace("remove", makeCommandRemove());
+    72	    command_descriptions.emplace("link", makeCommandLink());
+    73	    command_descriptions.emplace("copy", makeCommandCopy());
+    74	    command_descriptions.emplace("write", makeCommandWrite());
+    75	    command_descriptions.emplace("read", makeCommandRead());
+    76	}
+    77	
+    78	void DisksApp::processOptions()
+    79	{
+    80	    if (options.count("config-file"))
+    81	        config().setString("config-file", options["config-file"].as<String>());
+    82	    if (options.count("disk"))
+    83	        config().setString("disk", options["disk"].as<String>());
+    84	    if (options.count("send-logs"))
+    85	        config().setBool("send-logs", true);
+    86	    if (options.count("log-level"))
+    87	        Poco::Logger::root().setLevel(options["log-level"].as<std::string>());
+    88	}
+    89	
+    90	void DisksApp::init(std::vector<String> & common_arguments)
+    91	{
+    92	    stopOptionsProcessing();
+    93	
+    94	    ProgramOptionsDescription options_description{createOptionsDescription("clickhouse-disks", getTerminalWidth())};
+    95	
+    96	    po::positional_options_description positional_options_description;
+    97	
+    98	    addOptions(options_description, positional_options_description);
+    99	
+   100	    size_t command_pos = findCommandPos(common_arguments);
+   101	    std::vector<String> global_flags(command_pos);
+   102	    command_arguments.resize(common_arguments.size() - command_pos);
+   103	    copy(common_arguments.begin(), common_arguments.begin() + command_pos, global_flags.begin());
+   104	    copy(common_arguments.begin() + command_pos, common_arguments.end(), command_arguments.begin());
+   105	
+   106	    parseAndCheckOptions(options_description, positional_options_description, global_flags);
+   107	
+   108	    po::notify(options);
+   109	
+   110	    if (options.count("help"))
+   111	    {
+   112	        printHelpMessage(options_description);
+   113	        exit(0);
+   114	    }
+   115	
+   116	    if (!supported_commands.contains(command_name))
+   117	    {
+   118	        std::cerr << "Unknown command name:  " << command_name << "\n";
+   119	        printHelpMessage(options_description);
+   120	        throw DB::Exception("Bad Arguments", DB::ErrorCodes::BAD_ARGUMENTS);
+   121	    }
+   122	
+   123	    processOptions();
+   124	}
+   125	
+   126	void DisksApp::parseAndCheckOptions(
+   127	    ProgramOptionsDescription & options_description_,
+   128	    boost::program_options::positional_options_description & positional_options_description,
+   129	    std::vector<String> & arguments)
+   130	{
+   131	    auto parser = po::command_line_parser(arguments)
+   132	        .options(options_description_)
+   133	        .positional(positional_options_description)
+   134	        .allow_unregistered();
+   135	    po::parsed_options parsed = parser.run();
+   136	    po::store(parsed, options);
+   137	
+   138	    auto positional_arguments = po::collect_unrecognized(parsed.options, po::collect_unrecognized_mode::include_positional);
+   139	    for (const auto & arg : positional_arguments)
+   140	    {
+   141	        if (command_descriptions.contains(arg))
+   142	        {
+   143	            command_name = arg;
+   144	            break;
+   145	        }
+   146	    }
+   147	}
+   148	
+   149	int DisksApp::main(const std::vector<String> & /*args*/)
+   150	{
+   151	    if (config().has("send-logs"))
+   152	    {
+   153	        auto log_level = config().getString("log-level", "trace");
+   154	        Poco::Logger::root().setLevel(Poco::Logger::parseLevel(log_level));
+   155	
+   156	        auto log_path = config().getString("logger.clickhouse-disks", "/var/log/clickhouse-server/clickhouse-disks.log");
+   157	        Poco::Logger::root().setChannel(Poco::AutoPtr<Poco::FileChannel>(new Poco::FileChannel(log_path)));
+   158	    }
+   159	
+   160	    if (config().has("config-file") || fs::exists(getDefaultConfigFileName()))
+   161	    {
+   162	        String config_path = config().getString("config-file", getDefaultConfigFileName());
+   163	        ConfigProcessor config_processor(config_path, false, false);
+   164	        config_processor.setConfigPath(fs::path(config_path).parent_path());
+   165	        auto loaded_config = config_processor.loadConfig();
+   166	        config().add(loaded_config.configuration.duplicate(), false, false);
+   167	    }
+   168	    else
+   169	    {
+   170	        throw Exception(ErrorCodes::BAD_ARGUMENTS, "No config-file specifiged");
+   171	    }
+   172	
+   173	    registerDisks();
+   174	    registerFormats();
+   175	
+   176	    shared_context = Context::createShared();
+   177	    global_context = Context::createGlobal(shared_context.get());
+   178	
+   179	    global_context->makeGlobalContext();
+   180	    global_context->setApplicationType(Context::ApplicationType::DISKS);
+   181	
+   182	    String path = config().getString("path", DBMS_DEFAULT_PATH);
+   183	    global_context->setPath(path);
+   184	
+   185	    auto & command = command_descriptions[command_name];
+   186	
+   187	    auto command_options = command->getCommandOptions();
+   188	    std::vector<String> args;
+   189	    if (command_options)
+   190	    {
+   191	        auto parser = po::command_line_parser(command_arguments).options(*command_options).allow_unregistered();
+   192	        po::parsed_options parsed = parser.run();
+   193	        po::store(parsed, options);
+   194	        po::notify(options);
+   195	        args = po::collect_unrecognized(parsed.options, po::collect_unrecognized_mode::include_positional);
+   196	
+   197	        command->processOptions(config(), options);
+   198	    }
+   199	    else
+   200	    {
+   201	        auto parser = po::command_line_parser(command_arguments).options({}).allow_unregistered();
+   202	        po::parsed_options parsed = parser.run();
+   203	        args = po::collect_unrecognized(parsed.options, po::collect_unrecognized_mode::include_positional);
+   204	    }
+   205	    command->execute(args, global_context, config());
+   206	
+   207	    return Application::EXIT_OK;
+   208	}
+   209	
+   210	}
+   211	
+   212	int mainEntryClickHouseDisks(int argc, char ** argv)
+   213	{
+   214	    try
+   215	    {
+   216	        DB::DisksApp app;
+   217	        std::vector<String> common_arguments{argv + 1, argv + argc};
+   218	        app.init(common_arguments);
+   219	        return app.run();
+   220	    }
+   221	    catch (const DB::Exception & e)
+   222	    {
+   223	        std::cerr << DB::getExceptionMessage(e, false) << std::endl;
+   224	        return 1;
+   225	    }
+   226	    catch (const boost::program_options::error & e)
+   227	    {
+   228	        std::cerr << "Bad arguments: " << e.what() << std::endl;
+   229	        return DB::ErrorCodes::BAD_ARGUMENTS;
+   230	    }
+   231	    catch (...)
+   232	    {
+   233	        std::cerr << DB::getCurrentExceptionMessage(true) << std::endl;
+   234	        return 1;
+   235	    }
+   236	}
+=== programs/disks/ICommand.cpp ===
+     1	#include "ICommand.h"
+     2	
+     3	namespace DB
+     4	{
+     5	
+     6	namespace ErrorCodes
+     7	{
+     8	    extern const int BAD_ARGUMENTS;
+     9	}
+    10	
+    11	void ICommand::printHelpMessage() const
+    12	{
+    13	    std::cout << "Command: " << command_name << '\n';
+    14	    std::cout << "Description: " << description << '\n';
+    15	    std::cout << "Usage: " << usage << '\n';
+    16	
+    17	    if (command_option_description)
+    18	    {
+    19	        auto options = *command_option_description;
+    20	        if (!options.options().empty())
+    21	            std::cout << options << '\n';
+    22	    }
+    23	}
+    24	
+    25	void ICommand::addOptions(ProgramOptionsDescription & options_description)
+    26	{
+    27	    if (!command_option_description || command_option_description->options().empty())
+    28	        return;
+    29	
+    30	    options_description.add(*command_option_description);
+    31	}
+    32	
+    33	String ICommand::fullPathWithValidate(const DiskPtr & disk, const String & path)
+    34	{
+    35	    if (fs::path(path).lexically_normal().string() != path)
+    36	        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Path {} is not normalized", path);
+    37	
+    38	    String disk_path = fs::canonical(fs::path(disk->getPath())) / "";
+    39	    String full_path = (fs::absolute(disk_path) / path).lexically_normal();
+    40	
+    41	    if (!full_path.starts_with(disk_path))
+    42	        throw DB::Exception(
+    43	            DB::ErrorCodes::BAD_ARGUMENTS, "Path {} must be inside disk path {}", full_path, disk_path);
+    44	
+    45	    return path;
+    46	}
+    47	
+    48	}
+=== programs/disks/clickhouse-disks.cpp ===
+     1	int mainEntryClickHouseDisks(int argc, char ** argv);
+     2	int main(int argc_, char ** argv_) { return mainEntryClickHouseDisks(argc_, argv_); }
+=== programs/disks/DisksApp.h ===
+     1	#pragma once
+     2	
+     3	#include "CommandCopy.cpp"
+     4	#include "CommandLink.cpp"
+     5	#include "CommandList.cpp"
+     6	#include "CommandListDisks.cpp"
+     7	#include "CommandMove.cpp"
+     8	#include "CommandRead.cpp"
+     9	#include "CommandRemove.cpp"
+    10	#include "CommandWrite.cpp"
+    11	
+    12	#include <Loggers/Loggers.h>
+    13	
+    14	#include <Common/ProgressIndication.h>
+    15	#include <Common/StatusFile.h>
+    16	#include <Common/InterruptListener.h>
+    17	#include <Core/Settings.h>
+    18	#include <Interpreters/Context.h>
+    19	
+    20	namespace DB
+    21	{
+    22	
+    23	using CommandPtr = std::unique_ptr<ICommand>;
+    24	
+    25	class DisksApp : public Poco::Util::Application, public Loggers
+    26	{
+    27	public:
+    28	    DisksApp() = default;
+    29	
+    30	    void init(std::vector<String> & common_arguments);
+    31	
+    32	    int main(const std::vector<String> & args) override;
+    33	
+    34	protected:
+    35	    static String getDefaultConfigFileName();
+    36	
+    37	    void addOptions(
+    38	        ProgramOptionsDescription & options_description,
+    39	        boost::program_options::positional_options_description & positional_options_description);
+    40	    void processOptions();
+    41	
+    42	    void printHelpMessage(ProgramOptionsDescription & command_option_description);
+    43	
+    44	    size_t findCommandPos(std::vector<String> & common_arguments);
+    45	
+    46	private:
+    47	    void parseAndCheckOptions(
+    48	        ProgramOptionsDescription & options_description,
+    49	        boost::program_options::positional_options_description & positional_options_description,
+    50	        std::vector<String> & arguments);
+    51	
+    52	protected:
+    53	    ContextMutablePtr global_context;
+    54	    SharedContextHolder shared_context;
+    55	
+    56	    String command_name;
+    57	    std::vector<String> command_arguments;
+    58	
+    59	    std::unordered_set<String> supported_commands;
+    60	
+    61	    std::unordered_map<String, CommandPtr> command_descriptions;
+    62	
+    63	    po::variables_map options;
+    64	};
+    65	}
+=== programs/disks/ICommand.h ===
+     1	#pragma once
+     2	
+     3	#include <Disks/IDisk.h>
+     4	
+     5	#include <Poco/Util/Application.h>
+     6	
+     7	#include <IO/WriteBufferFromFileDescriptor.h>
+     8	#include <IO/ReadBufferFromFileDescriptor.h>
+     9	#include <IO/copyData.h>
+    10	
+    11	#include <boost/program_options.hpp>
+    12	
+    13	#include <Common/TerminalSize.h>
+    14	#include <Common/Config/ConfigProcessor.h>
+    15	
+    16	#include <memory>
+    17	
+    18	namespace DB
+    19	{
+    20	
+    21	namespace po = boost::program_options;
+    22	using ProgramOptionsDescription = boost::program_options::options_description;
+    23	using CommandLineOptions = boost::program_options::variables_map;
+    24	
+    25	class ICommand
+    26	{
+    27	public:
+    28	    ICommand() = default;
+    29	
+    30	    virtual ~ICommand() = default;
+    31	
+    32	    virtual void execute(
+    33	        const std::vector<String> & command_arguments,
+    34	        DB::ContextMutablePtr & global_context,
+    35	        Poco::Util::LayeredConfiguration & config) = 0;
+    36	
+    37	    const std::optional<ProgramOptionsDescription> & getCommandOptions() const { return command_option_description; }
+    38	
+    39	    void addOptions(ProgramOptionsDescription & options_description);
+    40	
+    41	    virtual void processOptions(Poco::Util::LayeredConfiguration & config, po::variables_map & options) const = 0;
+    42	
+    43	protected:
+    44	    void printHelpMessage() const;
+    45	
+    46	    static String fullPathWithValidate(const DiskPtr & disk, const String & path);
+    47	
+    48	public:
+    49	    String command_name;
+    50	    String description;
+    51	
+    52	protected:
+    53	    std::optional<ProgramOptionsDescription> command_option_description;
+    54	    String usage;
+    55	    po::positional_options_description positional_options_description;
+    56	};
+    57	
+    58	}
+    59	
+    60	std::unique_ptr <DB::ICommand> makeCommandCopy();
+    61	std::unique_ptr <DB::ICommand> makeCommandLink();
+    62	std::unique_ptr <DB::ICommand> makeCommandList();
+    63	std::unique_ptr <DB::ICommand> makeCommandListDisks();
+    64	std::unique_ptr <DB::ICommand> makeCommandMove();
+    65	std::unique_ptr <DB::ICommand> makeCommandRead();
+    66	std::unique_ptr <DB::ICommand> makeCommandRemove();
+    67	std::unique_ptr <DB::ICommand> makeCommandWrite();

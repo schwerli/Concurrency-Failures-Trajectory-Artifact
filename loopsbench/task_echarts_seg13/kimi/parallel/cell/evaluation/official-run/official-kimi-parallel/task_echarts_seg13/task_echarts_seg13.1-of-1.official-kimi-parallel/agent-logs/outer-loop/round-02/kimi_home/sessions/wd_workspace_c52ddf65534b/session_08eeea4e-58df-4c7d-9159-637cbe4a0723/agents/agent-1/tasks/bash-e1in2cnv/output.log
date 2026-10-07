@@ -1,0 +1,1521 @@
+diff --git a/src/chart/pie/PieView.ts b/src/chart/pie/PieView.ts
+index 26b657c429..1c15c2f7a3 100644
+--- a/src/chart/pie/PieView.ts
++++ b/src/chart/pie/PieView.ts
+@@ -25,7 +25,7 @@ import { setStatesStylesFromModel, toggleHoverEmphasis } from '../../util/states
+ import ChartView from '../../view/Chart';
+ import GlobalModel from '../../model/Global';
+ import ExtensionAPI from '../../core/ExtensionAPI';
+-import { Payload, ColorString, CircleLayoutOptionMixin, SeriesOption } from '../../util/types';
++import { Payload, ColorString } from '../../util/types';
+ import SeriesData from '../../data/SeriesData';
+ import PieSeriesModel, {PieDataItemOption} from './PieSeries';
+ import labelLayout from './labelLayout';
+@@ -197,7 +197,7 @@ class PiePiece extends graphic.Sector {
+         sector.setTextConfig({
+             // reset position, rotation
+             position: null,
+-            rotation: null
++            rotation: null,
+         });
+ 
+         // Make sure update style on labelText after setLabelStyle.
+
+diff --git a/src/chart/pie/labelLayout.ts b/src/chart/pie/labelLayout.ts
+index 35edb358c3..b99d118577 100644
+--- a/src/chart/pie/labelLayout.ts
++++ b/src/chart/pie/labelLayout.ts
+@@ -27,7 +27,9 @@ import ZRText from 'zrender/src/graphic/Text';
+ import BoundingRect, {RectLike} from 'zrender/src/core/BoundingRect';
+ import { each, isNumber } from 'zrender/src/core/util';
+ import { limitTurnAngle, limitSurfaceAngle } from '../../label/labelGuideHelper';
+-import { shiftLayoutOnY } from '../../label/labelLayoutHelper';
++import {
++    computeLabelGeometry, LabelGeometry, shiftLayoutOnXY
++} from '../../label/labelLayoutHelper';
+ 
+ const RADIAN = Math.PI / 180;
+ 
+@@ -139,7 +141,7 @@ function adjustSingleSide(
+         }
+     }
+ 
+-    if (shiftLayoutOnY(list, viewTop, viewTop + viewHeight)) {
++    if (shiftLayoutOnXY(list, 1, viewTop, viewTop + viewHeight)) {
+         recalculateX(list);
+     }
+ }
+@@ -212,7 +214,7 @@ function avoidOverlap(
+             }
+             layout.targetTextWidth = targetTextWidth;
+ 
+-            constrainTextWidth(layout, targetTextWidth);
++            constrainTextWidth(layout, targetTextWidth, false);
+         }
+     }
+ 
+@@ -267,7 +269,7 @@ function avoidOverlap(
+ function constrainTextWidth(
+     layout: LabelLayout,
+     availableWidth: number,
+-    forceRecalculate: boolean = false
++    forceRecalculate: boolean
+ ) {
+     if (layout.labelStyleWidth != null) {
+         // User-defined style.width has the highest priority.
+@@ -285,7 +287,7 @@ function constrainTextWidth(
+     // textRect.width already contains paddingH if bgColor is set
+     const oldOuterWidth = textRect.width + (bgColor ? 0 : paddingH);
+     if (availableWidth < oldOuterWidth || forceRecalculate) {
+-        const oldHeight = textRect.height;
++
+         if (overflow && overflow.match('break')) {
+             // Temporarily set background to be null to calculate
+             // the bounding box without background.
+@@ -325,14 +327,20 @@ function constrainTextWidth(
+             label.setStyle('width', newWidth);
+         }
+ 
+-        const newRect = label.getBoundingRect();
+-        textRect.width = newRect.width;
+-        const margin = ((label.style.margin as number) || 0) + 2.1;
+-        textRect.height = newRect.height + margin;
+-        textRect.y -= (textRect.height - oldHeight) / 2;
++        computeLabelGlobalRect(textRect, label);
+     }
+ }
+ 
++function computeLabelGlobalRect(out: BoundingRect, label: ZRText): void {
++    _tmpLabelGeometry.rect = out;
++    computeLabelGeometry(_tmpLabelGeometry, label, _computeLabelGeometryOpt);
++}
++const _computeLabelGeometryOpt = {
++    minMarginForce: [null, 0, null, 0],
++    marginDefault: [1, 0, 1, 0], // Arbitrary value
++};
++const _tmpLabelGeometry: Partial<LabelGeometry> = {};
++
+ function isPositionCenter(sectorShape: LabelLayout) {
+     // Not change x for center label
+     return sectorShape.position === 'center';
+@@ -502,12 +510,9 @@ export default function pieLabelLayout(
+ 
+         // Not sectorShape the inside label
+         if (!isLabelInside) {
+-            const textRect = label.getBoundingRect().clone();
+-            textRect.applyTransform(label.getComputedTransform());
+-            // Text has a default 1px stroke. Exclude this.
+-            const margin = ((label.style.margin as number) || 0) + 2.1;
+-            textRect.y -= margin / 2;
+-            textRect.height += margin;
++
++            const textRect = new BoundingRect(0, 0, 0, 0);
++            computeLabelGlobalRect(textRect, label);
+ 
+             labelLayoutList.push({
+                 label,
+
+diff --git a/src/component/axis/AxisBuilder.ts b/src/component/axis/AxisBuilder.ts
+index f5fa721256..c6cb25e84c 100644
+--- a/src/component/axis/AxisBuilder.ts
++++ b/src/component/axis/AxisBuilder.ts
+@@ -51,17 +51,15 @@ import { PathProps, PathStyleProps } from 'zrender/src/graphic/Path';
+ import OrdinalScale from '../../scale/Ordinal';
+ import {
+     hideOverlap,
+-    LabelLayoutInfoComputed,
++    LabelLayoutWithGeometry,
+     labelIntersect,
+-    LabelIntersectionCheckInfo,
+-    prepareIntersectionCheckInfo,
+-    LabelLayoutInfoAll,
+-    ensureLabelLayoutInfoComputed,
+-    LabelLayoutInfoRaw,
+-    LABEL_LAYOUT_INFO_KIND_RAW,
+-    rollbackToLabelLayoutInfoRaw,
+-    LABEL_LAYOUT_INFO_KIND_COMPUTED,
+-    createSingleLayoutInfoComputed,
++    LabelGeometry,
++    computeLabelGeometry2,
++    ensureLabelLayoutWithGeometry,
++    labelLayoutApplyTranslation,
++    setLabelLayoutDirty,
++    newLabelLayoutWithGeometry,
++    LabelLayoutData,
+ } from '../../label/labelLayoutHelper';
+ import ExtensionAPI from '../../core/ExtensionAPI';
+ import { makeInner } from '../../util/model';
+@@ -81,10 +79,12 @@ const PI = Math.PI;
+ 
+ // This tune is also for backward compat, since nameMoveOverlap is set as default,
+ // in compact layout (multiple charts in one canvas), name should be more close to the axis line and labels.
+-const DEFAULT_CENTER_NAME_MARGIN_LEVELS: Record<AxisBuilderBuildExtraParams['nameMarginLevel'], [number, number]> =
+-    [[1, 2], [5, 3], [8, 3]];
+-const DEFAULT_ENDS_NAME_MARGIN_LEVELS: Record<AxisBuilderBuildExtraParams['nameMarginLevel'], [number, number]> =
+-    [[0, 1], [0, 3], [0, 3]];
++type DefaultCenterAxisNameMarginLevels =
++    Record<AxisBuilderBuildExtraParams['nameMarginLevel'], [number, number, number, number]>;
++const DEFAULT_CENTER_NAME_MARGIN_LEVELS: DefaultCenterAxisNameMarginLevels =
++    [[1, 2, 1, 2], [5, 3, 5, 3], [8, 3, 8, 3]];
++const DEFAULT_ENDS_NAME_MARGIN_LEVELS: DefaultCenterAxisNameMarginLevels =
++    [[0, 1, 0, 1], [0, 3, 0, 3], [0, 3, 0, 3]];
+ 
+ type AxisIndexKey = 'xAxisIndex' | 'yAxisIndex' | 'radiusAxisIndex'
+     | 'angleAxisIndex' | 'singleAxisIndex';
+@@ -221,7 +221,7 @@ interface AxisBuilderCfgDetermined {
+  * @see AxisBuilderSharedContext
+  */
+ interface AxisBuilderLocalContext {
+-    labelLayoutList?: LabelLayoutInfoAll[] | NullUndefined
++    labelLayoutList?: LabelLayoutData[] | NullUndefined
+     labelGroup?: graphic.Group
+     axisLabelsCreationContext?: AxisLabelsComputingContext
+     nameEl?: graphic.Text | NullUndefined
+@@ -235,7 +235,7 @@ export type AxisBuilderSharedContextRecord = {
+     // - Sorted in ascending order of the distance to transformGroup.x/y.
+     //  This sorting is for OBB intersection checking.
+     // - No NullUndefined item, and ignored items has been removed.
+-    labelInfoList?: LabelLayoutInfoComputed[]
++    labelInfoList?: LabelLayoutWithGeometry[]
+     // `stOccupiedRect` is based on the "standard axis".
+     // If no label, be `NullUndefined`.
+     // - When `nameLocation` is 'center', `stOccupiedRect` is the union of labels, and is used for the case
+@@ -258,7 +258,7 @@ export type AxisBuilderSharedContextRecord = {
+     //          ----|------------|  A axis name
+     //          1,000,000   300,000,000
+     stOccupiedRect?: BoundingRect | NullUndefined;
+-    nameLayout?: LabelLayoutInfoComputed | NullUndefined;
++    nameLayout?: LabelLayoutWithGeometry | NullUndefined;
+     nameLocation?: AxisBaseOption['nameLocation'];
+     // Only used in __DEV__ mode.
+     ready: Partial<Record<AxisBuilderAxisPartName, boolean>>
+@@ -300,7 +300,7 @@ export class AxisBuilderSharedContext {
+         cfg: AxisBuilderCfgDetermined,
+         ctx: AxisBuilderSharedContext | NullUndefined,
+         axisModel: AxisBaseModel,
+-        nameLayoutInfo: LabelLayoutInfoComputed, // The existing has been ensured.
++        nameLayoutInfo: LabelLayoutWithGeometry, // The existing has been ensured.
+         nameMoveDirVec: Point,
+         thisRecord: AxisBuilderSharedContextRecord // The existing has been ensured.
+     ) => void;
+@@ -316,7 +316,7 @@ function resetOverlapRecordToShared(
+     cfg: AxisBuilderCfgDetermined,
+     shared: AxisBuilderSharedContext,
+     axisModel: AxisBaseModel,
+-    labelLayoutInfoList: LabelLayoutInfoAll[]
++    labelLayoutList: LabelLayoutData[]
+ ): void {
+     const axis = axisModel.axis;
+     const record = shared.ensureRecord(axisModel);
+@@ -324,8 +324,8 @@ function resetOverlapRecordToShared(
+     let stOccupiedRect: AxisBuilderSharedContextRecord['stOccupiedRect'];
+     const useStOccupiedRect = hasAxisName(cfg.axisName) && isNameLocationCenter(cfg.nameLocation);
+ 
+-    each(labelLayoutInfoList, layout => {
+-        const layoutInfo = ensureLabelLayoutInfoComputed(layout);
++    each(labelLayoutList, layout => {
++        const layoutInfo = ensureLabelLayoutWithGeometry(layout);
+         if (!layoutInfo || layoutInfo.label.ignore) {
+             return;
+         }
+@@ -381,7 +381,7 @@ export const resolveAxisNameOverlapDefault: AxisBuilderSharedContext['resolveAxi
+         const stOccupiedRect = thisRecord.stOccupiedRect;
+         if (stOccupiedRect) {
+             moveIfOverlap(
+-                prepareIntersectionCheckInfo(stOccupiedRect, thisRecord.transGroup.transform),
++                computeLabelGeometry2({}, stOccupiedRect, thisRecord.transGroup.transform),
+                 nameLayoutInfo,
+                 nameMoveDirVec
+             );
+@@ -396,8 +396,8 @@ export const resolveAxisNameOverlapDefault: AxisBuilderSharedContext['resolveAxi
+ 
+ // [NOTICE] not consider ignore.
+ function moveIfOverlap(
+-    basedLayoutInfo: LabelIntersectionCheckInfo,
+-    movableLayoutInfo: LabelLayoutInfoComputed,
++    basedLayoutInfo: LabelGeometry,
++    movableLayoutInfo: LabelLayoutWithGeometry,
+     moveDirVec: Point
+ ): void {
+     const mtv = new Point();
+@@ -406,15 +406,14 @@ function moveIfOverlap(
+         bidirectional: false,
+         touchThreshold: 0.05,
+     })) {
+-        Point.add(movableLayoutInfo.label, movableLayoutInfo.label, mtv);
+-        ensureLabelLayoutInfoComputed(rollbackToLabelLayoutInfoRaw(movableLayoutInfo));
++        labelLayoutApplyTranslation(movableLayoutInfo, mtv);
+     }
+ }
+ 
+ export function moveIfOverlapByLinearLabels(
+-    baseLayoutInfoList: LabelLayoutInfoComputed[],
++    baseLayoutInfoList: LabelLayoutWithGeometry[],
+     baseDirVec: Point,
+-    movableLayoutInfo: LabelLayoutInfoComputed,
++    movableLayoutInfo: LabelLayoutWithGeometry,
+     moveDirVec: Point,
+ ): void {
+     // Detect and move from far to close.
+@@ -796,7 +795,7 @@ const builders: Record<AxisBuilderAxisPartName, AxisElementsBuilder> = {
+         }
+         const needCallLayout = dealLastTickLabelResultReusable(local, group, extraParams);
+         if (needCallLayout) {
+-            axisTickLabelLayout(
++            layOutAxisTickLabel(
+                 cfg, local, shared, axisModel, group, transformGroup, api, AxisTickLabelComputingKind.estimate
+             );
+         }
+@@ -813,7 +812,7 @@ const builders: Record<AxisBuilderAxisPartName, AxisElementsBuilder> = {
+         }
+         const needCallLayout = dealLastTickLabelResultReusable(local, group, extraParams);
+         if (needCallLayout) {
+-            axisTickLabelLayout(
++            layOutAxisTickLabel(
+                 cfg, local, shared, axisModel, group, transformGroup, api, AxisTickLabelComputingKind.determine
+             );
+         }
+@@ -927,14 +926,6 @@ const builders: Record<AxisBuilderAxisPartName, AxisElementsBuilder> = {
+                     || labelLayout.textAlign,
+                 verticalAlign: textStyleModel.get('verticalAlign')
+                     || labelLayout.textVerticalAlign
+-            }, {
+-                defaultTextMargin: isNameLocationCenter(nameLocation)
+-                    // Make axis name visually far from axis labels.
+-                    // (but not too aggressive, consider multiple small charts)
+-                    ? (DEFAULT_CENTER_NAME_MARGIN_LEVELS[nameMarginLevel])
+-                    // top/button margin is set to `0` to inserted the xAxis name into the indention
+-                    // above the axis labels to save space. (see example below.)
+-                    : (DEFAULT_ENDS_NAME_MARGIN_LEVELS[nameMarginLevel]),
+             }),
+             z2: 1
+         }) as AxisLabelText;
+@@ -960,7 +951,18 @@ const builders: Record<AxisBuilderAxisPartName, AxisElementsBuilder> = {
+         textEl.updateTransform();
+ 
+         local.nameEl = textEl;
+-        const nameLayout = sharedRecord.nameLayout = createSingleLayoutInfoComputed(textEl);
++        const nameLayout = sharedRecord.nameLayout = ensureLabelLayoutWithGeometry({
++            label: textEl,
++            priority: textEl.z2,
++            defaultAttr: {ignore: textEl.ignore},
++            marginDefault: isNameLocationCenter(nameLocation)
++                // Make axis name visually far from axis labels.
++                // (but not too aggressive, consider multiple small charts)
++                ? (DEFAULT_CENTER_NAME_MARGIN_LEVELS[nameMarginLevel])
++                // top/button margin is set to `0` to inserted the xAxis name into the indention
++                // above the axis labels to save space. (see example below.)
++                : (DEFAULT_ENDS_NAME_MARGIN_LEVELS[nameMarginLevel]),
++        });
+         sharedRecord.nameLocation = nameLocation;
+         group.add(textEl);
+ 
+@@ -977,7 +979,7 @@ const builders: Record<AxisBuilderAxisPartName, AxisElementsBuilder> = {
+ 
+ };
+ 
+-function axisTickLabelLayout(
++function layOutAxisTickLabel(
+     cfg: AxisBuilderCfgDetermined,
+     local: AxisBuilderLocalContext,
+     shared: AxisBuilderSharedContext,
+@@ -1056,7 +1058,7 @@ function endTextLayout(
+  */
+ function fixMinMaxLabelShow(
+     axisModel: AxisBaseModel,
+-    labelLayoutList: LabelLayoutInfoAll[],
++    labelLayoutList: LabelLayoutData[],
+     optionHideOverlap: AxisBaseOption['axisLabel']['hideOverlap']
+ ) {
+     if (shouldShowAllLabels(axisModel.axis)) {
+@@ -1072,56 +1074,44 @@ function fixMinMaxLabelShow(
+         outmostLabelIdx: number,
+         innerLabelIdx: number,
+     ) {
+-        let outmostLabelLayout = labelLayoutList[outmostLabelIdx];
+-        let innerLabelLayout = labelLayoutList[innerLabelIdx];
++        let outmostLabelLayout = ensureLabelLayoutWithGeometry(labelLayoutList[outmostLabelIdx]);
++        let innerLabelLayout = ensureLabelLayoutWithGeometry(labelLayoutList[innerLabelIdx]);
+         if (!outmostLabelLayout || !innerLabelLayout) {
+             return;
+         }
+ 
+-        if (showMinMaxLabel === false) {
++        if (showMinMaxLabel === false || outmostLabelLayout.suggestIgnore) {
+             ignoreEl(outmostLabelLayout.label);
++            return;
++        }
++        if (innerLabelLayout.suggestIgnore) {
++            ignoreEl(innerLabelLayout.label);
++            return;
+         }
+         // PENDING: Originally we thought `optionHideOverlap === false` means do not hide anything,
+         //  since currently the bounding rect of text might not accurate enough and might slightly bigger,
+         //  which causes false positive. But `optionHideOverlap: null/undfined` is falsy and likely
+         //  be treated as false.
+-        else {
+-            // In most fonts the glyph does not reach the boundary of the bounding rect.
+-            // This is needed to avoid too aggressive to hide two elements that meet at the edge
+-            // due to compact layout by the same bounding rect or OBB.
+-            const touchThreshold = 0.1;
+-            // This treatment is for backward compatibility. And `!optionHideOverlap` implies that
+-            // the user accepts the visual touch between adjacent labels, thus "hide min/max label"
+-            // should be conservative, since the space might be sufficient in this case.
+-            const ignoreMargin = !optionHideOverlap;
+-            if (ignoreMargin) {
+-                // Make a copy to apply `ignoreMargin`.
+-                outmostLabelLayout = rollbackToLabelLayoutInfoRaw(defaults({ignoreMargin}, outmostLabelLayout));
+-                innerLabelLayout = rollbackToLabelLayoutInfoRaw(defaults({ignoreMargin}, innerLabelLayout));
+-            }
+ 
+-            let anyIgnored = false;
+-            if (outmostLabelLayout.suggestIgnore) {
+-                ignoreEl(outmostLabelLayout.label);
+-                anyIgnored = true;
+-            }
+-            if (innerLabelLayout.suggestIgnore) {
++        // In most fonts the glyph does not reach the boundary of the bounding rect.
++        // This is needed to avoid too aggressive to hide two elements that meet at the edge
++        // due to compact layout by the same bounding rect or OBB.
++        const touchThreshold = 0.1;
++        // This treatment is for backward compatibility. And `!optionHideOverlap` implies that
++        // the user accepts the visual touch between adjacent labels, thus "hide min/max label"
++        // should be conservative, since the space might be sufficient in this case.
++        if (!optionHideOverlap) {
++            const marginForce = [0, 0, 0, 0];
++            // Make a copy to apply `ignoreMargin`.
++            outmostLabelLayout = newLabelLayoutWithGeometry({marginForce}, outmostLabelLayout);
++            innerLabelLayout = newLabelLayoutWithGeometry({marginForce}, innerLabelLayout);
++        }
++        if (labelIntersect(outmostLabelLayout, innerLabelLayout, null, {touchThreshold})) {
++            if (showMinMaxLabel) {
+                 ignoreEl(innerLabelLayout.label);
+-                anyIgnored = true;
+             }
+-
+-            if (!anyIgnored && labelIntersect(
+-                ensureLabelLayoutInfoComputed(outmostLabelLayout),
+-                ensureLabelLayoutInfoComputed(innerLabelLayout),
+-                null,
+-                {touchThreshold}
+-            )) {
+-                if (showMinMaxLabel) {
+-                    ignoreEl(innerLabelLayout.label);
+-                }
+-                else {
+-                    ignoreEl(outmostLabelLayout.label);
+-                }
++            else {
++                ignoreEl(outmostLabelLayout.label);
+             }
+         }
+     }
+@@ -1139,7 +1129,7 @@ function fixMinMaxLabelShow(
+ // PENDING: Is it necessary to display a tick while the corresponding label is ignored?
+ function syncLabelIgnoreToMajorTicks(
+     cfg: AxisBuilderCfgDetermined,
+-    labelLayoutList: LabelLayoutInfoAll[],
++    labelLayoutList: LabelLayoutData[],
+     tickEls: graphic.Line[],
+ ) {
+     if (cfg.showMinorTicks) {
+@@ -1299,7 +1289,7 @@ function buildAxisMinorTicks(
+     }
+ }
+ 
+-// Return whether need to call `axisTickLabelLayout` again.
++// Return whether need to call `layOutAxisTickLabel` again.
+ function dealLastTickLabelResultReusable(
+     local: AxisBuilderLocalContext,
+     group: graphic.Group,
+@@ -1496,8 +1486,7 @@ function buildAxisLabel(
+         labelGroup.add(textEl);
+     });
+ 
+-    const labelLayoutList: LabelLayoutInfoRaw[] = map(labelEls, label => ({
+-        kind: LABEL_LAYOUT_INFO_KIND_RAW,
++    const labelLayoutList = map(labelEls, label => ({
+         label,
+         priority: getLabelInner(label).break
+             ? label.z2 + (z2Max - z2Min + 1) // Make break labels be highest priority.
+@@ -1510,7 +1499,7 @@ function buildAxisLabel(
+     axisLabelBuildResultSet(local, labelLayoutList, labelGroup, axisLabelCreationCtx);
+ }
+ 
+-// Indicate that `axisTickLabelLayout` has been called.
++// Indicate that `layOutAxisTickLabel` has been called.
+ function axisLabelBuildResultExists(local: AxisBuilderLocalContext) {
+     return !!local.labelLayoutList;
+ }
+@@ -1529,20 +1518,20 @@ function axisLabelBuildResultSet(
+ function updateAxisLabelChangableProps(
+     cfg: AxisBuilderCfgDetermined,
+     axisModel: AxisBaseModel,
+-    labelLayoutList: LabelLayoutInfoAll[],
++    labelLayoutList: LabelLayoutData[],
+     transformGroup: graphic.Group,
+ ): void {
+     const labelMargin = axisModel.get(['axisLabel', 'margin']);
+-    each(labelLayoutList, (layoutInfo, idx) => {
+-        if (!layoutInfo) {
++    each(labelLayoutList, (layout, idx) => {
++        const geometry = ensureLabelLayoutWithGeometry(layout);
++        if (!geometry) {
+             return;
+         }
+-
+-        const labelEl = layoutInfo.label;
++        const labelEl = geometry.label;
+         const inner = getLabelInner(labelEl);
+ 
+         // See the comment in `suggestIgnore`.
+-        layoutInfo.suggestIgnore = labelEl.ignore;
++        geometry.suggestIgnore = labelEl.ignore;
+         // Currently no `ignore:true` is set in `buildAxisLabel`
+         // But `ignore:true` may be set subsequently for overlap handling, thus reset it here.
+         labelEl.ignore = false;
+@@ -1560,9 +1549,8 @@ function updateAxisLabelChangableProps(
+         copyTransform(labelEl, _tmpLayoutEl);
+         labelEl.markRedraw();
+ 
+-        if (layoutInfo.kind === LABEL_LAYOUT_INFO_KIND_COMPUTED) {
+-            rollbackToLabelLayoutInfoRaw(layoutInfo);
+-        }
++        setLabelLayoutDirty(geometry, true);
++        ensureLabelLayoutWithGeometry(geometry);
+     });
+ }
+ const _tmpLayoutEl = new graphic.Rect();
+@@ -1594,7 +1582,7 @@ function addBreakEventHandler(
+ function adjustBreakLabels(
+     axisModel: AxisBaseModel,
+     axisRotation: AxisBuilderCfgDetermined['rotation'],
+-    labelLayoutList: LabelLayoutInfoAll[]
++    labelLayoutList: LabelLayoutData[]
+ ): void {
+     const scaleBreakHelper = getScaleBreakHelper();
+     if (!scaleBreakHelper) {
+@@ -1609,8 +1597,8 @@ function adjustBreakLabels(
+     if (moveOverlap === true || moveOverlap === 'auto') {
+         each(breakLabelIndexPairs, idxPair => {
+             getAxisBreakHelper()!.adjustBreakLabelPair(axisModel.axis.inverse, axisRotation, [
+-                ensureLabelLayoutInfoComputed(labelLayoutList[idxPair[0]]),
+-                ensureLabelLayoutInfoComputed(labelLayoutList[idxPair[1]])
++                ensureLabelLayoutWithGeometry(labelLayoutList[idxPair[0]]),
++                ensureLabelLayoutWithGeometry(labelLayoutList[idxPair[1]])
+             ]);
+         });
+     }
+
+diff --git a/src/component/axis/axisBreakHelper.ts b/src/component/axis/axisBreakHelper.ts
+index 1abd906599..2b1723c7c8 100644
+--- a/src/component/axis/axisBreakHelper.ts
++++ b/src/component/axis/axisBreakHelper.ts
+@@ -29,7 +29,7 @@ import type { AxisBuilderCfg } from './AxisBuilder';
+ import type { BaseAxisBreakPayload } from './axisAction';
+ import type { AxisBaseOption } from '../../coord/axisCommonTypes';
+ import type { AxisBreakOptionIdentifierInAxis, NullUndefined } from '../../util/types';
+-import { LabelLayoutInfoComputed } from '../../label/labelLayoutHelper';
++import { LabelLayoutWithGeometry } from '../../label/labelLayoutHelper';
+ import type ComponentModel from '../../model/Component';
+ 
+ /**
+@@ -45,7 +45,7 @@ export type AxisBreakHelper = {
+     adjustBreakLabelPair(
+         axisInverse: boolean,
+         axisRotation: AxisBuilderCfg['rotation'],
+-        layoutPair: (LabelLayoutInfoComputed | NullUndefined)[],
++        layoutPair: (LabelLayoutWithGeometry | NullUndefined)[],
+     ): void;
+     buildAxisBreakLine(
+         axisModel: AxisBaseModel,
+
+diff --git a/src/component/axis/axisBreakHelperImpl.ts b/src/component/axis/axisBreakHelperImpl.ts
+index 841c6ba765..8fdb14f069 100644
+--- a/src/component/axis/axisBreakHelperImpl.ts
++++ b/src/component/axis/axisBreakHelperImpl.ts
+@@ -38,8 +38,9 @@ import {
+     BaseAxisBreakPayload
+ } from './axisAction';
+ import {
+-    LabelLayoutInfoComputed,
+-    labelIntersect
++    LabelLayoutWithGeometry,
++    labelIntersect,
++    labelLayoutApplyTranslation
+ } from '../../label/labelLayoutHelper';
+ import type SingleAxisView from './SingleAxisView';
+ import type { AxisBuilderCfg } from './AxisBuilder';
+@@ -424,7 +425,7 @@ function buildAxisBreakLine(
+ function adjustBreakLabelPair(
+     axisInverse: boolean,
+     axisRotation: AxisBuilderCfg['rotation'],
+-    layoutPair: (LabelLayoutInfoComputed | NullUndefined)[], // Means [brk_min_label, brk_max_label]
++    layoutPair: (LabelLayoutWithGeometry | NullUndefined)[], // Means [brk_min_label, brk_max_label]
+ ): void {
+ 
+     if (find(layoutPair, item => !item)) {
+@@ -512,8 +513,12 @@ function adjustBreakLabelPair(
+         k = (qval - uval) / mtvSt.x;
+     }
+ 
+-    Point.scaleAndAdd(layoutPair[0].label, layoutPair[0].label, mtv, -k);
+-    Point.scaleAndAdd(layoutPair[1].label, layoutPair[1].label, mtv, 1 - k);
++    const delta0 = new Point();
++    const delta1 = new Point();
++    Point.scale(delta0, mtv, -k);
++    Point.scale(delta1, mtv, 1 - k);
++    labelLayoutApplyTranslation(layoutPair[0], delta0);
++    labelLayoutApplyTranslation(layoutPair[1], delta1);
+ }
+ 
+ function updateModelAxisBreak(
+
+diff --git a/src/coord/cartesian/Grid.ts b/src/coord/cartesian/Grid.ts
+index bd91338f66..97ac081bf0 100644
+--- a/src/coord/cartesian/Grid.ts
++++ b/src/coord/cartesian/Grid.ts
+@@ -754,7 +754,7 @@ function layOutGridByOuterBounds(
+ 
+     // [NOTE]:
+     // - The bounding rect of the axis elements might be sensitve to variations in `axis.extent` due to strategies
+-    //  like hideOverlap/moveOverlap. @see the comment in `LabelLayoutInfoBase['suggestIgnore']`.
++    //  like hideOverlap/moveOverlap. @see the comment in `LabelLayoutBase['suggestIgnore']`.
+     // - The final `gridRect` might be slightly smaller than the ideally expected result if labels are giant and
+     //  get hidden due to overlapping. More iterations could improve precision, but not performant. We consider
+     //  the current result acceptable, since no alignment among charts can be guaranteed when using this feature.
+
+diff --git a/src/core/echarts.ts b/src/core/echarts.ts
+index 1bb6ac60b4..fe5b995ece 100644
+--- a/src/core/echarts.ts
++++ b/src/core/echarts.ts
+@@ -1826,19 +1826,18 @@ class ECharts extends Eventful<ECEventDefinition> {
+                 clearColorPalette(ecModel);
+                 scheduler.performVisualTasks(ecModel, payload);
+ 
+-                render(this, ecModel, api, payload, updateParams);
+-
+-                // Set background
++                // Set background and dark mode before rendering, because they affect auto-color-determination
++                // in zrender Text, and consequently affect the bounding rect if stroke is added.
+                 const backgroundColor = ecModel.get('backgroundColor') || 'transparent';
+-                const darkMode = ecModel.get('darkMode');
+-
+                 zr.setBackgroundColor(backgroundColor);
+-
+                 // Force set dark mode.
++                const darkMode = ecModel.get('darkMode');
+                 if (darkMode != null && darkMode !== 'auto') {
+                     zr.setDarkMode(darkMode);
+                 }
+ 
++                render(this, ecModel, api, payload, updateParams);
++
+                 lifecycle.trigger('afterupdate', ecModel, api);
+             },
+ 
+
+diff --git a/src/label/LabelManager.ts b/src/label/LabelManager.ts
+index 2f262c4ebe..b60a9ac2b2 100644
+--- a/src/label/LabelManager.ts
++++ b/src/label/LabelManager.ts
+@@ -52,15 +52,15 @@ import { retrieve2, each, keys, isFunction, filter, indexOf } from 'zrender/src/
+ import { PathStyleProps } from 'zrender/src/graphic/Path';
+ import Model from '../model/Model';
+ import {
+-    hideOverlap, shiftLayoutOnX, shiftLayoutOnY,
+-    createLabelLayoutList,
+-    LabelLayoutInfoRaw,
+-    LABEL_LAYOUT_INFO_KIND_RAW,
++    hideOverlap, shiftLayoutOnXY,
++    restoreIgnore,
++    LabelLayoutWithGeometry,
++    newLabelLayoutWithGeometry,
+ } from './labelLayoutHelper';
+ import { labelInner, animateLabelValue } from './labelStyle';
+ import { normalizeRadian } from 'zrender/src/contain/util';
+ 
+-interface LabelDesc extends LabelLayoutInfoRaw {
++interface LabelDesc {
+     label: ZRText
+     labelLine: Polyline
+ 
+@@ -82,6 +82,15 @@ interface LabelDesc extends LabelLayoutInfoRaw {
+     defaultAttr: SavedLabelAttr
+ }
+ 
++/**
++ * Save the original value determined in a pass of echarts main process. That refers to the values
++ * rendered by `SeriesView`, before `series:layoutlabels` is triggered in `renderSeries`.
++ *
++ * 'series:layoutlabels' may be triggered during some shortcut passes, such as zooming in series.graph/geo
++ * (`updateLabelLayout`), where the modified `Element` props should be restorable by the original value here.
++ *
++ * Regarding `Element` state, simply consider the values here as the normal state values.
++ */
+ interface SavedLabelAttr {
+     ignore: boolean
+     labelGuideIgnore: boolean
+@@ -239,7 +248,6 @@ class LabelManager {
+         const labelGuide = hostRect && host.getTextGuideLine();
+ 
+         this._labelList.push({
+-            kind: LABEL_LAYOUT_INFO_KIND_RAW,
+             label,
+             labelLine: labelGuide,
+ 
+@@ -435,7 +443,13 @@ class LabelManager {
+         const width = api.getWidth();
+         const height = api.getHeight();
+ 
+-        const labelList = createLabelLayoutList(this._labelList);
++        const labelList: LabelLayoutWithGeometry[] = [];
++        each(this._labelList, inputItem => {
++            if (!inputItem.defaultAttr.ignore) {
++                labelList.push(newLabelLayoutWithGeometry({}, inputItem));
++            }
++        });
++
+         const labelsNeedsAdjustOnX = filter(labelList, function (item) {
+             return item.layoutOption.moveOverlap === 'shiftX';
+         });
+@@ -443,13 +457,14 @@ class LabelManager {
+             return item.layoutOption.moveOverlap === 'shiftY';
+         });
+ 
+-        shiftLayoutOnX(labelsNeedsAdjustOnX, 0, width);
+-        shiftLayoutOnY(labelsNeedsAdjustOnY, 0, height);
++        shiftLayoutOnXY(labelsNeedsAdjustOnX, 0, 0, width);
++        shiftLayoutOnXY(labelsNeedsAdjustOnY, 1, 0, height);
+ 
+         const labelsNeedsHideOverlap = filter(labelList, function (item) {
+             return item.layoutOption.hideOverlap;
+         });
+ 
++        restoreIgnore(labelsNeedsHideOverlap);
+         hideOverlap(labelsNeedsHideOverlap);
+     }
+ 
+
+diff --git a/src/label/labelLayoutHelper.ts b/src/label/labelLayoutHelper.ts
+index 66d07d20d8..1136bb63d8 100644
+--- a/src/label/labelLayoutHelper.ts
++++ b/src/label/labelLayoutHelper.ts
+@@ -18,245 +18,326 @@
+ */
+ 
+ import ZRText from 'zrender/src/graphic/Text';
+-import { LabelExtendedTextStyle, LabelLayoutOption, LabelMarginType, NullUndefined } from '../util/types';
++import { LabelLayoutOption, NullUndefined } from '../util/types';
+ import {
+-    BoundingRect, OrientedBoundingRect, Polyline, expandOrShrinkRect,
++    BoundingRect, OrientedBoundingRect, Polyline, WH, XY, ensureCopyRect, ensureCopyTransform, expandOrShrinkRect,
+     isBoundingRectAxisAligned
+ } from '../util/graphic';
+ import type Element from 'zrender/src/Element';
+ import { PointLike } from 'zrender/src/core/Point';
+-import { each, extend, retrieve2 } from 'zrender/src/core/util';
+-import { normalizeCssArray } from '../util/format';
+ import { BoundingRectIntersectOpt } from 'zrender/src/core/BoundingRect';
+ import { MatrixArray } from 'zrender/src/core/matrix';
++import { LabelExtendedTextStyle, LabelMarginType } from './labelStyle';
+ 
+-// Also prevent duck typing.
+-export const LABEL_LAYOUT_INFO_KIND_RAW = 1 as const;
+-export const LABEL_LAYOUT_INFO_KIND_COMPUTED = 2 as const;
+-
+-// PENDING: a LabelLayoutInfoRaw with `defaultAttr.ignore: false` will become a NullUndefined,
+-//  rather than a LabelLayoutInfoComputed.
+-export type LabelLayoutInfoAll = LabelLayoutInfoRaw | LabelLayoutInfoComputed | NullUndefined;
+-
+-interface LabelLayoutInfoBase {
++/**
++ * This is the input for label layout and overlap resolving.
++ */
++interface LabelLayoutBase {
+     label: ZRText
+     labelLine?: Polyline | NullUndefined
+     layoutOption?: LabelLayoutOption | NullUndefined
+     priority: number
+-    // Save the original value that may be modified in overlap resolving.
++    // @see `SavedLabelAttr` in `LabelManager.ts`
+     defaultAttr: {
+         ignore?: boolean
+         labelGuideIgnore?: boolean
+     }
+-    ignoreMargin?: boolean; // For backward compatibility.
+-
+-    // In grid (cartesian) estimation process (for `grid.containLabel` and related overflow resolving handlings),
++    // To replace user specified `textMargin` or `minMargin`.
++    // Format: `[top, right, bottom, left]`
++    // e.g., `[0, null, 0, null]` means that the top and bottom margin is replaced as `0`,
++    //  and use the original settings of left and right margin.
++    marginForce?: (number | NullUndefined)[] | NullUndefined;
++    // For backward compatibility for `minMargin`. `minMargin` can only be a number rather than number[],
++    // some series only apply `minMargin` on top/bottom but disregard left/right.
++    minMarginForce?: (number | NullUndefined)[] | NullUndefined;
++    // If no `textMargin` and `minMargin` is specified, use this as default.
++    // Format: `[top, right, bottom, left]`
++    marginDefault?: number[] | NullUndefined;
++
++    // In grid (Cartesian) estimation process (for `grid.containLabel` and related overflow resolving handlings),
+     // the `gridRect` is shrunk gradually according to the last union boundingRect of the axis labels and names.
+-    // But the `ignore` stretegy (such as in `hideOverlap` and `fixMinMaxLabelShow`) affects this process
++    // But the `ignore` strategy (such as in `hideOverlap` and `fixMinMaxLabelShow`) affects this process
+     // significantly - the outermost labels might be determined `ignore:true` in a big `gridRect`, but be determined
+     // `ignore:false` in a shrunk `gridRect`. (e.g., if the third label touches the outermost label in a shrunk
+-    // `gridRect`.) That probably causes the result overflowing unexpectedly. Therefore, `suggestIgnore` is
+-    // introduced to ensure the `ignore` consistent during that estimation process.
++    // `gridRect`.) That probably causes the result overflowing unexpectedly.
++    // Therefore, `suggestIgnore` is introduced to ensure the `ignore` consistent during that estimation process.
++    // It suggests that this label has the lowest priority in ignore-if-overlap strategy.
+     suggestIgnore?: boolean;
+ }
++const LABEL_LAYOUT_BASE_PROPS = [
++    'label', 'labelLine', 'layoutOption', 'priority', 'defaultAttr',
++    'marginForce', 'minMarginForce', 'marginDefault', 'suggestIgnore'
++] as const;
+ 
+-export interface LabelLayoutInfoRaw extends LabelLayoutInfoBase {
+-    kind: typeof LABEL_LAYOUT_INFO_KIND_RAW
+-    // Should no other properties - ensure to be a subset of LabelLayoutInfoComputed.
+-}
+-
+-export interface LabelLayoutInfoComputed extends LabelLayoutInfoBase, LabelIntersectionCheckInfo {
+-    kind: typeof LABEL_LAYOUT_INFO_KIND_COMPUTED
+-    // The original props in `LabelLayoutInfoBase` are preserved.
+-
+-    // ------ Computed properites ------
+-    // All of the members in `LabelIntersectionCheckInfo`.
+-}
+-
+-export interface LabelIntersectionCheckInfo {
++/**
++ * [CAUTION]
++ *  - These props will be created and cached.
++ *  - The created props may be modified directly (rather than recreate) for performance consideration,
++ *      therefore, do not use the internal data structure of the el.
++ */
++export interface LabelGeometry {
++    // Only ignore is necessary in intersection check.
++    label: Pick<ZRText, 'ignore'>
++    // `NullUndefined` means dirty, as that is a uninitialized value.
++    dirty: (typeof LABEL_LAYOUT_DIRTY_ALL) | NullUndefined
+     // Global rect from `localRect`
+     rect: BoundingRect
+     // Weither the localRect aligns to screen-pixel x or y axis.
+     axisAligned: boolean
+     // Considering performance, obb is not created until it is really needed.
+-    // Use `ensureOBB(labelLayoutInfo)` to create and cache obb before using it,
++    // Use `ensureOBB(labelLayout)` to create and cache obb before using it,
+     // created by `localRect`&`transform`.
+     obb: OrientedBoundingRect | NullUndefined
+     // localRect of the label.
+-    // [CAUTION] do not modify it, since it may be the internal data structure of the el.
+     localRect: BoundingRect
+-    // transform of `label`. If `label` has no `transform`, this prop is `NullUndefined`.
+-    // [CAUTION] do not modify it, since it may be the internal data structure of the el.
++    // The transform of `label`. Be `NullUndefined` if no `transform`, which follows
++    // the rule of `Element['transform']`, and bypass some unnecessary calculation.
+     transform: number[] | NullUndefined
+ }
+ 
+-export function createLabelLayoutList(
+-    rawList: LabelLayoutInfoRaw[]
+-): LabelLayoutInfoComputed[] {
+-    const resultList: LabelLayoutInfoComputed[] = [];
+-    each(rawList, raw => {
+-        // PENDING: necessary?
+-        raw = extend({}, raw);
+-        const layoutInfo = prepareLabelLayoutInfo(raw);
+-        if (layoutInfo) {
+-            resultList.push(layoutInfo);
+-        }
+-    });
+-    return resultList;
++// A `LabelLayoutData` indicates that the props of `LabelGeometry` are not necessarily computed.
++// Use `Partial<LabelGeometry>` to check prop name conflicts with `LabelGeometry`.
++export type LabelLayoutData = LabelLayoutBase & Partial<LabelGeometry>;
++// A `LabelLayoutWithGeometry` indicates that `ensureLabelLayoutWithGeometry` has been performed.
++export type LabelLayoutWithGeometry = LabelLayoutBase & LabelGeometry;
++
++
++const LABEL_LAYOUT_DIRTY_BIT_OTHERS = 1 as const;
++const LABEL_LAYOUT_DIRTY_BIT_OBB = 2 as const;
++const LABEL_LAYOUT_DIRTY_ALL = LABEL_LAYOUT_DIRTY_BIT_OTHERS | LABEL_LAYOUT_DIRTY_BIT_OBB;
++
++export function setLabelLayoutDirty(
++    labelGeometry: Partial<LabelGeometry>, dirtyOrClear: boolean, dirtyBits?: number
++): void {
++    dirtyBits = dirtyBits || LABEL_LAYOUT_DIRTY_ALL;
++    dirtyOrClear
++        ? (labelGeometry.dirty |= dirtyBits)
++        : (labelGeometry.dirty &= ~dirtyBits);
++}
++
++function isLabelLayoutDirty(
++    labelGeometry: Partial<LabelGeometry>, dirtyBits?: number
++): boolean {
++    dirtyBits = dirtyBits || LABEL_LAYOUT_DIRTY_ALL;
++    return labelGeometry.dirty == null || !!(labelGeometry.dirty & dirtyBits);
+ }
+ 
+ /**
+- * If `defaultAttr.ignore: true`, return `NullUndefined`.
+- *  (the caller is reponsible for ensuring the label is always `ignore: true`.)
+- * Otherwise the `layoutInfo` will be modified and returned.
+- * `label.ignore` is not necessarily falsy, since it might be modified by some overlap resolving handling.
++ * [CAUTION]
++ *  - No auto dirty propagation mechanism yet. If the transform of the raw label or any of its ancestors is
++ *    changed, must sync the changes to the props of `LabelGeometry` by:
++ *    either explicitly call:
++ *      `setLabelLayoutDirty(labelLayout, true); ensureLabelLayoutWithGeometry(labelLayout);`
++ *    or call (if only translation is performed):
++ *      `labelLayoutApplyTranslation(labelLayout);`
++ *  - `label.ignore` is not necessarily falsy, and not considered in computing `LabelGeometry`,
++ *    since it might be modified by some overlap resolving handling.
++ *  - To duplicate or make a variation:
++ *    use `newLabelLayoutWithGeometry`.
+  *
+  * The result can also be the input of this method.
+- *
+- * @see ensureLabelLayoutInfoComputed
++ * @return `NullUndefined` if and only if `labelLayout` is `NullUndefined`.
+  */
+-function prepareLabelLayoutInfo(
+-    layoutInfo: LabelLayoutInfoAll
+-): LabelLayoutInfoComputed | NullUndefined {
+-
+-    if (!layoutInfo || layoutInfo.defaultAttr.ignore) {
++export function ensureLabelLayoutWithGeometry(
++    labelLayout: LabelLayoutData | NullUndefined
++): LabelLayoutWithGeometry | NullUndefined {
++    if (!labelLayout) {
+         return;
+     }
++    if (isLabelLayoutDirty(labelLayout)) {
++        computeLabelGeometry(labelLayout, labelLayout.label, labelLayout);
++    }
++    return labelLayout as LabelLayoutWithGeometry;
++}
+ 
+-    const label = layoutInfo.label;
+-    const ignoreMargin = layoutInfo.ignoreMargin;
++/**
++ * The props in `out` will be filled if existing, or created.
++ */
++export function computeLabelGeometry<TOut extends LabelGeometry>(
++    out: Partial<TOut>,
++    label: ZRText,
++    opt?: Pick<LabelLayoutData, 'marginForce' | 'minMarginForce' | 'marginDefault'>
++): TOut {
++    // [CAUTION] These props may be modified directly for performance consideration,
++    //  therefore, do not output the internal data structure of zrender Element.
++
++    const rawTransform = label.getComputedTransform();
++    out.transform = ensureCopyTransform(out.transform, rawTransform);
++
++    // NOTE: should call `getBoundingRect` after `getComputedTransform`, or may get an inaccurate bounding rect.
++    //  The reason is that `getComputedTransform` calls `__host.updateInnerText()` internally, which updates the label
++    //  by `textConfig` mounted on the host.
++    // PENDING: add a dirty bit for that in zrender?
++    const outLocalRect = out.localRect = ensureCopyRect(out.localRect, label.getBoundingRect());
++
++    const labelStyleExt = label.style as LabelExtendedTextStyle;
++    let margin = labelStyleExt.margin;
++    const marginForce = opt && opt.marginForce;
++    const minMarginForce = opt && opt.minMarginForce;
++    const marginDefault = opt && opt.marginDefault;
++    let marginType = labelStyleExt.__marginType;
++    if (marginType == null && marginDefault) {
++        margin = marginDefault;
++        marginType = LabelMarginType.textMargin;
++    }
++    // `textMargin` and `minMargin` can not exist both.
++    for (let i = 0; i < 4; i++) {
++        _tmpLabelMargin[i] =
++            (marginType === LabelMarginType.minMargin && minMarginForce && minMarginForce[i] != null)
++            ? minMarginForce[i]
++            : (marginForce && marginForce[i] != null)
++            ? marginForce[i]
++            : (margin ? margin[i] : 0);
++    }
++    if (marginType === LabelMarginType.textMargin) {
++        expandOrShrinkRect(outLocalRect, _tmpLabelMargin, false, false);
++    }
+ 
+-    const transform = label.getComputedTransform();
+-    // NOTE: Get bounding rect after getComputedTransform, or label may not been updated by the host el.
+-    let localRect = label.getBoundingRect();
+-    const axisAligned = isBoundingRectAxisAligned(transform);
++    const outGlobalRect = out.rect = ensureCopyRect(out.rect, outLocalRect);
++    if (rawTransform) {
++        outGlobalRect.applyTransform(rawTransform);
++    }
+ 
+-    if (!ignoreMargin) {
+-        localRect = applyTextMarginToLocalRect(label, localRect);
++    // Notice: label.style.margin is actually `minMargin / 2`, handled by `setTextStyleCommon`.
++    if (marginType === LabelMarginType.minMargin) {
++        expandOrShrinkRect(outGlobalRect, _tmpLabelMargin, false, false);
+     }
+ 
+-    const globalRect = localRect.clone();
+-    globalRect.applyTransform(transform);
++    out.axisAligned = isBoundingRectAxisAligned(rawTransform);
+ 
+-    if (!ignoreMargin && (label.style as LabelExtendedTextStyle).__marginType === LabelMarginType.minMargin) {
+-        // `minMargin` only support number value.
+-        const halfMinMargin = ((label.style.margin as number) || 0) / 2;
+-        expandOrShrinkRect(globalRect, halfMinMargin, false, false);
+-    }
++    (out.label = out.label || {} as TOut['label']).ignore = label.ignore;
+ 
+-    const computed = layoutInfo as LabelLayoutInfoComputed;
+-    computed.kind = LABEL_LAYOUT_INFO_KIND_COMPUTED,
+-    // --- computed properties ---
+-    computed.rect = globalRect;
+-    computed.localRect = localRect;
+-    computed.obb = null, // will be created by `ensureOBB` when using.
+-    computed.axisAligned = axisAligned;
+-    computed.transform = transform;
++    setLabelLayoutDirty(out as TOut, false);
++    setLabelLayoutDirty(out as TOut, true, LABEL_LAYOUT_DIRTY_BIT_OBB);
++    // Do not remove `obb` (if existing) for reuse, just reset the dirty bit.
+ 
+-    return computed;
++    return out as TOut;
+ }
++const _tmpLabelMargin: number[] = [0, 0, 0, 0];
+ 
+ /**
+- * The reverse operation of `ensureLabelLayoutInfoComputedv`.
++ * The props in `out` will be filled if existing, or created.
+  */
+-export function rollbackToLabelLayoutInfoRaw(
+-    labelLayoutInfo: LabelLayoutInfoAll
+-): LabelLayoutInfoRaw {
+-    if (labelLayoutInfo == null) {
+-        return;
++export function computeLabelGeometry2<TOut extends LabelGeometry>(
++    out: Partial<TOut>,
++    rawLocalRect: BoundingRect,
++    rawTransform: MatrixArray | NullUndefined
++): TOut {
++    out.transform = ensureCopyTransform(out.transform, rawTransform);
++    out.localRect = ensureCopyRect(out.localRect, rawLocalRect);
++    out.rect = ensureCopyRect(out.rect, rawLocalRect);
++    if (rawTransform) {
++        out.rect.applyTransform(rawTransform);
+     }
+-    const raw = labelLayoutInfo as unknown as LabelLayoutInfoRaw;
+-    raw.kind = LABEL_LAYOUT_INFO_KIND_RAW;
+-    return raw;
++    out.axisAligned = isBoundingRectAxisAligned(rawTransform);
++    out.obb = undefined; // Reset to undefined, will be created by `ensureOBB` when using.
++    (out.label = out.label || {} as TOut['label']).ignore = false;
++
++    return out as TOut;
+ }
+ 
+ /**
+- * This method supports that the label layout info is not computed until needed,
+- * for performance consideration.
+- *
+- * [CAUTION]
+- *  - If the raw label is changed, must call
+- *    `ensureLabelLayoutInfoComputed(rollbackToLabelLayoutInfoRaw(layoutInfo))`
+- *    to recreate the layout info.
+- *  - Null checking is needed for the result. @see prepareLabelLayoutInfo
+- *
+- * Usage:
+- *  To make a copy of labelLayoutInfo, simply:
+- *      const layoutInfoCopy = rollbackToLabelLayoutInfoRaw(extends({}, someLabelLayoutInfo));
++ * This is a shortcut of
++ *   ```js
++ *   labelLayout.label.x = newX;
++ *   labelLayout.label.y = newY;
++ *   setLabelLayoutDirty(labelLayout, true);
++ *   ensureLabelLayoutWithGeometry(labelLayout);
++ *   ```
++ * and provide better performance in this common case.
+  */
+-export function ensureLabelLayoutInfoComputed(
+-    labelLayoutInfo: LabelLayoutInfoAll
+-): LabelLayoutInfoComputed | NullUndefined {
+-    if (!labelLayoutInfo) {
++export function labelLayoutApplyTranslation(
++    labelLayout: LabelLayoutData,
++    offset: PointLike,
++): void {
++    if (!labelLayout) {
+         return;
+     }
+-    if (labelLayoutInfo.kind !== LABEL_LAYOUT_INFO_KIND_COMPUTED) {
+-        labelLayoutInfo = prepareLabelLayoutInfo(labelLayoutInfo);
++
++    labelLayout.label.x += offset.x;
++    labelLayout.label.y += offset.y;
++    labelLayout.label.markRedraw();
++
++    const transform = labelLayout.transform;
++    if (transform) {
++        transform[4] += offset.x;
++        transform[5] += offset.y;
+     }
+-    return labelLayoutInfo;
+-}
+ 
+-export function prepareIntersectionCheckInfo(
+-    localRect: BoundingRect, transform: MatrixArray | NullUndefined
+-): LabelIntersectionCheckInfo {
+-    const globalRect = localRect.clone();
+-    globalRect.applyTransform(transform);
+-    return {
+-        obb: null,
+-        rect: globalRect,
+-        localRect,
+-        axisAligned: isBoundingRectAxisAligned(transform),
+-        transform,
+-    };
+-}
++    const globalRect = labelLayout.rect;
++    if (globalRect) {
++        globalRect.x += offset.x;
++        globalRect.y += offset.y;
++    }
+ 
+-export function createSingleLayoutInfoComputed(el: ZRText): LabelLayoutInfoComputed | NullUndefined {
+-    return ensureLabelLayoutInfoComputed({
+-        kind: LABEL_LAYOUT_INFO_KIND_RAW,
+-        label: el,
+-        priority: el.z2,
+-        defaultAttr: {ignore: el.ignore},
+-    });
++    const obb = labelLayout.obb;
++    if (obb) {
++        obb.fromBoundingRect(labelLayout.localRect, transform);
++    }
+ }
+ 
+ /**
+- * Create obb if no one, can cache it.
++ * To duplicate or make a variation of a label layout.
++ * Copy the only relevant properties to avoid the conflict or wrongly reuse of the props of `LabelLayoutWithGeometry`.
+  */
+-function ensureOBB(layoutInfo: LabelIntersectionCheckInfo): OrientedBoundingRect {
+-    return layoutInfo.obb || (
+-        layoutInfo.obb = new OrientedBoundingRect(layoutInfo.localRect, layoutInfo.transform)
+-    );
++export function newLabelLayoutWithGeometry(
++    newBaseWithDefaults: Partial<LabelLayoutData>,
++    source: LabelLayoutBase
++): LabelLayoutWithGeometry {
++    for (let i = 0; i < LABEL_LAYOUT_BASE_PROPS.length; i++) {
++        const prop = LABEL_LAYOUT_BASE_PROPS[i];
++        if (newBaseWithDefaults[prop] == null) {
++            (newBaseWithDefaults[prop] as any) = source[prop];
++        }
++    }
++    return ensureLabelLayoutWithGeometry(newBaseWithDefaults as LabelLayoutData);
+ }
+ 
+ /**
+- * The input localRect is never modified.
+- * The returned localRect maybe the input localRect.
++ * Create obb if no one, can cache it.
+  */
+-export function applyTextMarginToLocalRect(
+-    label: ZRText,
+-    localRect: BoundingRect,
+-): BoundingRect {
+-    if ((label.style as LabelExtendedTextStyle).__marginType !== LabelMarginType.textMargin) {
+-        return localRect;
+-    }
+-    const textMargin = normalizeCssArray(retrieve2(label.style.margin, [0, 0]));
+-    localRect = localRect.clone();
+-    expandOrShrinkRect(localRect, textMargin, false, false);
+-    return localRect;
++function ensureOBB(labelGeometry: LabelGeometry): OrientedBoundingRect {
++    let obb = labelGeometry.obb;
++    if (!obb || isLabelLayoutDirty(labelGeometry, LABEL_LAYOUT_DIRTY_BIT_OBB)) {
++        labelGeometry.obb = obb = obb || new OrientedBoundingRect();
++        obb.fromBoundingRect(labelGeometry.localRect, labelGeometry.transform);
++        setLabelLayoutDirty(labelGeometry, false, LABEL_LAYOUT_DIRTY_BIT_OBB);
++    }
++    return obb;
+ }
+ 
+-function shiftLayout(
+-    list: Pick<LabelLayoutInfoComputed, 'rect' | 'label'>[],
+-    xyDim: 'x' | 'y',
+-    sizeDim: 'width' | 'height',
+-    minBound: number,
+-    maxBound: number,
+-    balanceShift: boolean
+-) {
++/**
++ * Adjust labels on x/y direction to avoid overlap.
++ *
++ * PENDING: the current implementation is based on the global bounding rect rather than the local rect,
++ *  which may be not preferable in some edge cases when the label has rotation, but works for most cases,
++ *  since rotation is unnecessary when there is sufficient space, while squeezing is applied regardless
++ *  of overlapping when there is no enough space.
++ *
++ * NOTICE:
++ *  - The input `list` and its content will be modified (sort, label.x/y, rect).
++ *  - The caller should sync the modifications to the other parts by
++ *    `setLabelLayoutDirty` and `ensureLabelLayoutWithGeometry` if needed.
++ *
++ * @return adjusted
++ */
++export function shiftLayoutOnXY(
++    list: Pick<LabelLayoutWithGeometry, 'rect' | 'label'>[],
++    xyDimIdx: 0 | 1, // 0 for x, 1 for y
++    minBound: number, // for x, leftBound; for y, topBound
++    maxBound: number, // for x, rightBound; for y, bottomBound
++    // If average the shifts on all labels and add them to 0
++    // TODO: Not sure if should enable it.
++    // Pros: The angle of lines will distribute more equally
++    // Cons: In some layout. It may not what user wanted. like in pie. the label of last sector is usually changed unexpectedly.
++    balanceShift?: boolean
++): boolean {
+     const len = list.length;
++    const xyDim = XY[xyDimIdx];
++    const sizeDim = WH[xyDimIdx];
+ 
+     if (len < 2) {
+-        return;
++        return false;
+     }
+ 
+     list.sort(function (a, b) {
+@@ -267,7 +348,7 @@ function shiftLayout(
+     let delta;
+     let adjusted = false;
+ 
+-    const shifts = [];
++    // const shifts = [];
+     let totalShifts = 0;
+     for (let i = 0; i < len; i++) {
+         const item = list[i];
+@@ -280,7 +361,7 @@ function shiftLayout(
+             adjusted = true;
+         }
+         const shift = Math.max(-delta, 0);
+-        shifts.push(shift);
++        // shifts.push(shift);
+         totalShifts += shift;
+ 
+         lastPos = rect[xyDim] + rect[sizeDim];
+@@ -413,46 +494,33 @@ function shiftLayout(
+ }
+ 
+ /**
+- * Adjust labels on x direction to avoid overlap.
++ * @see `SavedLabelAttr` in `LabelManager.ts`
++ * @see `hideOverlap`
+  */
+-export function shiftLayoutOnX(
+-    list: Pick<LabelLayoutInfoComputed, 'rect' | 'label'>[],
+-    leftBound: number,
+-    rightBound: number,
+-    // If average the shifts on all labels and add them to 0
+-    // TODO: Not sure if should enable it.
+-    // Pros: The angle of lines will distribute more equally
+-    // Cons: In some layout. It may not what user wanted. like in pie. the label of last sector is usually changed unexpectedly.
+-    balanceShift?: boolean
+-): boolean {
+-    return shiftLayout(list, 'x', 'width', leftBound, rightBound, balanceShift);
+-}
+-
+-/**
+- * Adjust labels on y direction to avoid overlap.
+- */
+-export function shiftLayoutOnY(
+-    list: Pick<LabelLayoutInfoComputed, 'rect' | 'label'>[],
+-    topBound: number,
+-    bottomBound: number,
+-    // If average the shifts on all labels and add them to 0
+-    balanceShift?: boolean
+-): boolean {
+-    return shiftLayout(list, 'y', 'height', topBound, bottomBound, balanceShift);
++export function restoreIgnore(labelList: LabelLayoutData[]): void {
++    for (let i = 0; i < labelList.length; i++) {
++        const labelItem = labelList[i];
++        const defaultAttr = labelItem.defaultAttr;
++        const labelLine = labelItem.labelLine;
++        labelItem.label.attr('ignore', defaultAttr.ignore);
++        labelLine && labelLine.attr('ignore', defaultAttr.labelGuideIgnore);
++    }
+ }
+ 
+ /**
+- * [CAUTION]: the `label.ignore` in the input is not necessarily falsy.
+- *  this method checks intersection regardless of current `ignore`,
+- *  if no intersection, restore the `ignore` to `defaultAttr.ignore`.
+- *  And `labelList` will be modified.
+- *  Therefore, if some other overlap resolving strategy has ignored some elements,
+- *  do not input them to this method.
+- * PENDING: review the diff between the requirements from LabelManager and AxisBuilder,
+- *  and uniform the behavior?
++ * [NOTICE - restore]:
++ *  'series:layoutlabels' may be triggered during some shortcut passes, such as zooming in series.graph/geo
++ *  (`updateLabelLayout`), where the modified `Element` props should be restorable from `defaultAttr`.
++ *  @see `SavedLabelAttr` in `LabelManager.ts`
++ *  `restoreIgnore` can be called to perform the restore, if needed.
++ *
++ * [NOTICE - state]:
++ *  Regarding Element's states, this method is only designed for the normal state.
++ *  PENDING: although currently this method is effectively called in other states in `updateLabelLayout` case,
++ *      the bad case is not noticeable in the zooming scenario.
+  */
+-export function hideOverlap(labelList: LabelLayoutInfoAll[]): void {
+-    const displayedLabels: LabelLayoutInfoComputed[] = [];
++export function hideOverlap(labelList: LabelLayoutData[]): void {
++    const displayedLabels: LabelLayoutWithGeometry[] = [];
+ 
+     // TODO, render overflow visible first, put in the displayedLabels.
+     labelList.sort(function (a, b) {
+@@ -473,9 +541,11 @@ export function hideOverlap(labelList: LabelLayoutInfoAll[]): void {
+     }
+ 
+     for (let i = 0; i < labelList.length; i++) {
+-        const labelItem = ensureLabelLayoutInfoComputed(labelList[i]);
++        const labelItem = ensureLabelLayoutWithGeometry(labelList[i]);
+ 
+-        if (!labelItem || labelItem.label.ignore) {
++        // The current `el.ignore` is involved, since some previous overlap
++        // resolving strategies may have set `el.ignore` to true.
++        if (labelItem.label.ignore) {
+             continue;
+         }
+ 
+@@ -501,31 +571,32 @@ export function hideOverlap(labelList: LabelLayoutInfoAll[]): void {
+             labelLine && hideEl(labelLine);
+         }
+         else {
+-            label.attr('ignore', labelItem.defaultAttr.ignore);
+-            labelLine && labelLine.attr('ignore', labelItem.defaultAttr.labelGuideIgnore);
+-
+             displayedLabels.push(labelItem);
+         }
+     }
+ }
+ 
+ /**
+- * [NOTICE]:
+- *  - `label.ignore` is not considered - no requirement so far.
+- *  - `baseLayoutInfo` and `targetLayoutInfo` may be modified - obb may be created and saved.
+- *
+  * Enable fast check for performance; use obb if inevitable.
+  * If `mtv` is used, `targetLayoutInfo` can be moved based on the values filled into `mtv`.
++ *
++ * This method is based only on the current `Element` states (regardless of other states).
++ * Typically this method (and the entire layout process) is performed in normal state.
+  */
+ export function labelIntersect(
+-    baseLayoutInfo: LabelIntersectionCheckInfo | NullUndefined,
+-    targetLayoutInfo: LabelIntersectionCheckInfo | NullUndefined,
++    baseLayoutInfo: LabelGeometry | NullUndefined,
++    targetLayoutInfo: LabelGeometry | NullUndefined,
+     mtv?: PointLike,
+     intersectOpt?: BoundingRectIntersectOpt
+ ): boolean {
+     if (!baseLayoutInfo || !targetLayoutInfo) {
+         return false;
+     }
++    if ((baseLayoutInfo.label && baseLayoutInfo.label.ignore)
++        || (targetLayoutInfo.label && targetLayoutInfo.label.ignore)
++    ) {
++        return false;
++    }
+     // Fast rejection.
+     if (!baseLayoutInfo.rect.intersect(targetLayoutInfo.rect, mtv, intersectOpt)) {
+         return false;
+
+diff --git a/src/label/labelStyle.ts b/src/label/labelStyle.ts
+index 43734f3401..7d294232d2 100644
+--- a/src/label/labelStyle.ts
++++ b/src/label/labelStyle.ts
+@@ -35,11 +35,12 @@ import {
+     LabelCommonOption,
+     TextCommonOptionNuanceBase,
+     TextCommonOptionNuanceDefault,
+-    LabelMarginType,
+-    LabelExtendedTextStyle
++    NullUndefined,
+ } from '../util/types';
+ import GlobalModel from '../model/Global';
+-import { isFunction, retrieve2, extend, keys, trim, clone, retrieve3 } from 'zrender/src/core/util';
++import {
++    isFunction, retrieve2, extend, keys, trim, retrieve3, isNumber, normalizeCssArray
++} from 'zrender/src/core/util';
+ import { SPECIAL_STATES, DISPLAY_STATES } from '../util/states';
+ import { deprecateReplaceLog } from '../util/log';
+ import { makeInner, interpolateRawValues } from '../util/model';
+@@ -450,28 +451,34 @@ function setTextStyleCommon<
+     if (richResult) {
+         textStyle.rich = richResult;
+     }
++
+     const overflow = textStyleModel.get('overflow');
+     if (overflow) {
+         textStyle.overflow = overflow;
+     }
+-    const minMargin = textStyleModel.get('minMargin');
+-    if (minMargin != null) {
+-        textStyle.margin = minMargin;
+-        (textStyle as LabelExtendedTextStyle).__marginType = LabelMarginType.minMargin;
+-    }
+-    const textMargin = textStyleModel.get('textMargin');
+-    if (textMargin != null) {
+-        textStyle.margin = clone(textMargin);
+-        (textStyle as LabelExtendedTextStyle).__marginType = LabelMarginType.textMargin;
+-    }
+-    else if (opt.defaultTextMargin != null) {
+-        textStyle.margin = clone(opt.defaultTextMargin);
+-        (textStyle as LabelExtendedTextStyle).__marginType = LabelMarginType.textMargin;
+-    }
+     const lineOverflow = textStyleModel.get('lineOverflow');
+     if (lineOverflow) {
+         textStyle.lineOverflow = lineOverflow;
+     }
++
++    const labelTextStyle = textStyle as LabelExtendedTextStyle;
++    // `minMargin` has a higher precedence than `textMargin`, because `textMargin` is allowed
++    // to be set in `defaultOption`.
++    let minMargin = textStyleModel.get('minMargin');
++    if (minMargin != null) {
++        // `minMargin` only support number value.
++        minMargin = !isNumber(minMargin) ? 0 : minMargin / 2;
++        labelTextStyle.margin = [minMargin, minMargin, minMargin, minMargin];
++        labelTextStyle.__marginType = LabelMarginType.minMargin;
++    }
++    else {
++        const textMargin = textStyleModel.get('textMargin');
++        if (textMargin != null) {
++            labelTextStyle.margin = normalizeCssArray(textMargin);
++            labelTextStyle.__marginType = LabelMarginType.textMargin;
++        }
++    }
++
+     setTokenTextStyle<TNuance>(
+         textStyle, textStyleModel, globalTextStyle, null, null, opt, isNotNormal, isAttached, true, false
+     );
+@@ -803,3 +810,21 @@ export function animateLabelValue(
+         percent: 1
+     }, animatableModel, dataIndex, null, during);
+ }
++
++/**
++ * PENDING: Temporary impl. unify them?
++ * @see {LabelCommonOption['textMargin']}
++ * @see {LabelCommonOption['minMargin']}
++ */
++export const LabelMarginType = {
++    minMargin: 1,
++    textMargin: 2,
++} as const;
++export type LabelMarginType = (typeof LabelMarginType)[keyof typeof LabelMarginType];
++
++export interface LabelExtendedTextStyle extends TextStyleProps {
++    // `margin` must exist if `__marginType` exists
++    //  and length 4, as the return of `normalizeCssArray`.
++    margin: number[] | NullUndefined
++    __marginType?: LabelMarginType | NullUndefined
++}
+
+diff --git a/src/util/graphic.ts b/src/util/graphic.ts
+index 259d3a5d83..45bf8b556a 100644
+--- a/src/util/graphic.ts
++++ b/src/util/graphic.ts
+@@ -68,6 +68,7 @@ import {
+     isArray,
+     isNumber,
+     clone,
++    assert,
+ } from 'zrender/src/core/util';
+ import { getECData } from './innerStore';
+ import ComponentModel from '../model/Component';
+@@ -607,6 +608,9 @@ export function expandOrShrinkRect<TRect extends RectLike>(
+         _tmpExpandRectDelta[0] = _tmpExpandRectDelta[1] = _tmpExpandRectDelta[2] = _tmpExpandRectDelta[3] = delta;
+     }
+     else {
++        if (__DEV__) {
++            assert(delta.length === 4);
++        }
+         _tmpExpandRectDelta[0] = delta[0];
+         _tmpExpandRectDelta[1] = delta[1];
+         _tmpExpandRectDelta[2] = delta[2];
+@@ -739,6 +743,34 @@ export function isBoundingRectAxisAligned(transform: matrix.MatrixArray | NullUn
+ }
+ const AXIS_ALIGN_EPSILON = 1e-5;
+ 
++/**
++ * Create or copy to the existing bounding rect to avoid modifying `source`.
++ *
++ * @usage
++ *  out.rect = ensureCopyRect(out.rect, sourceRect);
++ */
++export function ensureCopyRect(
++    target: BoundingRect | NullUndefined,
++    source: BoundingRect
++): BoundingRect {
++    return target ? BoundingRect.copy(target, source) : source.clone();
++}
++
++/**
++ * Create or copy to the existing transform to avoid modifying `source`.
++ *
++ * [CAUTION]: transform is `NullUndefined` if no transform, following convention of zrender,
++ *  and enable to bypass some unnecessary calculation, since in most cases there is no transform.
++ *
++ * @usage
++ *  out.transform = ensureCopyTransform(out.transform, sourceTransform);
++ */
++export function ensureCopyTransform(
++    target: matrix.MatrixArray | NullUndefined,
++    source: matrix.MatrixArray | NullUndefined
++): matrix.MatrixArray | NullUndefined {
++    return source ? matrix.copy(target || matrix.create(), source) : undefined;
++}
+ 
+ export function retrieveZInfo(
+     model: Model<Partial<Pick<ComponentOption, 'z' | 'zlevel'>>>,
+
+diff --git a/src/util/types.ts b/src/util/types.ts
+index 950d7df660..2a37e39a0f 100644
+--- a/src/util/types.ts
++++ b/src/util/types.ts
+@@ -1315,6 +1315,9 @@ export interface LabelCommonOption<
+      * PENDING: @see {LabelMarginType}
+      * It's `minMargin` instead of `margin` is for not breaking the previous code using `margin`.
+      * See the summary in `textMargin`.
++     *
++     * [CAUTION]: do not set `minMargin` in `defaultOption`, otherwise users have to explicitly
++     *  clear the `minMargin` to use `textMargin`.
+      */
+     minMargin?: number
+     /**
+@@ -1342,19 +1345,6 @@ export interface LabelCommonOption<
+     rich?: RichTextOption
+ }
+ 
+-/**
+- * PENDING: Temporary impl. unify them?
+- * @see {LabelCommonOption['textMargin']}
+- * @see {LabelCommonOption['minMargin']}
+- */
+-export const LabelMarginType = {
+-    minMargin: 0,
+-    textMargin: 1,
+-} as const;
+-export interface LabelExtendedTextStyle extends TextStyleProps {
+-    __marginType?: (typeof LabelMarginType)[keyof typeof LabelMarginType]
+-}
+-
+ export interface SeriesLabelOption<
+     TCallbackDataParams extends CallbackDataParams = CallbackDataParams,
+     TNuance extends {positionExtra: unknown} = {positionExtra: never}
+

@@ -1,0 +1,1538 @@
+═══════════ dictdatabase/__init__.py ═══════════
+from .configuration import config  # noqa: F401
+from .models import at  # noqa: F401
+═══════════ dictdatabase/byte_codes.py ═══════════
+# See: https://www.charset.org/utf-8
+BACKSLASH = 92
+QUOTE = 34
+OPEN_SQUARE = 91
+CLOSE_SQUARE = 93
+OPEN_CURLY = 123
+CLOSE_CURLY = 125
+SPACE = 32
+TAB = 9
+NEWLINE = 10
+COMMA = 44
+═══════════ dictdatabase/configuration.py ═══════════
+from __future__ import annotations
+
+
+class Confuguration:
+	__slots__ = ("storage_directory", "indent", "use_compression", "use_orjson")
+
+	storage_directory: str
+	indent: int | str | None  # eg. "\t" or 4 or None
+	use_compression: bool
+	use_orjson: bool
+
+	def __init__(
+		self,
+		storage_directory: str = "ddb_storage",
+		indent: str | int | None = "\t",
+		use_compression: bool = False,
+		use_orjson: bool = True,
+	) -> None:
+		self.storage_directory = storage_directory
+		self.indent = indent
+		self.use_compression = use_compression
+		self.use_orjson = use_orjson
+
+
+config = Confuguration()
+═══════════ dictdatabase/indexing.py ═══════════
+import os
+from typing import Union
+
+import orjson
+
+from . import config
+
+# Problem: Multiple read processes will concurrently read and write the same file
+# In some cases this will result in a empty read error, thats why the try-except exists
+
+
+# Idea 1:
+# - Never write to the index when reading
+# - When writing, the lock is exclusive on the index aswell, so no other process can read or write
+# Problem: If a file is only ever reed, it will never be indexed
+
+# Idea 2:
+# - Write a new index_record to a new unique file
+# - Reading index happens from all related files
+# - When writing, the new index_record is collected and written into the main file
+# Problem: If a file is only ever reed, lots of index record files will accumulate
+
+# Idea 3:
+# - Leave everything as is. While not ideal, it works. When empty read error occurs, don't use the index for that read
+
+
+class Indexer:
+	"""
+	The Indexer takes the name of a database file, and tries to load the .index file
+	of the corresponding database file.
+
+	The name of the index file is the name of the database file, with the extension
+	.index and all "/" replaced with "___"
+
+	The content of the index file is a json object, where the keys are keys inside
+	the database json file, and the values are lists of 5 elements:
+	- start_index: The index of the first byte of the value of the key in the database file
+	- end_index: The index of the last byte of the value of the key in the database file
+	- indent_level: The indent level of the key in the database file
+	- indent_with: The indent string used.
+	- value_hash: The hash of the value bytes
+	"""
+
+	__slots__ = ("data", "path")
+
+	def __init__(self, db_name: str) -> None:
+		# Make path of index file
+		db_name = db_name.replace("/", "___")
+		self.path = os.path.join(config.storage_directory, ".ddb", f"{db_name}.index")
+
+		os.makedirs(os.path.dirname(self.path), exist_ok=True)
+		if not os.path.exists(self.path):
+			self.data = {}
+			return
+
+		try:
+			with open(self.path, "rb") as f:
+				self.data = orjson.loads(f.read())
+		except orjson.JSONDecodeError:
+			self.data = {}
+
+	def get(self, key: str) -> Union[list, None]:
+		"""
+		Returns a list of 5 elements for a key if it exists, otherwise None
+		Elements:[start_index, end_index, indent_level, indent_with, value_hash]
+		"""
+		return self.data.get(key, None)
+
+	def write(
+		self,
+		key: str,
+		start_index: int,
+		end_index: int,
+		indent_level: int,
+		indent_with: str,
+		value_hash: int,
+		old_value_end: int,
+	) -> None:
+		"""
+		Write index information for a key to the index file
+		"""
+
+		if self.data.get(key, None) is not None:
+			delta = end_index - old_value_end
+			for entry in self.data.values():
+				if entry[0] > old_value_end:
+					entry[0] += delta
+					entry[1] += delta
+
+		self.data[key] = [start_index, end_index, indent_level, indent_with, value_hash]
+		with open(self.path, "wb") as f:
+			f.write(orjson.dumps(self.data))
+═══════════ dictdatabase/io_bytes.py ═══════════
+import os
+import zlib
+
+from . import config, utils
+
+
+def read(db_name: str, *, start: int = None, end: int = None) -> bytes:
+	"""
+	Read the content of a file as bytes. Reading works even when the config
+	changes, so a compressed ddb file can also be read if compression is
+	disabled, and vice versa.
+
+	If no compression is used, efficient reading can be done by specifying a start
+	and end byte index, such that only the bytes in that range are read from the
+	file.
+
+	If compression is used, specifying a start and end byte index is still possible,
+	but the entire file has to be read and decompressed first, and then the bytes
+	in the range are returned. This is because the compressed file is not seekable.
+
+	Args:
+	- `db_name`: The name of the database file to read from.
+	- `start`: The start byte index to read from.
+	- `end`: The end byte index to read up to (not included).
+
+	Raises:
+	- `FileNotFoundError`: If the file does not exist as .json nor .ddb.
+	- `OSError`: If no compression is used and `start` is negative.
+	- `FileExistsError`: If the file exists as .json and .ddb.
+	"""
+
+	json_path, json_exists, ddb_path, ddb_exists = utils.file_info(db_name)
+
+	if json_exists:
+		if ddb_exists:
+			raise FileExistsError(f'Inconsistent: "{db_name}" exists as .json and .ddb.' "Please remove one of them.")
+		with open(json_path, "rb") as f:
+			if start is None and end is None:
+				return f.read()
+			start = start or 0
+			f.seek(start)
+			if end is None:
+				return f.read()
+			return f.read(end - start)
+	if not ddb_exists:
+		raise FileNotFoundError(f'No database file exists for "{db_name}"')
+	with open(ddb_path, "rb") as f:
+		json_bytes = zlib.decompress(f.read())
+		if start is None and end is None:
+			return json_bytes
+		start = start or 0
+		end = end or len(json_bytes)
+		return json_bytes[start:end]
+
+
+def write(db_name: str, dump: bytes, *, start: int = None) -> None:
+	"""
+	Write the bytes to the file of the db_path. If the db was compressed but no
+	compression is enabled, remove the compressed file, and vice versa.
+
+	Args:
+	- `db_name`: The name of the database to write to.
+	- `dump`: The bytes to write to the file, representing correct JSON when
+	decoded.
+	- `start`: The start byte index to write to. If None, the whole file is overwritten.
+	If the original content was longer, the rest truncated.
+	"""
+
+	json_path, json_exists, ddb_path, ddb_exists = utils.file_info(db_name)
+
+	# Write bytes or string to file
+	remove_file = None
+	if config.use_compression:
+		if start is not None:
+			raise RuntimeError("Cannot write to compressed file at a specific index")
+		write_file = ddb_path
+		if json_exists:
+			remove_file = json_path
+		dump = zlib.compress(dump, 1)
+	else:
+		write_file = json_path
+		if ddb_exists:
+			remove_file = ddb_path
+
+	# Write bytes or string to file
+	if start is None:
+		with open(write_file, "wb") as f:
+			f.write(dump)
+	else:
+		with open(write_file, "ab") as f:
+			f.seek(start)
+			f.truncate()
+			f.write(dump)
+
+	# Remove the other file if it exists
+	# This is done after writing to avoid data loss
+	if remove_file is not None:
+		os.remove(remove_file)
+═══════════ dictdatabase/io_safe.py ═══════════
+import os
+
+from . import config, io_unsafe, locking, utils
+
+
+def read(file_name: str) -> dict:
+	"""
+	Read the content of a file as a dict.
+
+	Args:
+	- `file_name`: The name of the file to read from.
+	"""
+
+	_, json_exists, _, ddb_exists = utils.file_info(file_name)
+
+	if not json_exists and not ddb_exists:
+		return None
+
+	with locking.ReadLock(file_name):
+		return io_unsafe.read(file_name)
+
+
+def partial_read(file_name: str, key: str) -> dict:
+	"""
+	Read only the value of a key-value pair from a file.
+
+	Args:
+	- `file_name`: The name of the file to read from.
+	- `key`: The key to read the value of.
+	"""
+
+	_, json_exists, _, ddb_exists = utils.file_info(file_name)
+
+	if not json_exists and not ddb_exists:
+		return None
+
+	with locking.ReadLock(file_name):
+		return io_unsafe.partial_read(file_name, key)
+
+
+def write(file_name: str, data: dict) -> None:
+	"""
+	Ensures that writing only starts if there is no reading or writing in progress.
+
+	Args:
+	- `file_name`: The name of the file to write to.
+	- `data`: The data to write to the file.
+	"""
+
+	dirname = os.path.dirname(f"{config.storage_directory}/{file_name}.any")
+	os.makedirs(dirname, exist_ok=True)
+
+	with locking.WriteLock(file_name):
+		io_unsafe.write(file_name, data)
+
+
+def delete(file_name: str) -> None:
+	"""
+	Ensures that deleting only starts if there is no reading or writing in progress.
+
+	Args:
+	- `file_name`: The name of the file to delete.
+	"""
+
+	json_path, json_exists, ddb_path, ddb_exists = utils.file_info(file_name)
+
+	if not json_exists and not ddb_exists:
+		return
+
+	with locking.WriteLock(file_name):
+		if json_exists:
+			os.remove(json_path)
+		if ddb_exists:
+			os.remove(ddb_path)
+═══════════ dictdatabase/io_unsafe.py ═══════════
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+
+import orjson
+
+from . import byte_codes, config, indexing, io_bytes, utils
+
+
+@dataclass(frozen=True)  # slots=True not supported by python 3.8 and 3.9
+class PartialDict:
+	prefix: bytes
+	key: str
+	value: dict
+	value_start: int
+	value_end: int
+	suffix: bytes
+
+
+@dataclass(frozen=True)  # slots=True not supported by python 3.8 and 3.9
+class PartialFileHandle:
+	db_name: str
+	partial_dict: PartialDict
+	indent_level: int
+	indent_with: str
+	indexer: indexing.Indexer
+
+
+########################################################################################
+#### Full Reading
+########################################################################################
+
+
+def read(db_name: str) -> dict:
+	"""
+	Read the file at db_path from the configured storage directory.
+	Make sure the file exists. If it does not a FileNotFoundError is
+	raised.
+	"""
+	# Always use orjson to read the file, because it is faster
+	return orjson.loads(io_bytes.read(db_name))
+
+
+########################################################################################
+#### Partial Reading
+########################################################################################
+
+
+def try_read_bytes_using_indexer(indexer: indexing.Indexer, db_name: str, key: str) -> bytes | None:
+	"""
+	Check if the key info is saved in the file's index file.
+	If it is and the value has not changed, return the value bytes.
+	Otherwise return None.
+	"""
+
+	if (index := indexer.get(key)) is None:
+		return None
+	start, end, _, _, value_hash = index
+	partial_bytes = io_bytes.read(db_name, start=start, end=end)
+	if value_hash != hashlib.sha256(partial_bytes).hexdigest():
+		return None
+	return partial_bytes
+
+
+def partial_read(db_name: str, key: str) -> dict | None:
+	"""
+	Partially read a key from a db.
+	The key MUST be unique in the entire db, otherwise the behavior is undefined.
+	This is a lot faster than reading the entire db, because it does not parse
+	the entire file, but only the part <value> part of the <key>: <value> pair.
+
+	If the key is not found, a `KeyError` is raised.
+	"""
+
+	# Search for key in the index file
+	indexer = indexing.Indexer(db_name)
+	if (value_bytes := try_read_bytes_using_indexer(indexer, db_name, key)) is not None:
+		return orjson.loads(value_bytes)
+
+	# Not found in index file, search for key in the entire file
+	all_file_bytes = io_bytes.read(db_name)
+	key_start, key_end = utils.find_outermost_key_in_json_bytes(all_file_bytes, key)
+
+	if key_end == -1:
+		return None
+
+	# Key found, now determine the bounding byte indices of the value
+	start = key_end + (1 if all_file_bytes[key_end] == byte_codes.SPACE else 0)
+	end = utils.seek_index_through_value_bytes(all_file_bytes, start)
+
+	indent_level, indent_with = utils.detect_indentation_in_json_bytes(all_file_bytes, key_start)
+	value_bytes = all_file_bytes[start:end]
+	value_hash = hashlib.sha256(value_bytes).hexdigest()
+
+	# Write key info to index file
+	indexer.write(key, start, end, indent_level, indent_with, value_hash, end)
+	return orjson.loads(value_bytes)
+
+
+################################################################################
+#### Writing
+################################################################################
+
+
+def serialize_data_to_json_bytes(data: dict) -> bytes:
+	"""
+	Serialize the data as json bytes. Depending on the config,
+	this can be done with orjson or the standard json module.
+	Additionally config.indent is respected.
+	"""
+	if config.use_orjson:
+		option = (orjson.OPT_INDENT_2 if config.indent else 0) | orjson.OPT_SORT_KEYS
+		return orjson.dumps(data, option=option)
+	else:
+		db_dump = json.dumps(data, indent=config.indent, sort_keys=True)
+		return db_dump.encode()
+
+
+def write(db_name: str, data: dict) -> None:
+	"""
+	Write the dict db dumped as a json string
+	to the file of the db_path.
+	"""
+	data_bytes = serialize_data_to_json_bytes(data)
+	io_bytes.write(db_name, data_bytes)
+
+
+################################################################################
+#### Partial Writing
+################################################################################
+
+
+def try_get_partial_file_handle_by_index(
+	indexer: indexing.Indexer,
+	db_name: str,
+	key: str,
+) -> tuple[PartialFileHandle | None, bytes | None]:
+	"""
+	Try to get a partial file handle by using the key entry in the index file.
+
+	If the data could be read from the index file, a tuple of the partial file
+	handle and None is returned.
+	If the data could not be read from the index file, a tuple of None and the file
+	bytes is returned, so that the file bytes can be searched for the key.
+	"""
+
+	if (index := indexer.get(key)) is None:
+		return None, io_bytes.read(db_name)
+	start, end, indent_level, indent_with, value_hash = index
+
+	# If compression is enabled, all data has to be read from the file
+	if config.use_compression:
+		all_file_bytes = io_bytes.read(db_name)
+		value_bytes = all_file_bytes[start:end]
+		if value_hash != hashlib.sha256(value_bytes).hexdigest():
+			return None, all_file_bytes
+		value_data = orjson.loads(value_bytes)
+		partial_dict = PartialDict(all_file_bytes[:start], key, value_data, start, end, all_file_bytes[end:])
+
+	# If compression is disabled, only the value and suffix have to be read
+	else:
+		value_and_suffix_bytes = io_bytes.read(db_name, start=start)
+		value_length = end - start
+		value_bytes = value_and_suffix_bytes[:value_length]
+		if value_hash != hashlib.sha256(value_bytes).hexdigest():
+			# If the hashes don't match, read the prefix to concat the full file bytes
+			prefix_bytes = io_bytes.read(db_name, end=start)
+			return None, prefix_bytes + value_and_suffix_bytes
+		value_data = orjson.loads(value_bytes)
+		partial_dict = PartialDict(None, key, value_data, start, end, value_and_suffix_bytes[value_length:])
+
+	return PartialFileHandle(db_name, partial_dict, indent_level, indent_with, indexer), None
+
+
+def get_partial_file_handle(db_name: str, key: str) -> PartialFileHandle:
+	"""
+	Partially read a key from a db.
+	The key MUST be unique in the entire db, otherwise the behavior is undefined.
+	This is a lot faster than reading the entire db, because it does not parse
+	the entire file, but only the part <value> part of the <key>: <value> pair.
+
+	If the key is not found, a `KeyError` is raised.
+	"""
+
+	# Search for key in the index file
+	indexer = indexing.Indexer(db_name)
+	partial_handle, all_file_bytes = try_get_partial_file_handle_by_index(indexer, db_name, key)
+	if partial_handle is not None:
+		return partial_handle
+
+	# Not found in index file, search for key in the entire file
+	key_start, key_end = utils.find_outermost_key_in_json_bytes(all_file_bytes, key)
+
+	if key_end == -1:
+		raise KeyError(f'Key "{key}" not found in db "{db_name}"')
+
+	# Key found, now determine the bounding byte indices of the value
+	start = key_end + (1 if all_file_bytes[key_end] == byte_codes.SPACE else 0)
+	end = utils.seek_index_through_value_bytes(all_file_bytes, start)
+
+	indent_level, indent_with = utils.detect_indentation_in_json_bytes(all_file_bytes, key_start)
+
+	partial_value = orjson.loads(all_file_bytes[start:end])
+	prefix_bytes = all_file_bytes[:start] if config.use_compression else None
+	partial_dict = PartialDict(prefix_bytes, key, partial_value, start, end, all_file_bytes[end:])
+	return PartialFileHandle(db_name, partial_dict, indent_level, indent_with, indexer)
+
+
+def partial_write(pf: PartialFileHandle) -> None:
+	"""
+	Write a partial file handle to the db.
+	"""
+
+	partial_bytes = serialize_data_to_json_bytes(pf.partial_dict.value)
+
+	# Add indentation
+	if pf.indent_level > 0 and pf.indent_with:
+		replace_this = b"\n"
+		replace_with = ("\n" + (pf.indent_level * pf.indent_with)).encode()
+		partial_bytes = partial_bytes.replace(replace_this, replace_with)
+
+	# Write key info to index file
+	pf.indexer.write(
+		key=pf.partial_dict.key,
+		start_index=pf.partial_dict.value_start,
+		end_index=pf.partial_dict.value_start + len(partial_bytes),
+		indent_level=pf.indent_level,
+		indent_with=pf.indent_with,
+		value_hash=hashlib.sha256(partial_bytes).hexdigest(),
+		old_value_end=pf.partial_dict.value_end,
+	)
+
+	if pf.partial_dict.prefix is None:
+		# Prefix could not be determined due to compression, so write the entire file
+		io_bytes.write(pf.db_name, partial_bytes + pf.partial_dict.suffix, start=pf.partial_dict.value_start)
+	else:
+		# Prefix was determined, so only write the changed part and the suffix
+		io_bytes.write(pf.db_name, pf.partial_dict.prefix + partial_bytes + pf.partial_dict.suffix)
+═══════════ dictdatabase/locking.py ═══════════
+from __future__ import annotations
+
+import contextlib
+import os
+import threading
+import time
+
+from . import config
+
+# Design decisions:
+# - Do not use pathlib, because it is slower than os
+
+# Constants
+SLEEP_TIMEOUT = 0.001 * 1  # (ms)
+LOCK_KEEP_ALIVE_TIMEOUT = 0.001 * 0.08  # (ms)
+
+# Duration to wait updating the timestamp of the lock file
+ALIVE_LOCK_REFRESH_INTERVAL_NS = 1_000_000_000 * 10  # (s)
+
+# Duration to wait before considering a lock as orphaned
+REMOVE_ORPHAN_LOCK_TIMEOUT = 20.0
+
+# Duration to wait before giving up on acquiring a lock
+AQUIRE_LOCK_TIMEOUT = 60.0
+
+
+def os_touch(path: str) -> None:
+	"""
+	Create an empty file at the given path. This mimics the UNIX touch command
+	and is compatible with both Windows and UNIX systems.
+	"""
+	mode = 0o666
+	flags = os.O_CREAT | os.O_WRONLY | os.O_EXCL
+	fd = os.open(path, flags, mode)
+	os.close(fd)
+
+
+class LockFileMeta:
+	"""
+	Metadata representation for a lock file.
+	"""
+
+	__slots__ = ("ddb_dir", "name", "id", "time_ns", "stage", "mode", "path")
+
+	ddb_dir: str
+	name: str
+	id: str
+	time_ns: str
+	stage: str
+	mode: str
+	path: str
+
+	def __init__(self, ddb_dir: str, name: str, id: str, time_ns: str, stage: str, mode: str) -> None:
+		self.ddb_dir = ddb_dir
+		self.name = name
+		self.id = id
+		self.time_ns = time_ns
+		self.stage = stage
+		self.mode = mode
+		lock_file = f"{name}.{id}.{time_ns}.{stage}.{mode}.lock"
+		self.path = os.path.join(ddb_dir, lock_file)
+
+	def __repr__(self) -> str:
+		return f"LockFileMeta({self.ddb_dir=}, {self.name=}, {self.id=}, {self.time_ns=}, {self.stage=}, {self.mode=})"
+
+	def new_with_updated_time(self) -> LockFileMeta:
+		"""
+		Create a new instance with an updated timestamp.
+		"""
+		time_ns = f"{time.time_ns()}"
+		return LockFileMeta(self.ddb_dir, self.name, self.id, time_ns, self.stage, self.mode)
+
+
+class FileLocksSnapshot:
+	"""
+	Represents a snapshot of the current state of file locks in the directory.
+	This snapshot assists in deciding which lock should be acquired or released next.
+
+	On init, orphaned locks are removed.
+	"""
+
+	__slots__ = ("any_has_locks", "any_write_locks", "any_has_write_locks", "locks")
+
+	locks: list[LockFileMeta]
+	any_has_locks: bool
+	any_write_locks: bool
+	any_has_write_locks: bool
+
+	def __init__(self, need_lock: LockFileMeta) -> None:
+		self.locks = []
+		self.any_has_locks = False
+		self.any_write_locks = False
+		self.any_has_write_locks = False
+
+		for file_name in os.listdir(need_lock.ddb_dir):
+			if not file_name.endswith(".lock"):
+				continue
+			name, id, time_ns, stage, mode, _ = file_name.split(".")
+			if name != need_lock.name:
+				continue
+
+			lock_meta = LockFileMeta(need_lock.ddb_dir, name, id, time_ns, stage, mode)
+
+			# Remove orphaned locks
+			if lock_meta.path != need_lock.path:
+				lock_age = time.time_ns() - int(lock_meta.time_ns)
+				if lock_age > REMOVE_ORPHAN_LOCK_TIMEOUT * 1_000_000_000:
+					os.unlink(lock_meta.path)
+					print(f"Removed orphaned lock ({lock_meta.path})")
+					continue
+
+			self.locks.append(lock_meta)
+
+			# Update lock state flags
+			if lock_meta.stage == "has":
+				self.any_has_locks = True
+				if lock_meta.mode == "write":
+					self.any_has_write_locks = True
+			if lock_meta.mode == "write":
+				self.any_write_locks = True
+
+	def exists(self, l: LockFileMeta) -> bool:
+		"""
+		Check if a lock with the same ID, stage, and mode exists in the current snapshot.
+		"""
+		return any(x.id == l.id and x.stage == l.stage and x.mode == l.mode for x in self.locks)
+
+	def oldest_need(self, need_lock: LockFileMeta) -> bool:
+		"""
+		Determine if the provided 'need_lock' is the oldest among all 'need' locks in the snapshot.
+		"""
+		# len(need_locks) is at least 1 since this function is only called if there is a need_lock
+		need_locks = [l for l in self.locks if l.stage == "need"]
+		# Sort by time_ns. If multiple, the the one with the smaller id is first
+		need_locks = sorted(need_locks, key=lambda l: (int(l.time_ns), int(l.id)))
+		return need_locks[0].id == need_lock.id
+
+
+class AbstractLock:
+	"""
+	Abstract base class for file locks. This class doesn't lock/unlock by itself but
+	provides a blueprint for derived classes to implement.
+	"""
+
+	__slots__ = ("db_name", "need_lock", "has_lock", "snapshot", "mode", "is_alive" "keep_alive_thread")
+
+	db_name: str
+	need_lock: LockFileMeta
+	has_lock: LockFileMeta
+	snapshot: FileLocksSnapshot
+	mode: str
+	is_alive: bool
+	keep_alive_thread: threading.Thread
+
+	def __init__(self, db_name: str) -> None:
+		# Normalize db_name to avoid file naming conflicts
+		self.db_name = db_name.replace("/", "___").replace(".", "____")
+		time_ns = time.time_ns()
+		t_id = f"{threading.get_native_id()}"  # ID that's unique across processes and threads.
+		dir = os.path.join(config.storage_directory, ".ddb")
+
+		self.need_lock = LockFileMeta(dir, self.db_name, t_id, time_ns, "need", self.mode)
+		self.has_lock = LockFileMeta(dir, self.db_name, t_id, time_ns, "has", self.mode)
+
+		self.is_alive = False
+		self.keep_alive_thread = None
+
+		# Ensure lock directory exists
+		if not os.path.isdir(dir):
+			os.makedirs(dir, exist_ok=True)
+
+	def _keep_alive_thread(self) -> None:
+		"""
+		Keep the lock alive by updating the timestamp of the lock file.
+		"""
+
+		current_has_lock_time_ns: int = int(self.has_lock.time_ns)
+
+		while self.is_alive:
+			time.sleep(LOCK_KEEP_ALIVE_TIMEOUT)
+			if time.time_ns() - current_has_lock_time_ns < ALIVE_LOCK_REFRESH_INTERVAL_NS:
+				continue
+
+			# Assert: The lock is older than ALIVE_LOCK_REFRESH_INTERVAL_NS ns
+			# This means the has_lock must be refreshed
+
+			new_has_lock = self.has_lock.new_with_updated_time()
+			os_touch(new_has_lock.path)
+			with contextlib.suppress(FileNotFoundError):
+				os.unlink(self.has_lock.path)  # Remove old lock file
+			self.has_lock = new_has_lock
+			current_has_lock_time_ns = int(new_has_lock.time_ns)
+
+	def _start_keep_alive_thread(self) -> None:
+		"""
+		Start a thread that keeps the lock alive by updating the timestamp of the lock file.
+		"""
+
+		if self.keep_alive_thread is not None:
+			raise RuntimeError("Keep alive thread already exists.")
+
+		self.is_alive = True
+		self.keep_alive_thread = threading.Thread(target=self._keep_alive_thread, daemon=False)
+		self.keep_alive_thread.start()
+
+	def _lock(self) -> None:
+		"""Override this method to implement locking mechanism."""
+		raise NotImplementedError
+
+	def _unlock(self) -> None:
+		"""Remove the lock files associated with this lock."""
+
+		if self.keep_alive_thread is not None:
+			self.is_alive = False
+			self.keep_alive_thread.join()
+			self.keep_alive_thread = None
+
+		for p in ("need_lock", "has_lock"):
+			try:
+				if lock := getattr(self, p, None):
+					os.unlink(lock.path)
+			except FileNotFoundError:
+				pass
+			finally:
+				setattr(self, p, None)
+
+	def __enter__(self) -> None:
+		self._lock()
+
+	def __exit__(self, exc_type, exc_val, exc_tb) -> None:  # noqa: ANN001
+		self._unlock()
+
+
+class ReadLock(AbstractLock):
+	"""
+	A file-based read lock.
+	Multiple threads/processes can simultaneously hold a read lock unless there's a write lock.
+	"""
+
+	mode = "read"
+
+	def _lock(self) -> None:
+		# Express intention to acquire read lock
+		os.makedirs(os.path.dirname(self.need_lock.path), exist_ok=True)
+		os_touch(self.need_lock.path)
+		self.snapshot = FileLocksSnapshot(self.need_lock)
+
+		# If this thread already holds a read lock, raise an exception.
+		if self.snapshot.exists(self.has_lock):
+			os.unlink(self.need_lock.path)
+			raise RuntimeError("Thread already has a read lock. Do not try to obtain a read lock twice.")
+
+		start_time = time.time()
+
+		# Try to acquire lock until conditions are met or a timeout occurs
+		while True:
+			if not self.snapshot.any_write_locks or (
+				not self.snapshot.any_has_write_locks and self.snapshot.oldest_need(self.need_lock)
+			):
+				self.has_lock = self.has_lock.new_with_updated_time()
+				os_touch(self.has_lock.path)
+				os.unlink(self.need_lock.path)
+				self._start_keep_alive_thread()
+				return
+			time.sleep(SLEEP_TIMEOUT)
+			if time.time() - start_time > AQUIRE_LOCK_TIMEOUT:
+				raise RuntimeError("Timeout while waiting for read lock.")
+			self.snapshot = FileLocksSnapshot(self.need_lock)
+
+
+class WriteLock(AbstractLock):
+	"""
+	A file-based write lock.
+	Only one thread/process can hold a write lock, blocking others from acquiring either read or write locks.
+	"""
+
+	mode = "write"
+
+	def _lock(self) -> None:
+		# Express intention to acquire write lock
+		os.makedirs(os.path.dirname(self.need_lock.path), exist_ok=True)
+		os_touch(self.need_lock.path)
+		self.snapshot = FileLocksSnapshot(self.need_lock)
+
+		# If this thread already holds a write lock, raise an exception.
+		if self.snapshot.exists(self.has_lock):
+			os.unlink(self.need_lock.path)
+			raise RuntimeError("Thread already has a write lock. Do not try to obtain a write lock twice.")
+
+		start_time = time.time()
+
+		# Try to acquire lock until conditions are met or a timeout occurs
+		while True:
+			if not self.snapshot.any_has_locks and self.snapshot.oldest_need(self.need_lock):
+				self.has_lock = self.has_lock.new_with_updated_time()
+				os_touch(self.has_lock.path)
+				os.unlink(self.need_lock.path)
+				self._start_keep_alive_thread()
+				return
+			time.sleep(SLEEP_TIMEOUT)
+			if time.time() - start_time > AQUIRE_LOCK_TIMEOUT:
+				raise RuntimeError("Timeout while waiting for write lock.")
+			self.snapshot = FileLocksSnapshot(self.need_lock)
+═══════════ dictdatabase/models.py ═══════════
+from __future__ import annotations
+
+from typing import Any, Callable, Type, TypeVar
+
+from . import config, io_safe, utils
+from .sessions import (
+	SessionDirFull,
+	SessionDirWhere,
+	SessionFileFull,
+	SessionFileKey,
+	SessionFileWhere,
+)
+
+T = TypeVar("T")
+
+
+class OperationType:
+	"""
+	Legal:
+	- DDB.at("file")
+	- DDB.at("file", key="subkey")
+	- DDB.at("file", where=lambda k, v: ...)
+	- DDB.at("dir", "*")
+	- DDB.at("dir", "*", where=lambda k, v: ...)
+
+	Illegal:
+	- DDB.at("file", key="subkey", where=lambda k, v: ...)
+	- DDB.at("dir", key="subkey", where=lambda k, v: ...)
+	- DDB.at("dir", key="subkey")
+	"""
+
+	def __init__(self, path: str, key: str, where: Callable) -> None:
+		self.dir = "*" in path
+		self.file = not self.dir
+		self.where = where is not None
+		self.key = key is not None
+
+		if self.key and self.where:
+			raise TypeError("Cannot specify both key and where")
+		if self.key and self.dir:
+			raise TypeError("Cannot specify sub-key when selecting a folder. Specify the key in the path instead.")
+
+	@property
+	def file_normal(self) -> bool:
+		return self.file and not self.where and not self.key
+
+	@property
+	def file_key(self) -> bool:
+		return self.file and not self.where and self.key
+
+	@property
+	def file_where(self) -> bool:
+		return self.file and self.where and not self.key
+
+	@property
+	def dir_normal(self) -> bool:
+		return self.dir and not self.where and not self.key
+
+	@property
+	def dir_where(self) -> bool:
+		return self.dir and self.where and not self.key
+
+
+def at(*path, key: str = None, where: Callable[[Any, Any], bool] = None) -> DDBMethodChooser:
+	"""
+	Select a file or folder to perform an operation on.
+	If you want to select a specific key in a file, use the `key` parameter,
+	e.g. `DDB.at("file", key="subkey")`.
+
+	If you want to select an entire folder, use the `*` wildcard,
+	eg. `DDB.at("folder", "*")`, or `DDB.at("folder/*")`. You can also use
+	the `where` callback to select a subset of the file or folder.
+
+	If the callback returns `True`, the item will be selected. The callback
+	needs to accept a key and value as arguments.
+
+	Args:
+	- `path`: The path to the file or folder. Can be a string, a
+	comma-separated list of strings, or a list.
+	- `key`: The key to select from the file.
+	- `where`: A function that takes a key and value and returns `True` if the
+	key should be selected.
+
+	Beware: If you select a folder with the `*` wildcard, you can't use the `key` parameter.
+	Also, you cannot use the `key` and `where` parameters at the same time.
+	"""
+	return DDBMethodChooser(path, key, where)
+
+
+class DDBMethodChooser:
+	__slots__ = ("path", "key", "where", "op_type")
+
+	path: str
+	key: str
+	where: Callable[[Any, Any], bool]
+	op_type: OperationType
+
+	def __init__(
+		self,
+		path: tuple,
+		key: str = None,
+		where: Callable[[Any, Any], bool] = None,
+	) -> None:
+		# Convert path to a list of strings
+		pc = []
+		for p in path:
+			pc += p if isinstance(p, list) else [p]
+		self.path = "/".join([str(p) for p in pc])
+		self.key = key
+		self.where = where
+		self.op_type = OperationType(self.path, self.key, self.where)
+		# Invariants:
+		# - Both key and where cannot be not None at the same time
+		# - If key is not None, then there is no wildcard in the path.
+
+	def exists(self) -> bool:
+		"""
+		Efficiently checks if a database exists. If the selected path contains
+		a wildcard, it will return True if at least one file exists in the folder.
+
+
+		If a key was specified, check if it exists in a database.
+		The key can be anywhere in the database, even deeply nested.
+		As long it exists as a key in any dict, it will be found.
+		"""
+		if self.where is not None:
+			raise RuntimeError("DDB.at(where=...).exists() cannot be used with the where parameter")
+
+		if not utils.file_exists(self.path):
+			return False
+		if self.key is None:
+			return True
+		# Key is passed and occurs is True
+		return io_safe.partial_read(self.path, key=self.key) is not None
+
+	def create(self, data: dict | None = None, force_overwrite: bool = False) -> None:
+		"""
+		Create a new file with the given data as the content. If the file
+		already exists, a FileExistsError will be raised unless
+		`force_overwrite` is set to True.
+
+		Args:
+		- `data`: The data to write to the file. If not specified, it will be `{}`
+		will be written.
+		- `force_overwrite`: If `True`, will overwrite the file if it already
+		exists, defaults to False (optional).
+		"""
+		if self.where is not None or self.key is not None:
+			raise RuntimeError("DDB.at().create() cannot be used with the where or key parameters")
+
+		# Except if db exists and force_overwrite is False
+		if not force_overwrite and self.exists():
+			raise FileExistsError(
+				f"Database {self.path} already exists in {config.storage_directory}. Pass force_overwrite=True to overwrite."
+			)
+		# Write db to file
+		if data is None:
+			data = {}
+		io_safe.write(self.path, data)
+
+	def delete(self) -> None:
+		"""
+		Delete the file at the selected path.
+		"""
+		if self.where is not None or self.key is not None:
+			raise RuntimeError("DDB.at().delete() cannot be used with the where or key parameters")
+		io_safe.delete(self.path)
+
+	def read(self, as_type: Type[T] = None) -> dict | T | None:
+		"""
+		Reads a file or folder depending on previous `.at(...)` selection.
+
+		Args:
+		- `as_type`: If provided, return the value as the given type.
+		Eg. as_type=str will return str(value).
+		"""
+
+		def type_cast(value):
+			if as_type is None:
+				return value
+			return as_type(value)
+
+		data = {}
+
+		if self.op_type.file_normal:
+			data = io_safe.read(self.path)
+
+		elif self.op_type.file_key:
+			data = io_safe.partial_read(self.path, self.key)
+
+		elif self.op_type.file_where:
+			file_content = io_safe.read(self.path)
+			if file_content is None:
+				return None
+			for k, v in file_content.items():
+				if self.where(k, type_cast(v)):
+					data[k] = v
+
+		elif self.op_type.dir_normal:
+			pattern_paths = utils.find_all(self.path)
+			data = {n.split("/")[-1]: io_safe.read(n) for n in pattern_paths}
+
+		elif self.op_type.dir_where:
+			for db_name in utils.find_all(self.path):
+				k, v = db_name.split("/")[-1], io_safe.read(db_name)
+				if self.where(k, type_cast(v)):
+					data[k] = v
+
+		return type_cast(data)
+
+	def session(
+		self, as_type: Type[T] = None
+	) -> SessionFileFull[T] | SessionFileKey[T] | SessionFileWhere[T] | SessionDirFull[T] | SessionDirWhere[T]:
+		"""
+		Opens a session to the selected file(s) or folder, depending on previous
+		`.at(...)` selection. Inside the with block, you have exclusive access
+		to the file(s) or folder.
+		Call `session.write()` to write the data to the file(s) or folder.
+
+		Args:
+		- `as_type`: If provided, cast the value to the given type.
+		Eg. as_type=str will return str(value).
+
+		Raises:
+		- `FileNotFoundError`: If the file does not exist.
+		- `KeyError`: If a key is specified and it does not exist.
+
+		Returns:
+		- Tuple of (session_object, data)
+		"""
+		if self.op_type.file_normal:
+			return SessionFileFull(self.path, as_type)
+		if self.op_type.file_key:
+			return SessionFileKey(self.path, self.key, as_type)
+		if self.op_type.file_where:
+			return SessionFileWhere(self.path, self.where, as_type)
+		if self.op_type.dir_normal:
+			return SessionDirFull(self.path, as_type)
+		if self.op_type.dir_where:
+			return SessionDirWhere(self.path, self.where, as_type)
+═══════════ dictdatabase/sessions.py ═══════════
+from __future__ import annotations
+
+from contextlib import contextmanager
+from typing import Any, Callable, Generic, Tuple, TypeVar
+
+from . import io_unsafe, locking, utils
+
+T = TypeVar("T")
+JSONSerializable = TypeVar("JSONSerializable", str, int, float, bool, None, list, dict)
+
+
+def type_cast(obj, as_type):
+	return obj if as_type is None else as_type(obj)
+
+
+class SessionBase:
+	in_session: bool
+	db_name: str
+	as_type: T
+
+	def __init__(self, db_name: str, as_type):
+		self.in_session = False
+		self.db_name = db_name
+		self.as_type = as_type
+
+	def __enter__(self):
+		self.in_session = True
+		self.data_handle = {}
+
+	def __exit__(self, type, value, tb):
+		write_lock = getattr(self, "write_lock", None)
+		if write_lock is not None:
+			if isinstance(write_lock, list):
+				for lock in write_lock:
+					lock._unlock()
+			else:
+				write_lock._unlock()
+		self.write_lock, self.in_session = None, False
+
+	def write(self):
+		if not self.in_session:
+			raise PermissionError("Only call write() inside a with statement.")
+
+
+@contextmanager
+def safe_context(super, self, *, db_names_to_lock=None):
+	"""
+	If an exception happens in the context, the __exit__ method of the passed super
+	class will be called.
+	"""
+	super.__enter__()
+	try:
+		if isinstance(db_names_to_lock, str):
+			self.write_lock = locking.WriteLock(self.db_name)
+			self.write_lock._lock()
+		elif isinstance(db_names_to_lock, list):
+			self.write_lock = [locking.WriteLock(x) for x in self.db_name]
+			for lock in self.write_lock:
+				lock._lock()
+		yield
+	except BaseException as e:
+		super.__exit__(type(e), e, e.__traceback__)
+		raise e
+
+
+########################################################################################
+#### File sessions
+########################################################################################
+
+
+class SessionFileFull(SessionBase, Generic[T]):
+	"""
+	Context manager for read-write access to a full file.
+
+	Efficiency:
+	Reads and writes the entire file.
+	"""
+
+	def __enter__(self) -> Tuple[SessionFileFull, JSONSerializable | T]:
+		with safe_context(super(), self, db_names_to_lock=self.db_name):
+			self.data_handle = io_unsafe.read(self.db_name)
+			return self, type_cast(self.data_handle, self.as_type)
+
+	def write(self):
+		super().write()
+		io_unsafe.write(self.db_name, self.data_handle)
+
+
+class SessionFileKey(SessionBase, Generic[T]):
+	"""
+	Context manager for read-write access to a single key-value item in a file.
+
+	Efficiency:
+	Uses partial reading, which allows only reading the bytes of the key-value item.
+	When writing, only the bytes of the key-value and the bytes of the file after
+	the key-value are written.
+	"""
+
+	def __init__(self, db_name: str, key: str, as_type: T):
+		super().__init__(db_name, as_type)
+		self.key = key
+
+	def __enter__(self) -> Tuple[SessionFileKey, JSONSerializable | T]:
+		with safe_context(super(), self, db_names_to_lock=self.db_name):
+			self.partial_handle = io_unsafe.get_partial_file_handle(self.db_name, self.key)
+			self.data_handle = self.partial_handle.partial_dict.value
+			return self, type_cast(self.data_handle, self.as_type)
+
+	def write(self):
+		super().write()
+		io_unsafe.partial_write(self.partial_handle)
+
+
+class SessionFileWhere(SessionBase, Generic[T]):
+	"""
+	Context manager for read-write access to selection of key-value items in a file.
+	The where callable is called with the key and value of each item in the file.
+
+	Efficiency:
+	Reads and writes the entire file, so it is not more efficient than
+	SessionFileFull.
+	"""
+
+	def __init__(self, db_name: str, where: Callable[[Any, Any], bool], as_type: T):
+		super().__init__(db_name, as_type)
+		self.where = where
+
+	def __enter__(self) -> Tuple[SessionFileWhere, JSONSerializable | T]:
+		with safe_context(super(), self, db_names_to_lock=self.db_name):
+			self.original_data = io_unsafe.read(self.db_name)
+			for k, v in self.original_data.items():
+				if self.where(k, v):
+					self.data_handle[k] = v
+			return self, type_cast(self.data_handle, self.as_type)
+
+	def write(self):
+		super().write()
+		self.original_data.update(self.data_handle)
+		io_unsafe.write(self.db_name, self.original_data)
+
+
+########################################################################################
+#### File sessions
+########################################################################################
+
+
+class SessionDirFull(SessionBase, Generic[T]):
+	"""
+	Context manager for read-write access to all files in a directory.
+	They are provided as a dict of {str(file_name): dict(file_content)}, where the
+	file name does not contain the directory name nor the file extension.
+
+	Efficiency:
+	Fully reads and writes all files.
+	"""
+
+	def __init__(self, db_name: str, as_type: T):
+		super().__init__(utils.find_all(db_name), as_type)
+
+	def __enter__(self) -> Tuple[SessionDirFull, JSONSerializable | T]:
+		with safe_context(super(), self, db_names_to_lock=self.db_name):
+			self.data_handle = {n.split("/")[-1]: io_unsafe.read(n) for n in self.db_name}
+			return self, type_cast(self.data_handle, self.as_type)
+
+	def write(self):
+		super().write()
+		for name in self.db_name:
+			io_unsafe.write(name, self.data_handle[name.split("/")[-1]])
+
+
+class SessionDirWhere(SessionBase, Generic[T]):
+	"""
+	Context manager for read-write access to selection of files in a directory.
+	The where callable is called with the file name and parsed content of each file.
+
+	Efficiency:
+	Fully reads all files, but only writes the selected files.
+	"""
+
+	def __init__(self, db_name: str, where: Callable[[Any, Any], bool], as_type: T):
+		super().__init__(utils.find_all(db_name), as_type)
+		self.where = where
+
+	def __enter__(self) -> Tuple[SessionDirWhere, JSONSerializable | T]:
+		with safe_context(super(), self):
+			selected_db_names, write_lock = [], []
+			for db_name in self.db_name:
+				lock = locking.WriteLock(db_name)
+				lock._lock()
+				k, v = db_name.split("/")[-1], io_unsafe.read(db_name)
+				if self.where(k, v):
+					self.data_handle[k] = v
+					write_lock.append(lock)
+					selected_db_names.append(db_name)
+				else:
+					lock._unlock()
+			self.write_lock = write_lock
+			self.db_name = selected_db_names
+			return self, type_cast(self.data_handle, self.as_type)
+
+	def write(self):
+		super().write()
+		for name in self.db_name:
+			io_unsafe.write(name, self.data_handle[name.split("/")[-1]])
+═══════════ dictdatabase/utils.py ═══════════
+from __future__ import annotations
+
+import glob
+import os
+from typing import Tuple
+
+from . import byte_codes, config
+
+
+def file_info(db_name: str) -> Tuple[str, bool, str, bool]:
+	"""
+	Returns a tuple of four elements, the first and third being the paths to the
+	JSON and DDB files, and the second and third being booleans indicating whether
+	those files exist:
+
+	>>> (json_path, json_exists, ddb_path, ddb_exists)
+
+	Args:
+	- `db_name`: The name of the database
+	"""
+	base = f"{config.storage_directory}/{db_name}"
+	j, d = f"{base}.json", f"{base}.ddb"
+	return j, os.path.exists(j), d, os.path.exists(d)
+
+
+def file_exists(db_name: str) -> bool:
+	"""
+	Returns True if the given database exists, either as a JSON or DDB file.
+
+	Args:
+	- `db_name`: The name of the database
+	"""
+	base = f"{config.storage_directory}/{db_name}"
+	j, d = f"{base}.json", f"{base}.ddb"
+	return os.path.exists(j) or os.path.exists(d)
+
+
+def find_all(file_name: str) -> list[str]:
+	"""
+	Returns a list of all the database names that match the given glob file_name.
+
+	Args:
+	- `file_name`: The glob file_name to search for
+	"""
+
+	files_all = glob.glob(f"{config.storage_directory}/{file_name}.ddb")
+	files_all += glob.glob(f"{config.storage_directory}/{file_name}.json")
+
+	for trim in [f"{config.storage_directory}/", ".ddb", ".json"]:
+		files_all = [d.replace(trim, "") for d in files_all]
+	return files_all
+
+
+def seek_index_through_value_bytes(json_bytes: bytes, index: int) -> int:
+	"""
+	Finds the index of the next comma or closing bracket/brace after the value
+	of a key-value pair in a bytes object containing valid JSON when decoded.
+
+	Args:
+	- `json_bytes`: A bytes object containing valid JSON when decoded
+	- `index`: The start index in json_bytes
+
+	Returns:
+	- The end index of the value.
+	"""
+
+	# TODO: Try to implement this using bytes.find() instead of a loop
+	# This make count_nesting a lot faster
+
+	# See https://www.json.org/json-en.html for the JSON syntax
+
+	list_depth, dict_depth, i, len_json_bytes = 0, 0, index, len(json_bytes)
+
+	while i < len_json_bytes:
+		current = json_bytes[i]
+		# If backslash, skip the next character
+		if current == byte_codes.BACKSLASH:
+			i += 1
+
+		# Assert: the current character is not escaped with a backslash
+
+		elif current == byte_codes.QUOTE:
+			while True:
+				i = json_bytes.find(byte_codes.QUOTE, i + 1)
+				if i == -1:
+					raise TypeError("Invalid JSON")
+
+				j = i - 1
+				backslash_count = 0
+				while j >= 0 and json_bytes[j] == byte_codes.BACKSLASH:
+					backslash_count += 1
+					j -= 1
+				if backslash_count % 2 == 0:
+					# If the number of backslashes is even, the quote is not escaped
+					break
+				# Else, the quote is escaped, and the loop continues
+
+			# Exit point where string ends and nesting is zero
+			if list_depth == 0 and dict_depth == 0:
+				return i + 1
+
+		# Invariant: Not in_str, not escaped
+
+		# Handle opening brackets
+		elif current == byte_codes.OPEN_SQUARE:
+			list_depth += 1
+		elif current == byte_codes.OPEN_CURLY:
+			dict_depth += 1
+		# Handle closing brackets
+		elif current == byte_codes.CLOSE_SQUARE:
+			list_depth -= 1
+			if list_depth == 0 and dict_depth <= 0:
+				return i + 1 + dict_depth  # dict_depth is -1 in case: {"a": {}}
+		elif current == byte_codes.CLOSE_CURLY:
+			dict_depth -= 1
+			if dict_depth <= 0 and list_depth == 0:
+				return i + 1 + dict_depth  # dict_depth is -1 in case: {"a": {}}
+		elif list_depth == 0:
+			if dict_depth == -1:
+				return i
+			if dict_depth == 0 and current in [byte_codes.COMMA, byte_codes.NEWLINE]:
+				# Handle commas and newline as exit points
+				return i
+		i += 1
+
+	raise TypeError("Invalid JSON")
+
+
+def count_nesting_in_bytes(json_bytes: bytes, start: int, end: int) -> int:
+	"""
+	Returns the number of nesting levels.
+	Considered bytes are from `start` inclusive to `end` exclusive.
+
+	The nesting is counted by the number of opening and closing brackets/braces
+	that are not in a string or escaped with a backslash.
+
+	Args:
+	- `json_bytes`: A bytes object containing valid JSON when decoded
+	"""
+	i, nesting = start, 0
+	# Find the number of opening curly braces
+	while (i := json_bytes.find(byte_codes.OPEN_CURLY, i, end)) != -1:
+		if i == 0 or json_bytes[i - 1] != byte_codes.BACKSLASH:
+			nesting += 1
+		i += 1
+	i = start
+	# Find the number of closing curly braces
+	while (i := json_bytes.find(byte_codes.CLOSE_CURLY, i, end)) != -1:
+		if i == 0 or json_bytes[i - 1] != byte_codes.BACKSLASH:
+			nesting -= 1
+		i += 1
+	return nesting
+
+
+def find_outermost_key_in_json_bytes(json_bytes: bytes, key: str) -> Tuple[int, int]:
+	"""
+	Returns the index of the key that is at the outermost nesting level. If the
+	key is not found, return -1. If the key you are looking for is `some_key`,
+	the function will search for `"some_key":` and return the start and end
+	index of that string that is at the outermost nesting level, or -1 if the
+	it is not found.
+
+	Args:
+	- `json_bytes`: A bytes object containing valid JSON when decoded
+	- `key`: The key of an key-value pair in `json_bytes` to search for,
+	represented as bytes.
+
+	Returns:
+	- A tuple of the key start (inclusive) and end (exclusive) index,
+	or `(-1, -1)` if the key is not found.
+	"""
+
+	# TODO: Very strict. the key must have a colon directly after it
+	# For example {"a": 1} will work, but {"a" : 1} will not work!
+
+	key = f'"{key}":'.encode()
+
+	if (curr_i := json_bytes.find(key, 0)) == -1:
+		return (-1, -1)
+
+	# Assert: Key was found and curr_i is the index of the first character of the key
+
+	# Keep track of all found keys and their nesting level
+	key_nest = [(curr_i, count_nesting_in_bytes(json_bytes, 0, curr_i))]
+
+	# As long as more keys are found, keep track of them and their nesting level
+	while (next_i := json_bytes.find(key, curr_i + len(key))) != -1:
+		nesting = count_nesting_in_bytes(json_bytes, curr_i + len(key), next_i)
+		key_nest.append((next_i, nesting))
+		curr_i = next_i
+
+	# Assert: all keys have been found, and their nesting relative to each other is
+	# stored in key_nest, whose length is at least 1.
+
+	# Early exit if there is only one key
+	if len(key_nest) == 1:
+		index, level = key_nest[0]
+		return (index, index + len(key)) if level == 1 else (-1, -1)
+
+	# Relative to total nesting
+	for i in range(1, len(key_nest)):
+		key_nest[i] = (key_nest[i][0], key_nest[i - 1][1] + key_nest[i][1])
+
+	# Filter out all keys that are not at the outermost nesting level
+	indices_at_index_one = [i for i, level in key_nest if level == 1]
+	if len(indices_at_index_one) != 1:
+		return (-1, -1)
+	return (indices_at_index_one[0], indices_at_index_one[0] + len(key))
+
+
+def detect_indentation_in_json_bytes(json_bytes: bytes, index: int) -> Tuple[int, str]:
+	"""
+	Count the amount of whitespace before the index to determine the indentation
+	level and whitespace used.
+
+	Args:
+	- `json_bytes`: A bytes object containing valid JSON when decoded
+	- `index`: The index behind which the indentation is to be determined
+
+	Returns:
+	- A tuple of the indentation level and the whitespace used
+	"""
+
+	indentation_bytes, contains_tab = bytes(), False
+	for i in range(index - 1, -1, -1):
+		if json_bytes[i] not in [byte_codes.SPACE, byte_codes.TAB]:
+			break
+		if json_bytes[i] == byte_codes.TAB:
+			contains_tab = True
+		indentation_bytes = indentation_bytes + bytes([json_bytes[i]])
+
+	if contains_tab:
+		return len(indentation_bytes), "\t"
+	if isinstance(config.indent, int) and config.indent > 0:
+		return len(indentation_bytes) // config.indent, " " * config.indent
+	if isinstance(config.indent, str):
+		return len(indentation_bytes) // 2, "  "
+	return 0, ""

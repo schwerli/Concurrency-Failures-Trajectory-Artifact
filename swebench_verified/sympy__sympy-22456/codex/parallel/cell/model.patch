@@ -1,0 +1,82 @@
+diff --git a/sympy/codegen/ast.py b/sympy/codegen/ast.py
+index a02714b174..7fa580cc39 100644
+--- a/sympy/codegen/ast.py
++++ b/sympy/codegen/ast.py
+@@ -135,6 +135,7 @@
+ from sympy.core.basic import Basic
+ from sympy.core.expr import Expr
+ from sympy.core.numbers import Float, Integer, oo
++from sympy.core.symbol import Str
+ from sympy.core.sympify import _sympify, sympify, SympifyError
+ from sympy.utilities.iterables import (iterable, topological_sort,
+                                        numbered_symbols, filter_symbols)
+@@ -895,14 +896,23 @@ class String(Token):
+ 
+     """
+     __slots__ = ('text',)
+-    not_in_args = ['text']
+     is_Atom = True
+ 
++    def __new__(cls, *args, **kwargs):
++        obj = Token.__new__(cls, *args, **kwargs)
++        if isinstance(obj.text, Str):
++            # Keep a SymPy string atom in .args while preserving the public
++            # .text attribute as a plain Python string.
++            obj.text = obj.text.name
++        return obj
++
+     @classmethod
+     def _construct_text(cls, text):
++        if isinstance(text, Str):
++            return text
+         if not isinstance(text, str):
+             raise TypeError("Argument text is not a string type.")
+-        return text
++        return Str(text)
+ 
+     def _sympystr(self, printer, *args, **kwargs):
+         return self.text
+diff --git a/sympy/codegen/tests/test_ast.py b/sympy/codegen/tests/test_ast.py
+index 00c5d4cf28..bd6f6f34bf 100644
+--- a/sympy/codegen/tests/test_ast.py
++++ b/sympy/codegen/tests/test_ast.py
+@@ -2,7 +2,7 @@
+ from sympy.core.containers import Tuple
+ from sympy.core.numbers import nan, oo, Float, Integer
+ from sympy.core.relational import Lt
+-from sympy.core.symbol import symbols, Symbol
++from sympy.core.symbol import symbols, Symbol, Str
+ from sympy.functions.elementary.trigonometric import sin
+ from sympy.matrices.dense import Matrix
+ from sympy.matrices.expressions.matexpr import MatrixSymbol
+@@ -265,7 +265,9 @@ def test_String():
+     st = String('foobar')
+     assert st.is_Atom
+     assert st == String('foobar')
++    assert st.args == (Str('foobar'),)
+     assert st.text == 'foobar'
++    assert st.func(*st.args) == st
+     assert st.func(**st.kwargs()) == st
+ 
+ 
+@@ -275,6 +277,7 @@ class Signifier(String):
+     si = Signifier('foobar')
+     assert si != st
+     assert si.text == st.text
++    assert si.func(*si.args) == si
+     s = String('foo')
+     assert str(s) == 'foo'
+     assert repr(s) == "String('foo')"
+diff --git a/sympy/codegen/tests/test_cnodes.py b/sympy/codegen/tests/test_cnodes.py
+index f0578d66e8..3633eb37fb 100644
+--- a/sympy/codegen/tests/test_cnodes.py
++++ b/sympy/codegen/tests/test_cnodes.py
+@@ -78,7 +78,7 @@ def test_sizeof():
+     assert ccode(sz) == 'sizeof(%s)' % typename
+     assert sz.func(*sz.args) == sz
+     assert not sz.is_Atom
+-    assert sz.atoms() == {String('unsigned int'), String('sizeof')}
++    assert sz.atoms(String) == {String('unsigned int'), String('sizeof')}
+ 
+ 
+ def test_struct():

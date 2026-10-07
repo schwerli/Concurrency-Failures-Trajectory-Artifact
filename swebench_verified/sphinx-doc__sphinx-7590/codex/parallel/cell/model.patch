@@ -1,0 +1,169 @@
+diff --git a/sphinx/domains/cpp.py b/sphinx/domains/cpp.py
+index fe52d881d..85eb86cf2 100644
+--- a/sphinx/domains/cpp.py
++++ b/sphinx/domains/cpp.py
+@@ -35,6 +35,7 @@ from sphinx.util.cfamily import (
+     BaseParser, DefinitionError, UnsupportedMultiCharacterCharLiteral,
+     identifier_re, anon_identifier_re, integer_literal_re, octal_literal_re,
+     hex_literal_re, binary_literal_re, float_literal_re,
++    user_defined_literal_suffix_re,
+     char_literal_re
+ )
+ from sphinx.util.docfields import Field, GroupedField
+@@ -296,7 +297,7 @@ T = TypeVar('T')
+             nested-name
+ """
+ 
+-_string_re = re.compile(r"[LuU8]?('([^'\\]*(?:\\.[^'\\]*)*)'"
++_string_re = re.compile(r"(?:u8|[LuU])?('([^'\\]*(?:\\.[^'\\]*)*)'"
+                         r'|"([^"\\]*(?:\\.[^"\\]*)*)")', re.S)
+ _visibility_re = re.compile(r'\b(public|private|protected)\b')
+ _operator_re = re.compile(r'''(?x)
+@@ -855,6 +856,23 @@ class ASTStringLiteral(ASTLiteral):
+         signode.append(nodes.Text(txt, txt))
+ 
+ 
++class ASTUserDefinedLiteral(ASTLiteral):
++    def __init__(self, literal: str, suffix: ASTIdentifier) -> None:
++        self.literal = literal
++        self.suffix = suffix
++
++    def _stringify(self, transform: StringifyTransform) -> str:
++        return self.literal + transform(self.suffix)
++
++    def get_id(self, version: int) -> str:
++        return str(self)
++
++    def describe_signature(self, signode: TextElement, mode: str,
++                           env: "BuildEnvironment", symbol: "Symbol") -> None:
++        txt = str(self)
++        signode.append(nodes.Text(txt, txt))
++
++
+ class ASTCharLiteral(ASTLiteral):
+     def __init__(self, prefix: str, data: str) -> None:
+         self.prefix = prefix  # may be None when no prefix
+@@ -4625,9 +4643,16 @@ class DefinitionParser(BaseParser):
+         return self.config.cpp_paren_attributes
+ 
+     def _parse_string(self) -> str:
+-        if self.current_char != '"':
+-            return None
+         startPos = self.pos
++        if self.current_char != '"':
++            for prefix in ('u8', 'u', 'U', 'L'):
++                nextPos = self.pos + len(prefix)
++                if (self.definition.startswith(prefix, self.pos)
++                        and self.definition[nextPos:nextPos + 1] == '"'):
++                    self.pos = nextPos
++                    break
++            else:
++                return None
+         self.pos += 1
+         escape = False
+         while True:
+@@ -4643,6 +4668,11 @@ class DefinitionParser(BaseParser):
+             self.pos += 1
+         return self.definition[startPos:self.pos]
+ 
++    def _parse_user_defined_literal_suffix(self) -> ASTIdentifier:
++        if not self.match(user_defined_literal_suffix_re):
++            return None
++        return ASTIdentifier(self.matched_text)
++
+     def _parse_literal(self) -> ASTLiteral:
+         # -> integer-literal
+         #  | character-literal
+@@ -4664,14 +4694,25 @@ class DefinitionParser(BaseParser):
+             if self.match(regex):
+                 while self.current_char in 'uUlLfF':
+                     self.pos += 1
+-                return ASTNumberLiteral(self.definition[pos:self.pos])
++                literal = self.definition[pos:self.pos]
++                suffix = self._parse_user_defined_literal_suffix()
++                if suffix is not None:
++                    return ASTUserDefinedLiteral(literal, suffix)
++                return ASTNumberLiteral(literal)
+ 
+         string = self._parse_string()
+         if string is not None:
++            suffix = self._parse_user_defined_literal_suffix()
++            if suffix is not None:
++                return ASTUserDefinedLiteral(string, suffix)
+             return ASTStringLiteral(string)
+ 
+         # character-literal
+         if self.match(char_literal_re):
++            literal = self.matched_text
++            suffix = self._parse_user_defined_literal_suffix()
++            if suffix is not None:
++                return ASTUserDefinedLiteral(literal, suffix)
+             prefix = self.last_match.group(1)  # may be None when no prefix
+             data = self.last_match.group(2)
+             try:
+@@ -4681,8 +4722,6 @@ class DefinitionParser(BaseParser):
+             except UnsupportedMultiCharacterCharLiteral:
+                 self.fail("Can not handle character literal"
+                           " resulting in multiple decoded characters.")
+-
+-        # TODO: user-defined lit
+         return None
+ 
+     def _parse_fold_or_paren_expression(self) -> ASTExpression:
+@@ -5283,7 +5322,7 @@ class DefinitionParser(BaseParser):
+         # user-defined literal?
+         if self.skip_string('""'):
+             self.skip_ws()
+-            if not self.match(identifier_re):
++            if not self.match(user_defined_literal_suffix_re):
+                 self.fail("Expected user-defined literal suffix.")
+             identifier = ASTIdentifier(self.matched_text)
+             return ASTOperatorLiteral(identifier)
+diff --git a/sphinx/util/cfamily.py b/sphinx/util/cfamily.py
+index 790a492a5..b7b25db97 100644
+--- a/sphinx/util/cfamily.py
++++ b/sphinx/util/cfamily.py
+@@ -37,6 +37,9 @@ identifier_re = re.compile(r'''(?x)
+     )
+     [a-zA-Z0-9_]*\b
+ ''')
++user_defined_literal_suffix_re = re.compile(r'''
++    [a-zA-Z_][a-zA-Z0-9_]*\b
++''', re.X)
+ integer_literal_re = re.compile(r'[1-9][0-9]*')
+ octal_literal_re = re.compile(r'0[0-7]*')
+ hex_literal_re = re.compile(r'0[xX][0-9a-fA-F][0-9a-fA-F]*')
+diff --git a/tests/test_domain_cpp.py b/tests/test_domain_cpp.py
+index 9db741ae5..4cda5796f 100644
+--- a/tests/test_domain_cpp.py
++++ b/tests/test_domain_cpp.py
+@@ -176,7 +176,10 @@ def test_expressions():
+         exprCheck(p + "'\\U0001f34c'", t + "127820")
+         exprCheck(p + "'\\U0001F34C'", t + "127820")
+ 
+-    # TODO: user-defined lit
++    exprCheck('1q_s', '1q_s')
++    exprCheck('6.62607015e-34q_J', '6.62607015e-34q_J')
++    exprCheck("'a'_c", "'a'_c")
++    exprCheck('u8"abc"_s', 'u8"abc"_s')
+     exprCheck('(... + Ns)', '(... + Ns)', id4='flpl2Ns')
+     exprCheck('(Ns + ...)', '(Ns + ...)', id4='frpl2Ns')
+     exprCheck('(Ns + ... + 0)', '(Ns + ... + 0)', id4='fLpl2NsL0E')
+@@ -561,6 +564,7 @@ def test_operators():
+     check('function', 'void operator delete[]()', {1: "delete-array-operator", 2: "dav"})
+     check('function', 'operator bool() const', {1: "castto-b-operatorC", 2: "NKcvbEv"})
+     check('function', 'void operator""_udl()', {2: 'li4_udlv'})
++    check('function', 'void operator""q_J()', {2: 'li3q_Jv'})
+ 
+     check('function', 'void operator~()', {1: "inv-operator", 2: "cov"})
+     check('function', 'void operator compl()', {2: "cov"})
+@@ -808,6 +812,9 @@ def test_initializers():
+     check('member', 'T v{42, 42, args...}', idsMember)
+     # other
+     check('member', 'T v = T{}', idsMember)
++    check('member',
++          'constexpr auto units::si::planck_constant = 6.62607015e-34q_J * 1q_s',
++          {1: 'planck_constant__auto', 2: '16planck_constant'})
+ 
+ 
+ def test_attributes():

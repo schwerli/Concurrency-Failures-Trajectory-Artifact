@@ -1,0 +1,115 @@
+diff --git a/xarray/core/indexing.py b/xarray/core/indexing.py
+index e262d9ee..2324ab75 100644
+--- a/xarray/core/indexing.py
++++ b/xarray/core/indexing.py
+@@ -1305,3 +1305,14 @@ class PandasIndexAdapter(ExplicitlyIndexedNDArrayMixin):
+     def __repr__(self):
+         return ('%s(array=%r, dtype=%r)'
+                 % (type(self).__name__, self.array, self.dtype))
++
++    def copy(self, deep=True):
++        # Not the same as just writing `self.array.copy(deep=deep)`, as
++        # shallow copies of the underlying numpy.ndarrays become deep ones
++        # upon pickling
++        # >>> len(pickle.dumps((self.array, self.array)))
++        # 4000281
++        # >>> len(pickle.dumps((self.array, self.array.copy(deep=False))))
++        # 8000341
++        array = self.array.copy(deep=True) if deep else self.array
++        return PandasIndexAdapter(array, self._dtype)
+diff --git a/xarray/core/variable.py b/xarray/core/variable.py
+index 379be8f5..4f629416 100644
+--- a/xarray/core/variable.py
++++ b/xarray/core/variable.py
+@@ -1944,10 +1944,10 @@ class IndexVariable(Variable):
+         if data is None:
+             if deep:
+                 # self._data should be a `PandasIndexAdapter` instance at this
+-                # point, which doesn't have a copy method, so make a deep copy
+-                # of the underlying `pandas.MultiIndex` and create a new
+-                # `PandasIndexAdapter` instance with it.
+-                data = PandasIndexAdapter(self._data.array.copy(deep=True))
++                # point, so make a deep copy of the underlying `pandas.Index`.
++                # Its `copy` method preserves the dtype cached on the adapter,
++                # which pandas would otherwise widen (e.g. '<U3' -> object).
++                data = self._data.copy(deep=True)
+             else:
+                 data = self._data
+         else:
+diff --git a/xarray/tests/test_dataarray.py b/xarray/tests/test_dataarray.py
+index 5697704b..8180b3b9 100644
+--- a/xarray/tests/test_dataarray.py
++++ b/xarray/tests/test_dataarray.py
+@@ -3480,6 +3480,19 @@ class TestDataArray:
+ 
+         assert_identical(da['a'], expected_orig)
+ 
++    @pytest.mark.parametrize('deep', [True, False])
++    def test_copy_index_dtype(self, deep):
++        # regression test for GH2933: copying a DataArray used to cast unicode
++        # indexes to object
++        da = DataArray([1], dims='x',
++                       coords={'x': ['foo'], 'y': ('x', ['bar'])})
++        assert da.x.dtype == np.dtype('<U3')
++
++        for copied in [da.copy(deep=deep), deepcopy(da)]:
++            assert_identical(da, copied)
++            assert copied.x.dtype == da.x.dtype
++            assert copied.y.dtype == da.y.dtype
++
+     def test_real_and_imag(self):
+         array = DataArray(1 + 2j)
+         assert_identical(array.real, DataArray(1))
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index fc6f7f36..eeacc414 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -2107,6 +2107,19 @@ class TestDataset:
+ 
+         assert_identical(ds.coords['a'], expected_orig)
+ 
++    @pytest.mark.parametrize('deep', [True, False])
++    def test_copy_index_dtype(self, deep):
++        # regression test for GH2933: deep-copying a Dataset used to cast
++        # unicode indexes to object
++        ds = Dataset(coords={'x': ['foo'], 'y': ('x', ['bar'])},
++                     data_vars={'z': ('x', ['baz'])})
++        assert ds.x.dtype == np.dtype('<U3')
++
++        for copied in [ds.copy(deep=deep), copy(ds), deepcopy(ds)]:
++            assert_identical(ds, copied)
++            for k, v in ds.variables.items():
++                assert copied.variables[k].dtype == v.dtype
++
+     def test_copy_with_data_errors(self):
+         orig = create_test_data()
+         new_var1 = np.arange(orig['var1'].size).reshape(orig['var1'].shape)
+diff --git a/xarray/tests/test_variable.py b/xarray/tests/test_variable.py
+index 73d2a40b..c6a13757 100644
+--- a/xarray/tests/test_variable.py
++++ b/xarray/tests/test_variable.py
+@@ -502,6 +502,24 @@ class VariableSubclassobjects:
+             assert isinstance(w.to_index(), pd.MultiIndex)
+             assert_array_equal(v._data.array, w._data.array)
+ 
++    @pytest.mark.parametrize('deep', [True, False])
++    @pytest.mark.parametrize('values', [
++        np.array(['a', 'bc', 'def'], dtype=object),
++        np.array(['a', 'bc', 'def']),
++        np.array([b'a', b'bc', b'def']),
++        np.arange(3, dtype='int32'),
++        np.arange(3, dtype='float32'),
++        np.array(['2000-01-01', '2000-01-02', '2000-01-03'],
++                 dtype='datetime64[ns]'),
++    ])
++    def test_copy_dtype(self, deep, values):
++        # regression test for GH2933: copy() used to widen the dtype cached on
++        # an IndexVariable, e.g. '<U3' became object
++        v = self.cls('x', values)
++        w = v.copy(deep=deep)
++        assert v.dtype == w.dtype
++        assert_array_equal(v.values, w.values)
++
+     def test_copy_with_data(self):
+         orig = Variable(('x', 'y'), [[1.5, 2.0], [3.1, 4.3]], {'foo': 'bar'})
+         new_data = np.array([[2.5, 5.0], [7.1, 43]])

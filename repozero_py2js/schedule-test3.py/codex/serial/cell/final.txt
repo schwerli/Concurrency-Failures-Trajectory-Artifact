@@ -1,0 +1,318 @@
+Saved under `/output`. Library files first, then the entry file.
+
+[lib/path-utils.mjs](/output/lib/path-utils.mjs)
+```js
+export function basename(pathValue) {
+  if (pathValue === undefined || pathValue === null) {
+    return '';
+  }
+
+  const pathText = String(pathValue);
+  let end = pathText.length;
+
+  while (end > 0) {
+    const char = pathText[end - 1];
+    if (char !== '/' && char !== '\\') {
+      break;
+    }
+    end -= 1;
+  }
+
+  if (end === 0) {
+    return '';
+  }
+
+  let start = end - 1;
+
+  while (start >= 0) {
+    const char = pathText[start];
+    if (char === '/' || char === '\\') {
+      break;
+    }
+    start -= 1;
+  }
+
+  return pathText.slice(start + 1, end);
+}
+```
+
+[lib/cli/test3-args.mjs](/output/lib/cli/test3-args.mjs)
+```js
+import { basename } from '../path-utils.mjs';
+
+const LONG_OPTIONS = ['--help', '--a', '--b'];
+const NEGATIVE_NUMBER_PATTERN = /^-\d+$|^-\d*\.\d+$/;
+
+function getProgramName(processArgv) {
+  const scriptPath = processArgv.length > 1 ? processArgv[1] : '';
+  return basename(scriptPath) || 'test3.mjs';
+}
+
+function formatUsage(programName) {
+  return `usage: ${programName} [-h] --a A --b B`;
+}
+
+function formatHelp(programName) {
+  return `${formatUsage(programName)}\n\noptions:\n  -h, --help  show this help message and exit\n  --a A\n  --b B\n`;
+}
+
+function formatError(programName, message) {
+  return `${formatUsage(programName)}\n${programName}: error: ${message}\n`;
+}
+
+function pythonStringRepr(value) {
+  const text = String(value);
+  const quote = text.includes('\'') && !text.includes('"') ? '"' : '\'';
+
+  let escaped = '';
+
+  for (const char of text) {
+    if (char === '\\') {
+      escaped += '\\\\';
+    } else if (char === '\n') {
+      escaped += '\\n';
+    } else if (char === '\r') {
+      escaped += '\\r';
+    } else if (char === '\t') {
+      escaped += '\\t';
+    } else if (char === quote) {
+      escaped += `\\${quote}`;
+    } else {
+      escaped += char;
+    }
+  }
+
+  return `${quote}${escaped}${quote}`;
+}
+
+function resolveLongOption(name) {
+  if (name === '--') {
+    return null;
+  }
+
+  if (LONG_OPTIONS.includes(name)) {
+    return name;
+  }
+
+  const matches = LONG_OPTIONS.filter((option) => option.startsWith(name));
+
+  if (matches.length === 1) {
+    return matches[0];
+  }
+
+  return null;
+}
+
+function parseOptionToken(token) {
+  if (token === '-h') {
+    return { name: '--help', hasInlineValue: false, inlineValue: '' };
+  }
+
+  if (!token.startsWith('--')) {
+    return null;
+  }
+
+  const equalsIndex = token.indexOf('=');
+  const rawName = equalsIndex === -1 ? token : token.slice(0, equalsIndex);
+  const name = resolveLongOption(rawName);
+
+  if (name === null) {
+    return null;
+  }
+
+  return {
+    name,
+    hasInlineValue: equalsIndex !== -1,
+    inlineValue: equalsIndex === -1 ? '' : token.slice(equalsIndex + 1),
+  };
+}
+
+function acceptsSeparatedValue(nextToken) {
+  if (nextToken === undefined) {
+    return false;
+  }
+
+  if (!nextToken.startsWith('-')) {
+    return true;
+  }
+
+  return NEGATIVE_NUMBER_PATTERN.test(nextToken);
+}
+
+function parsePythonInt(value) {
+  const trimmedValue = String(value).trim();
+
+  if (!/^[+-]?(?:\d+(?:_\d+)*)$/.test(trimmedValue)) {
+    return null;
+  }
+
+  try {
+    return BigInt(trimmedValue.replace(/_/g, ''));
+  } catch {
+    return null;
+  }
+}
+
+export function parseTest3CommandLine(processArgv) {
+  const programName = getProgramName(processArgv);
+  const argv = processArgv.slice(2);
+  let aValue;
+  let bValue;
+  const extras = [];
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    const option = parseOptionToken(token);
+
+    if (option === null) {
+      extras.push(token);
+      continue;
+    }
+
+    if (option.name === '--help') {
+      if (option.hasInlineValue) {
+        return {
+          kind: 'error',
+          exitCode: 2,
+          output: formatError(
+            programName,
+            `argument -h/--help: ignored explicit argument ${pythonStringRepr(option.inlineValue)}`,
+          ),
+        };
+      }
+
+      return {
+        kind: 'help',
+        exitCode: 0,
+        output: formatHelp(programName),
+      };
+    }
+
+    let rawValue = option.inlineValue;
+
+    if (!option.hasInlineValue) {
+      const nextToken = argv[index + 1];
+
+      if (!acceptsSeparatedValue(nextToken)) {
+        return {
+          kind: 'error',
+          exitCode: 2,
+          output: formatError(programName, `argument ${option.name}: expected one argument`),
+        };
+      }
+
+      rawValue = nextToken;
+      index += 1;
+    }
+
+    if (option.name === '--a') {
+      const parsedInt = parsePythonInt(rawValue);
+
+      if (parsedInt === null) {
+        return {
+          kind: 'error',
+          exitCode: 2,
+          output: formatError(
+            programName,
+            `argument --a: invalid int value: ${pythonStringRepr(rawValue)}`,
+          ),
+        };
+      }
+
+      aValue = parsedInt;
+      continue;
+    }
+
+    bValue = rawValue;
+  }
+
+  const missing = [];
+
+  if (aValue === undefined) {
+    missing.push('--a');
+  }
+
+  if (bValue === undefined) {
+    missing.push('--b');
+  }
+
+  if (missing.length > 0) {
+    return {
+      kind: 'error',
+      exitCode: 2,
+      output: formatError(
+        programName,
+        `the following arguments are required: ${missing.join(', ')}`,
+      ),
+    };
+  }
+
+  if (extras.length > 0) {
+    return {
+      kind: 'error',
+      exitCode: 2,
+      output: formatError(programName, `unrecognized arguments: ${extras.join(' ')}`),
+    };
+  }
+
+  return {
+    kind: 'ok',
+    exitCode: 0,
+    args: {
+      a: aValue,
+      b: bValue,
+    },
+  };
+}
+```
+
+[lib/schedule/job.mjs](/output/lib/schedule/job.mjs)
+```js
+export class Job {
+  constructor(interval, unit) {
+    this.interval = interval;
+    this.unit = unit;
+  }
+}
+
+export class EveryBuilder {
+  constructor(interval) {
+    this.interval = interval;
+  }
+
+  get minutes() {
+    return new Job(this.interval, 'minutes');
+  }
+}
+```
+
+[lib/schedule/index.mjs](/output/lib/schedule/index.mjs)
+```js
+import { EveryBuilder, Job } from './job.mjs';
+
+export function every(interval) {
+  return new EveryBuilder(interval);
+}
+
+export { EveryBuilder, Job };
+```
+
+[test3.mjs](/output/test3.mjs)
+```js
+import { parseTest3CommandLine } from './lib/cli/test3-args.mjs';
+import { every } from './lib/schedule/index.mjs';
+
+const result = parseTest3CommandLine(process.argv);
+
+if (result.kind === 'help') {
+  process.stdout.write(result.output);
+} else if (result.kind === 'error') {
+  process.stderr.write(result.output);
+  process.exitCode = result.exitCode;
+} else {
+  const job = every(result.args.a).minutes;
+  process.stdout.write(`${String(job.interval)}\n`);
+}
+```
+
+Verified against `/workspace/dataset/test3_executable` across success, help, missing-arg, invalid-int, repeated-flag, unknown-arg, `--opt=value`, and negative-number cases.

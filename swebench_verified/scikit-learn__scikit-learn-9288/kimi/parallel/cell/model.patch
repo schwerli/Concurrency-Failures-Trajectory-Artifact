@@ -1,0 +1,69 @@
+diff --git a/doc/whats_new/v0.22.rst b/doc/whats_new/v0.22.rst
+index 7be27894a..719059cf4 100644
+--- a/doc/whats_new/v0.22.rst
++++ b/doc/whats_new/v0.22.rst
+@@ -283,6 +283,11 @@ Changelog
+   match `spectral_clustering`.
+   :pr:`13726` by :user:`Shuzhe Xiao <fdas3213>`.
+ 
++- |Fix| Fixed a bug in :class:`cluster.KMeans` where results depended on
++  ``n_jobs`` when ``random_state`` was set because seeds for the different
++  ``n_init`` runs were drawn differently in the sequential and parallel code
++  paths. :issue:`9288` by :user:`Jane Doe <janedoe>`.
++
+ :mod:`sklearn.feature_selection`
+ ................................
+ 
+diff --git a/sklearn/cluster/k_means_.py b/sklearn/cluster/k_means_.py
+index b7fbdf7da..040819227 100644
+--- a/sklearn/cluster/k_means_.py
++++ b/sklearn/cluster/k_means_.py
+@@ -360,6 +360,7 @@ def k_means(X, n_clusters, sample_weight=None, init='k-means++',
+     else:
+         raise ValueError("Algorithm must be 'auto', 'full' or 'elkan', got"
+                          " %s" % str(algorithm))
++    seeds = random_state.randint(np.iinfo(np.int32).max, size=n_init)
+     if effective_n_jobs(n_jobs) == 1:
+         # For a single thread, less memory is needed if we just store one set
+         # of the best results (as opposed to one set per run per thread).
+@@ -369,7 +370,8 @@ def k_means(X, n_clusters, sample_weight=None, init='k-means++',
+                 X, sample_weight, n_clusters, max_iter=max_iter, init=init,
+                 verbose=verbose, precompute_distances=precompute_distances,
+                 tol=tol, x_squared_norms=x_squared_norms,
+-                random_state=random_state)
++                # Change seed to ensure variety
++                random_state=seeds[it])
+             # determine if these results are the best so far
+             if best_inertia is None or inertia < best_inertia:
+                 best_labels = labels.copy()
+@@ -378,7 +380,6 @@ def k_means(X, n_clusters, sample_weight=None, init='k-means++',
+                 best_n_iter = n_iter_
+     else:
+         # parallelisation of k-means runs
+-        seeds = random_state.randint(np.iinfo(np.int32).max, size=n_init)
+         results = Parallel(n_jobs=n_jobs, verbose=0)(
+             delayed(kmeans_single)(X, sample_weight, n_clusters,
+                                    max_iter=max_iter, init=init,
+diff --git a/sklearn/cluster/tests/test_k_means.py b/sklearn/cluster/tests/test_k_means.py
+index 362b0a914..512d9b5d1 100644
+--- a/sklearn/cluster/tests/test_k_means.py
++++ b/sklearn/cluster/tests/test_k_means.py
+@@ -315,6 +315,18 @@ def test_k_means_fortran_aligned_data():
+     assert_array_equal(km.labels_, labels)
+ 
+ 
++def test_k_means_n_jobs():
++    # Check that the results are the same with n_jobs=1 and n_jobs>1
++    # Non-regression test for issue #9288
++    X, _ = make_blobs(n_samples=1000, centers=10, random_state=0)
++
++    km_1 = KMeans(n_clusters=10, random_state=0, n_jobs=1).fit(X)
++    km_2 = KMeans(n_clusters=10, random_state=0, n_jobs=2).fit(X)
++
++    assert_allclose(km_1.inertia_, km_2.inertia_)
++    assert_array_almost_equal(km_1.cluster_centers_, km_2.cluster_centers_)
++
++
+ @pytest.mark.parametrize('algo', ['full', 'elkan'])
+ @pytest.mark.parametrize('dtype', [np.float32, np.float64])
+ @pytest.mark.parametrize('constructor', [np.asarray, sp.csr_matrix])

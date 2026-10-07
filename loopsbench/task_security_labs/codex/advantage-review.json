@@ -1,0 +1,160 @@
+{
+  "schema_version": 2,
+  "phase": "fixed",
+  "pair_id": "loopsbench/task_security_labs/codex",
+  "task": {
+    "plain_summary_zh": "该任务要求在同一个安全实验代码库中完成 25 个单元，覆盖可打印编码、MessagePack 编解码、ECDSA/WEP 攻击、Python 逃逸、WebAssembly SHA-256 包装器以及 Merkle 树存储、客户端和攻击逻辑。",
+    "acceptance_target_zh": "交付目标是每个需求 slug 都有非空 diff，并让官方测试套件全部通过，包括隐藏的 ECDSA nonce reuse 正确私钥恢复测试。"
+  },
+  "modes": {
+    "parallel": {
+      "solution_passed": true,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 1337.369
+    },
+    "serial": {
+      "solution_passed": false,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 1261.233
+    }
+  },
+  "reconstruction": {
+    "parallel_strategy_zh": "并行 run 中父上下文先做全局调查和小模块提交，然后同时派出 Merkle、sandbox/escape、fuzz/crypto 三个子上下文；部分子上下文直接在共享分支提交代码，父上下文随后用可见 grader 和补丁检查接管、纠错并完成剩余需求。",
+    "serial_strategy_zh": "串行 run 是单一模型上下文按模块顺序调查、实现、测试和提交。它也完成了 25 个 diff、通过了可见 grader，并正常结束，但最终 ECDSA nonce reuse 实现只针对可见 grader 的 NIST192p 默认曲线。",
+    "realized_parallelism_zh": "父上下文在 04:42:07 派出三个子上下文，fuzz/crypto 子上下文在父上下文继续实现时返回指导，Merkle 和 sandbox/escape 子上下文仍运行到 04:51 后被中断；这不是单上下文的并行 shell，而是真实重叠的模型上下文工作。",
+    "parallel_workers": 4,
+    "peak_overlapping_useful_workers": 4
+  },
+  "baseline_audit": {
+    "same_task_and_prompt": true,
+    "serial_run_valid": true,
+    "parallel_run_valid": true,
+    "external_or_harness_issues_zh": [
+      "并行 agent 进程有 timeout/returncode 标记，但 cell/status 的官方 evaluation.failure_mode 为 none，测试完成且 solution_passed 为 true；该标记没有造成评估不可比。"
+    ]
+  },
+  "decision": "retain",
+  "exclusion_code": null,
+  "decision_reason_zh": "保留。并行官方通过而串行官方只在 ECDSA nonce reuse 隐藏正确私钥测试失败；串行没有外部故障，也不是被取消或评估失败。关键链条是并行子上下文先给出并留下 NIST256 取向的 ECDSA 解法，父上下文独立运行 grader 后发现可见环境实际需要 NIST192p，随后把实现改成按签名分量选择曲线阶，从而同时覆盖可见 NIST192p 和隐藏 NIST256p。串行单路径也发现可见 NIST192p，但最终硬编码 NIST192p，导致隐藏 NIST256p 失败。",
+  "advantage": {
+    "proposed_dimension_zh": "独立校验与纠错",
+    "secondary_mechanism_zh": null,
+    "benefit_kind": "quality",
+    "measured_benefit_zh": "并行官方评估通过任务，串行官方评估失败；具体差异是串行在 `test_ecdsa_problem_2b_correct_key` 上恢复出错误私钥，而并行对应测试通过。并行 wall time 更长，因此不是时间优势。",
+    "parallel_action_zh": "并行中 fuzz/crypto 子上下文和 shared-worktree 子上下文提供了 NIST256 取向的 nonce reuse 解法，父上下文随后用 ECDSA grader 检查该解法，发现曲线阶问题，并把代码修成从 NIST192p 到 NIST521p 的候选阶选择。",
+    "serial_contrast_zh": "串行只有一个上下文；它先因 NIST256 硬编码在可见 grader 中失败，探测到 grader 默认曲线是 NIST192p 后把 `n` 设为 NIST192p.order，虽然本地 grader 通过，但没有保留 P256 隐藏用例所需的曲线阶泛化。",
+    "mechanism_link_zh": "质量收益来自“已有并发解法路径被父上下文独立验证并纠错”的链条，而不是子任务数量本身。父上下文没有简单采纳子输出：它先看到 ECDSA 失败，再把 NIST256-only 实现改为多阶选择；这个修正正好解释串行隐藏 NIST256 测试失败而并行通过。"
+  },
+  "new_pattern_candidate": {
+    "is_candidate": false,
+    "name_zh": null,
+    "mechanism_zh": null,
+    "why_existing_dimensions_fail_zh": null
+  },
+  "evidence": {
+    "parallel": [
+      {
+        "path": "parallel/agent/codex/round-01/sessions/2026/08/13/rollout-2026-08-13T04-41-11-019ff96c-976f-7fe3-a363-10862be7584e.jsonl",
+        "line": 153,
+        "summary_zh": "父上下文说明要把 Merkle、sandbox/escape、crypto/fuzz 分给并行分析任务。"
+      },
+      {
+        "path": "parallel/agent/codex/round-01/sessions/2026/08/13/rollout-2026-08-13T04-41-11-019ff96c-976f-7fe3-a363-10862be7584e.jsonl",
+        "line": 160,
+        "summary_zh": "fuzz/crypto 子上下文在 04:42:07 启动，和父上下文及其他子上下文形成真实重叠。"
+      },
+      {
+        "path": "parallel/agent/codex/round-01/sessions/2026/08/13/rollout-2026-08-13T04-42-07-019ff96d-72fb-7821-8932-48a02d27d2b8.jsonl",
+        "line": 155,
+        "summary_zh": "fuzz/crypto 子上下文的最终指导明确建议 problem_2b 使用 NIST256p.order，并给出 nonce reuse 公式。"
+      },
+      {
+        "path": "parallel/agent/codex/round-01/sessions/2026/08/13/rollout-2026-08-13T04-42-07-019ff96d-7274-73c3-9e5c-e6df9f28e122.jsonl",
+        "line": 304,
+        "summary_zh": "另一个并行子上下文提交了 ECDSA nonce reuse 改动，形成父上下文后续验证和纠错的共享工作树候选。"
+      },
+      {
+        "path": "parallel/agent/codex/round-01/sessions/2026/08/13/rollout-2026-08-13T04-41-11-019ff96c-976f-7fe3-a363-10862be7584e.jsonl",
+        "line": 602,
+        "summary_zh": "父上下文运行 ECDSA grader，看到 nonce reuse 仍失败，说明它没有盲目采纳子工作。"
+      },
+      {
+        "path": "parallel/agent/codex/round-01/sessions/2026/08/13/rollout-2026-08-13T04-41-11-019ff96c-976f-7fe3-a363-10862be7584e.jsonl",
+        "line": 785,
+        "summary_zh": "父上下文把 NIST256-only 的 problem_2b 改为遍历 NIST192p、NIST224p、NIST256p、NIST384p、NIST521p 阶并按签名分量选择。"
+      },
+      {
+        "path": "parallel/cell/evaluation/official-run/official-codex-parallel/task_security_labs/task_security_labs.1-of-1.official-codex-parallel/requirement_patches/ecdsa_nonce_reuse.diff",
+        "line": 9,
+        "summary_zh": "最终并行 ECDSA diff 保留多曲线阶列表，包含 NIST256p.order。"
+      }
+    ],
+    "serial": [
+      {
+        "path": "serial/cell/evaluation/official-run/official-codex-serial/task_security_labs/task_security_labs.1-of-1.official-codex-serial/agent-logs/outer-loop/round-01/agent-run-status.json",
+        "line": 191,
+        "summary_zh": "串行协议记录没有 spawn 调用、没有子线程，并且 parallel_used 为 false。"
+      },
+      {
+        "path": "serial/agent/codex/round-01/sessions/2026/08/13/rollout-2026-08-13T04-19-36-019ff958-d64d-7673-a12a-3e367838e247.jsonl",
+        "line": 268,
+        "summary_zh": "串行单路径在 nonce reuse 中发现曲线阶不匹配，并准备根据可见 grader 的默认曲线修复。"
+      },
+      {
+        "path": "serial/agent/codex/round-01/sessions/2026/08/13/rollout-2026-08-13T04-19-36-019ff958-d64d-7673-a12a-3e367838e247.jsonl",
+        "line": 279,
+        "summary_zh": "串行也读到了实验文档中 P256 的说明，但后续最终实现没有保留该隐藏用例所需泛化。"
+      },
+      {
+        "path": "serial/agent/codex/round-01/sessions/2026/08/13/rollout-2026-08-13T04-19-36-019ff958-d64d-7673-a12a-3e367838e247.jsonl",
+        "line": 288,
+        "summary_zh": "串行修复后本地 ECDSA test_2 通过，使它有正常解决机会而非外部失败。"
+      },
+      {
+        "path": "serial/cell/evaluation/official-run/official-codex-serial/task_security_labs/task_security_labs.1-of-1.official-codex-serial/requirement_patches/ecdsa_nonce_reuse.diff",
+        "line": 21,
+        "summary_zh": "最终串行 ECDSA diff 将 nonce reuse 的模数硬编码为 NIST192p.order。"
+      },
+      {
+        "path": "serial/agent/codex/round-01/sessions/2026/08/13/rollout-2026-08-13T04-19-36-019ff958-d64d-7673-a12a-3e367838e247.jsonl",
+        "line": 732,
+        "summary_zh": "串行最终汇报 25/25 已实现且可见验证通过，说明它是正常完成但隐藏测试漏掉。"
+      }
+    ],
+    "evaluator": [
+      {
+        "path": "parallel/cell.json",
+        "line": 14,
+        "summary_zh": "并行 cell 官方记录 solution_passed 为 true。"
+      },
+      {
+        "path": "serial/cell.json",
+        "line": 14,
+        "summary_zh": "串行 cell 官方记录 solution_passed 为 false。"
+      },
+      {
+        "path": "parallel/cell/evaluation/official-run/official-codex-parallel/task_security_labs/task_security_labs.1-of-1.official-codex-parallel/panes/post-test.txt",
+        "line": 184,
+        "summary_zh": "并行官方测试 pane 显示 91 passed，退出码为 0。"
+      },
+      {
+        "path": "serial/cell/evaluation/official-run/official-codex-serial/task_security_labs/task_security_labs.1-of-1.official-codex-serial/panes/post-test.txt",
+        "line": 85,
+        "summary_zh": "串行官方测试失败项是 test_ecdsa_problem_2b_correct_key。"
+      },
+      {
+        "path": "serial/cell/evaluation/official-run/official-codex-serial/task_security_labs/task_security_labs.1-of-1.official-codex-serial/panes/post-test.txt",
+        "line": 120,
+        "summary_zh": "串行隐藏测试显示恢复出的私钥不等于 NIST256p 用例中的期望私钥。"
+      }
+    ]
+  },
+  "case_narrative_zh": "该对比任务要求完成 25 个安全实验单元。并行 run 确实产生了真实模型上下文重叠：父上下文继续实现和验收时，crypto/fuzz 子上下文给出 NIST256 nonce reuse 指导，另一个子上下文在共享分支提交了 ECDSA 解法。父上下文随后运行 grader 发现该 ECDSA 解法在可见默认 NIST192p 环境失败，并把代码从 NIST256-only 改成按签名分量选择多个可能曲线阶；最终官方隐藏 NIST256 用例通过。串行 run 正常完成、没有子上下文，也通过了本地可见检查，但它在看到可见 grader 默认 NIST192p 后把模数硬编码为 NIST192p.order，官方隐藏 NIST256 正确私钥测试失败。因此这里保留为质量优势，解释链条是并发产生的解法路径被独立验证后纠错，而不是更高分数本身、时间节省或串行外部故障。",
+  "confidence": "medium"
+}

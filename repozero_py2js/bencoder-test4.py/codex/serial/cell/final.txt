@@ -1,0 +1,48 @@
+The ESM migration is written under `/output` and uses only local `.mjs` imports.
+
+**Library Files**
+- Public interface: [index.mjs](/output/lib/index.mjs:1)
+- CLI: [program-name.mjs](/output/lib/cli/program-name.mjs:1), [messages.mjs](/output/lib/cli/messages.mjs:1), [parse-args.mjs](/output/lib/cli/parse-args.mjs:1)
+- Bencode core: [bytes-value.mjs](/output/lib/bencode/bytes-value.mjs:1), [dict-value.mjs](/output/lib/bencode/dict-value.mjs:1), [decode-first.mjs](/output/lib/bencode/decode-first.mjs:1), [decode.mjs](/output/lib/bencode/decode.mjs:1)
+- Formatting/support: [python-repr.mjs](/output/lib/format/python-repr.mjs:1), [ensure-ascii.mjs](/output/lib/text/ensure-ascii.mjs:1), [named-error.mjs](/output/lib/shared/named-error.mjs:1)
+
+**Entry File**
+- [test4.mjs](/output/test4.mjs:1)
+
+```js
+import { CliExit, decode, ensureAscii, formatPythonValue, parseArgs } from './lib/index.mjs';
+import { formatPythonTraceback } from './lib/shared/named-error.mjs';
+
+function main(argv = process.argv) {
+  const { a } = parseArgs(argv);
+  const result = decode(ensureAscii(a));
+  console.log(formatPythonValue(result));
+}
+
+try {
+  main(process.argv);
+} catch (error) {
+  if (error instanceof CliExit) {
+    if (error.stdout) {
+      process.stdout.write(error.stdout);
+    }
+
+    if (error.stderr) {
+      process.stderr.write(error.stderr);
+    }
+
+    process.exitCode = error.exitCode;
+  } else if (error && error.isPythonStyleError) {
+    if (error.stdout) {
+      process.stdout.write(error.stdout);
+    }
+
+    process.stderr.write(`${formatPythonTraceback(error)}\n`);
+    process.exitCode = 1;
+  } else {
+    throw error;
+  }
+}
+```
+
+Verified with `node /output/test4.mjs --a 9:value`, `--a 6:mu`, `--a 10:deco`, `--a 4:dict`, `--a=value`, repeated `--a`, `--help`, missing `--a`, and nested list/dict cases. Valid-path stdout matches the executable; malformed decode errors are rendered in Python-style form, without the executable’s extra PyInstaller footer.

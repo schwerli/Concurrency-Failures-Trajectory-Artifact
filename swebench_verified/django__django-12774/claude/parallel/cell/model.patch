@@ -1,0 +1,250 @@
+diff --git a/_scratch_review/run.py b/_scratch_review/run.py
+new file mode 100644
+index 0000000000..f876ebdab6
+--- /dev/null
++++ b/_scratch_review/run.py
+@@ -0,0 +1,52 @@
++import sys
++sys.path.insert(0, '/workspace/_scratch_review')
++import django
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 'scratchapp'],
++    USE_TZ=False,
++)
++django.setup()
++from django.db import connection
++from scratchapp.models import Author, ProfileC, ProfileAttnameC, ProfileO2O
++
++
++def pre_patch_guard(qs, field_name):
++    # verbatim HEAD (pre-patch) guard
++    if field_name != 'pk' and not qs.model._meta.get_field(field_name).unique:
++        raise ValueError("in_bulk()'s field_name must be a unique field but %r isn't." % field_name)
++    return True
++
++
++with connection.schema_editor() as se:
++    for m in (Author, ProfileC, ProfileAttnameC, ProfileO2O):
++        se.create_model(m)
++a = Author.objects.create(name='a')
++ProfileC.objects.create(author=a)
++ProfileAttnameC.objects.create(author=a)
++ProfileO2O.objects.create(author=a)
++
++cases = [
++    (ProfileC, "UniqueConstraint(fields=['author'])"),
++    (ProfileAttnameC, "UniqueConstraint(fields=['author_id'])"),
++    (ProfileO2O, "OneToOneField (unique via field)"),
++]
++print("=== PRE-PATCH guard (HEAD) ===")
++for model, label in cases:
++    for sp in ('author', 'author_id'):
++        try:
++            pre_patch_guard(model.objects.all(), sp)
++            print("  %-38s %-11r -> ALLOWED" % (label, sp))
++        except ValueError:
++            print("  %-38s %-11r -> ValueError" % (label, sp))
++
++print("\n=== POST-PATCH (working tree) actual in_bulk ===")
++for model, label in cases:
++    for sp in ('author', 'author_id'):
++        try:
++            r = model.objects.in_bulk(field_name=sp)
++            print("  %-38s %-11r -> OK   %r" % (label, sp, r))
++        except ValueError as e:
++            print("  %-38s %-11r -> ValueError" % (label, sp))
+diff --git a/_scratch_review/scratchapp/__init__.py b/_scratch_review/scratchapp/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/_scratch_review/scratchapp/models.py b/_scratch_review/scratchapp/models.py
+new file mode 100644
+index 0000000000..4b5831fdea
+--- /dev/null
++++ b/_scratch_review/scratchapp/models.py
+@@ -0,0 +1,23 @@
++from django.db import models
++
++
++class Author(models.Model):
++    name = models.CharField(max_length=50)
++
++
++class ProfileC(models.Model):
++    author = models.ForeignKey(Author, models.CASCADE)
++
++    class Meta:
++        constraints = [models.UniqueConstraint(fields=['author'], name='pc_author')]
++
++
++class ProfileAttnameC(models.Model):
++    author = models.ForeignKey(Author, models.CASCADE)
++
++    class Meta:
++        constraints = [models.UniqueConstraint(fields=['author_id'], name='pac_author')]
++
++
++class ProfileO2O(models.Model):
++    author = models.OneToOneField(Author, models.CASCADE)
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index d9c9b0db04..c1aa352701 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -689,7 +689,17 @@ class QuerySet:
+         """
+         assert not self.query.is_sliced, \
+             "Cannot use 'limit' or 'offset' with in_bulk"
+-        if field_name != 'pk' and not self.model._meta.get_field(field_name).unique:
++        opts = self.model._meta
++        unique_fields = [
++            constraint.fields[0]
++            for constraint in opts.total_unique_constraints
++            if len(constraint.fields) == 1
++        ]
++        if (
++            field_name != 'pk' and
++            not opts.get_field(field_name).unique and
++            field_name not in unique_fields
++        ):
+             raise ValueError("in_bulk()'s field_name must be a unique field but %r isn't." % field_name)
+         if id_list is not None:
+             if not id_list:
+diff --git a/docs/ref/models/querysets.txt b/docs/ref/models/querysets.txt
+index c51c4dd43a..28a2c720b3 100644
+--- a/docs/ref/models/querysets.txt
++++ b/docs/ref/models/querysets.txt
+@@ -2184,7 +2184,9 @@ Takes a list of field values (``id_list``) and the ``field_name`` for those
+ values, and returns a dictionary mapping each value to an instance of the
+ object with the given field value. If ``id_list`` isn't provided, all objects
+ in the queryset are returned. ``field_name`` must be a unique field, and it
+-defaults to the primary key.
++defaults to the primary key. A field is considered unique if it's declared
++with ``unique=True`` or if it's the only field of a total (i.e. without a
++``condition``) :class:`~django.db.models.UniqueConstraint`.
+ 
+ Example::
+ 
+@@ -2201,6 +2203,11 @@ Example::
+ 
+ If you pass ``in_bulk()`` an empty list, you'll get an empty dictionary.
+ 
++.. versionchanged:: 3.1
++
++    Support for fields with a total
++    :class:`~django.db.models.UniqueConstraint` was added.
++
+ ``iterator()``
+ ~~~~~~~~~~~~~~
+ 
+diff --git a/docs/releases/3.1.txt b/docs/releases/3.1.txt
+index 029ad3150c..b18548bcb6 100644
+--- a/docs/releases/3.1.txt
++++ b/docs/releases/3.1.txt
+@@ -377,6 +377,9 @@ Models
+   <sqlite3.Connection.create_function>` on Python 3.8+. This allows using them
+   in check constraints and partial indexes.
+ 
++* :meth:`.QuerySet.in_bulk` now accepts a ``field_name`` for fields with a
++  total :class:`~django.db.models.UniqueConstraint`.
++
+ Pagination
+ ~~~~~~~~~~
+ 
+diff --git a/tests/lookup/models.py b/tests/lookup/models.py
+index fbc9fa606f..1c6bbc1b6e 100644
+--- a/tests/lookup/models.py
++++ b/tests/lookup/models.py
+@@ -67,6 +67,11 @@ class Season(models.Model):
+     gt = models.IntegerField(null=True, blank=True)
+     nulled_text_field = NulledTextField(null=True)
+ 
++    class Meta:
++        constraints = [
++            models.UniqueConstraint(fields=['year'], name='season_year_unique'),
++        ]
++
+     def __str__(self):
+         return str(self.year)
+ 
+@@ -108,3 +113,28 @@ class Freebie(models.Model):
+         to_fields=['id', 'product'],
+         on_delete=models.CASCADE,
+     )
++
++
++class MultipleFieldsConstraintProduct(models.Model):
++    name = models.CharField(max_length=80)
++    color = models.CharField(max_length=32)
++
++    class Meta:
++        constraints = [
++            models.UniqueConstraint(fields=['name', 'color'], name='lookup_name_color_uniq'),
++        ]
++
++
++class ConditionConstraintProduct(models.Model):
++    name = models.CharField(max_length=80)
++    color = models.CharField(max_length=32, null=True)
++
++    class Meta:
++        required_db_features = {'supports_partial_indexes'}
++        constraints = [
++            models.UniqueConstraint(
++                fields=['name'],
++                name='lookup_name_without_color_uniq',
++                condition=models.Q(color__isnull=True),
++            ),
++        ]
+diff --git a/tests/lookup/tests.py b/tests/lookup/tests.py
+index baefdf9701..24041dce90 100644
+--- a/tests/lookup/tests.py
++++ b/tests/lookup/tests.py
+@@ -11,7 +11,8 @@ from django.test import TestCase, skipUnlessDBFeature
+ from django.utils.deprecation import RemovedInDjango40Warning
+ 
+ from .models import (
+-    Article, Author, Freebie, Game, IsNullWithNoneAsRHS, Player, Season, Tag,
++    Article, Author, ConditionConstraintProduct, Freebie, Game,
++    IsNullWithNoneAsRHS, MultipleFieldsConstraintProduct, Player, Season, Tag,
+ )
+ 
+ 
+@@ -189,11 +190,36 @@ class LookupTests(TestCase):
+             }
+         )
+ 
++    def test_in_bulk_meta_constraint(self):
++        season_2011 = Season.objects.create(year=2011)
++        season_2012 = Season.objects.create(year=2012)
++        Season.objects.create(year=2013)
++        self.assertEqual(
++            Season.objects.in_bulk(
++                [season_2011.year, season_2012.year],
++                field_name='year',
++            ),
++            {season_2011.year: season_2011, season_2012.year: season_2012},
++        )
++
+     def test_in_bulk_non_unique_field(self):
+         msg = "in_bulk()'s field_name must be a unique field but 'author' isn't."
+         with self.assertRaisesMessage(ValueError, msg):
+             Article.objects.in_bulk([self.au1], field_name='author')
+ 
++    def test_in_bulk_multiple_fields_meta_constraint(self):
++        msg = "in_bulk()'s field_name must be a unique field but %r isn't."
++        for field_name in ['name', 'color']:
++            with self.subTest(field_name=field_name):
++                with self.assertRaisesMessage(ValueError, msg % field_name):
++                    MultipleFieldsConstraintProduct.objects.in_bulk(field_name=field_name)
++
++    @skipUnlessDBFeature('supports_partial_indexes')
++    def test_in_bulk_conditional_meta_constraint(self):
++        msg = "in_bulk()'s field_name must be a unique field but 'name' isn't."
++        with self.assertRaisesMessage(ValueError, msg):
++            ConditionConstraintProduct.objects.in_bulk(field_name='name')
++
+     def test_values(self):
+         # values() returns a list of dictionaries instead of object instances --
+         # and you can specify which fields you want to retrieve.

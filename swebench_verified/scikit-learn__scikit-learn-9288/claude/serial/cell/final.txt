@@ -1,0 +1,19 @@
+Fixed.
+
+**Root cause** (`sklearn/cluster/k_means_.py`): the two code paths consumed randomness differently.
+
+- Sequential path: passed the shared `random_state` *object* into all `n_init` runs, so each run drew from wherever the previous run left the stream.
+- Parallel path: drew `n_init` integer seeds up front and passed one per run (necessary, since a `RandomState` object can't be shared across processes).
+
+Same number of inits, different random streams → different k-means++ initializations → a different best run and a slightly different inertia. Neither answer was wrong; they just weren't the same.
+
+**Fix:** hoist the seed generation above the branch so both paths run identically-seeded inits. This aligns the sequential path onto the parallel path's stream, which is what makes `n_jobs=1` now produce the value the issue reported for `n_jobs>1`.
+
+**Verification** (using `/opt/miniconda3/envs/testbed/bin/python` — the plain `python` on PATH has no numpy):
+
+- The issue's reproducer now prints `17815.060435554242` for all of `n_jobs=1..4`, matching the expected output.
+- Parity is exact, not just approximate: `labels_`, `cluster_centers_`, `inertia_`, and `n_iter_` all match between `n_jobs=1` and `n_jobs>1`, for both `algorithm='full'` and `'elkan'`, and for sparse input.
+- Added `test_result_of_kmeans_equal_in_diff_n_jobs`. I confirmed it genuinely catches the bug by stashing the fix and watching it fail, then restoring.
+- Full suite: 124 passed (123 pre-existing + the new one), no regressions.
+
+One note on scope: this changes the exact clustering returned for a given `random_state` when `n_jobs=1`. Results remain deterministic and reproducible, but anyone with a hardcoded expected inertia/label array from a single-threaded fit will see it shift. That's unavoidable — fixing the discrepancy means one of the two paths has to move — and no existing test depended on the old values.

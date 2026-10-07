@@ -1,0 +1,58 @@
+diff --git a/astropy/io/fits/card.py b/astropy/io/fits/card.py
+index 1b3285ddc..6218074c5 100644
+--- a/astropy/io/fits/card.py
++++ b/astropy/io/fits/card.py
+@@ -859,7 +859,11 @@ class Card(_Verify):
+                     return kw, vc
+ 
+                 value = m.group("strg") or ""
+-                value = value.rstrip().replace("''", "'")
++                # Do NOT unescape doubled quotes ('' -> ') here: the joined
++                # value is re-wrapped in quotes below and re-parsed by
++                # _parse_value, which performs the single unescape.  Doing it
++                # here too would collapse literal '' pairs in the value.
++                value = value.rstrip()
+                 if value and value[-1] == "&":
+                     value = value[:-1]
+                 values.append(value)
+diff --git a/astropy/io/fits/tests/test_header.py b/astropy/io/fits/tests/test_header.py
+index c573100c9..ad6bb658d 100644
+--- a/astropy/io/fits/tests/test_header.py
++++ b/astropy/io/fits/tests/test_header.py
+@@ -468,6 +468,27 @@ class TestHeaderFunctions(FitsTestCase):
+             "CONTINUE  'xml'                                                                 "
+         )
+ 
++    def test_long_string_value_with_quotes_roundtrip(self):
++        """
++        Regression test: adjacent single quotes in a string value must not be
++        double-unescaped when the value is split across CONTINUE cards.
++
++        The value is wrapped in quotes (with '' escaping a literal ') when
++        written, and unescaped again when parsed; a roundtrip through str()
++        and fromstring() must preserve the value regardless of where the
++        80-column card boundary falls.
++        """
++        for n in range(60, 70):
++            card1 = fits.Card("CONFIG", "x" * n + "''")
++            card2 = fits.Card.fromstring(str(card1))
++            assert card2.value == card1.value
++
++        # '' embedded mid-value
++        for n in range(50, 70):
++            card1 = fits.Card("CONFIG", "x" * n + "''" + "x" * 10)
++            card2 = fits.Card.fromstring(str(card1))
++            assert card2.value == card1.value
++
+     def test_long_unicode_string(self):
+         """Regression test for
+         https://github.com/spacetelescope/PyFITS/issues/1
+diff --git a/docs/changes/io.fits/14650.bugfix.rst b/docs/changes/io.fits/14650.bugfix.rst
+new file mode 100644
+index 000000000..f8f2173b7
+--- /dev/null
++++ b/docs/changes/io.fits/14650.bugfix.rst
+@@ -0,0 +1,3 @@
++``Card`` no longer loses a single quote when reading back a long string value
++(CONTINUE convention) containing adjacent single quotes, so
++``Card.fromstring(str(card))`` now round-trips such values correctly.

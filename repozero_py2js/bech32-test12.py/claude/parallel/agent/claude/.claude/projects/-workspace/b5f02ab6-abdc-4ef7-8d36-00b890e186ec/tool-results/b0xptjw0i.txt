@@ -1,0 +1,855 @@
+/output/test12.mjs
+/output/lib/bech32/convert.mjs
+/output/lib/bech32/codec.mjs
+/output/lib/bech32/segwit.mjs
+/output/lib/bech32/charset.mjs
+/output/lib/bech32/index.mjs
+/output/lib/bech32/checksum.mjs
+/output/lib/cli/argparse.mjs
+/output/lib/cli/formatter.mjs
+/output/lib/cli/errors.mjs
+/output/lib/cli/actions.mjs
+/output/lib/python/stdio.mjs
+/output/lib/python/repr.mjs
+/output/lib/python/text.mjs
+---
+=== /output/test12.mjs ===
+     1	#!/usr/bin/env node
+     2	// Port of /workspace/dataset/bech32/test12.py
+     3	//
+     4	//   decoded = bech32.decode(args.a, args.b)
+     5	//   if decoded[0] is not None and decoded[1] is not None:
+     6	//       witver, witprog = decoded
+     7	//       converted = bech32.convertbits(witprog, 5, 8)
+     8	//       print(witver)
+     9	//       print(converted)
+    10	
+    11	import * as bech32 from './lib/bech32/index.mjs';
+    12	import { ArgumentParser, ParserExit } from './lib/cli/argparse.mjs';
+    13	import { pyRepr } from './lib/python/repr.mjs';
+    14	import { print, writeStderr, writeStdout } from './lib/python/stdio.mjs';
+    15	
+    16	function buildParser() {
+    17	  const parser = new ArgumentParser();
+    18	  parser.addArgument(['--a'], { type: String, required: true }); // HRP
+    19	  parser.addArgument(['--b'], { type: String, required: true }); // Segwit address
+    20	  return parser;
+    21	}
+    22	
+    23	function main(argv) {
+    24	  const parser = buildParser();
+    25	  const args = parser.parseArgs(argv);
+    26	
+    27	  const decoded = bech32.decode(args.a, args.b); // Decode segwit address
+    28	  // Python's `is not None`, not a truthiness test: witness version 0 is falsy
+    29	  // in JavaScript but is a perfectly good result here.
+    30	  if (decoded[0] !== null && decoded[1] !== null) {
+    31	    const [witver, witprog] = decoded;
+    32	    const converted = bech32.convertbits(witprog, 5, 8); // Convert 5-bit to 8-bit
+    33	    print(pyRepr(witver));
+    34	    print(pyRepr(converted));
+    35	  }
+    36	}
+    37	
+    38	try {
+    39	  main(process.argv.slice(2));
+    40	} catch (error) {
+    41	  if (!(error instanceof ParserExit)) {
+    42	    throw error;
+    43	  }
+    44	  writeStdout(error.stdout);
+    45	  writeStderr(error.stderr);
+    46	  // Setting exitCode rather than calling process.exit() lets Node flush both
+    47	  // streams before the process goes away.
+    48	  process.exitCode = error.status;
+    49	}
+=== /output/lib/bech32/convert.mjs ===
+     1	// General power-of-2 base conversion, as `bech32.convertbits`.
+     2	
+     3	/**
+     4	 * Regroup `data` from `frombits`-wide symbols into `tobits`-wide ones.
+     5	 *
+     6	 * Returns `null` (Python's `None`) when a symbol does not fit in `frombits` --
+     7	 * which is what makes `convertbits(witprog, 5, 8)` fail for any witness program
+     8	 * byte >= 32 -- and, when `pad` is false, when the trailing partial group is
+     9	 * either too wide or not all zeroes.
+    10	 */
+    11	export function convertbits(data, frombits, tobits, pad = true) {
+    12	  let acc = 0;
+    13	  let bits = 0;
+    14	  const ret = [];
+    15	  const maxv = (1 << tobits) - 1;
+    16	  const maxAcc = (1 << (frombits + tobits - 1)) - 1;
+    17	
+    18	  for (const value of data) {
+    19	    if (value < 0 || value >> frombits) {
+    20	      return null;
+    21	    }
+    22	    acc = ((acc << frombits) | value) & maxAcc;
+    23	    bits += frombits;
+    24	    while (bits >= tobits) {
+    25	      bits -= tobits;
+    26	      ret.push((acc >> bits) & maxv);
+    27	    }
+    28	  }
+    29	
+    30	  if (pad) {
+    31	    if (bits) {
+    32	      ret.push((acc << (tobits - bits)) & maxv);
+    33	    }
+    34	  } else if (bits >= frombits || ((acc << (tobits - bits)) & maxv)) {
+    35	    return null;
+    36	  }
+    37	  return ret;
+    38	}
+=== /output/lib/bech32/codec.mjs ===
+     1	// Generic bech32 string layer: the character-level validation, the separator
+     2	// hunt and the checksum gate. Knows nothing about segwit.
+     3	
+     4	import {
+     5	  CHARSET,
+     6	  CHECKSUM_LENGTH,
+     7	  MAX_HRP_LENGTH,
+     8	  charsetIndex,
+     9	  isCharsetChar,
+    10	} from './charset.mjs';
+    11	import { bech32CreateChecksum, bech32VerifyChecksum } from './checksum.mjs';
+    12	import { isMixedCase, isPrintableAsciiRange } from '../python/text.mjs';
+    13	
+    14	/** What a failed decode yields: Python's `(None, None)`. */
+    15	function failure() {
+    16	  return [null, null];
+    17	}
+    18	
+    19	/**
+    20	 * Validate a bech32 string and split it into `[hrp, data]`, or `[null, null]`.
+    21	 *
+    22	 * `data` excludes the six checksum symbols. The HRP is returned lower-cased,
+    23	 * so an all-upper-case address never matches an upper-case HRP argument.
+    24	 */
+    25	export function bech32Decode(bech) {
+    26	  if (!isPrintableAsciiRange(bech) || isMixedCase(bech)) {
+    27	    return failure();
+    28	  }
+    29	
+    30	  const lowered = bech.toLowerCase();
+    31	  const pos = lowered.lastIndexOf('1');
+    32	  // `pos` is both the separator index and the HRP length.
+    33	  if (pos < 1 || pos + 1 + CHECKSUM_LENGTH > lowered.length || pos > MAX_HRP_LENGTH) {
+    34	    return failure();
+    35	  }
+    36	
+    37	  const tail = lowered.slice(pos + 1);
+    38	  for (const char of tail) {
+    39	    if (!isCharsetChar(char)) {
+    40	      return failure();
+    41	    }
+    42	  }
+    43	
+    44	  const hrp = lowered.slice(0, pos);
+    45	  const data = [];
+    46	  for (const char of tail) {
+    47	    data.push(charsetIndex(char));
+    48	  }
+    49	  if (!bech32VerifyChecksum(hrp, data)) {
+    50	    return failure();
+    51	  }
+    52	  return [hrp, data.slice(0, -CHECKSUM_LENGTH)];
+    53	}
+    54	
+    55	/** Compute a bech32 string from an HRP and 5-bit data values. */
+    56	export function bech32Encode(hrp, data) {
+    57	  const combined = [...data, ...bech32CreateChecksum(hrp, data)];
+    58	  return `${hrp}1${combined.map((value) => CHARSET[value]).join('')}`;
+    59	}
+=== /output/lib/bech32/segwit.mjs ===
+     1	// Segwit address layer -- `bech32.decode` / `bech32.encode`.
+     2	//
+     3	// This mirrors the BIP-173-only behaviour of the reference module: a witness
+     4	// version of 1..16 is accepted with an ordinary bech32 checksum, and bech32m
+     5	// (BIP-350) strings are rejected outright.
+     6	
+     7	import { bech32Decode, bech32Encode } from './codec.mjs';
+     8	import { convertbits } from './convert.mjs';
+     9	
+    10	export const MIN_PROGRAM_LENGTH = 2;
+    11	export const MAX_PROGRAM_LENGTH = 40;
+    12	export const MAX_WITNESS_VERSION = 16;
+    13	
+    14	function failure() {
+    15	  return [null, null];
+    16	}
+    17	
+    18	/**
+    19	 * Decode a segwit address into `[witnessVersion, witnessProgram]`, where the
+    20	 * program is a plain array of byte values, or `[null, null]` on any failure.
+    21	 *
+    22	 * The program-length check deliberately precedes the `data[0]` read: for a
+    23	 * checksum-only string the payload is empty, the conversion yields `[]`, and the
+    24	 * length test bails out before the witness version would be indexed.
+    25	 */
+    26	export function decode(hrp, addr) {
+    27	  const [hrpGot, data] = bech32Decode(addr);
+    28	  if (hrpGot !== hrp) {
+    29	    return failure();
+    30	  }
+    31	
+    32	  const decoded = convertbits(data.slice(1), 5, 8, false);
+    33	  if (
+    34	    decoded === null ||
+    35	    decoded.length < MIN_PROGRAM_LENGTH ||
+    36	    decoded.length > MAX_PROGRAM_LENGTH
+    37	  ) {
+    38	    return failure();
+    39	  }
+    40	  if (data[0] > MAX_WITNESS_VERSION) {
+    41	    return failure();
+    42	  }
+    43	  if (data[0] === 0 && decoded.length !== 20 && decoded.length !== 32) {
+    44	    return failure();
+    45	  }
+    46	  return [data[0], decoded];
+    47	}
+    48	
+    49	/** Encode a segwit address, or `null` when the result would not round-trip. */
+    50	export function encode(hrp, witver, witprog) {
+    51	  const addr = bech32Encode(hrp, [witver, ...convertbits(witprog, 8, 5)]);
+    52	  const [version, program] = decode(hrp, addr);
+    53	  if (version === null && program === null) {
+    54	    return null;
+    55	  }
+    56	  return addr;
+    57	}
+=== /output/lib/bech32/charset.mjs ===
+     1	// Bech32 alphabet and the constants that bound a well-formed string.
+     2	
+     3	export const CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+     4	
+     5	export const GENERATOR = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+     6	
+     7	/** Trailing data symbols that carry the BCH checksum. */
+     8	export const CHECKSUM_LENGTH = 6;
+     9	
+    10	/**
+    11	 * BIP-173 caps the human-readable part at 83 characters. The reference module
+    12	 * enforces that bound and imposes no 90-character limit on the string as a
+    13	 * whole: an 83-character HRP with a 40-byte witness program (155 characters
+    14	 * total) decodes, while an 84-character HRP is rejected at any total length.
+    15	 */
+    16	export const MAX_HRP_LENGTH = 83;
+    17	
+    18	export function charsetIndex(char) {
+    19	  return CHARSET.indexOf(char);
+    20	}
+    21	
+    22	export function isCharsetChar(char) {
+    23	  return CHARSET.includes(char);
+    24	}
+=== /output/lib/bech32/index.mjs ===
+     1	// Facade mirroring the surface of Python's `bech32` module, so callers can
+     2	// `import * as bech32` and use `bech32.decode` / `bech32.convertbits` directly.
+     3	
+     4	export { CHARSET, CHECKSUM_LENGTH, GENERATOR, MAX_HRP_LENGTH } from './charset.mjs';
+     5	export {
+     6	  bech32CreateChecksum,
+     7	  bech32HrpExpand,
+     8	  bech32Polymod,
+     9	  bech32VerifyChecksum,
+    10	} from './checksum.mjs';
+    11	export { convertbits } from './convert.mjs';
+    12	export { bech32Decode, bech32Encode } from './codec.mjs';
+    13	export {
+    14	  MAX_PROGRAM_LENGTH,
+    15	  MAX_WITNESS_VERSION,
+    16	  MIN_PROGRAM_LENGTH,
+    17	  decode,
+    18	  encode,
+    19	} from './segwit.mjs';
+=== /output/lib/bech32/checksum.mjs ===
+     1	// The BCH checksum over GF(32) that bech32 strings carry.
+     2	//
+     3	// Every intermediate stays inside 30 bits -- `chk` is masked to 25 bits before
+     4	// being shifted left by 5, and the generator constants are all below 2**30 --
+     5	// so JavaScript's 32-bit bitwise operators are exact here and agree with
+     6	// Python's arbitrary-precision integers bit for bit.
+     7	
+     8	import { CHECKSUM_LENGTH, GENERATOR } from './charset.mjs';
+     9	import { codePoints } from '../python/text.mjs';
+    10	
+    11	export function bech32Polymod(values) {
+    12	  let chk = 1;
+    13	  for (const value of values) {
+    14	    const top = chk >> 25;
+    15	    chk = ((chk & 0x1ffffff) << 5) ^ value;
+    16	    for (let i = 0; i < GENERATOR.length; i += 1) {
+    17	      if ((top >> i) & 1) {
+    18	        chk ^= GENERATOR[i];
+    19	      }
+    20	    }
+    21	  }
+    22	  return chk;
+    23	}
+    24	
+    25	/** High bits of the HRP, a zero separator, then the low bits. */
+    26	export function bech32HrpExpand(hrp) {
+    27	  const points = codePoints(hrp);
+    28	  return [...points.map((point) => point >> 5), 0, ...points.map((point) => point & 31)];
+    29	}
+    30	
+    31	export function bech32VerifyChecksum(hrp, data) {
+    32	  return bech32Polymod([...bech32HrpExpand(hrp), ...data]) === 1;
+    33	}
+    34	
+    35	export function bech32CreateChecksum(hrp, data) {
+    36	  const values = [...bech32HrpExpand(hrp), ...data, ...new Array(CHECKSUM_LENGTH).fill(0)];
+    37	  const polymod = bech32Polymod(values) ^ 1;
+    38	  const checksum = [];
+    39	  for (let i = 0; i < CHECKSUM_LENGTH; i += 1) {
+    40	    checksum.push((polymod >> (5 * (5 - i))) & 31);
+    41	  }
+    42	  return checksum;
+    43	}
+=== /output/lib/cli/argparse.mjs ===
+     1	// A faithful port of the slice of Python's `argparse.ArgumentParser` that this
+     2	// CLI exercises: two required value-taking long options plus the automatic
+     3	// `-h/--help`, and no positionals.
+     4	//
+     5	// The token-classification and consumption algorithm follows CPython's
+     6	// `_parse_known_args` closely, because its quirks are observable:
+     7	//   * a required-argument error is raised before unrecognised arguments are
+     8	//     reported, so a missing `--a` wins over trailing junk;
+     9	//   * `-5` and `-1.5` are values (they look like negative numbers) while `-x`
+    10	//     and `-5x` are option strings, so `--b -x` fails with "expected one
+    11	//     argument" rather than storing "-x";
+    12	//   * `--h`, `--he` and `--hel` all resolve to `--help` by unique-prefix match;
+    13	//   * `--` is a separator that is itself left over as an unrecognised argument,
+    14	//     since no positional action is declared to absorb it.
+    15	
+    16	import { basename } from 'node:path';
+    17	
+    18	import { HELP, STORE, Action, destFromOptionStrings, makeHelpAction } from './actions.mjs';
+    19	import { ArgumentError, ParserExit } from './errors.mjs';
+    20	import { formatHelp, formatUsage } from './formatter.mjs';
+    21	import { pyRepr } from '../python/repr.mjs';
+    22	
+    23	const PREFIX_CHARS = '-';
+    24	
+    25	/** argparse's own "this token is a negative number, not an option" test. */
+    26	const NEGATIVE_NUMBER = /^-\d+$|^-\d*\.\d+$/;
+    27	
+    28	/** argparse's default `prog`: `os.path.basename(sys.argv[0])`. */
+    29	export function defaultProg() {
+    30	  const script = process.argv[1];
+    31	  return script === undefined ? '' : basename(script);
+    32	}
+    33	
+    34	export class ArgumentParser {
+    35	  constructor({ prog = defaultProg(), addHelp = true } = {}) {
+    36	    this.prog = prog;
+    37	    this.actions = [];
+    38	    this.optionStringActions = new Map();
+    39	    if (addHelp) {
+    40	      this.addAction(makeHelpAction());
+    41	    }
+    42	  }
+    43	
+    44	  addAction(action) {
+    45	    this.actions.push(action);
+    46	    for (const optionString of action.optionStrings) {
+    47	      this.optionStringActions.set(optionString, action);
+    48	    }
+    49	    return action;
+    50	  }
+    51	
+    52	  addArgument(flags, options = {}) {
+    53	    const optionStrings = Array.isArray(flags) ? flags : [flags];
+    54	    return this.addAction(
+    55	      new Action({
+    56	        optionStrings,
+    57	        dest: options.dest ?? destFromOptionStrings(optionStrings),
+    58	        kind: STORE,
+    59	        nargs: null,
+    60	        required: options.required === true,
+    61	        metavar: options.metavar ?? null,
+    62	        help: options.help ?? '',
+    63	        type: options.type ?? null,
+    64	      }),
+    65	    );
+    66	  }
+    67	
+    68	  formatUsage() {
+    69	    return formatUsage(this.prog, this.actions);
+    70	  }
+    71	
+    72	  formatHelp() {
+    73	    return formatHelp(this.prog, this.actions);
+    74	  }
+    75	
+    76	  /** Print usage plus a message on stderr and terminate with status 2. */
+    77	  error(message) {
+    78	    throw new ParserExit(2, {
+    79	      stderr: `${this.formatUsage()}${this.prog}: error: ${message}\n`,
+    80	    });
+    81	  }
+    82	
+    83	  parseArgs(argv) {
+    84	    const [namespace, extras] = this.parseKnownArgs(argv);
+    85	    if (extras.length > 0) {
+    86	      this.error(`unrecognized arguments: ${extras.join(' ')}`);
+    87	    }
+    88	    return namespace;
+    89	  }
+    90	
+    91	  parseKnownArgs(argv) {
+    92	    try {
+    93	      return this.parseKnownArgsUnchecked(argv);
+    94	    } catch (error) {
+    95	      if (error instanceof ArgumentError) {
+    96	        this.error(error.message);
+    97	      }
+    98	      throw error;
+    99	    }
+   100	  }
+   101	
+   102	  parseKnownArgsUnchecked(argv) {
+   103	    const namespace = {};
+   104	    for (const action of this.actions) {
+   105	      if (action.kind === STORE) {
+   106	        namespace[action.dest] = null;
+   107	      }
+   108	    }
+   109	
+   110	    // Classify every token up front: 'O' for something that looks like an
+   111	    // option, 'A' for a value, '-' for the `--` separator. Option matching then
+   112	    // works against this pattern rather than against the raw strings, which is
+   113	    // what makes `--b -- value` fail instead of storing "--".
+   114	    const pattern = [];
+   115	    const optionTuples = new Map();
+   116	    let index = 0;
+   117	    while (index < argv.length) {
+   118	      if (argv[index] === '--') {
+   119	        pattern.push('-');
+   120	        index += 1;
+   121	        while (index < argv.length) {
+   122	          pattern.push('A');
+   123	          index += 1;
+   124	        }
+   125	        break;
+   126	      }
+   127	      const tuple = this.parseOptional(argv[index]);
+   128	      if (tuple === null) {
+   129	        pattern.push('A');
+   130	      } else {
+   131	        optionTuples.set(index, tuple);
+   132	        pattern.push('O');
+   133	      }
+   134	      index += 1;
+   135	    }
+   136	
+   137	    const extras = [];
+   138	    const seen = new Set();
+   139	    const context = { argv, pattern, optionTuples, extras, seen, namespace };
+   140	
+   141	    const optionIndices = [...optionTuples.keys()].sort((left, right) => left - right);
+   142	    const maxOptionIndex = optionIndices.length === 0 ? -1 : optionIndices[optionIndices.length - 1];
+   143	    let start = 0;
+   144	    while (start <= maxOptionIndex) {
+   145	      const next = optionIndices.find((candidate) => candidate >= start);
+   146	      if (next === undefined) {
+   147	        break;
+   148	      }
+   149	      if (start !== next) {
+   150	        // No positional action is declared, so nothing before the next option
+   151	        // can be consumed -- it all becomes unrecognised.
+   152	        extras.push(...argv.slice(start, next));
+   153	        start = next;
+   154	      }
+   155	      start = this.consumeOptional(start, context);
+   156	    }
+   157	    extras.push(...argv.slice(start));
+   158	
+   159	    const missing = this.actions
+   160	      .filter((action) => action.required && !seen.has(action))
+   161	      .map((action) => action.optionStrings.join('/'));
+   162	    if (missing.length > 0) {
+   163	      this.error(`the following arguments are required: ${missing.join(', ')}`);
+   164	    }
+   165	
+   166	    return [namespace, extras];
+   167	  }
+   168	
+   169	  consumeOptional(startIndex, context) {
+   170	    const { argv, pattern, optionTuples, extras, seen, namespace } = context;
+   171	    let { action, optionString, explicitArg } = optionTuples.get(startIndex);
+   172	    const actionTuples = [];
+   173	    let stop = startIndex + 1;
+   174	
+   175	    for (;;) {
+   176	      if (action === null) {
+   177	        // An option string no action claims: report the whole token verbatim.
+   178	        extras.push(argv[startIndex]);
+   179	        return startIndex + 1;
+   180	      }
+   181	
+   182	      if (explicitArg !== null) {
+   183	        const argCount = this.matchArgument(action, 'A');
+   184	        if (argCount === 0 && !PREFIX_CHARS.includes(optionString[1]) && explicitArg !== '') {
+   185	          // A single-dash flag with a tail: `-hz` means `-h` then `-z`.
+   186	          actionTuples.push([action, []]);
+   187	          const prefix = optionString[0];
+   188	          optionString = prefix + explicitArg[0];
+   189	          const nextAction = this.optionStringActions.get(optionString);
+   190	          if (nextAction === undefined) {
+   191	            extras.push(prefix + explicitArg);
+   192	            stop = startIndex + 1;
+   193	            break;
+   194	          }
+   195	          action = nextAction;
+   196	          explicitArg = explicitArg.slice(1);
+   197	          if (explicitArg === '') {
+   198	            explicitArg = null;
+   199	          } else if (explicitArg[0] === '=') {
+   200	            explicitArg = explicitArg.slice(1);
+   201	          }
+   202	        } else if (argCount === 1) {
+   203	          stop = startIndex + 1;
+   204	          actionTuples.push([action, [explicitArg]]);
+   205	          break;
+   206	        } else {
+   207	          throw new ArgumentError(action, `ignored explicit argument ${pyRepr(explicitArg)}`);
+   208	        }
+   209	      } else {
+   210	        const valueStart = startIndex + 1;
+   211	        const argCount = this.matchArgument(action, pattern.slice(valueStart).join(''));
+   212	        stop = valueStart + argCount;
+   213	        actionTuples.push([action, argv.slice(valueStart, stop)]);
+   214	        break;
+   215	      }
+   216	    }
+   217	
+   218	    for (const [chosen, values] of actionTuples) {
+   219	      seen.add(chosen);
+   220	      this.takeAction(chosen, values, namespace);
+   221	    }
+   222	    return stop;
+   223	  }
+   224	
+   225	  /** How many following tokens this action consumes, or a parse error. */
+   226	  matchArgument(action, patternText) {
+   227	    if (action.nargs === 0) {
+   228	      return 0;
+   229	    }
+   230	    if (patternText.startsWith('A')) {
+   231	      return 1;
+   232	    }
+   233	    throw new ArgumentError(action, 'expected one argument');
+   234	  }
+   235	
+   236	  takeAction(action, values, namespace) {
+   237	    if (action.kind === HELP) {
+   238	      throw new ParserExit(0, { stdout: this.formatHelp() });
+   239	    }
+   240	    const [value] = values;
+   241	    namespace[action.dest] = action.type === null ? value : action.type(value);
+   242	  }
+   243	
+   244	  hasNegativeNumberOptionals() {
+   245	    for (const optionString of this.optionStringActions.keys()) {
+   246	      if (NEGATIVE_NUMBER.test(optionString)) {
+   247	        return true;
+   248	      }
+   249	    }
+   250	    return false;
+   251	  }
+   252	
+   253	  /**
+   254	   * Decide whether a token is an option. Returns `null` when it should be
+   255	   * treated as a value, otherwise `{action, optionString, explicitArg}` where a
+   256	   * `null` action means "looks like an option, but nothing matches".
+   257	   */
+   258	  parseOptional(argString) {
+   259	    if (argString === '') {
+   260	      return null;
+   261	    }
+   262	    if (!PREFIX_CHARS.includes(argString[0])) {
+   263	      return null;
+   264	    }
+   265	    const exact = this.optionStringActions.get(argString);
+   266	    if (exact !== undefined) {
+   267	      return { action: exact, optionString: argString, explicitArg: null };
+   268	    }
+   269	    if (argString.length === 1) {
+   270	      // A lone '-' is a value.
+   271	      return null;
+   272	    }
+   273	
+   274	    const equals = argString.indexOf('=');
+   275	    if (equals !== -1) {
+   276	      const optionString = argString.slice(0, equals);
+   277	      const action = this.optionStringActions.get(optionString);
+   278	      if (action !== undefined) {
+   279	        return { action, optionString, explicitArg: argString.slice(equals + 1) };
+   280	      }
+   281	    }
+   282	
+   283	    const tuples = this.getOptionTuples(argString);
+   284	    if (tuples.length > 1) {
+   285	      const options = tuples.map((tuple) => tuple.optionString).join(', ');
+   286	      this.error(`ambiguous option: ${argString} could match ${options}`);
+   287	    }
+   288	    if (tuples.length === 1) {
+   289	      return tuples[0];
+   290	    }
+   291	
+   292	    if (NEGATIVE_NUMBER.test(argString) && !this.hasNegativeNumberOptionals()) {
+   293	      return null;
+   294	    }
+   295	    if (argString.includes(' ')) {
+   296	      return null;
+   297	    }
+   298	    return { action: null, optionString: argString, explicitArg: null };
+   299	  }
+   300	
+   301	  /** Every option string this abbreviation could stand for. */
+   302	  getOptionTuples(argString) {
+   303	    const tuples = [];
+   304	
+   305	    if (PREFIX_CHARS.includes(argString[0]) && PREFIX_CHARS.includes(argString[1])) {
+   306	      // Long options must be separated from their value by '=' or a space.
+   307	      const equals = argString.indexOf('=');
+   308	      const optionPrefix = equals === -1 ? argString : argString.slice(0, equals);
+   309	      const explicitArg = equals === -1 ? null : argString.slice(equals + 1);
+   310	      for (const [optionString, action] of this.optionStringActions) {
+   311	        if (optionString.startsWith(optionPrefix)) {
+   312	          tuples.push({ action, optionString, explicitArg });
+   313	        }
+   314	      }
+   315	      return tuples;
+   316	    }
+   317	
+   318	    // Single-character options may be concatenated with their value.
+   319	    const shortOptionPrefix = argString.slice(0, 2);
+   320	    const shortExplicitArg = argString.slice(2);
+   321	    for (const [optionString, action] of this.optionStringActions) {
+   322	      if (optionString === shortOptionPrefix) {
+   323	        tuples.push({ action, optionString, explicitArg: shortExplicitArg });
+   324	      } else if (optionString.startsWith(argString)) {
+   325	        tuples.push({ action, optionString, explicitArg: null });
+   326	      }
+   327	    }
+   328	    return tuples;
+   329	  }
+   330	}
+   331	
+   332	export { ArgumentError, ParserExit };
+=== /output/lib/cli/formatter.mjs ===
+     1	// Usage and help rendering, reproducing argparse's HelpFormatter layout.
+     2	
+     3	const INDENT = 2;
+     4	const MAX_HELP_POSITION = 24;
+     5	
+     6	/** `-h, --help` for a flag, `--a A` for an option that takes a value. */
+     7	export function formatInvocation(action) {
+     8	  const joined = action.optionStrings.join(', ');
+     9	  return action.nargs === 0 ? joined : `${joined} ${action.metavar}`;
+    10	}
+    11	
+    12	/** The bracketed form used in the usage line, built from the first option only. */
+    13	function formatUsagePart(action) {
+    14	  const option = action.optionStrings[0];
+    15	  const part = action.nargs === 0 ? option : `${option} ${action.metavar}`;
+    16	  return action.required ? part : `[${part}]`;
+    17	}
+    18	
+    19	export function formatUsage(prog, actions) {
+    20	  const parts = actions.map(formatUsagePart);
+    21	  const tail = parts.length === 0 ? '' : ` ${parts.join(' ')}`;
+    22	  return `usage: ${prog}${tail}\n`;
+    23	}
+    24	
+    25	export function formatHelp(prog, actions) {
+    26	  const invocations = actions.map(formatInvocation);
+    27	  const actionMaxLength = Math.max(0, ...invocations.map((text) => text.length + INDENT));
+    28	  const helpPosition = Math.min(actionMaxLength + 2, MAX_HELP_POSITION);
+    29	  const actionWidth = helpPosition - INDENT - 2;
+    30	
+    31	  const pad = ' '.repeat(INDENT);
+    32	  const lines = [formatUsage(prog, actions), '\n', 'options:\n'];
+    33	
+    34	  actions.forEach((action, index) => {
+    35	    const invocation = invocations[index];
+    36	    if (!action.help) {
+    37	      // No help text: the invocation stands alone, with no trailing padding.
+    38	      lines.push(`${pad}${invocation}\n`);
+    39	    } else if (invocation.length <= actionWidth) {
+    40	      lines.push(`${pad}${invocation.padEnd(actionWidth)}  ${action.help}\n`);
+    41	    } else {
+    42	      // Too wide to share a line, so the help text starts on the next one.
+    43	      lines.push(`${pad}${invocation}\n`);
+    44	      lines.push(`${' '.repeat(helpPosition)}${action.help}\n`);
+    45	    }
+    46	  });
+    47	
+    48	  return `${lines.join('').replace(/\n+$/, '')}\n`;
+    49	}
+=== /output/lib/cli/errors.mjs ===
+     1	// Control-flow signals used by the argparse port.
+     2	
+     3	/**
+     4	 * A recoverable parse failure. `ArgumentParser.parseKnownArgs` catches these and
+     5	 * converts them into a `parser.error(...)`, exactly as CPython's
+     6	 * `parse_known_args` does.
+     7	 *
+     8	 * The rendered form is `argument --a: expected one argument`, where the argument
+     9	 * name is every option string for the action joined by `/`.
+    10	 */
+    11	export class ArgumentError extends Error {
+    12	  constructor(action, detail) {
+    13	    super(action === null ? detail : `argument ${action.optionStrings.join('/')}: ${detail}`);
+    14	    this.name = 'ArgumentError';
+    15	  }
+    16	}
+    17	
+    18	/**
+    19	 * A request to terminate, carrying whatever the parser wanted to emit first.
+    20	 * `--help` exits 0 with the help text on stdout; a usage error exits 2 with the
+    21	 * usage line plus the message on stderr.
+    22	 */
+    23	export class ParserExit extends Error {
+    24	  constructor(status, { stdout = '', stderr = '' } = {}) {
+    25	    super(`parser exit ${status}`);
+    26	    this.name = 'ParserExit';
+    27	    this.status = status;
+    28	    this.stdout = stdout;
+    29	    this.stderr = stderr;
+    30	  }
+    31	}
+=== /output/lib/cli/actions.mjs ===
+     1	// Argument actions. Only the two kinds this CLI needs exist: `store` (the
+     2	// default for `add_argument`) and `help` (the automatic `-h/--help`).
+     3	
+     4	export const STORE = 'store';
+     5	export const HELP = 'help';
+     6	
+     7	/**
+     8	 * `nargs === 0` marks a flag that consumes no value; `nargs === null` marks
+     9	 * argparse's default "exactly one value".
+    10	 */
+    11	export class Action {
+    12	  constructor({
+    13	    optionStrings,
+    14	    dest,
+    15	    kind = STORE,
+    16	    nargs = null,
+    17	    required = false,
+    18	    metavar = null,
+    19	    help = '',
+    20	    type = null,
+    21	  }) {
+    22	    this.optionStrings = optionStrings;
+    23	    this.dest = dest;
+    24	    this.kind = kind;
+    25	    this.nargs = nargs;
+    26	    this.required = required;
+    27	    this.help = help;
+    28	    this.type = type;
+    29	    // argparse derives an absent metavar for an optional from `dest.upper()`.
+    30	    this.metavar = metavar === null ? dest.toUpperCase() : metavar;
+    31	  }
+    32	}
+    33	
+    34	/** `--flag` -> dest `flag`; argparse also maps inner dashes to underscores. */
+    35	export function destFromOptionStrings(optionStrings) {
+    36	  const long = optionStrings.find((option) => option.startsWith('--'));
+    37	  const chosen = long === undefined ? optionStrings[0] : long;
+    38	  return chosen.replace(/^-+/, '').replace(/-/g, '_');
+    39	}
+    40	
+    41	export function makeHelpAction() {
+    42	  return new Action({
+    43	    optionStrings: ['-h', '--help'],
+    44	    dest: 'help',
+    45	    kind: HELP,
+    46	    nargs: 0,
+    47	    help: 'show this help message and exit',
+    48	  });
+    49	}
+=== /output/lib/python/stdio.mjs ===
+     1	// Python's `print` / `sys.stderr.write` mapped onto Node's streams.
+     2	//
+     3	// Nothing here calls `process.exit()`. The entry point sets `process.exitCode`
+     4	// and returns instead, so Node always drains stdout/stderr before terminating --
+     5	// `process.exit()` truncates pipes because those streams are asynchronous.
+     6	
+     7	export function writeStdout(text) {
+     8	  process.stdout.write(text);
+     9	}
+    10	
+    11	export function writeStderr(text) {
+    12	  process.stderr.write(text);
+    13	}
+    14	
+    15	/** `print(value)` -- the text followed by a single newline. */
+    16	export function print(text) {
+    17	  writeStdout(`${text}\n`);
+    18	}
+=== /output/lib/python/repr.mjs ===
+     1	// Python's `repr()` for the value shapes this program prints: int, None and
+     2	// list-of-int. `print(x)` uses `str(x)`, which for all of these equals `repr(x)`.
+     3	
+     4	export function pyRepr(value) {
+     5	  if (value === null || value === undefined) {
+     6	    return 'None';
+     7	  }
+     8	  if (Array.isArray(value)) {
+     9	    return `[${value.map(pyRepr).join(', ')}]`;
+    10	  }
+    11	  if (typeof value === 'boolean') {
+    12	    return value ? 'True' : 'False';
+    13	  }
+    14	  if (typeof value === 'string') {
+    15	    return `'${value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+    16	  }
+    17	  return String(value);
+    18	}
+=== /output/lib/python/text.mjs ===
+     1	// Python `str` primitives that bech32's decoder depends on.
+     2	//
+     3	// `bech32_decode` inspects its input one code point at a time and compares the
+     4	// string against its own `lower()`/`upper()` forms, so these helpers reproduce
+     5	// those exact semantics rather than approximating them.
+     6	
+     7	/**
+     8	 * Ordinals of a string, iterated the way Python iterates a `str`:
+     9	 * one entry per code point, not per UTF-16 unit.
+    10	 */
+    11	export function codePoints(text) {
+    12	  const points = [];
+    13	  for (const char of text) {
+    14	    points.push(char.codePointAt(0));
+    15	  }
+    16	  return points;
+    17	}
+    18	
+    19	/** Python's `not any(ord(x) < 33 or ord(x) > 126 for x in text)`. */
+    20	export function isPrintableAsciiRange(text) {
+    21	  for (const char of text) {
+    22	    const point = char.codePointAt(0);
+    23	    if (point < 33 || point > 126) {
+    24	      return false;
+    25	    }
+    26	  }
+    27	  return true;
+    28	}
+    29	
+    30	/**
+    31	 * Python's `text.lower() != text and text.upper() != text`.
+    32	 *
+    33	 * A string with no cased characters at all (e.g. "1231PQYPQA3AQ5Z" has none in
+    34	 * its digits, but its letters are all upper) is *not* mixed case, which is why
+    35	 * both halves of the conjunction matter. Callers reject non-ASCII input first,
+    36	 * so ASCII case mapping is the only behaviour exercised here.
+    37	 */
+    38	export function isMixedCase(text) {
+    39	  return text.toLowerCase() !== text && text.toUpperCase() !== text;
+    40	}

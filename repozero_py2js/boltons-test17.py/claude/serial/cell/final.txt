@@ -1,0 +1,21 @@
+The migration is complete and verified. Files in `/output`:
+
+## `lib/pystr.mjs` — CPython `str` primitives
+`codePointLen` (Python's `len` counts code points — `'😀ab'` is 3, not 4), `pyCapitalize` (titlecases the first code point, lowercases the rest, so `'ß' → 'Ss'`), `pyTitle`, `pyReplace` (Python replaces *all* occurrences; JS `String.replace` with a string only replaces the first).
+
+## `lib/pyrepr.mjs` — `repr()` / `print()` formatting
+Quote selection (`"` only when the string has a `'` and no `"`), `\n`/`\t`/`\\` escapes, and `\xhh`/`\uxxxx`/`\Uxxxxxxxx` for non-printables — matching `str.isprintable()` via `\p{Cc Cf Cs Co Cn Zs Zl Zp}` minus ASCII space, so `\xa0` escapes but `é` and `中` print raw.
+
+## `lib/strutils.mjs` — the boltons string helpers
+- `camel2under`: `/((?<=[a-z0-9])[A-Z]|(?!^)[A-Z](?=[a-z]))/g` → `_$1`, then lowercase (`'FOOBar' → 'foo_bar'`, `'A1B' → 'a1_b'`).
+- `under2camel`: `capitalize() or '_'` per chunk — empty chunks emit a literal underscore (`'' → '_'`, `'a__b' → 'A_B'`).
+- `slugify`/`splitPunctWs`: two quirks found by probing, both baked in — **backslash is not a separator** (`slugify('back\slash')` keeps it, because in the underlying character class `\` only escapes the following `]`), and all-separator input collapses to a bare `_` while empty input stays empty.
+- `pluralize`/`cardinalize`/`unitLen`, with case-pattern matching.
+
+## `lib/dictutils.mjs` — `FrozenDict`, `pyDict`, `zip`
+Map-backed so duplicate keys keep first-insert position with last-write-wins, exactly like a dict comprehension.
+
+## `lib/cli.mjs` — argparse subset
+Reproduces the usage line, the help column arithmetic (`min(maxInvocation + 4, 24)` → the observed 2- and 7-space gaps), `--a=v` form, negative numbers as values, unknown options deferred to "unrecognized arguments" so the required-arg error fires first, and exit code 2.
+
+**Verification:** 42 hand-picked differential cases (unicode, punctuation-only tokens, empty/duplicate tokens, all six argparse error paths) plus 400 random fuzz inputs — all byte-identical to the executable. The one intentional difference is the program name in argparse messages: Python derives it from `sys.argv[0]` (`test17_executable`), so the port derives it from the script (`test17.mjs`); the fuzz harness normalizes that name and reports 400/400 identical.

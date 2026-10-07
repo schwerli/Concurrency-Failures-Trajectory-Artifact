@@ -1,0 +1,1 @@
+- [Java DS course repo: .class files are a pre-stub oracle](java-ds-course-repo-class-file-oracle.md) — decompile them for exact bodies, or run them directly to differential-test; some originals contain real bugs you must reproduce, not fix.

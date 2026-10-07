@@ -1,0 +1,33 @@
+The migration is complete and verified. Here's what was built in `/output`:
+
+```
+/output
+├── lib
+│   ├── pyvalues.mjs          value model + hashing + Python operators
+│   ├── pyformat.mjs          repr() / str() / print()
+│   ├── pyeval.mjs            eval() — tokenizer + recursive-descent parser
+│   ├── pyargparse.mjs        ArgumentParser subset
+│   └── boltons
+│       ├── iterutils.mjs     flatten, chunked, bucketize, partition
+│       └── dictutils.mjs     OrderedMultiDict (OMD), FrozenDict
+└── test19.mjs                entry point
+```
+
+**Key behaviors reverse-engineered from the executable (black box):**
+
+| Behavior | Finding | Implementation |
+|---|---|---|
+| `int` vs `float` | `type(x).__name__` distinguishes them; `100000000000000000000` stays exact | Python `int` → **BigInt**, `float` → **number**. Gives exact big-int arithmetic and free `int`/`float`/`bool` discrimination |
+| `flatten` | strings/bytes are scalars; dicts contribute **keys**; tuples/sets/ranges recurse | `isIterable` + `isScalar` in `iterutils.mjs` |
+| `dict(omd)` | keys in **first**-insertion order, values from **last** `add` | `OrderedMultiDict.toPyDict()` — matches CPython's generic `dict_merge` path via `keys()` + `__getitem__` |
+| `partition` | returns a **tuple** `([...], [...])`; built from the True/False buckets | implemented on top of `bucketize`, so non-bool keys drop as upstream |
+| float repr | `1e+16`, `1000000000000000.0`, `1e-05`, `-0.0`, `inf`/`nan` | shortest round-trip digits via `toExponential()`, then CPython's `decpt <= -4 \|\| decpt > 16` switch and 2-digit exponent |
+| `%` on negatives | `-3 % 2 == 1` | floored modulo, not JS truncated |
+| `len(str(x))` | `len('中文') == 2` | code-point counting, not UTF-16 units |
+| `str` repr | `"it's"` vs `'say "hi"'`; `\t`/`\n` escaped; printable Unicode kept raw | quote selection + `str.isprintable()` emulated with `\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}` |
+| dict key identity | `True == 1 == 1.0` collide, first key object wins | `canonicalKey()` in `pyvalues.mjs` |
+| argparse | `--a=v` works, `-a` doesn't; repeated `--a` → last wins; required check precedes unrecognized-args check | `pyargparse.mjs`, exit codes 0/2 preserved |
+
+**Verification** (harnesses left in `/workspace/verify/`): 48 curated cases plus 1090 randomly generated nested-dict literals across 5 seeds — stdout byte-identical and exit codes equal in every case.
+
+One intentional difference: `--help`/error text prints `usage: test19.mjs ...` where the executable prints `usage: test19_executable ...`. Argparse derives this from `basename(sys.argv[0])`, so the port reproduces the *logic* rather than hardcoding the PyInstaller binary's name; every other character of the help and error output matches. I also don't reproduce the `[PYI-…:ERROR] Failed to execute script` line, which is PyInstaller bootloader noise rather than program output.

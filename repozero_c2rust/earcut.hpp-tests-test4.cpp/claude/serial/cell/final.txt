@@ -1,0 +1,34 @@
+Done. The Rust port is complete and verified byte-for-byte against the C++ binary.
+
+## What was built
+
+```
+/output
+├── Cargo.toml            # edition 2021, [[bin]] test4 -> test4.rs, no dependencies
+├── test4.rs              # entry point: CLI parsing + polygon construction + printing
+├── test4                 # compiled executable
+└── earcut/
+    ├── mod.rs            # public API: `Point` trait + `earcut()` free function
+    ├── algorithm.rs      # the ear-clipping state machine (`Earcut`)
+    ├── node.rs           # arena replacing the C++ pointer-based node pool
+    └── geom.rs           # coordinate-level predicates (area, sign, point-in-triangle, z-order)
+```
+
+## Key porting decisions
+
+- **Pointers → arena indices.** The C++ `Node*` graph became a `Vec<Node>` with `usize` links. Nodes are never freed mid-run, so indices behave exactly like the original pointers — including identity comparisons like `p != ear->prev`, which the algorithm depends on.
+- **Float semantics preserved.** `fmin`/`fmax` replicate `std::min<double>`/`std::max<double>` tie-breaking rather than using `f64::min` (which differs on NaN/±0). Expression operand order in `area`, `point_in_triangle` and the bridge-finding interpolation is kept verbatim so rounding is identical.
+- **Subtle details that mattered:** in `find_hole_bridge`, `mx`/`my` are snapshotted before the scan loop while `m->x` inside the comparison tracks the *current* `m`; in `cure_local_intersections`, `p->next` is read after the first `remove_node`; the `threshold`-based early exit decides `hashing` (kicks in at n ≥ 21, exercising the z-order code path).
+- **`atoi` reimplemented** — leading whitespace, optional sign, stop at first non-digit, `0` on garbage.
+- **Output** uses `write!(…, "{} ", idx)` — trailing space, no newline, matching `std::cout` exactly (confirmed with `xxd`).
+
+## Verification
+
+| Test | Result |
+|---|---|
+| n = 0…120, plus `-1`, `-5`, `abc`, `""`, `" 7x"`, `"+9"`, no-arg | 127/127 byte-identical (hex-compared) |
+| n = 150, 200, 300, 400 | identical; runtime within ~5% of C++ |
+| `rustc --edition 2021 -O test4.rs` | compiles with zero warnings |
+| `cargo build --release` | compiles clean, same output |
+
+Note: `cargo clippy` isn't installed in this environment, so only `rustc`'s own lints ran.

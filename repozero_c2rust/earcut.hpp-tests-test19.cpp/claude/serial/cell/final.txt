@@ -1,0 +1,37 @@
+Done. The migration is complete and verified byte-exact against the C++ reference binary.
+
+## What I built
+
+`mapbox::earcut` re-implemented from scratch in `std`-only Rust (ear clipping with winding normalization, colinear-point filtering, the three fallback passes, hole bridging, and z-order curve hashing), reverse-engineered black-box from the interface and validated differentially.
+
+```
+/output/
+├── Cargo.toml            # [[bin]] name="test19" path="test19.rs"
+├── test19.rs             # entry point (main + #[path] module decls)
+├── test19               # compiled executable
+└── src/
+    ├── cli.rs            # std::atoi semantics
+    ├── fractal.rs        # damped-sine polygon generation
+    └── earcut/
+        ├── mod.rs        # triangulator core (ear slicing, holes, split passes)
+        ├── node.rs       # arena node; usize indices with NIL for nullptr
+        ├── geom.rs       # predicates (area, pointInTriangle, intersects, …)
+        ├── zorder.rs     # z-order hashing + Tatham merge sort
+        └── tests.rs      # unit tests
+```
+
+Because C++ links raw `Node*` from an object pool, I used a single `Vec<Node>` arena with index links — indices stay valid across reallocation, where pointers would not.
+
+## Verification
+
+- **265 byte-exact matches, 0 mismatches** against `test19_executable` for n ∈ [-5, 220] plus 300/500/1000/2000/5000, compared with `cmp` (not `$(...)`, which would hide the trailing space `std::cout << idx << " "` emits — the output correctly ends with a space and no newline).
+- All 5 documented examples reproduce exactly.
+- CLI edge cases match: no args (default 19), `abc`, `0`, `-1`, `12abc`, `" 42"`, `+7`, `3.9`, integer overflow.
+- Both build paths verified: `cargo build --release` and bare `rustc test19.rs`, each with **zero warnings**.
+- Debug build (overflow + bounds checks on) ran the whole small-n range without panicking.
+- 3 unit tests pass, covering hole elimination and degenerate rings — code paths this test never reaches, so they'd otherwise have gone unexercised.
+
+Two details worth flagging:
+
+- **The hashing threshold matters.** The library switches to z-order hashing only when total vertices exceed 80, i.e. n ≥ 40. The default n=19 never takes that path, so I deliberately tested both sides of the boundary; n=40+ exercises the hashed ear test and merge sort.
+- **This polygon is pathological.** It self-intersects, so both implementations fall into the O(n²) `cureLocalIntersections`/`splitEarcut` fallbacks. Runtimes track each other (n=5000: 2.03s C++ vs 2.22s Rust; n=20000: 2m9s vs 2m39s), which confirms the same asymptotic path rather than accidental divergence into a different branch.

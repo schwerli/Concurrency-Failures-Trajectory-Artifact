@@ -1,0 +1,751 @@
+diff --git a/agent_plans/plan.json b/agent_plans/plan.json
+new file mode 100644
+index 0000000..99d49eb
+--- /dev/null
++++ b/agent_plans/plan.json
+@@ -0,0 +1,29 @@
++{
++  "nodes": [
++    {
++      "id": "soot",
++      "label": "Core IR and whole-program utilities",
++      "layer": "foundation"
++    },
++    {
++      "id": "flowdroid",
++      "label": "IFDS-style taint analysis",
++      "layer": "taint"
++    },
++    {
++      "id": "stubdroid",
++      "label": "Library summaries and taint wrapper",
++      "layer": "summaries"
++    }
++  ],
++  "edges": [
++    {
++      "from": "soot",
++      "to": "flowdroid"
++    },
++    {
++      "from": "flowdroid",
++      "to": "stubdroid"
++    }
++  ]
++}
+diff --git a/soot_analysis.py b/soot_analysis.py
+new file mode 100644
+index 0000000..de98e84
+--- /dev/null
++++ b/soot_analysis.py
+@@ -0,0 +1,710 @@
++"""Soot-inspired IR and whole-program utilities for Java-like benchmark programs."""
++
++from __future__ import annotations
++
++import argparse
++import os
++from collections import defaultdict, deque
++from dataclasses import dataclass, field, replace
++from typing import Any
++
++from program_model import ClassDef, FieldRef, Method, MethodSignature, Program, Statement, load_all_benchmarks
++from utils import Timer, build_hierarchy, get_all_subclasses
++
++
++def signature_key(signature: MethodSignature) -> str:
++    return signature.full_signature()
++
++
++def method_subsignature(signature: MethodSignature) -> tuple[str, tuple[str, ...], str]:
++    return (signature.method_name, tuple(signature.param_types), signature.return_type)
++
++
++def clone_field_ref(field_ref: FieldRef | None) -> FieldRef | None:
++    if field_ref is None:
++        return None
++    return replace(field_ref)
++
++
++def clone_statement(stmt: Statement, **changes: Any) -> Statement:
++    payload = {
++        "rhs_vars": list(stmt.rhs_vars),
++        "args": list(stmt.args),
++        "metadata": dict(stmt.metadata),
++        "field_ref": clone_field_ref(stmt.field_ref),
++    }
++    payload.update(changes)
++    return replace(stmt, **payload)
++
++
++def unique_in_order(items: list[int]) -> list[int]:
++    seen: set[int] = set()
++    result: list[int] = []
++    for item in items:
++        if item not in seen:
++            seen.add(item)
++            result.append(item)
++    return result
++
++
++@dataclass(frozen=True)
++class CallSite:
++    caller: MethodSignature
++    stmt_id: int
++
++
++@dataclass
++class JimpleMethodIR:
++    owner: ClassDef
++    method: Method
++    statements: list[Statement]
++    local_types: dict[str, str]
++    successors: dict[int, list[int]]
++    predecessors: dict[int, list[int]]
++
++    @classmethod
++    def from_method(cls, owner: ClassDef, method: Method) -> "JimpleMethodIR":
++        statements: list[Statement] = []
++        local_types: dict[str, str] = {}
++        if method.body is not None:
++            statements = [clone_statement(stmt) for stmt in method.body.statements]
++            statements.sort(key=lambda stmt: stmt.stmt_id)
++            for local in method.body.locals:
++                local_types[local.name] = local.var_type.name
++
++        successors = build_successors(statements)
++        predecessors: dict[int, list[int]] = defaultdict(list)
++        for stmt_id, succs in successors.items():
++            for succ in succs:
++                predecessors[succ].append(stmt_id)
++
++        return cls(
++            owner=owner,
++            method=method,
++            statements=statements,
++            local_types=local_types,
++            successors=successors,
++            predecessors={key: unique_in_order(value) for key, value in predecessors.items()},
++        )
++
++    def clone_with_statements(self, statements: list[Statement]) -> "JimpleMethodIR":
++        clone = JimpleMethodIR.from_method(self.owner, replace(self.method))
++        clone.statements = [clone_statement(stmt) for stmt in statements]
++        clone.successors = build_successors(clone.statements)
++        predecessors: dict[int, list[int]] = defaultdict(list)
++        for stmt_id, succs in clone.successors.items():
++            for succ in succs:
++                predecessors[succ].append(stmt_id)
++        clone.predecessors = {key: unique_in_order(value) for key, value in predecessors.items()}
++        return clone
++
++    @property
++    def signature(self) -> MethodSignature:
++        return self.method.signature
++
++    def statement_ids(self) -> list[int]:
++        return [stmt.stmt_id for stmt in self.statements]
++
++    def stmt_by_id(self) -> dict[int, Statement]:
++        return {stmt.stmt_id: stmt for stmt in self.statements}
++
++    def ordered_call_sites(self) -> list[Statement]:
++        return [stmt for stmt in self.statements if stmt.kind == "call" and stmt.callee is not None]
++
++    def entry_stmt_id(self) -> int | None:
++        if not self.statements:
++            return None
++        return self.statements[0].stmt_id
++
++    def reachable_stmt_ids(self) -> set[int]:
++        entry = self.entry_stmt_id()
++        if entry is None:
++            return set()
++
++        reachable: set[int] = set()
++        worklist = [entry]
++        while worklist:
++            current = worklist.pop()
++            if current in reachable:
++                continue
++            reachable.add(current)
++            worklist.extend(self.successors.get(current, []))
++        return reachable
++
++
++def build_successors(statements: list[Statement]) -> dict[int, list[int]]:
++    successors: dict[int, list[int]] = {}
++    stmt_ids = [stmt.stmt_id for stmt in statements]
++    id_set = set(stmt_ids)
++
++    for index, stmt in enumerate(statements):
++        next_stmt = stmt_ids[index + 1] if index + 1 < len(statements) else None
++        succs: list[int] = []
++        if stmt.kind == "if":
++            if stmt.true_target is not None and stmt.true_target in id_set:
++                succs.append(stmt.true_target)
++            if stmt.false_target is not None and stmt.false_target in id_set:
++                succs.append(stmt.false_target)
++            if stmt.false_target is None and next_stmt is not None:
++                succs.append(next_stmt)
++        elif stmt.kind != "return":
++            if next_stmt is not None:
++                succs.append(next_stmt)
++        successors[stmt.stmt_id] = unique_in_order(succs)
++    return successors
++
++
++@dataclass
++class Scene:
++    program: Program
++    class_index: dict[str, ClassDef] = field(init=False)
++    hierarchy: dict[str, list[str]] = field(init=False)
++    method_index: dict[str, tuple[ClassDef, Method]] = field(init=False)
++    methods_by_class: dict[str, dict[tuple[str, tuple[str, ...], str], Method]] = field(init=False)
++    _subclass_cache: dict[str, set[str]] = field(default_factory=dict, init=False)
++    _ir_cache: dict[str, JimpleMethodIR] = field(default_factory=dict, init=False)
++
++    def __post_init__(self) -> None:
++        self.class_index = {cls.name: cls for cls in self.program.classes}
++        self.hierarchy = build_hierarchy(self.program)
++        self.method_index = {}
++        self.methods_by_class = defaultdict(dict)
++        for cls in self.program.classes:
++            for method in cls.methods:
++                self.method_index[signature_key(method.signature)] = (cls, method)
++                self.methods_by_class[cls.name][method_subsignature(method.signature)] = method
++
++    def get_class(self, class_name: str) -> ClassDef | None:
++        return self.class_index.get(class_name)
++
++    def get_method(self, signature: MethodSignature | str) -> Method | None:
++        key = signature if isinstance(signature, str) else signature_key(signature)
++        owner_method = self.method_index.get(key)
++        if owner_method is None:
++            return None
++        return owner_method[1]
++
++    def get_method_owner(self, signature: MethodSignature | str) -> ClassDef | None:
++        key = signature if isinstance(signature, str) else signature_key(signature)
++        owner_method = self.method_index.get(key)
++        if owner_method is None:
++            return None
++        return owner_method[0]
++
++    def iter_methods(self) -> list[tuple[ClassDef, Method]]:
++        result: list[tuple[ClassDef, Method]] = []
++        for cls in self.program.classes:
++            for method in cls.methods:
++                result.append((cls, method))
++        return result
++
++    def get_entry_points(self) -> list[MethodSignature]:
++        if self.program.entry_points:
++            return list(self.program.entry_points)
++        entry_points = []
++        for _, method in self.iter_methods():
++            if method.is_entry_point:
++                entry_points.append(method.signature)
++        return entry_points
++
++    def get_subclasses(self, class_name: str) -> set[str]:
++        if class_name not in self._subclass_cache:
++            self._subclass_cache[class_name] = get_all_subclasses(self.hierarchy, class_name)
++        return set(self._subclass_cache[class_name])
++
++    def get_ir(self, signature: MethodSignature | str) -> JimpleMethodIR | None:
++        key = signature if isinstance(signature, str) else signature_key(signature)
++        if key in self._ir_cache:
++            return self._ir_cache[key]
++        owner_method = self.method_index.get(key)
++        if owner_method is None:
++            return None
++        ir = JimpleMethodIR.from_method(owner_method[0], owner_method[1])
++        self._ir_cache[key] = ir
++        return ir
++
++    def lookup_local_type(self, method_sig: MethodSignature, local_name: str | None) -> str | None:
++        if local_name is None:
++            return None
++        ir = self.get_ir(method_sig)
++        if ir is None:
++            return None
++        return ir.local_types.get(local_name)
++
++    def resolve_dispatch(self, receiver_type: str | None, callee_sig: MethodSignature) -> set[MethodSignature]:
++        target_method = self.get_method(callee_sig)
++        if target_method is not None and (target_method.is_static or target_method.is_constructor):
++            return {callee_sig}
++
++        candidate_roots: list[str] = []
++        if receiver_type:
++            candidate_roots.append(receiver_type)
++        if callee_sig.class_name not in candidate_roots:
++            candidate_roots.append(callee_sig.class_name)
++
++        candidates: dict[str, MethodSignature] = {}
++        for root in candidate_roots:
++            possible_types = {root}
++            possible_types.update(self.get_subclasses(root))
++            for type_name in possible_types:
++                impl = self.lookup_implementation(type_name, callee_sig)
++                if impl is not None:
++                    candidates[signature_key(impl.signature)] = impl.signature
++
++        if not candidates:
++            candidates[signature_key(callee_sig)] = callee_sig
++        return set(candidates.values())
++
++    def lookup_implementation(self, class_name: str, callee_sig: MethodSignature) -> Method | None:
++        subsig = method_subsignature(callee_sig)
++        current = class_name
++        seen: set[str] = set()
++        while current and current not in seen:
++            seen.add(current)
++            class_methods = self.methods_by_class.get(current)
++            if class_methods is not None and subsig in class_methods:
++                return class_methods[subsig]
++            current_cls = self.class_index.get(current)
++            if current_cls is None:
++                break
++            current = current_cls.super_class
++        return None
++
++
++SceneRegistry = Scene
++
++
++@dataclass
++class CallGraph:
++    entry_points: list[MethodSignature]
++    edges: dict[CallSite, set[MethodSignature]]
++    outgoing: dict[str, set[MethodSignature]]
++    incoming: dict[str, set[CallSite]]
++    reachable_methods: set[str]
++    unresolved_calls: dict[CallSite, MethodSignature]
++
++    def edge_count(self) -> int:
++        return sum(len(targets) for targets in self.edges.values())
++
++    def call_site_count(self) -> int:
++        return len(self.edges)
++
++
++class CHACallGraphBuilder:
++    """Constructs a call graph using class-hierarchy analysis."""
++
++    def __init__(self, scene: Scene) -> None:
++        self.scene = scene
++
++    def build(self, entry_points: list[MethodSignature] | None = None) -> CallGraph:
++        roots = entry_points or self.scene.get_entry_points()
++        edges: dict[CallSite, set[MethodSignature]] = {}
++        outgoing: dict[str, set[MethodSignature]] = defaultdict(set)
++        incoming: dict[str, set[CallSite]] = defaultdict(set)
++        unresolved: dict[CallSite, MethodSignature] = {}
++        reachable: set[str] = set()
++
++        worklist = deque(roots)
++        queued = {signature_key(root) for root in roots}
++        while worklist:
++            current = worklist.popleft()
++            current_key = signature_key(current)
++            reachable.add(current_key)
++            ir = self.scene.get_ir(current)
++            if ir is None:
++                continue
++
++            for stmt in ir.ordered_call_sites():
++                callsite = CallSite(caller=current, stmt_id=stmt.stmt_id)
++                targets = self.resolve_call_targets(ir, stmt)
++                edges[callsite] = targets
++                for target in targets:
++                    outgoing[current_key].add(target)
++                    incoming[signature_key(target)].add(callsite)
++                    if self.scene.get_method(target) is None:
++                        unresolved[callsite] = target
++                        continue
++                    target_key = signature_key(target)
++                    if target_key not in queued:
++                        queued.add(target_key)
++                        worklist.append(target)
++
++        return CallGraph(
++            entry_points=list(roots),
++            edges=edges,
++            outgoing={key: set(value) for key, value in outgoing.items()},
++            incoming={key: set(value) for key, value in incoming.items()},
++            reachable_methods=reachable,
++            unresolved_calls=unresolved,
++        )
++
++    def resolve_call_targets(self, caller_ir: JimpleMethodIR, stmt: Statement) -> set[MethodSignature]:
++        if stmt.callee is None:
++            return set()
++
++        receiver_type = self.scene.lookup_local_type(caller_ir.signature, stmt.receiver)
++        return self.scene.resolve_dispatch(receiver_type, stmt.callee)
++
++
++ClassHierarchyAnalysis = CHACallGraphBuilder
++
++
++def local_names_for_ir(ir: JimpleMethodIR) -> set[str]:
++    return set(ir.local_types)
++
++
++def is_local_token(token: str | None, local_names: set[str]) -> bool:
++    return token is not None and token in local_names
++
++
++def resolve_env_value(env: dict[str, str], token: str, local_names: set[str]) -> str:
++    current = token
++    seen = {current}
++    while is_local_token(current, local_names) and current in env:
++        replacement = env[current]
++        if replacement.startswith("@") or replacement in seen:
++            break
++        current = replacement
++        seen.add(current)
++    return current
++
++
++def rewrite_token(token: str | None, env: dict[str, str], local_names: set[str]) -> str | None:
++    if token is None or not is_local_token(token, local_names):
++        return token
++    replacement = resolve_env_value(env, token, local_names)
++    if replacement.startswith("@"):
++        return token
++    return replacement
++
++
++def statement_uses(stmt: Statement, local_names: set[str]) -> set[str]:
++    uses: set[str] = set()
++
++    if stmt.receiver and stmt.receiver in local_names:
++        uses.add(stmt.receiver)
++    if stmt.field_ref is not None and stmt.field_ref.base in local_names:
++        uses.add(stmt.field_ref.base)
++    if stmt.rhs and stmt.rhs in local_names:
++        uses.add(stmt.rhs)
++    for value in stmt.rhs_vars:
++        if value in local_names:
++            uses.add(value)
++    for arg in stmt.args:
++        if arg in local_names:
++            uses.add(arg)
++    if stmt.kind == "return" and stmt.rhs and stmt.rhs in local_names:
++        uses.add(stmt.rhs)
++    if stmt.kind == "if" and stmt.condition and stmt.condition in local_names:
++        uses.add(stmt.condition)
++    return uses
++
++
++def statement_defs(stmt: Statement) -> set[str]:
++    if stmt.lhs is None:
++        return set()
++    return {stmt.lhs}
++
++
++def statement_has_side_effects(stmt: Statement) -> bool:
++    return stmt.kind in {"call", "field_store"}
++
++
++def propagate_statement(stmt: Statement, env: dict[str, str], local_names: set[str]) -> Statement:
++    updates: dict[str, Any] = {}
++
++    rewritten_rhs = rewrite_token(stmt.rhs, env, local_names)
++    if rewritten_rhs != stmt.rhs:
++        updates["rhs"] = rewritten_rhs
++
++    rewritten_args = [rewrite_token(arg, env, local_names) or arg for arg in stmt.args]
++    if rewritten_args != stmt.args:
++        updates["args"] = rewritten_args
++
++    rewritten_rhs_vars = [rewrite_token(value, env, local_names) or value for value in stmt.rhs_vars]
++    if rewritten_rhs_vars != stmt.rhs_vars:
++        updates["rhs_vars"] = rewritten_rhs_vars
++
++    rewritten_receiver = rewrite_token(stmt.receiver, env, local_names)
++    if rewritten_receiver != stmt.receiver:
++        updates["receiver"] = rewritten_receiver
++
++    if stmt.field_ref is not None:
++        rewritten_base = rewrite_token(stmt.field_ref.base, env, local_names)
++        if rewritten_base != stmt.field_ref.base:
++            updates["field_ref"] = replace(stmt.field_ref, base=rewritten_base or stmt.field_ref.base)
++
++    if stmt.kind == "if":
++        rewritten_condition = rewrite_token(stmt.condition, env, local_names)
++        if rewritten_condition != stmt.condition:
++            updates["condition"] = rewritten_condition
++
++    if not updates:
++        return clone_statement(stmt)
++    return clone_statement(stmt, **updates)
++
++
++def merge_copy_envs(envs: list[dict[str, str]]) -> dict[str, str]:
++    if not envs:
++        return {}
++    common_keys = set(envs[0])
++    for env in envs[1:]:
++        common_keys &= set(env)
++
++    merged: dict[str, str] = {}
++    for key in common_keys:
++        values = {env[key] for env in envs}
++        if len(values) == 1:
++            merged[key] = next(iter(values))
++    return merged
++
++
++@dataclass
++class CopyPropagationResult:
++    method_ir: JimpleMethodIR
++    replacements: int
++
++
++def copy_propagate_method(ir: JimpleMethodIR) -> CopyPropagationResult:
++    if not ir.statements:
++        return CopyPropagationResult(method_ir=ir.clone_with_statements([]), replacements=0)
++
++    local_names = local_names_for_ir(ir)
++    stmt_lookup = ir.stmt_by_id()
++    in_envs: dict[int, dict[str, str]] = {stmt.stmt_id: {} for stmt in ir.statements}
++    out_envs: dict[int, dict[str, str]] = {stmt.stmt_id: {} for stmt in ir.statements}
++    entry = ir.entry_stmt_id()
++    worklist = deque(ir.statement_ids())
++
++    while worklist:
++        stmt_id = worklist.popleft()
++        preds = ir.predecessors.get(stmt_id, [])
++        if stmt_id == entry:
++            new_in = {}
++        else:
++            new_in = merge_copy_envs([out_envs[pred] for pred in preds])
++        if new_in != in_envs[stmt_id]:
++            in_envs[stmt_id] = new_in
++
++        stmt = stmt_lookup[stmt_id]
++        new_out = dict(in_envs[stmt_id])
++        if stmt.lhs is not None:
++            new_out.pop(stmt.lhs, None)
++
++        if stmt.kind == "assign" and stmt.rhs is not None:
++            rewritten_rhs = rewrite_token(stmt.rhs, in_envs[stmt_id], local_names)
++            if rewritten_rhs is not None:
++                new_out[stmt.lhs] = rewritten_rhs
++        elif stmt.kind == "identity" and stmt.rhs is not None:
++            new_out[stmt.lhs] = stmt.rhs
++
++        if new_out != out_envs[stmt_id]:
++            out_envs[stmt_id] = new_out
++            for succ in ir.successors.get(stmt_id, []):
++                if succ not in worklist:
++                    worklist.append(succ)
++
++    replacements = 0
++    rewritten_statements: list[Statement] = []
++    for stmt in ir.statements:
++        rewritten = propagate_statement(stmt, in_envs[stmt.stmt_id], local_names)
++        replacements += count_replacements(stmt, rewritten)
++        rewritten_statements.append(rewritten)
++
++    return CopyPropagationResult(
++        method_ir=ir.clone_with_statements(rewritten_statements),
++        replacements=replacements,
++    )
++
++
++def count_replacements(before: Statement, after: Statement) -> int:
++    count = 0
++    if before.rhs != after.rhs:
++        count += 1
++    if before.receiver != after.receiver:
++        count += 1
++    if before.args != after.args:
++        count += sum(1 for old, new in zip(before.args, after.args) if old != new)
++    if before.rhs_vars != after.rhs_vars:
++        count += sum(1 for old, new in zip(before.rhs_vars, after.rhs_vars) if old != new)
++    before_base = before.field_ref.base if before.field_ref is not None else None
++    after_base = after.field_ref.base if after.field_ref is not None else None
++    if before_base != after_base:
++        count += 1
++    if before.condition != after.condition:
++        count += 1
++    return count
++
++
++@dataclass
++class DeadCodeEliminationResult:
++    method_ir: JimpleMethodIR
++    removed_stmt_ids: list[int]
++    unreachable_stmt_ids: list[int]
++
++
++def dead_code_eliminate_method(ir: JimpleMethodIR) -> DeadCodeEliminationResult:
++    if not ir.statements:
++        return DeadCodeEliminationResult(method_ir=ir.clone_with_statements([]), removed_stmt_ids=[], unreachable_stmt_ids=[])
++
++    local_names = local_names_for_ir(ir)
++    reachable = ir.reachable_stmt_ids()
++    unreachable = [stmt.stmt_id for stmt in ir.statements if stmt.stmt_id not in reachable]
++
++    live_in: dict[int, set[str]] = {stmt.stmt_id: set() for stmt in ir.statements}
++    live_out: dict[int, set[str]] = {stmt.stmt_id: set() for stmt in ir.statements}
++
++    changed = True
++    while changed:
++        changed = False
++        for stmt in reversed(ir.statements):
++            stmt_id = stmt.stmt_id
++            succ_live = set()
++            for succ in ir.successors.get(stmt_id, []):
++                succ_live |= live_in[succ]
++            uses = statement_uses(stmt, local_names)
++            defs = statement_defs(stmt)
++            new_out = succ_live
++            new_in = uses | (new_out - defs)
++            if new_out != live_out[stmt_id] or new_in != live_in[stmt_id]:
++                live_out[stmt_id] = new_out
++                live_in[stmt_id] = new_in
++                changed = True
++
++    removed: list[int] = []
++    kept: list[Statement] = []
++    for stmt in ir.statements:
++        if stmt.stmt_id not in reachable:
++            removed.append(stmt.stmt_id)
++            continue
++
++        defs = statement_defs(stmt)
++        dead_def = bool(defs) and defs.isdisjoint(live_out[stmt.stmt_id])
++        removable_kind = stmt.kind in {"assign", "identity", "new", "field_load", "nop"}
++        if removable_kind and dead_def and not statement_has_side_effects(stmt):
++            removed.append(stmt.stmt_id)
++            continue
++
++        kept.append(clone_statement(stmt))
++
++    return DeadCodeEliminationResult(
++        method_ir=ir.clone_with_statements(kept),
++        removed_stmt_ids=removed,
++        unreachable_stmt_ids=unreachable,
++    )
++
++
++@dataclass
++class OptimizedMethod:
++    original_ir: JimpleMethodIR
++    copy_result: CopyPropagationResult
++    dce_result: DeadCodeEliminationResult
++
++
++def optimize_method(ir: JimpleMethodIR) -> OptimizedMethod:
++    copy_result = copy_propagate_method(ir)
++    dce_result = dead_code_eliminate_method(copy_result.method_ir)
++    return OptimizedMethod(original_ir=ir, copy_result=copy_result, dce_result=dce_result)
++
++
++@dataclass
++class SootProgramResult:
++    program_name: str
++    scene: Scene
++    call_graph: CallGraph
++    optimized_methods: dict[str, OptimizedMethod]
++    metrics: dict[str, int]
++
++
++def analyze_program(program: Program) -> SootProgramResult:
++    scene = Scene(program)
++    call_graph = CHACallGraphBuilder(scene).build()
++    optimized_methods: dict[str, OptimizedMethod] = {}
++    copy_replacements = 0
++    dce_removed = 0
++    statements = 0
++
++    for owner, method in scene.iter_methods():
++        ir = scene.get_ir(method.signature)
++        if ir is None:
++            continue
++        statements += len(ir.statements)
++        optimized = optimize_method(ir)
++        optimized_methods[signature_key(method.signature)] = optimized
++        copy_replacements += optimized.copy_result.replacements
++        dce_removed += len(optimized.dce_result.removed_stmt_ids)
++
++    metrics = {
++        "classes": len(program.classes),
++        "methods": sum(len(cls.methods) for cls in program.classes),
++        "statements": statements,
++        "entry_points": len(scene.get_entry_points()),
++        "reachable_methods": len(call_graph.reachable_methods),
++        "call_sites": call_graph.call_site_count(),
++        "call_graph_edges": call_graph.edge_count(),
++        "unresolved_calls": len(call_graph.unresolved_calls),
++        "copy_replacements": copy_replacements,
++        "dead_statements_removed": dce_removed,
++    }
++
++    return SootProgramResult(
++        program_name=program.name,
++        scene=scene,
++        call_graph=call_graph,
++        optimized_methods=optimized_methods,
++        metrics=metrics,
++    )
++
++
++def analyze_benchmarks(directory: str) -> list[SootProgramResult]:
++    return [analyze_program(program) for program in load_all_benchmarks(directory)]
++
++
++def summarize_results(results: list[SootProgramResult], runtime_ms: float) -> dict[str, str]:
++    total_metrics: defaultdict[str, int] = defaultdict(int)
++    for result in results:
++        for key, value in result.metrics.items():
++            total_metrics[key] += value
++
++    return {
++        "SOOT_STATUS": "OK",
++        "SOOT_BENCHMARKS": str(len(results)),
++        "SOOT_CLASSES": str(total_metrics["classes"]),
++        "SOOT_METHODS": str(total_metrics["methods"]),
++        "SOOT_STATEMENTS": str(total_metrics["statements"]),
++        "SOOT_ENTRY_POINTS": str(total_metrics["entry_points"]),
++        "SOOT_REACHABLE_METHODS": str(total_metrics["reachable_methods"]),
++        "SOOT_CALL_SITES": str(total_metrics["call_sites"]),
++        "SOOT_CALL_GRAPH_EDGES": str(total_metrics["call_graph_edges"]),
++        "SOOT_UNRESOLVED_CALLS": str(total_metrics["unresolved_calls"]),
++        "SOOT_COPY_REPLACEMENTS": str(total_metrics["copy_replacements"]),
++        "SOOT_DEAD_STATEMENTS_REMOVED": str(total_metrics["dead_statements_removed"]),
++        "SOOT_RUNTIME_MS": f"{runtime_ms:.3f}",
++    }
++
++
++def emit_metrics(metrics: dict[str, str]) -> None:
++    for key, value in metrics.items():
++        print(f"{key}: {value}")
++
++
++def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        "--benchmarks",
++        default=os.path.join(os.path.dirname(__file__), "benchmarks"),
++        help="Directory containing benchmark JSON files.",
++    )
++    return parser.parse_args(argv)
++
++
++def main(argv: list[str] | None = None) -> int:
++    args = parse_args(argv)
++    with Timer() as timer:
++        results = analyze_benchmarks(args.benchmarks)
++    emit_metrics(summarize_results(results, timer.elapsed_ms))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

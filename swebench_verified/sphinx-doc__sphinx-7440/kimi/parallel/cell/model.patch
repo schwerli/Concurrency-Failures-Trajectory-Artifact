@@ -1,0 +1,164 @@
+diff --git a/CHANGES b/CHANGES
+index a7950b8e0..5300ef547 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -19,6 +19,8 @@ Bugs fixed
+ * #7428: py domain: a reference to class ``None`` emits a nitpicky warning
+ * #7438: C++, fix merging overloaded functions in parallel builds.
+ * #7422: autodoc: fails with ValueError when using autodoc_mock_imports
++* #7415: std domain: duplicated warning for glossary terms which have different
++  cases
+ 
+ Testing
+ --------
+diff --git a/sphinx/domains/std.py b/sphinx/domains/std.py
+index d820cfe5c..594b05a20 100644
+--- a/sphinx/domains/std.py
++++ b/sphinx/domains/std.py
+@@ -305,7 +305,7 @@ def make_glossary_term(env: "BuildEnvironment", textnodes: Iterable[Node], index
+         term['ids'].append(node_id)
+ 
+     std = cast(StandardDomain, env.get_domain('std'))
+-    std.note_object('term', termtext.lower(), node_id, location=term)
++    std.note_term(termtext, node_id, location=term)
+ 
+     # add an index entry too
+     indexnode = addnodes.index()
+@@ -565,8 +565,7 @@ class StandardDomain(Domain):
+         # links to tokens in grammar productions
+         'token':   TokenXRefRole(),
+         # links to terms in glossary
+-        'term':    XRefRole(lowercase=True, innernodeclass=nodes.inline,
+-                            warn_dangling=True),
++        'term':    XRefRole(innernodeclass=nodes.inline, warn_dangling=True),
+         # links to headings or arbitrary labels
+         'ref':     XRefRole(lowercase=True, innernodeclass=nodes.inline,
+                             warn_dangling=True),
+@@ -582,6 +581,7 @@ class StandardDomain(Domain):
+     initial_data = {
+         'progoptions': {},      # (program, name) -> docname, labelid
+         'objects': {},          # (type, name) -> docname, labelid
++        'terms': {},            # term -> docname, labelid
+         'labels': {             # labelname -> docname, labelid, sectionname
+             'genindex': ('genindex', '', _('Index')),
+             'modindex': ('py-modindex', '', _('Module Index')),
+@@ -646,6 +646,10 @@ class StandardDomain(Domain):
+     def objects(self) -> Dict[Tuple[str, str], Tuple[str, str]]:
+         return self.data.setdefault('objects', {})  # (objtype, name) -> docname, labelid
+ 
++    @property
++    def terms(self) -> Dict[str, Tuple[str, str]]:
++        return self.data.setdefault('terms', {})  # term -> docname, labelid
++
+     def note_object(self, objtype: str, name: str, labelid: str, location: Any = None
+                     ) -> None:
+         """Note a generic object for cross reference.
+@@ -658,6 +662,18 @@ class StandardDomain(Domain):
+                            objtype, name, docname, location=location)
+         self.objects[objtype, name] = (self.env.docname, labelid)
+ 
++    def note_term(self, text: str, node_id: str, location: Any = None) -> None:
++        """Note a glossary term for cross reference.
++
++        .. versionadded:: 3.0
++        """
++        if text in self.terms:
++            docname = self.terms[text][0]
++            logger.warning(__('duplicate term description of %s, other instance in %s'),
++                           text, docname, location=location)
++
++        self.terms[text] = (self.env.docname, node_id)
++
+     def add_object(self, objtype: str, name: str, docname: str, labelid: str) -> None:
+         warnings.warn('StandardDomain.add_object() is deprecated.',
+                       RemovedInSphinx50Warning)
+@@ -683,6 +699,9 @@ class StandardDomain(Domain):
+         for key, (fn, _l) in list(self.objects.items()):
+             if fn == docname:
+                 del self.objects[key]
++        for key, (fn, _l) in list(self.terms.items()):
++            if fn == docname:
++                del self.terms[key]
+         for key, (fn, _l, _l) in list(self.labels.items()):
+             if fn == docname:
+                 del self.labels[key]
+@@ -698,6 +717,9 @@ class StandardDomain(Domain):
+         for key, data in otherdata['objects'].items():
+             if data[0] in docnames:
+                 self.objects[key] = data
++        for key, data in otherdata.get('terms', {}).items():
++            if data[0] in docnames:
++                self.terms[key] = data
+         for key, data in otherdata['labels'].items():
+             if data[0] in docnames:
+                 self.labels[key] = data
+@@ -784,6 +806,8 @@ class StandardDomain(Domain):
+             resolver = self._resolve_doc_xref
+         elif typ == 'option':
+             resolver = self._resolve_option_xref
++        elif typ == 'term':
++            resolver = self._resolve_term_xref
+         elif typ == 'citation':
+             warnings.warn('pending_xref(domain=std, type=citation) is deprecated: %r' % node,
+                           RemovedInSphinx40Warning)
+@@ -797,6 +821,13 @@ class StandardDomain(Domain):
+     def _resolve_ref_xref(self, env: "BuildEnvironment", fromdocname: str,
+                           builder: "Builder", typ: str, target: str, node: pending_xref,
+                           contnode: Element) -> Element:
++        if typ == 'term':
++            docname, labelid = self.terms.get(target, ('', ''))
++            if not docname:
++                return None
++            else:
++                return make_refnode(builder, fromdocname, docname, labelid, contnode)
++
+         if node['refexplicit']:
+             # reference to anonymous label; the reference uses
+             # the supplied link caption
+@@ -812,6 +843,17 @@ class StandardDomain(Domain):
+         return self.build_reference_node(fromdocname, builder,
+                                          docname, labelid, sectname, 'ref')
+ 
++    def _resolve_term_xref(self, env: "BuildEnvironment", fromdocname: str,
++                           builder: "Builder", typ: str, target: str,
++                           node: pending_xref, contnode: Element) -> Element:
++        result = self._resolve_ref_xref(env, fromdocname, builder, typ, target.lower(),
++                                        node, contnode)
++        if result is None:
++            return self._resolve_ref_xref(env, fromdocname, builder, 'term', target,
++                                          node, contnode)
++        else:
++            return result
++
+     def _resolve_numref_xref(self, env: "BuildEnvironment", fromdocname: str,
+                              builder: "Builder", typ: str, target: str,
+                              node: pending_xref, contnode: Element) -> Element:
+@@ -951,9 +993,17 @@ class StandardDomain(Domain):
+                 results.append(('std:' + role, res))
+         # all others
+         for objtype in self.object_types:
+-            key = (objtype, target)
+             if objtype == 'term':
+-                key = (objtype, ltarget)
++                docname, labelid = self.terms.get(ltarget, ('', ''))
++                if not docname:
++                    docname, labelid = self.terms.get(target, ('', ''))
++                if docname:
++                    results.append(('std:term',
++                                    make_refnode(builder, fromdocname, docname,
++                                                 labelid, contnode)))
++                continue
++
++            key = (objtype, target)
+             if key in self.objects:
+                 docname, labelid = self.objects[key]
+                 results.append(('std:' + self.role_for_objtype(objtype),
+@@ -974,6 +1024,8 @@ class StandardDomain(Domain):
+         for (type, name), info in self.objects.items():
+             yield (name, name, type, info[0], info[1],
+                    self.object_types[type].attrs['searchprio'])
++        for name, info in self.terms.items():
++            yield (name, name, 'term', info[0], info[1], -1)
+         for name, (docname, labelid, sectionname) in self.labels.items():
+             yield (name, sectionname, 'label', docname, labelid, -1)
+         # add anonymous-only labels as well

@@ -1,0 +1,21 @@
+Fixed.
+
+**Root cause:** `XAxis._init` / `YAxis._init` (`lib/matplotlib/axis.py:2258` and `:2520`) hardcoded the offset text color to `{x,y}tick.color`, ignoring `{x,y}tick.labelcolor`. The `Tick` constructor already did the right resolution for `label1`/`label2` (`axis.py:122-127`) — the offset text just never got the same treatment, even though it's semantically part of the tick labels (and `Axis.set_tick_params` already applies `labelcolor` to it at `axis.py:972`).
+
+**The fix** applies the same `'inherit'` sentinel logic used for tick labels: use `labelcolor` when set, fall back to `tick.color` when it's `'inherit'` (the default). This also covers `Axis.clear()`, which calls `_init()` after resetting visual defaults.
+
+**Verification** — beyond the added regression test, I probed the resolved colors across the matrix:
+
+| rcParams | x offset | y offset |
+|---|---|---|
+| defaults | black ✓ | black ✓ |
+| `ytick.labelcolor='red'` (bug report) | black ✓ | **red** ✓ |
+| `xtick.labelcolor='red'` | **red** ✓ | black ✓ |
+| `color='blue'`, `labelcolor='red'` | red ✓ | red ✓ |
+| `color='blue'` only (inherit) | blue ✓ | blue ✓ |
+
+The last row confirms no regression to the default inheritance path, and the fourth confirms `labelcolor` correctly wins over `color`. I also rendered the bug report's exact snippet and confirmed the `1e9` label is now red, matching the "Expected outcome" screenshot.
+
+Two notes on test results:
+- `test_axes.py`, `test_ticker.py`, `test_rcparams.py`, `test_subplots.py`: 1506 passed, 3 failed. I confirmed all 3 failures (`test_mathtext_ticks`, `test_rcparams_update`, `test_rcparams_init`) reproduce on the unmodified tree via `git stash` — they're pre-existing and unrelated.
+- I did not add a `doc/users/next_whats_new` or API-change note; this is a bugfix restoring documented behavior rather than a feature, but let me know if this repo's conventions want a changelog entry.

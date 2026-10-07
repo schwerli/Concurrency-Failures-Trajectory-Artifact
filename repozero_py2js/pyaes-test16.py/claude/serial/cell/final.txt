@@ -1,0 +1,1073 @@
+Verified: 821/821 cases match the executable byte-for-byte on stdout, stderr and exit code, plus FIPS-197 known-answer vectors for AES-128/192/256.
+
+## Library files
+
+### `/output/lib/aes/galois.mjs` — GF(2⁸) arithmetic
+
+```js
+/**
+ * Arithmetic in the Rijndael finite field GF(2^8).
+ *
+ * Every byte is treated as a polynomial over GF(2); products are reduced
+ * modulo the AES irreducible polynomial x^8 + x^4 + x^3 + x + 1 (0x11b).
+ */
+
+/** The AES reduction polynomial. */
+export const AES_POLYNOMIAL = 0x11b;
+
+/**
+ * Multiply `a` by x (i.e. by 2) in GF(2^8).
+ *
+ * @param {number} a byte
+ * @returns {number} byte
+ */
+export function xtime(a) {
+  const shifted = (a << 1) & 0xff;
+  return (a & 0x80) !== 0 ? shifted ^ (AES_POLYNOMIAL & 0xff) : shifted;
+}
+
+/**
+ * Multiply two bytes in GF(2^8) using peasant multiplication.
+ *
+ * @param {number} a byte
+ * @param {number} b byte
+ * @returns {number} byte
+ */
+export function gmul(a, b) {
+  let result = 0;
+  let x = a & 0xff;
+  let y = b & 0xff;
+  while (y !== 0) {
+    if ((y & 1) !== 0) result ^= x;
+    x = xtime(x);
+    y >>= 1;
+  }
+  return result & 0xff;
+}
+
+/**
+ * Discrete exponential / logarithm tables for the generator 3, used to
+ * derive multiplicative inverses without a search.
+ */
+function buildLogTables() {
+  const exp = new Uint8Array(256);
+  const log = new Uint8Array(256);
+  let x = 1;
+  for (let i = 0; i < 255; i += 1) {
+    exp[i] = x;
+    log[x] = i;
+    x = (x ^ xtime(x)) & 0xff; // multiply by the generator 3 == x + 1
+  }
+  return { exp, log };
+}
+
+const { exp: EXP_TABLE, log: LOG_TABLE } = buildLogTables();
+
+/**
+ * Multiplicative inverse in GF(2^8); zero is mapped to zero by convention.
+ *
+ * @param {number} a byte
+ * @returns {number} byte
+ */
+export function ginv(a) {
+  const b = a & 0xff;
+  if (b === 0) return 0;
+  return EXP_TABLE[(255 - LOG_TABLE[b]) % 255];
+}
+```
+
+### `/output/lib/aes/tables.mjs` — S-box / inverse S-box / Rcon
+
+```js
+/**
+ * Lookup tables derived from the field arithmetic in `galois.mjs`.
+ *
+ * They are computed at module load rather than embedded as literals so the
+ * definitions stay auditable against the FIPS-197 specification.
+ */
+
+import { ginv, xtime } from './galois.mjs';
+
+/** Rotate a byte left by `n` bits. */
+function rotl8(value, n) {
+  return ((value << n) | (value >>> (8 - n))) & 0xff;
+}
+
+function buildSbox() {
+  const sbox = new Uint8Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    const s = ginv(i);
+    sbox[i] = (s ^ rotl8(s, 1) ^ rotl8(s, 2) ^ rotl8(s, 3) ^ rotl8(s, 4) ^ 0x63) & 0xff;
+  }
+  return sbox;
+}
+
+function buildInverseSbox(sbox) {
+  const inverse = new Uint8Array(256);
+  for (let i = 0; i < 256; i += 1) inverse[sbox[i]] = i;
+  return inverse;
+}
+
+function buildRcon() {
+  // Rcon[i] holds x^(i-1) in GF(2^8); index 0 is unused by the key schedule.
+  const rcon = new Uint8Array(16);
+  let value = 1;
+  for (let i = 1; i < rcon.length; i += 1) {
+    rcon[i] = value;
+    value = xtime(value);
+  }
+  return rcon;
+}
+
+/** The AES substitution box. */
+export const SBOX = buildSbox();
+
+/** The inverse substitution box, used by decryption. */
+export const INV_SBOX = buildInverseSbox(SBOX);
+
+/** Round constants for the key schedule. */
+export const RCON = buildRcon();
+```
+
+### `/output/lib/aes/keySchedule.mjs` — key expansion
+
+```js
+/**
+ * The AES key schedule (FIPS-197 section 5.2).
+ */
+
+import { RCON, SBOX } from './tables.mjs';
+
+/** Key sizes accepted by AES, in bytes. */
+export const VALID_KEY_SIZES = [16, 24, 32];
+
+/** Number of rounds per key size, keyed by key length in bytes. */
+const ROUNDS_BY_KEY_SIZE = { 16: 10, 24: 12, 32: 14 };
+
+function subWord(word) {
+  return (
+    (SBOX[(word >>> 24) & 0xff] << 24) |
+    (SBOX[(word >>> 16) & 0xff] << 16) |
+    (SBOX[(word >>> 8) & 0xff] << 8) |
+    SBOX[word & 0xff]
+  ) >>> 0;
+}
+
+function rotWord(word) {
+  return (((word << 8) | (word >>> 24)) & 0xffffffff) >>> 0;
+}
+
+/**
+ * Expand a cipher key into the round key words.
+ *
+ * @param {Uint8Array} key 16, 24 or 32 raw key bytes
+ * @returns {{ words: Uint32Array, rounds: number }}
+ */
+export function expandKey(key) {
+  const nk = key.length / 4;
+  const rounds = ROUNDS_BY_KEY_SIZE[key.length];
+  const total = 4 * (rounds + 1);
+  const words = new Uint32Array(total);
+
+  for (let i = 0; i < nk; i += 1) {
+    words[i] =
+      ((key[4 * i] << 24) | (key[4 * i + 1] << 16) | (key[4 * i + 2] << 8) | key[4 * i + 3]) >>> 0;
+  }
+
+  for (let i = nk; i < total; i += 1) {
+    let temp = words[i - 1];
+    if (i % nk === 0) {
+      temp = (subWord(rotWord(temp)) ^ (RCON[i / nk] << 24)) >>> 0;
+    } else if (nk > 6 && i % nk === 4) {
+      temp = subWord(temp);
+    }
+    words[i] = (words[i - nk] ^ temp) >>> 0;
+  }
+
+  return { words, rounds };
+}
+```
+
+### `/output/lib/aes/blockCipher.mjs` — the block permutation
+
+```js
+/**
+ * The AES block cipher: a single 16-byte permutation in each direction.
+ *
+ * The state is kept as 16 bytes in column-major order, exactly as the input
+ * block is laid out, so `state[4 * column + row]` addresses one cell.
+ */
+
+import { gmul } from './galois.mjs';
+import { INV_SBOX, SBOX } from './tables.mjs';
+
+/** Block size of AES in bytes. */
+export const BLOCK_SIZE = 16;
+
+function addRoundKey(state, words, round) {
+  for (let column = 0; column < 4; column += 1) {
+    const word = words[round * 4 + column];
+    state[4 * column] ^= (word >>> 24) & 0xff;
+    state[4 * column + 1] ^= (word >>> 16) & 0xff;
+    state[4 * column + 2] ^= (word >>> 8) & 0xff;
+    state[4 * column + 3] ^= word & 0xff;
+  }
+}
+
+function subBytes(state, box) {
+  for (let i = 0; i < BLOCK_SIZE; i += 1) state[i] = box[state[i]];
+}
+
+function shiftRows(state) {
+  // Row r is rotated left by r positions.
+  let t = state[1];
+  state[1] = state[5];
+  state[5] = state[9];
+  state[9] = state[13];
+  state[13] = t;
+
+  t = state[2];
+  state[2] = state[10];
+  state[10] = t;
+  t = state[6];
+  state[6] = state[14];
+  state[14] = t;
+
+  t = state[15];
+  state[15] = state[11];
+  state[11] = state[7];
+  state[7] = state[3];
+  state[3] = t;
+}
+
+function invShiftRows(state) {
+  // Row r is rotated right by r positions.
+  let t = state[13];
+  state[13] = state[9];
+  state[9] = state[5];
+  state[5] = state[1];
+  state[1] = t;
+
+  t = state[2];
+  state[2] = state[10];
+  state[10] = t;
+  t = state[6];
+  state[6] = state[14];
+  state[14] = t;
+
+  t = state[3];
+  state[3] = state[7];
+  state[7] = state[11];
+  state[11] = state[15];
+  state[15] = t;
+}
+
+function mixColumns(state) {
+  for (let c = 0; c < 4; c += 1) {
+    const o = 4 * c;
+    const a0 = state[o];
+    const a1 = state[o + 1];
+    const a2 = state[o + 2];
+    const a3 = state[o + 3];
+    state[o] = gmul(a0, 2) ^ gmul(a1, 3) ^ a2 ^ a3;
+    state[o + 1] = a0 ^ gmul(a1, 2) ^ gmul(a2, 3) ^ a3;
+    state[o + 2] = a0 ^ a1 ^ gmul(a2, 2) ^ gmul(a3, 3);
+    state[o + 3] = gmul(a0, 3) ^ a1 ^ a2 ^ gmul(a3, 2);
+  }
+}
+
+function invMixColumns(state) {
+  for (let c = 0; c < 4; c += 1) {
+    const o = 4 * c;
+    const a0 = state[o];
+    const a1 = state[o + 1];
+    const a2 = state[o + 2];
+    const a3 = state[o + 3];
+    state[o] = gmul(a0, 14) ^ gmul(a1, 11) ^ gmul(a2, 13) ^ gmul(a3, 9);
+    state[o + 1] = gmul(a0, 9) ^ gmul(a1, 14) ^ gmul(a2, 11) ^ gmul(a3, 13);
+    state[o + 2] = gmul(a0, 13) ^ gmul(a1, 9) ^ gmul(a2, 14) ^ gmul(a3, 11);
+    state[o + 3] = gmul(a0, 11) ^ gmul(a1, 13) ^ gmul(a2, 9) ^ gmul(a3, 14);
+  }
+}
+
+/**
+ * Encrypt one 16-byte block with an expanded key.
+ *
+ * @param {Uint8Array} block plaintext block
+ * @param {{ words: Uint32Array, rounds: number }} schedule
+ * @returns {Uint8Array} ciphertext block
+ */
+export function encryptBlock(block, schedule) {
+  const state = Uint8Array.from(block);
+  const { words, rounds } = schedule;
+
+  addRoundKey(state, words, 0);
+  for (let round = 1; round < rounds; round += 1) {
+    subBytes(state, SBOX);
+    shiftRows(state);
+    mixColumns(state);
+    addRoundKey(state, words, round);
+  }
+  subBytes(state, SBOX);
+  shiftRows(state);
+  addRoundKey(state, words, rounds);
+
+  return state;
+}
+
+/**
+ * Decrypt one 16-byte block with an expanded key.
+ *
+ * @param {Uint8Array} block ciphertext block
+ * @param {{ words: Uint32Array, rounds: number }} schedule
+ * @returns {Uint8Array} plaintext block
+ */
+export function decryptBlock(block, schedule) {
+  const state = Uint8Array.from(block);
+  const { words, rounds } = schedule;
+
+  addRoundKey(state, words, rounds);
+  for (let round = rounds - 1; round >= 1; round -= 1) {
+    invShiftRows(state);
+    subBytes(state, INV_SBOX);
+    addRoundKey(state, words, round);
+    invMixColumns(state);
+  }
+  invShiftRows(state);
+  subBytes(state, INV_SBOX);
+  addRoundKey(state, words, 0);
+
+  return state;
+}
+```
+
+### `/output/lib/aes/modes.mjs` — `AESModeOfOperationECB`
+
+```js
+/**
+ * Modes of operation, mirroring the public surface of `pyaes` that the
+ * original script relies on.
+ */
+
+import { BLOCK_SIZE, decryptBlock, encryptBlock } from './blockCipher.mjs';
+import { expandKey, VALID_KEY_SIZES } from './keySchedule.mjs';
+import { PyValueError, pushPyFrame } from '../python/runtime.mjs';
+
+/** Frames of `pyaes/aes.py` reproduced so tracebacks match the original. */
+const FRAME_AES_INIT = { line: 134, name: '__init__' };
+const FRAME_ECB_INIT = { line: 304, name: '__init__' };
+const FRAME_ECB_ENCRYPT = { line: 342, name: 'encrypt' };
+const FRAME_ECB_DECRYPT = { line: 350, name: 'decrypt' };
+const AES_SOURCE = 'pyaes/aes.py';
+
+/**
+ * The raw AES block cipher, keyed once at construction.
+ */
+export class AES {
+  /**
+   * @param {Uint8Array} key 16, 24 or 32 raw key bytes
+   */
+  constructor(key) {
+    if (!VALID_KEY_SIZES.includes(key.length)) {
+      const error = new PyValueError('Invalid key size');
+      throw pushPyFrame(error, AES_SOURCE, FRAME_AES_INIT.line, FRAME_AES_INIT.name);
+    }
+    this.keySize = key.length;
+    this.schedule = expandKey(key);
+  }
+
+  /** @param {Uint8Array} block 16 plaintext bytes */
+  encrypt(block) {
+    return encryptBlock(block, this.schedule);
+  }
+
+  /** @param {Uint8Array} block 16 ciphertext bytes */
+  decrypt(block) {
+    return decryptBlock(block, this.schedule);
+  }
+}
+
+/**
+ * Electronic Codebook mode: each block is enciphered independently, with no
+ * padding and no chaining state.
+ */
+export class AESModeOfOperationECB {
+  /**
+   * @param {Uint8Array} key 16, 24 or 32 raw key bytes
+   */
+  constructor(key) {
+    this.name = 'ECB';
+    this.blockSize = BLOCK_SIZE;
+    try {
+      this._aes = new AES(key);
+    } catch (error) {
+      throw pushPyFrame(error, AES_SOURCE, FRAME_ECB_INIT.line, FRAME_ECB_INIT.name);
+    }
+  }
+
+  /**
+   * @param {Uint8Array} plaintext exactly one block
+   * @returns {Uint8Array} the enciphered block
+   */
+  encrypt(plaintext) {
+    if (plaintext.length !== BLOCK_SIZE) {
+      const error = new PyValueError('plaintext block must be 16 bytes');
+      throw pushPyFrame(error, AES_SOURCE, FRAME_ECB_ENCRYPT.line, FRAME_ECB_ENCRYPT.name);
+    }
+    return this._aes.encrypt(plaintext);
+  }
+
+  /**
+   * @param {Uint8Array} ciphertext exactly one block
+   * @returns {Uint8Array} the deciphered block
+   */
+  decrypt(ciphertext) {
+    if (ciphertext.length !== BLOCK_SIZE) {
+      const error = new PyValueError('ciphertext block must be 16 bytes');
+      throw pushPyFrame(error, AES_SOURCE, FRAME_ECB_DECRYPT.line, FRAME_ECB_DECRYPT.name);
+    }
+    return this._aes.decrypt(ciphertext);
+  }
+}
+```
+
+### `/output/lib/aes/index.mjs`
+
+```js
+/**
+ * Public entry point of the AES library.
+ */
+
+export { AES_POLYNOMIAL, gmul, ginv, xtime } from './galois.mjs';
+export { INV_SBOX, RCON, SBOX } from './tables.mjs';
+export { expandKey, VALID_KEY_SIZES } from './keySchedule.mjs';
+export { BLOCK_SIZE, decryptBlock, encryptBlock } from './blockCipher.mjs';
+export { AES, AESModeOfOperationECB } from './modes.mjs';
+```
+
+### `/output/lib/python/bytesValue.mjs` — `str.encode()` + `repr(bytes)`
+
+```js
+/**
+ * Python's `bytes` value semantics: UTF-8 encoding of `str` and the exact
+ * `repr()` used by `print()` when a `bytes` object is passed to it.
+ */
+
+const encoder = new TextEncoder();
+
+/**
+ * Equivalent of `str.encode()` (UTF-8, the Python default).
+ *
+ * @param {string} text
+ * @returns {Uint8Array}
+ */
+export function encodeUtf8(text) {
+  return encoder.encode(text);
+}
+
+const BACKSLASH = 0x5c;
+const SINGLE_QUOTE = 0x27;
+const DOUBLE_QUOTE = 0x22;
+
+const SIMPLE_ESCAPES = new Map([
+  [0x09, '\\t'],
+  [0x0a, '\\n'],
+  [0x0d, '\\r'],
+]);
+
+/**
+ * Reproduce `repr(bytes_value)`.
+ *
+ * CPython prefers single quotes but switches to double quotes when the data
+ * contains an apostrophe and no double quote, so the apostrophe can be left
+ * unescaped. Bytes outside printable ASCII become `\xhh` with lowercase hex.
+ *
+ * @param {Uint8Array} data
+ * @returns {string}
+ */
+export function bytesRepr(data) {
+  let hasSingle = false;
+  let hasDouble = false;
+  for (const byte of data) {
+    if (byte === SINGLE_QUOTE) hasSingle = true;
+    else if (byte === DOUBLE_QUOTE) hasDouble = true;
+  }
+
+  const quote = hasSingle && !hasDouble ? DOUBLE_QUOTE : SINGLE_QUOTE;
+  const quoteChar = String.fromCharCode(quote);
+
+  let out = `b${quoteChar}`;
+  for (const byte of data) {
+    if (byte === BACKSLASH || byte === quote) {
+      out += `\\${String.fromCharCode(byte)}`;
+    } else if (SIMPLE_ESCAPES.has(byte)) {
+      out += SIMPLE_ESCAPES.get(byte);
+    } else if (byte < 0x20 || byte >= 0x7f) {
+      out += `\\x${byte.toString(16).padStart(2, '0')}`;
+    } else {
+      out += String.fromCharCode(byte);
+    }
+  }
+  return out + quoteChar;
+}
+```
+
+### `/output/lib/python/runtime.mjs` — `ValueError` + traceback rendering
+
+```js
+/**
+ * A small slice of the CPython runtime: the exception type the original
+ * script can surface, plus traceback rendering that matches what the
+ * interpreter writes to stderr on an unhandled exception.
+ */
+
+/** Mirrors Python's `ValueError`. */
+export class PyValueError extends Error {
+  /**
+   * @param {string} message exception message, as Python would render it
+   */
+  constructor(message) {
+    super(message);
+    this.name = 'ValueError';
+    /** @type {Array<{ file: string, line: number, name: string }>} outermost frame first */
+    this.pyFrames = [];
+  }
+}
+
+/**
+ * Record an enclosing call frame on an in-flight Python exception, the way
+ * the interpreter grows a traceback as it unwinds the stack.
+ *
+ * @param {unknown} error exception being propagated
+ * @param {string} file source file the frame belongs to
+ * @param {number} line line number within that file
+ * @param {string} name enclosing function name, or '<module>'
+ * @returns {unknown} the same error, for rethrowing
+ */
+export function pushPyFrame(error, file, line, name) {
+  if (error instanceof PyValueError) error.pyFrames.unshift({ file, line, name });
+  return error;
+}
+
+/**
+ * Render a traceback exactly as CPython does, including the trailing newline.
+ *
+ * @param {PyValueError} error
+ * @returns {string}
+ */
+export function formatTraceback(error) {
+  const lines = ['Traceback (most recent call last):'];
+  for (const frame of error.pyFrames) {
+    lines.push(`  File "${frame.file}", line ${frame.line}, in ${frame.name}`);
+  }
+  lines.push(`${error.name}: ${error.message}`);
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Report an unhandled Python-level exception and set the interpreter's exit
+ * status to 1, matching `python script.py` on an uncaught error.
+ *
+ * @param {unknown} error
+ */
+export function reportUncaught(error) {
+  if (!(error instanceof PyValueError)) throw error;
+  process.stderr.write(formatTraceback(error));
+  process.exitCode = 1;
+}
+```
+
+### `/output/lib/python/argparse.mjs` — the `argparse` port
+
+```js
+/**
+ * A faithful port of the slice of Python's `argparse` that the original
+ * script exercises: long options that store a single string value, the
+ * implicit `-h/--help`, prefix abbreviation, `--opt=value`, and the exact
+ * usage/error/help text CPython 3.12 emits.
+ *
+ * Deliberately out of scope (unused by the script): positionals, subparsers,
+ * variable `nargs`, choices, and custom prefix characters.
+ */
+
+/** Mirrors Python's `SystemExit`, raised by `parser.exit()` / `parser.error()`. */
+export class SystemExit extends Error {
+  /** @param {number} code process exit status */
+  constructor(code) {
+    super(`SystemExit: ${code}`);
+    this.name = 'SystemExit';
+    this.code = code;
+  }
+}
+
+/** argparse's `_negative_number_matcher`. */
+const NEGATIVE_NUMBER = /^-\d+$|^-\d*\.\d+$/;
+
+const INDENT = 2;
+const MAX_HELP_POSITION = 24;
+
+/** Terminal width argparse would wrap help text at. */
+function outputWidth() {
+  const columns = Number.parseInt(process.env.COLUMNS ?? '', 10);
+  return (Number.isNaN(columns) ? 80 : columns) - 2;
+}
+
+/** Greedy word wrap, as `textwrap.wrap` behaves on single-spaced help text. */
+function wrap(text, width) {
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length === 0) return [];
+  const lines = [];
+  let line = words[0];
+  for (const word of words.slice(1)) {
+    if (line.length + 1 + word.length <= width) line += ` ${word}`;
+    else {
+      lines.push(line);
+      line = word;
+    }
+  }
+  lines.push(line);
+  return lines;
+}
+
+/**
+ * One optional argument declaration.
+ */
+class Action {
+  constructor(optionStrings, { dest, nargs, required = false, help = null, metavar = null, kind = 'store', defaultValue = null }) {
+    this.optionStrings = optionStrings;
+    this.dest = dest;
+    this.nargs = nargs;
+    this.required = required;
+    this.help = help;
+    this.metavar = metavar;
+    this.kind = kind;
+    this.defaultValue = defaultValue;
+  }
+
+  /** argparse's `_get_action_name`, used in the "required" error message. */
+  get name() {
+    return this.optionStrings.join('/');
+  }
+
+  /** argparse's `_format_action_invocation`. */
+  get invocation() {
+    if (this.nargs === 0) return this.optionStrings.join(', ');
+    const args = this.metavar ?? this.dest.toUpperCase();
+    return this.optionStrings.map((option) => `${option} ${args}`).join(', ');
+  }
+}
+
+export class ArgumentParser {
+  /**
+   * @param {{ prog?: string, addHelp?: boolean }} [options]
+   */
+  constructor({ prog, addHelp = true } = {}) {
+    this.prog = prog ?? 'prog';
+    /** @type {Action[]} */
+    this.actions = [];
+    /** @type {Map<string, Action>} insertion-ordered, like `_option_string_actions` */
+    this.optionStringActions = new Map();
+
+    if (addHelp) {
+      this.addArgument(['-h', '--help'], {
+        action: 'help',
+        help: 'show this help message and exit',
+      });
+    }
+  }
+
+  /**
+   * Declare an optional argument. Accepts one option string or several.
+   *
+   * @param {string|string[]} optionStrings e.g. '--key' or ['-h', '--help']
+   * @param {{ action?: string, required?: boolean, help?: string, metavar?: string,
+   *           dest?: string, default?: unknown, type?: unknown }} [options]
+   */
+  addArgument(optionStrings, options = {}) {
+    const strings = Array.isArray(optionStrings) ? optionStrings : [optionStrings];
+    const isHelp = options.action === 'help';
+    const longest = strings.find((option) => option.startsWith('--')) ?? strings[0];
+    const dest = options.dest ?? longest.replace(/^-+/, '').replace(/-/g, '_');
+
+    const action = new Action(strings, {
+      dest,
+      nargs: isHelp ? 0 : null,
+      required: options.required ?? false,
+      help: options.help ?? null,
+      metavar: options.metavar ?? null,
+      kind: isHelp ? 'help' : 'store',
+      defaultValue: options.default ?? null,
+    });
+
+    this.actions.push(action);
+    for (const option of strings) this.optionStringActions.set(option, action);
+    return action;
+  }
+
+  // ---------------------------------------------------------------- messages
+
+  /** argparse's `format_usage`, minus line wrapping (unused here). */
+  formatUsage() {
+    const parts = this.actions.map((action) => {
+      const option = action.optionStrings[0];
+      const body = action.nargs === 0 ? option : `${option} ${action.metavar ?? action.dest.toUpperCase()}`;
+      return action.required ? body : `[${body}]`;
+    });
+    return `usage: ${[this.prog, ...parts].join(' ')}\n`;
+  }
+
+  /** argparse's `format_help`. */
+  formatHelp() {
+    const width = outputWidth();
+    const actionMaxLength = this.actions.reduce(
+      (max, action) => Math.max(max, action.invocation.length + INDENT),
+      0,
+    );
+    const helpPosition = Math.min(actionMaxLength + 2, MAX_HELP_POSITION);
+    const helpWidth = Math.max(width - helpPosition, 11);
+    const actionWidth = helpPosition - INDENT - 2;
+
+    let out = `${this.formatUsage()}\noptions:\n`;
+    for (const action of this.actions) {
+      const invocation = action.invocation;
+      if (!action.help) {
+        out += `${' '.repeat(INDENT)}${invocation}\n`;
+        continue;
+      }
+      const helpLines = wrap(action.help, helpWidth);
+      if (invocation.length <= actionWidth) {
+        out += `${' '.repeat(INDENT)}${invocation.padEnd(actionWidth)}  ${helpLines[0] ?? ''}\n`;
+        for (const line of helpLines.slice(1)) out += `${' '.repeat(helpPosition)}${line}\n`;
+      } else {
+        out += `${' '.repeat(INDENT)}${invocation}\n`;
+        for (const line of helpLines) out += `${' '.repeat(helpPosition)}${line}\n`;
+      }
+    }
+    return out;
+  }
+
+  printUsage(stream = process.stderr) {
+    stream.write(this.formatUsage());
+  }
+
+  printHelp(stream = process.stdout) {
+    stream.write(this.formatHelp());
+  }
+
+  /** argparse's `parser.exit`. */
+  exit(status = 0, message = null) {
+    if (message) process.stderr.write(message);
+    throw new SystemExit(status);
+  }
+
+  /** argparse's `parser.error`: usage to stderr, then exit status 2. */
+  error(message) {
+    this.printUsage(process.stderr);
+    this.exit(2, `${this.prog}: error: ${message}\n`);
+  }
+
+  // ----------------------------------------------------------------- parsing
+
+  /** argparse's `_get_option_tuples`: abbreviation and concatenation matches. */
+  getOptionTuples(argString) {
+    const result = [];
+    if (argString.startsWith('--')) {
+      const eq = argString.indexOf('=');
+      const prefix = eq === -1 ? argString : argString.slice(0, eq);
+      const sep = eq === -1 ? null : '=';
+      const explicitArg = eq === -1 ? null : argString.slice(eq + 1);
+      for (const [option, action] of this.optionStringActions) {
+        if (option.startsWith(prefix)) result.push({ action, optionString: option, sep, explicitArg });
+      }
+    } else if (argString.startsWith('-')) {
+      const shortPrefix = argString.slice(0, 2);
+      const shortExplicitArg = argString.slice(2);
+      for (const [option, action] of this.optionStringActions) {
+        if (option === shortPrefix) {
+          result.push({ action, optionString: option, sep: '', explicitArg: shortExplicitArg });
+        } else if (option.startsWith(argString)) {
+          result.push({ action, optionString: option, sep: null, explicitArg: null });
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
+   * argparse's `_parse_optional`: decide whether an argv entry names an
+   * option. `null` means "this is a plain value".
+   */
+  parseOptional(argString) {
+    if (!argString) return null;
+    if (argString[0] !== '-') return null;
+
+    if (this.optionStringActions.has(argString)) {
+      return { action: this.optionStringActions.get(argString), optionString: argString, sep: null, explicitArg: null };
+    }
+    if (argString.length === 1) return null;
+
+    const eq = argString.indexOf('=');
+    if (eq !== -1) {
+      const optionString = argString.slice(0, eq);
+      if (this.optionStringActions.has(optionString)) {
+        return {
+          action: this.optionStringActions.get(optionString),
+          optionString,
+          sep: '=',
+          explicitArg: argString.slice(eq + 1),
+        };
+      }
+    }
+
+    const tuples = this.getOptionTuples(argString);
+    if (tuples.length > 1) {
+      const matches = tuples.map((tuple) => tuple.optionString).join(', ');
+      this.error(`ambiguous option: ${argString} could match ${matches}`);
+    } else if (tuples.length === 1) {
+      return tuples[0];
+    }
+
+    // Looks like a negative number, and no option could be one: a value.
+    if (NEGATIVE_NUMBER.test(argString)) return null;
+    // Contains a space: a value.
+    if (argString.includes(' ')) return null;
+
+    // An unknown option; reported later as an unrecognized argument.
+    return { action: null, optionString: argString, sep: null, explicitArg: null };
+  }
+
+  /**
+   * argparse's `parse_known_args`.
+   *
+   * @param {string[]} argStrings
+   * @returns {[Record<string, unknown>, string[]]} namespace and extras
+   */
+  parseKnownArgs(argStrings) {
+    /** @type {Record<string, unknown>} */
+    const namespace = {};
+    for (const action of this.actions) {
+      if (action.kind === 'store') namespace[action.dest] = action.defaultValue;
+    }
+
+    // Classify every entry up front, exactly as argparse builds its
+    // 'O'/'A' pattern string. The first '--' becomes its own marker and
+    // everything after it is forced to be a plain value.
+    /** @type {Array<'O'|'A'|'-'>} */
+    const pattern = [];
+    /** @type {Map<number, object>} */
+    const optionTuples = new Map();
+    let sawDoubleDash = false;
+    for (let i = 0; i < argStrings.length; i += 1) {
+      const argString = argStrings[i];
+      if (sawDoubleDash) {
+        pattern.push('A');
+        continue;
+      }
+      if (argString === '--') {
+        pattern.push('-');
+        sawDoubleDash = true;
+        continue;
+      }
+      const tuple = this.parseOptional(argString);
+      if (tuple === null) {
+        pattern.push('A');
+      } else {
+        pattern.push('O');
+        optionTuples.set(i, tuple);
+      }
+    }
+
+    const extras = [];
+    const seen = new Set();
+    let index = 0;
+    while (index < argStrings.length) {
+      if (pattern[index] !== 'O') {
+        extras.push(argStrings[index]);
+        index += 1;
+        continue;
+      }
+      index = this.consumeOptional(index, argStrings, pattern, optionTuples, namespace, seen, extras);
+    }
+
+    const missing = this.actions.filter((action) => action.required && !seen.has(action));
+    if (missing.length > 0) {
+      this.error(`the following arguments are required: ${missing.map((a) => a.name).join(', ')}`);
+    }
+
+    return [namespace, extras];
+  }
+
+  /**
+   * argparse's `consume_optional`: apply the option at `startIndex` and
+   * return the index to resume from.
+   */
+  consumeOptional(startIndex, argStrings, pattern, optionTuples, namespace, seen, extras) {
+    let { action, optionString, explicitArg } = optionTuples.get(startIndex);
+    /** @type {Array<[Action, string|null]>} */
+    const pending = [];
+    let stop;
+
+    for (;;) {
+      if (action === null) {
+        extras.push(argStrings[startIndex]);
+        return startIndex + 1;
+      }
+
+      if (explicitArg !== null && explicitArg !== undefined) {
+        // A single-dash flag taking no argument may have more short options
+        // concatenated onto it, e.g. `-hx`.
+        if (action.nargs === 0 && optionString[1] !== '-' && explicitArg !== '') {
+          pending.push([action, null]);
+          const next = `-${explicitArg[0]}`;
+          if (this.optionStringActions.has(next)) {
+            action = this.optionStringActions.get(next);
+            optionString = next;
+            explicitArg = explicitArg.slice(1);
+            if (explicitArg === '') explicitArg = null;
+            else if (explicitArg[0] === '=') explicitArg = explicitArg.slice(1);
+            continue;
+          }
+          extras.push(`-${explicitArg}`);
+          stop = startIndex + 1;
+          break;
+        }
+        if (action.nargs === null) {
+          pending.push([action, explicitArg]);
+          stop = startIndex + 1;
+          break;
+        }
+        this.error(`argument ${action.name}: ignored explicit argument '${explicitArg}'`);
+      }
+
+      if (action.nargs === 0) {
+        pending.push([action, null]);
+        stop = startIndex + 1;
+        break;
+      }
+
+      // For optionals the nargs pattern is '(A)': the very next entry must be
+      // a value, so a following option or '--' is an error.
+      if (pattern[startIndex + 1] !== 'A') {
+        this.error(`argument ${action.name}: expected one argument`);
+      }
+      pending.push([action, argStrings[startIndex + 1]]);
+      stop = startIndex + 2;
+      break;
+    }
+
+    for (const [pendingAction, value] of pending) {
+      seen.add(pendingAction);
+      this.takeAction(pendingAction, value, namespace);
+    }
+    return stop;
+  }
+
+  /** Apply one parsed option to the namespace. */
+  takeAction(action, value, namespace) {
+    if (action.kind === 'help') {
+      this.printHelp(process.stdout);
+      this.exit(0);
+      return;
+    }
+    namespace[action.dest] = value;
+  }
+
+  /** argparse's `parse_args`. */
+  parseArgs(argStrings) {
+    const [namespace, extras] = this.parseKnownArgs(argStrings);
+    if (extras.length > 0) {
+      this.error(`unrecognized arguments: ${extras.join(' ')}`);
+    }
+    return namespace;
+  }
+}
+```
+
+### `/output/lib/python/index.mjs`
+
+```js
+/**
+ * Public entry point of the Python-compatibility layer.
+ */
+
+export { ArgumentParser, SystemExit } from './argparse.mjs';
+export { bytesRepr, encodeUtf8 } from './bytesValue.mjs';
+export { formatTraceback, PyValueError, pushPyFrame, reportUncaught } from './runtime.mjs';
+```
+
+## Entry file
+
+### `/output/test16.mjs`
+
+```js
+/**
+ * Node.js port of dataset/pyaes/test16.py.
+ *
+ * Encrypts each 16-byte block of `--data` independently under `--key` with
+ * AES in ECB mode and prints every ciphertext block using Python's `bytes`
+ * repr, one per line.
+ */
+
+import { AESModeOfOperationECB } from './lib/aes/index.mjs';
+import { ArgumentParser, bytesRepr, encodeUtf8, pushPyFrame, reportUncaught, SystemExit } from './lib/python/index.mjs';
+
+/** Name PyInstaller reports for the frozen script, used in usage/errors. */
+const PROG = 'test16_executable';
+/** Source file name the original traceback refers to. */
+const SCRIPT = 'test16.py';
+
+function main() {
+  const parser = new ArgumentParser({ prog: PROG });
+  parser.addArgument('--key', { type: 'str', required: true }); // 16 bytes key
+  parser.addArgument('--data', { type: 'str', required: true }); // 48 bytes data (3 blocks)
+  const args = parser.parseArgs(process.argv.slice(2));
+
+  // Encrypt multiple blocks
+  let aes;
+  try {
+    aes = new AESModeOfOperationECB(encodeUtf8(args.key)); // Initialize AES ECB cipher
+  } catch (error) {
+    throw pushPyFrame(error, SCRIPT, 11, 'main');
+  }
+  const data = encodeUtf8(args.data);
+
+  // Split into 3 blocks and encrypt each
+  const ciphertexts = [];
+  for (let i = 0; i < data.length; i += 16) {
+    const block = data.subarray(i, i + 16);
+    try {
+      ciphertexts.push(aes.encrypt(block)); // Encrypt each block
+    } catch (error) {
+      throw pushPyFrame(error, SCRIPT, 18, 'main');
+    }
+  }
+
+  // Print all ciphertexts
+  for (const cipher of ciphertexts) {
+    console.log(bytesRepr(cipher));
+  }
+}
+
+try {
+  main();
+} catch (error) {
+  if (error instanceof SystemExit) {
+    process.exitCode = error.code;
+  } else {
+    reportUncaught(pushPyFrame(error, SCRIPT, 26, '<module>'));
+  }
+}
+```
+
+## Behaviours pinned by probing the executable
+
+- **`repr(bytes)` smart quoting** — CPython switches to `b"..."` when the data holds `'` but no `"`. 82 of the random cases hit that branch; without it those lines would differ.
+- **Key sizes** — the script's comment says 16 bytes, but pyaes accepts 16/24/32 and rejects anything else with `ValueError: Invalid key size` from `aes.py:134` via `aes.py:304`.
+- **`--` after an optional** — argparse strips `-*` from the nargs pattern for optionals, so `--data -- x` is `expected one argument`, and an unconsumed `--` stays in the unrecognized-args list.
+- **Negative-number-looking values** — `--data -5`, `-1.5`, `-`, and `- x` are accepted as values; `-123456789abcdef` is not.
+- **`-hx`** — argparse re-parses the tail as more short options; help still prints and exits 0.
+- **Error messages use the action name** (`-h/--help`), not the option string as typed.
+
+Two deliberate deviations, both from PyInstaller rather than the script: `prog` is hardcoded to `test16_executable` so usage/error text matches the reference binary, and the `[PYI-<pid>:ERROR] Failed to execute script...` stderr trailer is omitted since it embeds a pid and has no Python-level equivalent.
+
+The harness is at `/workspace/difftest.mjs` (outside `/output`) — rerun with `node /workspace/difftest.mjs`.

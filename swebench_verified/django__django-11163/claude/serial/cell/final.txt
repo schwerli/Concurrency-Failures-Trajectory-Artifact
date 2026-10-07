@@ -1,0 +1,41 @@
+Fixed, with a regression test.
+
+**The change** — `django/forms/models.py:86`:
+
+```python
+if fields is not None and f.name not in fields:
+```
+
+`fields=[]` is falsy, so the old guard short-circuited and every editable field fell through to `data[f.name] = ...`. The `is not None` check distinguishes "no filter requested" (`None`) from "an empty filter" (`[]`), which correctly yields `{}`.
+
+**Verified behavior** by calling `model_to_dict` directly:
+
+| call | result |
+|---|---|
+| `fields=[]` | `{}` |
+| `fields=()` | `{}` |
+| `fields=None` | all 4 fields |
+| `fields=['name']` | `{'name': 'n'}` |
+| `exclude=[]` | all 4 fields (unchanged) |
+
+**Regression test** in `tests/model_forms/tests.py` — confirmed it fails on the unpatched tree (`AssertionError: {'id': None, 'name': 'blue'} != {}`) and passes with the fix.
+
+**Test suites:**
+
+| suite | result |
+|---|---|
+| model_forms | 165 OK |
+| model_formsets | 58 OK |
+| admin_views | 354 OK |
+| generic_views | 209 OK |
+| auth_tests | 497 OK |
+| forms_tests | 643, 1 error |
+
+The one `forms_tests` error is `FormsModelTestCase.test_unicode_filename` — a `UnicodeEncodeError` from the container's ASCII filesystem encoding. I confirmed it fails identically on a stashed (clean) tree, so it's pre-existing and unrelated.
+
+Two notes on scope:
+
+- I left the identical-looking `if fields and f.name not in fields` in `BaseModelForm._save_m2m` (`django/forms/models.py:434`) alone. There, `fields` is `Meta.fields`, and `[]`/`None` both legitimately mean "no fields on this form" — the loop body would be a no-op either way, so changing it has no behavioral upside and widens the diff past what was reported.
+- The only internal caller is `BaseModelForm.__init__` (line 290), which passes `opts.fields`. If a `ModelForm` sets `Meta.fields = []`, its `initial` data is now `{}` instead of all fields — but such a form renders no fields, so nothing observable changes. All the form/admin suites above agree.
+
+One environment thing worth flagging for future sessions: the default `python` on PATH (`/opt/miniconda3/bin/python`) has none of Django's dependencies and no network access to install them. The working interpreter is `/opt/miniconda3/envs/testbed/bin/python`.

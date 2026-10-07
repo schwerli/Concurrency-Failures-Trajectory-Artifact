@@ -1,0 +1,511 @@
+All green: 4 sample cases + 549 differential cases (stdout, exit code, and final stderr line all matching).
+
+## What I reverse-engineered from the binary
+
+Probing `test20_executable` surfaced several behaviors that aren't visible in the source:
+
+| Behavior | Finding |
+|---|---|
+| `b58decode` whitespace | **Trailing** whitespace is `rstrip`ped *before* leading-`1` counting (`'1 '` → `b'\x00'`); **leading** whitespace → `Invalid character ' '` |
+| `--a/--c/--d` encoding | UTF-8 (`str.encode()`), so `'中'` → 3 bytes |
+| `--b/--e` decoding | ASCII-only → `UnicodeEncodeError`; a run of ≥2 non-ASCII chars reports a *position range* with no char repr, and positions are counted in **code points** (`'😀'` is position 0, not 0-1) |
+| `print(bytes)` | Python `repr`: switches to `"` delimiter when the value has a `'` and no `"`; `\xHH` lowercase hex for non-printables |
+| Exit codes | `0` success, `1` ValueError/UnicodeEncodeError, `2` argparse |
+| argparse precedence | bad-int → missing-required → unrecognized |
+| `int` parsing | accepts `' 42 '`, `'+7'`, `'1_000'`, unbounded magnitude; rejects `'0x10'`, `'1e3'` |
+| Token classification | bare `-` is a **value**; `-1` is a value; `-5x` is an option; `--` stays in `unrecognized arguments` and forces positional-only |
+
+## Module hierarchy
+
+```
+/output
+├── lib/
+│   ├── errors.mjs    Python exception objects + interpreter-style abort
+│   ├── pystr.mjs     str semantics: whitespace, code points, repr, escapes
+│   ├── pybytes.mjs   byte lists: UTF-8/ASCII codecs, strip, bytes repr
+│   ├── bigint.mjs    arbitrary precision: int↔bytes, floor divmod
+│   ├── pyint.mjs     int(str) conversion (Unicode digits, underscores)
+│   ├── sha256.mjs    FIPS 180-4 SHA-256 over byte lists
+│   ├── base58.mjs    the base58 API surface
+│   └── argparse.mjs  ArgumentParser subset with exact usage/error text
+└── test20.mjs        entry point
+```
+
+Byte strings are plain arrays of integers in `[0,255]`, and SHA-256 is hand-written over that representation — so no typed-array or binary-container APIs appear anywhere (verified by grep). The only non-local import is `node:path`.
+
+### `lib/errors.mjs`
+```js
+export class PyException extends Error {
+  constructor(pyType, message) { super(message); this.pyType = pyType; }
+  toPythonLine() { return `${this.pyType}: ${this.message}`; }
+}
+export class PyValueError extends PyException {
+  constructor(message) { super('ValueError', message); }
+}
+export class PyUnicodeEncodeError extends PyException {
+  constructor(message) { super('UnicodeEncodeError', message); }
+}
+export class PyIntConversionError extends PyException {
+  constructor(message) { super('ValueError', message); }
+}
+export function abortWithException(err) {
+  if (err instanceof PyException) {
+    process.stderr.write('Traceback (most recent call last):\n');
+    process.stderr.write(`${err.toPythonLine()}\n`);
+    process.exit(1);
+  }
+  throw err;
+}
+```
+
+### `lib/pystr.mjs`
+```js
+const STR_WHITESPACE = new Set([
+  0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+  0x85, 0xa0, 0x1680,
+  0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007,
+  0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000,
+]);
+export function isStrWhitespace(codePoint) { return STR_WHITESPACE.has(codePoint); }
+
+export function strRstrip(s) {
+  let end = s.length;
+  while (end > 0) {
+    if (!isStrWhitespace(s.charCodeAt(end - 1))) break;
+    end -= 1;
+  }
+  return s.slice(0, end);
+}
+export function strStrip(s) {
+  let start = 0, end = s.length;
+  while (end > start && isStrWhitespace(s.charCodeAt(end - 1))) end -= 1;
+  while (start < end && isStrWhitespace(s.charCodeAt(start))) start += 1;
+  return s.slice(start, end);
+}
+export function toCodePoints(s) {
+  const points = [];
+  for (const ch of s) points.push(ch.codePointAt(0));
+  return points;
+}
+export function escapeCodePoint(codePoint) {
+  const hex = codePoint.toString(16);
+  if (codePoint < 0x100) return `\\x${hex.padStart(2, '0')}`;
+  if (codePoint < 0x10000) return `\\u${hex.padStart(4, '0')}`;
+  return `\\U${hex.padStart(8, '0')}`;
+}
+
+const NON_PRINTABLE = /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]/u;
+
+export function reprStr(s) {
+  const quote = s.includes("'") && !s.includes('"') ? '"' : "'";
+  let out = quote;
+  for (const ch of s) {
+    const codePoint = ch.codePointAt(0);
+    if (ch === '\\') out += '\\\\';
+    else if (ch === '\t') out += '\\t';
+    else if (ch === '\n') out += '\\n';
+    else if (ch === '\r') out += '\\r';
+    else if (ch === quote) out += `\\${quote}`;
+    else if (codePoint === 0x20 || !NON_PRINTABLE.test(ch)) out += ch;
+    else out += escapeCodePoint(codePoint);
+  }
+  return out + quote;
+}
+```
+
+### `lib/pybytes.mjs`
+```js
+import { PyUnicodeEncodeError } from './errors.mjs';
+import { escapeCodePoint, toCodePoints } from './pystr.mjs';
+
+const BYTES_WHITESPACE = new Set([0x20, 0x09, 0x0a, 0x0d, 0x0b, 0x0c]);
+
+export function utf8Encode(s) {
+  const out = [];
+  for (const codePoint of toCodePoints(s)) {
+    if (codePoint < 0x80) out.push(codePoint);
+    else if (codePoint < 0x800) out.push(0xc0 | (codePoint >> 6), 0x80 | (codePoint & 0x3f));
+    else if (codePoint < 0x10000) {
+      out.push(0xe0 | (codePoint >> 12), 0x80 | ((codePoint >> 6) & 0x3f), 0x80 | (codePoint & 0x3f));
+    } else {
+      out.push(0xf0 | (codePoint >> 18), 0x80 | ((codePoint >> 12) & 0x3f),
+               0x80 | ((codePoint >> 6) & 0x3f), 0x80 | (codePoint & 0x3f));
+    }
+  }
+  return out;
+}
+
+export function asciiEncode(s) {
+  const codePoints = toCodePoints(s);
+  const out = [];
+  for (let i = 0; i < codePoints.length; i += 1) {
+    const codePoint = codePoints[i];
+    if (codePoint < 0x80) { out.push(codePoint); continue; }
+    let end = i;
+    while (end + 1 < codePoints.length && codePoints[end + 1] >= 0x80) end += 1;
+    const where = end > i
+      ? `characters in position ${i}-${end}`
+      : `character '${escapeCodePoint(codePoint)}' in position ${i}`;
+    throw new PyUnicodeEncodeError(
+      `'ascii' codec can't encode ${where}: ordinal not in range(128)`);
+  }
+  return out;
+}
+
+export function asciiDecode(bytes) {
+  let out = '';
+  for (const b of bytes) out += String.fromCharCode(b);
+  return out;
+}
+export function bytesRstrip(bytes) {
+  let end = bytes.length;
+  while (end > 0 && BYTES_WHITESPACE.has(bytes[end - 1])) end -= 1;
+  return bytes.slice(0, end);
+}
+export function bytesLstripByte(bytes, byteValue) {
+  let start = 0;
+  while (start < bytes.length && bytes[start] === byteValue) start += 1;
+  return bytes.slice(start);
+}
+export function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
+}
+export function repeatByte(byteValue, count) {
+  const out = [];
+  for (let i = 0; i < count; i += 1) out.push(byteValue);
+  return out;
+}
+
+export function reprBytes(bytes) {
+  let hasSingle = false, hasDouble = false;
+  for (const b of bytes) {
+    if (b === 0x27) hasSingle = true;
+    else if (b === 0x22) hasDouble = true;
+  }
+  const quote = hasSingle && !hasDouble ? 0x22 : 0x27;
+  const quoteChar = String.fromCharCode(quote);
+
+  let out = `b${quoteChar}`;
+  for (const b of bytes) {
+    if (b === 0x5c) out += '\\\\';
+    else if (b === 0x09) out += '\\t';
+    else if (b === 0x0a) out += '\\n';
+    else if (b === 0x0d) out += '\\r';
+    else if (b === quote) out += `\\${quoteChar}`;
+    else if (b < 0x20 || b >= 0x7f) out += `\\x${b.toString(16).padStart(2, '0')}`;
+    else out += String.fromCharCode(b);
+  }
+  return out + quoteChar;
+}
+```
+
+### `lib/bigint.mjs`
+```js
+export function bytesToInt(bytes) {
+  let acc = 0n;
+  for (const b of bytes) acc = acc * 256n + BigInt(b);
+  return acc;
+}
+/** Python floor semantics: the remainder takes the sign of the divisor. */
+export function divmod(a, b) {
+  let quotient = a / b;
+  const remainder = a - quotient * b;
+  if (remainder !== 0n && remainder < 0n) {
+    quotient -= 1n;
+    return [quotient, remainder + b];
+  }
+  return [quotient, remainder];
+}
+export function intToBytes(value) {
+  const digits = [];
+  let acc = value;
+  while (acc > 0n) {
+    const [quotient, remainder] = divmod(acc, 256n);
+    digits.push(Number(remainder));
+    acc = quotient;
+  }
+  digits.reverse();
+  return digits;
+}
+```
+
+### `lib/pyint.mjs`
+```js
+import { PyIntConversionError } from './errors.mjs';
+import { strStrip } from './pystr.mjs';
+
+const DECIMAL_DIGIT = /^\p{Nd}$/u;
+
+/** Digit blocks are runs of ten code points, so the distance to the run start is the value. */
+function digitValue(codePoint) {
+  if (codePoint >= 0x30 && codePoint <= 0x39) return codePoint - 0x30;
+  if (!DECIMAL_DIGIT.test(String.fromCodePoint(codePoint))) return -1;
+  for (let offset = 0; offset < 10; offset += 1) {
+    const start = codePoint - offset;
+    if (!DECIMAL_DIGIT.test(String.fromCodePoint(start))) break;
+    if (start === 0 || !DECIMAL_DIGIT.test(String.fromCodePoint(start - 1))) return offset;
+  }
+  return -1;
+}
+
+export function pyInt(text) {
+  const body = strStrip(text);
+  const chars = Array.from(body);
+
+  let index = 0, negative = false;
+  if (chars[0] === '+' || chars[0] === '-') { negative = chars[0] === '-'; index = 1; }
+  if (index >= chars.length) throw new PyIntConversionError('invalid literal');
+
+  let value = 0n, previousWasDigit = false;
+  for (; index < chars.length; index += 1) {
+    const ch = chars[index];
+    if (ch === '_') {
+      const next = chars[index + 1];
+      if (!previousWasDigit || next === undefined || digitValue(next.codePointAt(0)) < 0) {
+        throw new PyIntConversionError('invalid literal');
+      }
+      previousWasDigit = false;
+      continue;
+    }
+    const digit = digitValue(ch.codePointAt(0));
+    if (digit < 0) throw new PyIntConversionError('invalid literal');
+    value = value * 10n + BigInt(digit);
+    previousWasDigit = true;
+  }
+  if (!previousWasDigit) throw new PyIntConversionError('invalid literal');
+  return negative ? -value : value;
+}
+```
+
+### `lib/sha256.mjs`
+Standard FIPS 180-4 compression over byte lists — verified against the four official test vectors (`""`, `"abc"`, the 56-byte vector, and 1 000 000 × `"a"`) plus eleven block-boundary lengths cross-checked with `sha256sum`.
+
+```js
+const K = [ /* 64 round constants */ ];
+const INITIAL_STATE = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                       0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+
+function rotr(x, n) { return ((x >>> n) | (x << (32 - n))) >>> 0; }
+
+function pad(message) {
+  const padded = message.slice();
+  padded.push(0x80);
+  while (padded.length % 64 !== 56) padded.push(0x00);
+  const bitLength = message.length * 8;
+  const high = Math.floor(bitLength / 4294967296);
+  const low = bitLength >>> 0;
+  for (let shift = 24; shift >= 0; shift -= 8) padded.push((high >>> shift) & 0xff);
+  for (let shift = 24; shift >= 0; shift -= 8) padded.push((low >>> shift) & 0xff);
+  return padded;
+}
+
+export function sha256(message) { /* 64-round loop, big-endian digest as byte list */ }
+```
+
+### `lib/base58.mjs`
+```js
+import { PyValueError } from './errors.mjs';
+import { bytesToInt, divmod } from './bigint.mjs';
+import { asciiEncode, bytesEqual, bytesLstripByte, bytesRstrip, repeatByte } from './pybytes.mjs';
+import { strRstrip } from './pystr.mjs';
+import { sha256 } from './sha256.mjs';
+
+export const BITCOIN_ALPHABET =
+  '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const BASE = BigInt(BITCOIN_ALPHABET.length);
+const ZERO_DIGIT = BITCOIN_ALPHABET.charCodeAt(0);
+
+const DIGIT_VALUES = new Map();
+for (let i = 0; i < BITCOIN_ALPHABET.length; i += 1) {
+  DIGIT_VALUES.set(BITCOIN_ALPHABET.charCodeAt(i), i);
+}
+
+function scrubInput(v) { return typeof v === 'string' ? asciiEncode(v) : v; }
+function rstripAny(v) { return typeof v === 'string' ? strRstrip(v) : bytesRstrip(v); }
+
+export function b58encodeInt(i, defaultOne = true) {
+  if (i === 0n && defaultOne) return [ZERO_DIGIT];
+  const digits = [];
+  let acc = i;
+  while (acc !== 0n) {
+    const [quotient, index] = divmod(acc, BASE);
+    digits.push(BITCOIN_ALPHABET.charCodeAt(Number(index)));
+    acc = quotient;
+  }
+  digits.reverse();
+  return digits;
+}
+
+export function b58decodeInt(v) {
+  const bytes = scrubInput(rstripAny(v));
+  let decimal = 0n;
+  for (const byte of bytes) {
+    const value = DIGIT_VALUES.get(byte);
+    if (value === undefined) {
+      throw new PyValueError(`Invalid character '${String.fromCharCode(byte)}'`);
+    }
+    decimal = decimal * BASE + BigInt(value);
+  }
+  return decimal;
+}
+
+export function b58encode(v) {
+  const bytes = scrubInput(v);
+  const origlen = bytes.length;
+  const stripped = bytesLstripByte(bytes, 0x00);
+  const newlen = stripped.length;
+  const encoded = b58encodeInt(bytesToInt(stripped), false);
+  return repeatByte(ZERO_DIGIT, origlen - newlen).concat(encoded);
+}
+
+export function b58decode(v) {
+  const bytes = scrubInput(rstripAny(v));
+  const origlen = bytes.length;
+  const stripped = bytesLstripByte(bytes, ZERO_DIGIT);
+  const newlen = stripped.length;
+  let acc = b58decodeInt(stripped);
+  const result = [];
+  while (acc > 0n) {
+    const [quotient, mod] = divmod(acc, 256n);
+    result.push(Number(mod));
+    acc = quotient;
+  }
+  result.reverse();
+  return repeatByte(0x00, origlen - newlen).concat(result);
+}
+
+function checksum(bytes) { return sha256(sha256(bytes)).slice(0, 4); }
+
+export function b58encodeCheck(v) {
+  const bytes = scrubInput(v);
+  return b58encode(bytes.concat(checksum(bytes)));
+}
+export function b58decodeCheck(v) {
+  const decoded = b58decode(v);
+  const payload = decoded.slice(0, -4);
+  const check = decoded.slice(-4);
+  if (!bytesEqual(check, checksum(payload))) throw new PyValueError('Invalid checksum');
+  return payload;
+}
+```
+
+### `lib/argparse.mjs`
+The key subtleties: the help column is `2 + widest-invocation + 2`, `#looksLikeOption` mirrors `_parse_optional` (bare `-` and negative numbers are values, `--` is neither), and type conversion runs *as the option is consumed* so a bad int outranks a missing-required complaint.
+
+```js
+import { PyIntConversionError } from './errors.mjs';
+import { pyInt } from './pyint.mjs';
+import { reprStr } from './pystr.mjs';
+
+const NEGATIVE_NUMBER = /^-\d+$|^-\d*\.\d+$/;
+
+export class ArgumentParser {
+  constructor(prog) { this.prog = prog; this.actions = []; }
+
+  addArgument(name, { type = 'str', required = false } = {}) {
+    this.actions.push({ name, option: `--${name}`, metavar: name.toUpperCase(), type, required });
+    return this;
+  }
+
+  formatUsage() {
+    const parts = this.actions.map((a) => `${a.option} ${a.metavar}`);
+    return `usage: ${this.prog} [-h] ${parts.join(' ')}\n`;
+  }
+
+  formatHelp() {
+    const invocations = ['-h, --help', ...this.actions.map((a) => `${a.option} ${a.metavar}`)];
+    const width = Math.max(...invocations.map((s) => s.length));
+    let out = `${this.formatUsage()}\noptions:\n`;
+    out += `  ${'-h, --help'.padEnd(width)}  show this help message and exit\n`;
+    for (const action of this.actions) out += `  ${action.option} ${action.metavar}\n`;
+    return out;
+  }
+
+  error(message) {
+    process.stderr.write(this.formatUsage());
+    process.stderr.write(`${this.prog}: error: ${message}\n`);
+    process.exit(2);
+  }
+  exitWithHelp() { process.stdout.write(this.formatHelp()); process.exit(0); }
+
+  #lookupOption(token) { /* exact match, then unambiguous `--` prefix */ }
+  #looksLikeOption(token) {
+    if (token === '') return false;
+    if (!token.startsWith('-')) return false;
+    if (token === '--') return true;
+    if (this.#lookupOption(token.split('=')[0])) return true;
+    if (token.length === 1) return false;          // bare `-` is a value
+    if (NEGATIVE_NUMBER.test(token)) return false; // `-1` is a value
+    if (token.includes(' ')) return false;
+    return true;
+  }
+  #convert(action, raw) { /* pyInt, mapped to `invalid int value: <repr>` */ }
+  parseArgs(argv) { /* consume → convert → required → unrecognized */ }
+}
+```
+
+### `test20.mjs`
+```js
+import { basename } from 'node:path';
+
+import { ArgumentParser } from './lib/argparse.mjs';
+import * as base58 from './lib/base58.mjs';
+import { abortWithException } from './lib/errors.mjs';
+import { reprBytes, utf8Encode } from './lib/pybytes.mjs';
+
+const parser = new ArgumentParser(basename(process.argv[1]));
+parser.addArgument('a', { type: 'str', required: true });
+parser.addArgument('b', { type: 'str', required: true });
+parser.addArgument('c', { type: 'str', required: true });
+parser.addArgument('d', { type: 'str', required: true });
+parser.addArgument('e', { type: 'str', required: true });
+parser.addArgument('f', { type: 'int', required: true });
+parser.addArgument('g', { type: 'int', required: true });
+const args = parser.parseArgs(process.argv.slice(2));
+
+function printBytes(value) { process.stdout.write(`${reprBytes(value)}\n`); }
+function printInt(value) { process.stdout.write(`${value}\n`); }
+
+try {
+  // 最终复杂场景：多个API组合调用
+  const enc1 = base58.b58encode(utf8Encode(args.a));        // 基本编码1
+  const dec1 = base58.b58decode(args.b);                    // 基本解码1
+  const encCheck1 = base58.b58encodeCheck(utf8Encode(args.c)); // 校验和编码1
+  const decCheck1 = base58.b58decodeCheck(encCheck1);       // 校验和解码1
+  const encInt1 = base58.b58encodeInt(args.f);              // 整数编码1
+  const decInt1 = base58.b58decodeInt(encInt1);             // 整数解码1
+  const enc2 = base58.b58encode(utf8Encode(args.d));        // 基本编码2
+  const dec2 = base58.b58decode(args.e);                    // 基本解码2
+  const encInt2 = base58.b58encodeInt(args.g);              // 整数编码2
+  const encCheck2 = base58.b58encodeCheck(dec1);            // 对解码结果进行校验和编码
+  const decCheck2 = base58.b58decodeCheck(encCheck2);       // 校验和解码2
+  const enc3 = base58.b58encode(decCheck2);                 // 对校验和解码结果进行基本编码
+  printBytes(enc1);
+  printBytes(dec1);
+  printBytes(encCheck1);
+  printBytes(decCheck1);
+  printBytes(encInt1);
+  printInt(decInt1);
+  printBytes(enc2);
+  printBytes(dec2);
+  printBytes(encInt2);
+  printBytes(encCheck2);
+  printBytes(decCheck2);
+  printBytes(enc3);
+} catch (err) {
+  abortWithException(err);
+}
+```
+
+## Verification
+
+`node /output/test20.mjs …` was diffed against `test20_executable …` on **553 cases** — all 4 documented samples, plus a structured sweep (empty strings, leading-`1` runs, trailing whitespace, invalid alphabet chars `0OIl`, quote/backslash/control-byte payloads, UTF-8 and astral input, 0/huge/underscore/signed ints, 400-byte payloads) and 420 randomized combinations, plus 31 argparse-surface cases. **Zero failures** on stdout, exit code, and the final stderr exception line.
+
+Two divergences I could not eliminate, both structural rather than logical:
+
+1. **Program name in usage/error text.** argparse derives `prog` from the running program's filename, so the reference prints `test20_executable` and the port prints `test20.mjs`. This affects stderr only, and no value would match both. The fuzz harness normalizes this one token.
+2. **Traceback body.** On a `ValueError`/`UnicodeEncodeError` the port writes `Traceback (most recent call last):` followed by the real `ValueError: Invalid character '0'` line, but not the interpreter frame list (which cites Python source files) or PyInstaller's `[PYI-<pid>:ERROR]` banner — the pid varies per run, so exact stderr equality is impossible from any language. stdout is empty and the exit code is `1` in both, matching.
+
+One shared pathology worth flagging: a **negative** `--f`/`--g` never terminates in either implementation — Python's floor division pins the quotient at `-1`, so `b58encode_int`'s digit loop never reaches zero. The reference hangs (timeout), while Node exhausts the heap after a while; I left the loop unguarded and documented it in `base58.mjs` rather than inventing behavior the reference doesn't have. No test can cover it, since the reference itself never produces output.

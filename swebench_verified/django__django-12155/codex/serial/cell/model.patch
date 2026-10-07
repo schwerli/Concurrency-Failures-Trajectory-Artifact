@@ -1,0 +1,84 @@
+diff --git a/django/contrib/admindocs/utils.py b/django/contrib/admindocs/utils.py
+index 4c0e7e2a56..cda95a90b3 100644
+--- a/django/contrib/admindocs/utils.py
++++ b/django/contrib/admindocs/utils.py
+@@ -34,7 +34,10 @@ def trim_docstring(docstring):
+         return ''
+     # Convert tabs to spaces and split into lines
+     lines = docstring.expandtabs().splitlines()
+-    indent = min(len(line) - len(line.lstrip()) for line in lines if line.lstrip())
++    indent = min(
++        (len(line) - len(line.lstrip()) for line in lines[1:] if line.lstrip()),
++        default=0,
++    )
+     trimmed = [lines[0].lstrip()] + [line[indent:].rstrip() for line in lines[1:]]
+     return "\n".join(trimmed).strip()
+ 
+diff --git a/tests/admin_docs/test_utils.py b/tests/admin_docs/test_utils.py
+index 17ea912015..3aa19a47ff 100644
+--- a/tests/admin_docs/test_utils.py
++++ b/tests/admin_docs/test_utils.py
+@@ -44,6 +44,13 @@ class TestUtils(AdminDocsSimpleTestCase):
+         )
+         self.assertEqual(trim_docstring_output, trimmed_docstring)
+ 
++    def test_trim_docstring_with_content_on_first_line(self):
++        docstring = """A title.
++
++        A body paragraph.
++        """
++        self.assertEqual(trim_docstring(docstring), 'A title.\n\nA body paragraph.')
++
+     def test_parse_docstring(self):
+         title, description, metadata = parse_docstring(self.docstring)
+         docstring_title = (
+diff --git a/tests/admin_docs/test_views.py b/tests/admin_docs/test_views.py
+index fb021f3dd2..a56553a72e 100644
+--- a/tests/admin_docs/test_views.py
++++ b/tests/admin_docs/test_views.py
+@@ -75,6 +75,14 @@ class AdminDocViewTests(TestDataMixin, AdminDocsTestCase):
+         # View docstring
+         self.assertContains(response, 'Base view for admindocs views.')
+ 
++    def test_view_detail_docstring_first_line(self):
++        url = reverse('django-admindocs-views-detail', args=['admin_docs.views.xview_docstring_first_line'])
++        with captured_stderr() as docutils_stderr:
++            response = self.client.get(url)
++        self.assertContains(response, 'Summary line.')
++        self.assertContains(response, '<p>Detailed body for the view.</p>', html=True)
++        self.assertNotIn('Error in "default-role" directive', docutils_stderr.getvalue())
++
+     @override_settings(ROOT_URLCONF='admin_docs.namespace_urls')
+     def test_namespaced_view_detail(self):
+         url = reverse('django-admindocs-views-detail', args=['admin_docs.views.XViewClass'])
+diff --git a/tests/admin_docs/urls.py b/tests/admin_docs/urls.py
+index f535afc9f2..93322d2f06 100644
+--- a/tests/admin_docs/urls.py
++++ b/tests/admin_docs/urls.py
+@@ -12,6 +12,7 @@ urlpatterns = [
+     path('admindocs/', include('django.contrib.admindocs.urls')),
+     path('', include(ns_patterns, namespace='test')),
+     path('xview/func/', views.xview_dec(views.xview)),
++    path('xview/docstring_on_first_line/', views.xview_docstring_first_line),
+     path('xview/class/', views.xview_dec(views.XViewClass.as_view())),
+     path('xview/callable_object/', views.xview_dec(views.XViewCallableObject())),
+     path('xview/callable_object_without_xview/', views.XViewCallableObject()),
+diff --git a/tests/admin_docs/views.py b/tests/admin_docs/views.py
+index 21fe382bba..47052bcd3a 100644
+--- a/tests/admin_docs/views.py
++++ b/tests/admin_docs/views.py
+@@ -10,6 +10,14 @@ def xview(request):
+     return HttpResponse()
+ 
+ 
++def xview_docstring_first_line(request):
++    """Summary line.
++
++    Detailed body for the view.
++    """
++    return HttpResponse()
++
++
+ class XViewClass(View):
+     def get(self, request):
+         return HttpResponse()

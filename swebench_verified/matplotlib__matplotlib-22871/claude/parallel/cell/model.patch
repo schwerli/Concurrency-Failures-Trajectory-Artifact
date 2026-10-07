@@ -1,0 +1,2733 @@
+diff --git a/probe/probe.py b/probe/probe.py
+new file mode 100644
+index 0000000000..2cc5cdb06e
+--- /dev/null
++++ b/probe/probe.py
+@@ -0,0 +1,118 @@
++import sys, datetime
++import numpy as np
++import matplotlib
++matplotlib.use('Agg')
++import matplotlib.pyplot as plt
++import matplotlib.dates as mdates
++
++# ---------------------------------------------------------------
++# Capture the REAL `level` local variable out of the UNMODIFIED
++# ConciseDateFormatter.format_ticks frame using sys.settrace.
++# No source is copied or reimplemented -> level is ground truth.
++# ---------------------------------------------------------------
++TARGET_CODE = mdates.ConciseDateFormatter.format_ticks.__code__
++captured = {}
++
++def _local_tracer(frame, event, arg):
++    if event == 'return':
++        captured['level'] = frame.f_locals.get('level')
++        captured['show_offset'] = frame.f_locals.get('show_offset')
++        captured['tickdate'] = frame.f_locals.get('tickdate')
++    return _local_tracer
++
++def _global_tracer(frame, event, arg):
++    if event == 'call' and frame.f_code is TARGET_CODE:
++        return _local_tracer
++    return None
++
++
++def probe(label, start, span):
++    """span: timedelta. Returns dict of observed behaviour."""
++    end = start + span
++    dates = [start, end]
++    y = [0, 1]
++    fig, ax = plt.subplots()
++    loc = mdates.AutoDateLocator()
++    fmt = mdates.ConciseDateFormatter(loc)
++    ax.xaxis.set_major_locator(loc)
++    ax.xaxis.set_major_formatter(fmt)
++    ax.plot(dates, y)
++    captured.clear()
++    sys.settrace(_global_tracer)
++    try:
++        fig.canvas.draw()
++    finally:
++        sys.settrace(None)
++    labels = [t.get_text() for t in ax.get_xticklabels()]
++    off = fmt.get_offset()
++    td = captured.get('tickdate')
++    lvl = captured.get('level')
++    plt.close(fig)
++    # unique-count per column of tickdate (year..second)
++    uniq = [len(np.unique(td[:, i])) for i in range(6)] if td is not None else None
++    months = sorted(set(int(v) for v in td[:, 1])) if td is not None else None
++    days = sorted(set(int(v) for v in td[:, 2])) if td is not None else None
++    years = sorted(set(int(v) for v in td[:, 0])) if td is not None else None
++    return dict(label=label, level=lvl, labels=labels, offset=off,
++                uniq=uniq, years=years, months=months, days=days,
++                show_offset=captured.get('show_offset'))
++
++
++def show(r):
++    print(f"{r['label']:<34} lvl={r['level']}  offset={r['offset']!r:<22} "
++          f"uniq(Y,M,D,h,m,s)={r['uniq']}")
++    print(f"{'':34}   labels={r['labels']}")
++    print(f"{'':34}   tick years={r['years']} months={r['months']} days={r['days']}")
++    print()
++
++
++cases = []
++def add(lbl, start, span):
++    cases.append((lbl, start, span))
++
++D = datetime.timedelta
++
++# --- the reported bug ---
++add('BUG 2021-02-15 +199d', datetime.datetime(2021, 2, 15), D(days=199))
++
++# --- spans of 1..11 months from 4 different start months ---
++for (sy, sm, sd, tag) in [(2021, 1, 1, 'Jan01'), (2021, 2, 15, 'Feb15'),
++                          (2021, 6, 1, 'Jun01'), (2021, 12, 1, 'Dec01')]:
++    for nmonths in range(1, 12):
++        add(f'{tag} +{nmonths}mo', datetime.datetime(sy, sm, sd),
++            D(days=int(nmonths * 30.44)))
++
++# --- multi-year ---
++for (yrs, tag) in [(2, '2y'), (20, '20y'), (200, '200y')]:
++    add(f'2021-02-15 +{tag}', datetime.datetime(2021, 2, 15), D(days=int(365.25 * yrs)))
++    add(f'2021-01-01 +{tag}', datetime.datetime(2021, 1, 1), D(days=int(365.25 * yrs)))
++
++# --- sub-month spans, mid-month and on the 1st ---
++for (sd, tag) in [(15, 'mid'), (1, '1st')]:
++    add(f'2021-06-{sd:02d} +1d  ({tag})', datetime.datetime(2021, 6, sd), D(days=1))
++    add(f'2021-06-{sd:02d} +1wk ({tag})', datetime.datetime(2021, 6, sd), D(weeks=1))
++    add(f'2021-06-{sd:02d} +3wk ({tag})', datetime.datetime(2021, 6, sd), D(weeks=3))
++
++# --- sub-day ---
++add('2021-06-15 +1h', datetime.datetime(2021, 6, 15, 10), D(hours=1))
++add('2021-06-15 +1min', datetime.datetime(2021, 6, 15, 10), D(minutes=1))
++add('2021-06-15 +0.01s', datetime.datetime(2021, 6, 15, 10), D(seconds=0.01))
++# exactly-zero-time cases
++add('2021-06-15T00 +1h', datetime.datetime(2021, 6, 15, 0), D(hours=1))
++add('2021-01-01T00 +1h', datetime.datetime(2021, 1, 1, 0), D(hours=1))
++
++# --- year boundary crossed but (maybe) no January tick ---
++add('2021-06-15 +200d (Xyear)', datetime.datetime(2021, 6, 15), D(days=200))
++add('2021-07-01 +200d (Xyear)', datetime.datetime(2021, 7, 1), D(days=200))
++add('2021-11-15 +60d (Xyear)', datetime.datetime(2021, 11, 15), D(days=60))
++add('2021-12-20 +20d (Xyear)', datetime.datetime(2021, 12, 20), D(days=20))
++add('2021-12-31T20 +8h (Xyear)', datetime.datetime(2021, 12, 31, 20), D(hours=8))
++
++results = [probe(*c) for c in cases]
++for r in results:
++    show(r)
++
++import json
++with open('/workspace/probe/results.json', 'w') as f:
++    json.dump([{k: v for k, v in r.items() if k != 'uniq'} | {'uniq': r['uniq']}
++               for r in results], f, indent=1, default=str)
+diff --git a/probe/results.json b/probe/results.json
+new file mode 100644
+index 0000000000..0685ab5f99
+--- /dev/null
++++ b/probe/results.json
+@@ -0,0 +1,2602 @@
++[
++ {
++  "label": "BUG 2021-02-15 +199d",
++  "level": 1,
++  "labels": [
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   3,
++   4,
++   5,
++   6,
++   7,
++   8,
++   9
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   7,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jan01 +1mo",
++  "level": 2,
++  "labels": [
++   "Jan",
++   "05",
++   "09",
++   "13",
++   "17",
++   "21",
++   "25",
++   "29",
++   "Feb"
++  ],
++  "offset": "2021-Feb",
++  "years": [
++   2021
++  ],
++  "months": [
++   1,
++   2
++  ],
++  "days": [
++   1,
++   5,
++   9,
++   13,
++   17,
++   21,
++   25,
++   29
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   2,
++   8,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jan01 +2mo",
++  "level": 2,
++  "labels": [
++   "Jan",
++   "08",
++   "15",
++   "22",
++   "Feb",
++   "08",
++   "15",
++   "22",
++   "Mar"
++  ],
++  "offset": "2021-Mar",
++  "years": [
++   2021
++  ],
++  "months": [
++   1,
++   2,
++   3
++  ],
++  "days": [
++   1,
++   8,
++   15,
++   22
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   3,
++   4,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jan01 +3mo",
++  "level": 2,
++  "labels": [
++   "Jan",
++   "15",
++   "Feb",
++   "15",
++   "Mar",
++   "15",
++   "Apr"
++  ],
++  "offset": "2021-Apr",
++  "years": [
++   2021
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4
++  ],
++  "days": [
++   1,
++   15
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   4,
++   2,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jan01 +4mo",
++  "level": 2,
++  "labels": [
++   "Jan",
++   "15",
++   "Feb",
++   "15",
++   "Mar",
++   "15",
++   "Apr",
++   "15",
++   "May"
++  ],
++  "offset": "2021-May",
++  "years": [
++   2021
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   5
++  ],
++  "days": [
++   1,
++   15
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   5,
++   2,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jan01 +5mo",
++  "level": 1,
++  "labels": [
++   "2021",
++   "Feb",
++   "Mar",
++   "Apr",
++   "May",
++   "Jun"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   5,
++   6
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   6,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jan01 +6mo",
++  "level": 1,
++  "labels": [
++   "2021",
++   "Feb",
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   5,
++   6,
++   7
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   7,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jan01 +7mo",
++  "level": 1,
++  "labels": [
++   "2021",
++   "Feb",
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul",
++   "Aug"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   5,
++   6,
++   7,
++   8
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   8,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jan01 +8mo",
++  "level": 1,
++  "labels": [
++   "2021",
++   "Feb",
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   5,
++   6,
++   7,
++   8,
++   9
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   9,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jan01 +9mo",
++  "level": 1,
++  "labels": [
++   "2021",
++   "Feb",
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   5,
++   6,
++   7,
++   8,
++   9,
++   10
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   10,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jan01 +10mo",
++  "level": 1,
++  "labels": [
++   "2021",
++   "Feb",
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct",
++   "Nov"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   5,
++   6,
++   7,
++   8,
++   9,
++   10,
++   11
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   11,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jan01 +11mo",
++  "level": 1,
++  "labels": [
++   "2021",
++   "Mar",
++   "May",
++   "Jul",
++   "Sep",
++   "Nov"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   1,
++   3,
++   5,
++   7,
++   9,
++   11
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   6,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Feb15 +1mo",
++  "level": 2,
++  "labels": [
++   "17",
++   "21",
++   "25",
++   "Mar",
++   "05",
++   "09",
++   "13",
++   "17"
++  ],
++  "offset": "2021-Mar",
++  "years": [
++   2021
++  ],
++  "months": [
++   2,
++   3
++  ],
++  "days": [
++   1,
++   5,
++   9,
++   13,
++   17,
++   21,
++   25
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   2,
++   7,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Feb15 +2mo",
++  "level": 2,
++  "labels": [
++   "15",
++   "22",
++   "Mar",
++   "08",
++   "15",
++   "22",
++   "Apr",
++   "08",
++   "15"
++  ],
++  "offset": "2021-Apr",
++  "years": [
++   2021
++  ],
++  "months": [
++   2,
++   3,
++   4
++  ],
++  "days": [
++   1,
++   8,
++   15,
++   22
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   3,
++   4,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Feb15 +3mo",
++  "level": 2,
++  "labels": [
++   "15",
++   "Mar",
++   "15",
++   "Apr",
++   "15",
++   "May",
++   "15"
++  ],
++  "offset": "2021-May",
++  "years": [
++   2021
++  ],
++  "months": [
++   2,
++   3,
++   4,
++   5
++  ],
++  "days": [
++   1,
++   15
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   4,
++   2,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Feb15 +4mo",
++  "level": 2,
++  "labels": [
++   "15",
++   "Mar",
++   "15",
++   "Apr",
++   "15",
++   "May",
++   "15",
++   "Jun",
++   "15"
++  ],
++  "offset": "2021-Jun",
++  "years": [
++   2021
++  ],
++  "months": [
++   2,
++   3,
++   4,
++   5,
++   6
++  ],
++  "days": [
++   1,
++   15
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   5,
++   2,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Feb15 +5mo",
++  "level": 1,
++  "labels": [
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   3,
++   4,
++   5,
++   6,
++   7
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   5,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Feb15 +6mo",
++  "level": 1,
++  "labels": [
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul",
++   "Aug"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   3,
++   4,
++   5,
++   6,
++   7,
++   8
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   6,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Feb15 +7mo",
++  "level": 1,
++  "labels": [
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   3,
++   4,
++   5,
++   6,
++   7,
++   8,
++   9
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   7,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Feb15 +8mo",
++  "level": 1,
++  "labels": [
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   3,
++   4,
++   5,
++   6,
++   7,
++   8,
++   9,
++   10
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   8,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Feb15 +9mo",
++  "level": 1,
++  "labels": [
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct",
++   "Nov"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   3,
++   4,
++   5,
++   6,
++   7,
++   8,
++   9,
++   10,
++   11
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   9,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Feb15 +10mo",
++  "level": 1,
++  "labels": [
++   "Feb",
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct",
++   "Nov",
++   "Dec"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   2,
++   3,
++   4,
++   5,
++   6,
++   7,
++   8,
++   9,
++   10,
++   11,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   11,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Feb15 +11mo",
++  "level": 1,
++  "labels": [
++   "Mar",
++   "May",
++   "Jul",
++   "Sep",
++   "Nov",
++   "2022"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   3,
++   5,
++   7,
++   9,
++   11
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   6,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jun01 +1mo",
++  "level": 2,
++  "labels": [
++   "Jun",
++   "05",
++   "09",
++   "13",
++   "17",
++   "21",
++   "25",
++   "29",
++   "Jul"
++  ],
++  "offset": "2021-Jul",
++  "years": [
++   2021
++  ],
++  "months": [
++   6,
++   7
++  ],
++  "days": [
++   1,
++   5,
++   9,
++   13,
++   17,
++   21,
++   25,
++   29
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   2,
++   8,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jun01 +2mo",
++  "level": 2,
++  "labels": [
++   "Jun",
++   "08",
++   "15",
++   "22",
++   "Jul",
++   "08",
++   "15",
++   "22",
++   "Aug"
++  ],
++  "offset": "2021-Aug",
++  "years": [
++   2021
++  ],
++  "months": [
++   6,
++   7,
++   8
++  ],
++  "days": [
++   1,
++   8,
++   15,
++   22
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   3,
++   4,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jun01 +3mo",
++  "level": 2,
++  "labels": [
++   "Jun",
++   "15",
++   "Jul",
++   "15",
++   "Aug",
++   "15",
++   "Sep"
++  ],
++  "offset": "2021-Sep",
++  "years": [
++   2021
++  ],
++  "months": [
++   6,
++   7,
++   8,
++   9
++  ],
++  "days": [
++   1,
++   15
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   4,
++   2,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jun01 +4mo",
++  "level": 2,
++  "labels": [
++   "Jun",
++   "15",
++   "Jul",
++   "15",
++   "Aug",
++   "15",
++   "Sep",
++   "15",
++   "Oct"
++  ],
++  "offset": "2021-Oct",
++  "years": [
++   2021
++  ],
++  "months": [
++   6,
++   7,
++   8,
++   9,
++   10
++  ],
++  "days": [
++   1,
++   15
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   5,
++   2,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jun01 +5mo",
++  "level": 1,
++  "labels": [
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct",
++   "Nov"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   6,
++   7,
++   8,
++   9,
++   10,
++   11
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   6,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jun01 +6mo",
++  "level": 1,
++  "labels": [
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct",
++   "Nov",
++   "Dec"
++  ],
++  "offset": "",
++  "years": [
++   2021
++  ],
++  "months": [
++   6,
++   7,
++   8,
++   9,
++   10,
++   11,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   7,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jun01 +7mo",
++  "level": 1,
++  "labels": [
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct",
++   "Nov",
++   "Dec",
++   "2022"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   6,
++   7,
++   8,
++   9,
++   10,
++   11,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   8,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jun01 +8mo",
++  "level": 1,
++  "labels": [
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct",
++   "Nov",
++   "Dec",
++   "2022",
++   "Feb"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   2,
++   6,
++   7,
++   8,
++   9,
++   10,
++   11,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   9,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jun01 +9mo",
++  "level": 1,
++  "labels": [
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct",
++   "Nov",
++   "Dec",
++   "2022",
++   "Feb",
++   "Mar"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   6,
++   7,
++   8,
++   9,
++   10,
++   11,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   10,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jun01 +10mo",
++  "level": 1,
++  "labels": [
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct",
++   "Nov",
++   "Dec",
++   "2022",
++   "Feb",
++   "Mar",
++   "Apr"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   6,
++   7,
++   8,
++   9,
++   10,
++   11,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   11,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Jun01 +11mo",
++  "level": 1,
++  "labels": [
++   "Jul",
++   "Sep",
++   "Nov",
++   "2022",
++   "Mar",
++   "May"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   3,
++   5,
++   7,
++   9,
++   11
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   6,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Dec01 +1mo",
++  "level": 2,
++  "labels": [
++   "Dec",
++   "05",
++   "09",
++   "13",
++   "17",
++   "21",
++   "25",
++   "29",
++   "Jan"
++  ],
++  "offset": "2022-Jan",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   12
++  ],
++  "days": [
++   1,
++   5,
++   9,
++   13,
++   17,
++   21,
++   25,
++   29
++  ],
++  "show_offset": true,
++  "uniq": [
++   2,
++   2,
++   8,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Dec01 +2mo",
++  "level": 2,
++  "labels": [
++   "Dec",
++   "08",
++   "15",
++   "22",
++   "Jan",
++   "08",
++   "15",
++   "22",
++   "Feb"
++  ],
++  "offset": "2022-Feb",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   2,
++   12
++  ],
++  "days": [
++   1,
++   8,
++   15,
++   22
++  ],
++  "show_offset": true,
++  "uniq": [
++   2,
++   3,
++   4,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Dec01 +3mo",
++  "level": 2,
++  "labels": [
++   "Dec",
++   "15",
++   "Jan",
++   "15",
++   "Feb",
++   "15",
++   "Mar"
++  ],
++  "offset": "2022-Mar",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   12
++  ],
++  "days": [
++   1,
++   15
++  ],
++  "show_offset": true,
++  "uniq": [
++   2,
++   4,
++   2,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Dec01 +4mo",
++  "level": 2,
++  "labels": [
++   "Dec",
++   "15",
++   "Jan",
++   "15",
++   "Feb",
++   "15",
++   "Mar",
++   "15",
++   "Apr"
++  ],
++  "offset": "2022-Apr",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   12
++  ],
++  "days": [
++   1,
++   15
++  ],
++  "show_offset": true,
++  "uniq": [
++   2,
++   5,
++   2,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Dec01 +5mo",
++  "level": 1,
++  "labels": [
++   "Dec",
++   "2022",
++   "Feb",
++   "Mar",
++   "Apr",
++   "May"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   5,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   6,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Dec01 +6mo",
++  "level": 1,
++  "labels": [
++   "Dec",
++   "2022",
++   "Feb",
++   "Mar",
++   "Apr",
++   "May",
++   "Jun"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   5,
++   6,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   7,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Dec01 +7mo",
++  "level": 1,
++  "labels": [
++   "Dec",
++   "2022",
++   "Feb",
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   5,
++   6,
++   7,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   8,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Dec01 +8mo",
++  "level": 1,
++  "labels": [
++   "Dec",
++   "2022",
++   "Feb",
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul",
++   "Aug"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   5,
++   6,
++   7,
++   8,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   9,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Dec01 +9mo",
++  "level": 1,
++  "labels": [
++   "Dec",
++   "2022",
++   "Feb",
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   5,
++   6,
++   7,
++   8,
++   9,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   10,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Dec01 +10mo",
++  "level": 1,
++  "labels": [
++   "Dec",
++   "2022",
++   "Feb",
++   "Mar",
++   "Apr",
++   "May",
++   "Jun",
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   2,
++   3,
++   4,
++   5,
++   6,
++   7,
++   8,
++   9,
++   10,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   11,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "Dec01 +11mo",
++  "level": 1,
++  "labels": [
++   "2022",
++   "Mar",
++   "May",
++   "Jul",
++   "Sep",
++   "Nov"
++  ],
++  "offset": "",
++  "years": [
++   2022
++  ],
++  "months": [
++   1,
++   3,
++   5,
++   7,
++   9,
++   11
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   1,
++   6,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-02-15 +2y",
++  "level": 1,
++  "labels": [
++   "Apr",
++   "Jul",
++   "Oct",
++   "2022",
++   "Apr",
++   "Jul",
++   "Oct",
++   "2023"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022,
++   2023
++  ],
++  "months": [
++   1,
++   4,
++   7,
++   10
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   3,
++   4,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-01-01 +2y",
++  "level": 1,
++  "labels": [
++   "2021",
++   "Apr",
++   "Jul",
++   "Oct",
++   "2022",
++   "Apr",
++   "Jul",
++   "Oct",
++   "2023"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022,
++   2023
++  ],
++  "months": [
++   1,
++   4,
++   7,
++   10
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   3,
++   4,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-02-15 +20y",
++  "level": 0,
++  "labels": [
++   "2020",
++   "2024",
++   "2028",
++   "2032",
++   "2036",
++   "2040",
++   "2044"
++  ],
++  "offset": "",
++  "years": [
++   2020,
++   2024,
++   2028,
++   2032,
++   2036,
++   2040,
++   2044
++  ],
++  "months": [
++   1
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   7,
++   1,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-01-01 +20y",
++  "level": 0,
++  "labels": [
++   "2020",
++   "2024",
++   "2028",
++   "2032",
++   "2036",
++   "2040",
++   "2044"
++  ],
++  "offset": "",
++  "years": [
++   2020,
++   2024,
++   2028,
++   2032,
++   2036,
++   2040,
++   2044
++  ],
++  "months": [
++   1
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   7,
++   1,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-02-15 +200y",
++  "level": 0,
++  "labels": [
++   "2000",
++   "2040",
++   "2080",
++   "2120",
++   "2160",
++   "2200",
++   "2240"
++  ],
++  "offset": "",
++  "years": [
++   2000,
++   2040,
++   2080,
++   2120,
++   2160,
++   2200,
++   2240
++  ],
++  "months": [
++   1
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   7,
++   1,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-01-01 +200y",
++  "level": 0,
++  "labels": [
++   "2000",
++   "2040",
++   "2080",
++   "2120",
++   "2160",
++   "2200",
++   "2240"
++  ],
++  "offset": "",
++  "years": [
++   2000,
++   2040,
++   2080,
++   2120,
++   2160,
++   2200,
++   2240
++  ],
++  "months": [
++   1
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   7,
++   1,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-06-15 +1d  (mid)",
++  "level": 3,
++  "labels": [
++   "Jun-15",
++   "03:00",
++   "06:00",
++   "09:00",
++   "12:00",
++   "15:00",
++   "18:00",
++   "21:00",
++   "Jun-16"
++  ],
++  "offset": "2021-Jun-16",
++  "years": [
++   2021
++  ],
++  "months": [
++   6
++  ],
++  "days": [
++   15,
++   16
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   1,
++   2,
++   8,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-06-15 +1wk (mid)",
++  "level": 2,
++  "labels": [
++   "15",
++   "16",
++   "17",
++   "18",
++   "19",
++   "20",
++   "21",
++   "22"
++  ],
++  "offset": "2021-Jun",
++  "years": [
++   2021
++  ],
++  "months": [
++   6
++  ],
++  "days": [
++   15,
++   16,
++   17,
++   18,
++   19,
++   20,
++   21,
++   22
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   1,
++   8,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-06-15 +3wk (mid)",
++  "level": 2,
++  "labels": [
++   "17",
++   "21",
++   "25",
++   "29",
++   "Jul",
++   "05"
++  ],
++  "offset": "2021-Jul",
++  "years": [
++   2021
++  ],
++  "months": [
++   6,
++   7
++  ],
++  "days": [
++   1,
++   5,
++   17,
++   21,
++   25,
++   29
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   2,
++   6,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-06-01 +1d  (1st)",
++  "level": 3,
++  "labels": [
++   "Jun-01",
++   "03:00",
++   "06:00",
++   "09:00",
++   "12:00",
++   "15:00",
++   "18:00",
++   "21:00",
++   "Jun-02"
++  ],
++  "offset": "2021-Jun-02",
++  "years": [
++   2021
++  ],
++  "months": [
++   6
++  ],
++  "days": [
++   1,
++   2
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   1,
++   2,
++   8,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-06-01 +1wk (1st)",
++  "level": 2,
++  "labels": [
++   "Jun",
++   "02",
++   "03",
++   "04",
++   "05",
++   "06",
++   "07",
++   "08"
++  ],
++  "offset": "2021-Jun",
++  "years": [
++   2021
++  ],
++  "months": [
++   6
++  ],
++  "days": [
++   1,
++   2,
++   3,
++   4,
++   5,
++   6,
++   7,
++   8
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   1,
++   8,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-06-01 +3wk (1st)",
++  "level": 2,
++  "labels": [
++   "Jun",
++   "05",
++   "09",
++   "13",
++   "17",
++   "21"
++  ],
++  "offset": "2021-Jun",
++  "years": [
++   2021
++  ],
++  "months": [
++   6
++  ],
++  "days": [
++   1,
++   5,
++   9,
++   13,
++   17,
++   21
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   1,
++   6,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-06-15 +1h",
++  "level": 4,
++  "labels": [
++   "10:00",
++   "10:10",
++   "10:20",
++   "10:30",
++   "10:40",
++   "10:50",
++   "11:00"
++  ],
++  "offset": "2021-Jun-15",
++  "years": [
++   2021
++  ],
++  "months": [
++   6
++  ],
++  "days": [
++   15
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   1,
++   1,
++   2,
++   6,
++   1
++  ]
++ },
++ {
++  "label": "2021-06-15 +1min",
++  "level": 5,
++  "labels": [
++   "10:00",
++   "10",
++   "20",
++   "30",
++   "40",
++   "50",
++   "10:01"
++  ],
++  "offset": "2021-Jun-15 10:01",
++  "years": [
++   2021
++  ],
++  "months": [
++   6
++  ],
++  "days": [
++   15
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   1,
++   1,
++   1,
++   2,
++   6
++  ]
++ },
++ {
++  "label": "2021-06-15 +0.01s",
++  "level": 5,
++  "labels": [
++   "59.998",
++   "10:00",
++   "00.002",
++   "00.004",
++   "00.006",
++   "00.008",
++   "00.010",
++   "00.012"
++  ],
++  "offset": "2021-Jun-15 10:00",
++  "years": [
++   2021
++  ],
++  "months": [
++   6
++  ],
++  "days": [
++   15
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   1,
++   1,
++   2,
++   2,
++   2
++  ]
++ },
++ {
++  "label": "2021-06-15T00 +1h",
++  "level": 4,
++  "labels": [
++   "00:00",
++   "00:10",
++   "00:20",
++   "00:30",
++   "00:40",
++   "00:50",
++   "01:00"
++  ],
++  "offset": "2021-Jun-15",
++  "years": [
++   2021
++  ],
++  "months": [
++   6
++  ],
++  "days": [
++   15
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   1,
++   1,
++   2,
++   6,
++   1
++  ]
++ },
++ {
++  "label": "2021-01-01T00 +1h",
++  "level": 4,
++  "labels": [
++   "00:00",
++   "00:10",
++   "00:20",
++   "00:30",
++   "00:40",
++   "00:50",
++   "01:00"
++  ],
++  "offset": "2021-Jan-01",
++  "years": [
++   2021
++  ],
++  "months": [
++   1
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": true,
++  "uniq": [
++   1,
++   1,
++   1,
++   2,
++   6,
++   1
++  ]
++ },
++ {
++  "label": "2021-06-15 +200d (Xyear)",
++  "level": 1,
++  "labels": [
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct",
++   "Nov",
++   "Dec",
++   "2022"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   7,
++   8,
++   9,
++   10,
++   11,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   7,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-07-01 +200d (Xyear)",
++  "level": 1,
++  "labels": [
++   "Jul",
++   "Aug",
++   "Sep",
++   "Oct",
++   "Nov",
++   "Dec",
++   "2022"
++  ],
++  "offset": "",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   7,
++   8,
++   9,
++   10,
++   11,
++   12
++  ],
++  "days": [
++   1
++  ],
++  "show_offset": false,
++  "uniq": [
++   2,
++   7,
++   1,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-11-15 +60d (Xyear)",
++  "level": 2,
++  "labels": [
++   "15",
++   "22",
++   "Dec",
++   "08",
++   "15",
++   "22",
++   "Jan",
++   "08",
++   "15"
++  ],
++  "offset": "2022-Jan",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   11,
++   12
++  ],
++  "days": [
++   1,
++   8,
++   15,
++   22
++  ],
++  "show_offset": true,
++  "uniq": [
++   2,
++   3,
++   4,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-12-20 +20d (Xyear)",
++  "level": 2,
++  "labels": [
++   "21",
++   "25",
++   "29",
++   "Jan",
++   "05",
++   "09"
++  ],
++  "offset": "2022-Jan",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   12
++  ],
++  "days": [
++   1,
++   5,
++   9,
++   21,
++   25,
++   29
++  ],
++  "show_offset": true,
++  "uniq": [
++   2,
++   2,
++   6,
++   1,
++   1,
++   1
++  ]
++ },
++ {
++  "label": "2021-12-31T20 +8h (Xyear)",
++  "level": 3,
++  "labels": [
++   "20:00",
++   "21:00",
++   "22:00",
++   "23:00",
++   "Jan-01",
++   "01:00",
++   "02:00",
++   "03:00",
++   "04:00"
++  ],
++  "offset": "2022-Jan-01",
++  "years": [
++   2021,
++   2022
++  ],
++  "months": [
++   1,
++   12
++  ],
++  "days": [
++   1,
++   31
++  ],
++  "show_offset": true,
++  "uniq": [
++   2,
++   2,
++   2,
++   9,
++   1,
++   1
++  ]
++ }
++]
+\ No newline at end of file

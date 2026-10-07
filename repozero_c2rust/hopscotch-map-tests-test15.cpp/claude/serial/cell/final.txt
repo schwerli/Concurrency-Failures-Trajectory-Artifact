@@ -1,0 +1,29 @@
+All checks pass. Final structure:
+
+```
+/output
+├── Cargo.toml            # bin "test15" → test15.rs, no [dependencies]
+├── test15.rs             # entry point (port of tests/test15.cpp)
+├── test15               # compiled executable
+└── src
+    ├── cxx_compat.rs     # std::stoi semantics + libstdc++ terminate/abort behavior
+    └── tsl
+        ├── mod.rs
+        ├── hash.rs             # FNV-1a + SplitMix64 finalizer, BuildHasher impl
+        ├── hopscotch_hash.rs   # hopscotch table: neighborhood bitmaps, hop-closer, overflow, growth, position-comparable iterators
+        └── hopscotch_map.rs    # map facade: insert / get / find / equal_range / iter
+```
+
+**Implementation notes**
+
+- `equal_range` is built on position-comparable iterators (an index into `buckets ++ overflow`), so the C++ `for (it = range.first; it != range.second; ++it)` loop ports literally as `while it != range_second { it.advance(); ... }`. Absent key → `(end, end)`; present key → a one-element range, matching unique-key semantics.
+- The table is real hopscotch hashing, not a `HashMap` wrapper: home bucket `hash & mask`, a 62-bit neighborhood bitmap per bucket, backward hopping of the free slot on insert, and an overflow list for entries that can't be hopped into reach.
+- `cxx_compat` reproduces the failure modes byte-for-byte, including stderr: `std::invalid_argument`/`std::out_of_range` from `stoi`, and the `std::logic_error` libstdc++ raises when `argv[2]` is null (`--a` with no number), each followed by `abort()` so the exit status is 134 like the C++ binary.
+
+**Verification**
+
+- 58 differential cases against `/workspace/dataset/test15_executable` — stdout, stderr, and exit code identical on all of them: no args; counts 0–100000 including neighborhood boundaries (61/62/63/64); negatives; and `stoi` edge cases (`" 7"`, `+7`, `0x10`, `007`, `12abc`, `1e3`, `""`, `2147483648`, `-2147483648`, overflow, missing arg, non-`--a` flags).
+- 8 unit tests (`cargo test --release`) covering the container itself, not just the test's output. The colliding-hash test earned its keep: it caught a real bug where an overflow-triggered rehash grew the table forever when all keys share one home bucket (OOM/SIGKILL). Growth on overflow is now gated on the table still being reasonably loaded, so pathological hashes degrade gracefully instead of allocating without bound.
+- Builds warning-free both ways: `rustc --edition 2021 -O test15.rs -o test15` and `cargo build --release`.
+
+One deviation worth flagging: requirement 7 asks for "an executable at `/output/test15.rs`", but that path holds the required entry source. The executable is at `/output/test15` (rustc's default output name for `test15.rs`), with the Cargo copy at `/output/target/release/test15`; I did not overwrite the source with the binary.

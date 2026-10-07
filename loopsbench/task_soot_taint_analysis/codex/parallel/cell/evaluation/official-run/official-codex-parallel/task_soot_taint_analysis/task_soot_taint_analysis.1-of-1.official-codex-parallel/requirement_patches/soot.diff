@@ -1,0 +1,713 @@
+diff --git a/__pycache__/flowdroid_analysis.cpython-312.pyc b/__pycache__/flowdroid_analysis.cpython-312.pyc
+new file mode 100644
+index 0000000..5df3b05
+Binary files /dev/null and b/__pycache__/flowdroid_analysis.cpython-312.pyc differ
+diff --git a/__pycache__/program_model.cpython-312.pyc b/__pycache__/program_model.cpython-312.pyc
+new file mode 100644
+index 0000000..23b5924
+Binary files /dev/null and b/__pycache__/program_model.cpython-312.pyc differ
+diff --git a/__pycache__/soot_analysis.cpython-312.pyc b/__pycache__/soot_analysis.cpython-312.pyc
+new file mode 100644
+index 0000000..5d1a755
+Binary files /dev/null and b/__pycache__/soot_analysis.cpython-312.pyc differ
+diff --git a/__pycache__/stubdroid_analysis.cpython-312.pyc b/__pycache__/stubdroid_analysis.cpython-312.pyc
+new file mode 100644
+index 0000000..e20f70d
+Binary files /dev/null and b/__pycache__/stubdroid_analysis.cpython-312.pyc differ
+diff --git a/__pycache__/utils.cpython-312.pyc b/__pycache__/utils.cpython-312.pyc
+new file mode 100644
+index 0000000..4b60d1b
+Binary files /dev/null and b/__pycache__/utils.cpython-312.pyc differ
+diff --git a/requirements/soot.yaml b/requirements/soot.yaml
+new file mode 100644
+index 0000000..de6f613
+--- /dev/null
++++ b/requirements/soot.yaml
+@@ -0,0 +1,9 @@
++slug: soot
++title: Soot-style IR and whole-program utilities
++requirements:
++  - Build a Jimple-like IR on top of the shared program model.
++  - Provide a scene registry for classes, methods, hierarchy lookup, and phantom resolution.
++  - Construct a CHA call graph for whole-program analysis.
++  - Implement copy propagation for local values.
++  - Implement dead-code elimination for unreachable code and dead local definitions.
++  - Keep the module runnable as `python3 soot_analysis.py`.
+diff --git a/soot_analysis.py b/soot_analysis.py
+new file mode 100644
+index 0000000..e68fd1e
+--- /dev/null
++++ b/soot_analysis.py
+@@ -0,0 +1,672 @@
++"""Soot-like whole-program utilities for the benchmark suite.
++
++This module builds a Jimple-like intermediate representation from the shared
++program model, exposes a scene registry, constructs a class-hierarchy-analysis
++call graph, and applies lightweight copy propagation and dead-code
++elimination. It is the dependency layer for the FlowDroid- and
++StubDroid-inspired analyses in this repository.
++"""
++
++from __future__ import annotations
++
++import copy
++from collections import defaultdict, deque
++from dataclasses import dataclass, field, replace
++from typing import Iterable
++
++from program_model import ClassDef, Method, MethodBody, MethodSignature, Program, Statement, load_all_benchmarks
++from utils import Timer, build_class_index, build_hierarchy, build_method_index, get_all_subclasses
++
++
++def _signature_key(signature: MethodSignature | str) -> str:
++    if isinstance(signature, str):
++        return signature
++    return signature.full_signature()
++
++
++def _subsignature(signature: MethodSignature) -> tuple[str, tuple[str, ...], str]:
++    return signature.method_name, tuple(signature.param_types), signature.return_type
++
++
++def _is_reference_type(type_name: str | None) -> bool:
++    if not type_name:
++        return False
++    return type_name not in {"boolean", "byte", "char", "short", "int", "long", "float", "double", "void"}
++
++
++def _stmt_token(token: str | None) -> str | None:
++    if token is None:
++        return None
++    return token.strip()
++
++
++@dataclass(frozen=True)
++class StatementRef:
++    method_signature: str
++    stmt_id: int
++
++    def __str__(self) -> str:
++        return f"{self.method_signature}#{self.stmt_id}"
++
++
++@dataclass
++class IRStatement:
++    statement: Statement
++    index: int
++    defines: str | None
++    uses: tuple[str, ...]
++    successors: tuple[int, ...]
++    has_side_effects: bool
++
++
++@dataclass
++class ControlFlowGraph:
++    method_signature: str
++    statements: list[IRStatement]
++    predecessors: dict[int, tuple[int, ...]]
++    successors: dict[int, tuple[int, ...]]
++
++    def reachable_indices(self) -> set[int]:
++        if not self.statements:
++            return set()
++        visited: set[int] = set()
++        worklist = deque([0])
++        while worklist:
++            index = worklist.popleft()
++            if index in visited:
++                continue
++            visited.add(index)
++            for succ in self.successors.get(index, ()):
++                if succ not in visited:
++                    worklist.append(succ)
++        return visited
++
++
++@dataclass
++class IRMethod:
++    owner: ClassDef
++    method: Method
++    cfg: ControlFlowGraph | None
++    local_types: dict[str, str]
++
++    @property
++    def signature(self) -> MethodSignature:
++        return self.method.signature
++
++
++@dataclass
++class OptimizationStats:
++    copy_rewrites: int = 0
++    dead_statements_removed: int = 0
++
++
++@dataclass
++class SootPipelineResult:
++    original_program: Program
++    optimized_program: Program
++    scene: "Scene"
++    call_graph: "CallGraph"
++    stats: OptimizationStats
++    build_time_ms: float
++
++
++@dataclass
++class BenchmarkSummary:
++    benchmark: str
++    classes: int
++    methods: int
++    entry_points: int
++    reachable_methods: int
++    call_edges: int
++    copy_rewrites: int
++    dead_removed: int
++    build_time_ms: float
++
++
++class Scene:
++    """Whole-program registry similar to Soot's Scene."""
++
++    def __init__(self, program: Program):
++        self.program = program
++        self.class_index: dict[str, ClassDef] = build_class_index(program)
++        self.method_index: dict[str, tuple[ClassDef, Method]] = build_method_index(program)
++        self.hierarchy: dict[str, list[str]] = build_hierarchy(program)
++        self._phantom_classes: dict[str, ClassDef] = {}
++        self._phantom_methods: dict[str, Method] = {}
++        self._subclass_cache: dict[str, tuple[str, ...]] = {}
++        self._ir_cache: dict[str, IRMethod] = {}
++
++    @classmethod
++    def from_program(cls, program: Program) -> "Scene":
++        return cls(program)
++
++    def entry_points(self) -> list[Method]:
++        ordered: list[Method] = []
++        for signature in self.program.entry_points:
++            method = self.get_method(signature)
++            if method is not None:
++                ordered.append(method)
++        return ordered
++
++    def all_classes(self) -> list[ClassDef]:
++        return list(self.class_index.values()) + list(self._phantom_classes.values())
++
++    def all_methods(self) -> list[Method]:
++        methods = [method for _, method in self.method_index.values()]
++        methods.extend(self._phantom_methods.values())
++        return methods
++
++    def get_class(self, class_name: str) -> ClassDef | None:
++        return self.class_index.get(class_name) or self._phantom_classes.get(class_name)
++
++    def ensure_class(self, class_name: str) -> ClassDef:
++        existing = self.get_class(class_name)
++        if existing is not None:
++            return existing
++        phantom = ClassDef(name=class_name, is_library=True, is_abstract=True)
++        self._phantom_classes[class_name] = phantom
++        return phantom
++
++    def get_method(self, signature: MethodSignature | str) -> Method | None:
++        key = _signature_key(signature)
++        owner_and_method = self.method_index.get(key)
++        if owner_and_method is not None:
++            return owner_and_method[1]
++        return self._phantom_methods.get(key)
++
++    def get_method_owner(self, signature: MethodSignature | str) -> ClassDef | None:
++        key = _signature_key(signature)
++        owner_and_method = self.method_index.get(key)
++        if owner_and_method is not None:
++            return owner_and_method[0]
++        method = self._phantom_methods.get(key)
++        if method is not None:
++            return self.get_class(method.signature.class_name)
++        return None
++
++    def ensure_method(self, signature: MethodSignature) -> Method:
++        existing = self.get_method(signature)
++        if existing is not None:
++            return existing
++        self.ensure_class(signature.class_name)
++        phantom = Method(signature=signature, body=None, is_static=False, is_abstract=True)
++        self._phantom_methods[signature.full_signature()] = phantom
++        return phantom
++
++    def subclasses_of(self, class_name: str) -> tuple[str, ...]:
++        cached = self._subclass_cache.get(class_name)
++        if cached is not None:
++            return cached
++        subclasses = tuple(sorted(get_all_subclasses(self.hierarchy, class_name)))
++        self._subclass_cache[class_name] = subclasses
++        return subclasses
++
++    def resolve_method_in_hierarchy(self, class_name: str, callee_signature: MethodSignature) -> Method | None:
++        target_shape = _subsignature(callee_signature)
++        current = class_name
++        while current:
++            cls = self.get_class(current)
++            if cls is None:
++                break
++            for method in cls.methods:
++                if _subsignature(method.signature) == target_shape:
++                    return method
++            current = cls.super_class
++        if class_name == callee_signature.class_name:
++            return self.ensure_method(callee_signature)
++        return None
++
++    def local_type(self, method_signature: MethodSignature | str, local_name: str) -> str | None:
++        ir_method = self.get_ir(method_signature)
++        return ir_method.local_types.get(local_name)
++
++    def get_ir(self, method_signature: MethodSignature | str) -> IRMethod:
++        key = _signature_key(method_signature)
++        cached = self._ir_cache.get(key)
++        if cached is not None:
++            return cached
++        owner = self.get_method_owner(key)
++        method = self.get_method(key)
++        if owner is None or method is None:
++            raise KeyError(f"Unknown method: {key}")
++        ir_method = build_ir_method(owner, method)
++        self._ir_cache[key] = ir_method
++        return ir_method
++
++    def invalidate_ir(self) -> None:
++        self._ir_cache.clear()
++
++
++def _statement_locals(method: Method) -> set[str]:
++    if method.body is None:
++        return set()
++    return {local.name for local in method.body.locals}
++
++
++def _statement_uses(statement: Statement, locals_in_scope: set[str]) -> tuple[str, ...]:
++    uses: list[str] = []
++    if statement.receiver in locals_in_scope:
++        uses.append(statement.receiver)
++    for arg in statement.args:
++        if arg in locals_in_scope:
++            uses.append(arg)
++    for var in statement.rhs_vars:
++        if var in locals_in_scope:
++            uses.append(var)
++    if statement.kind == "assign" and statement.rhs in locals_in_scope:
++        uses.append(statement.rhs)
++    if statement.kind == "return" and statement.rhs in locals_in_scope:
++        uses.append(statement.rhs)
++    if statement.kind == "field_load" and statement.field_ref and statement.field_ref.base in locals_in_scope:
++        uses.append(statement.field_ref.base)
++    if statement.kind == "field_store" and statement.field_ref and statement.field_ref.base in locals_in_scope:
++        uses.append(statement.field_ref.base)
++    return tuple(dict.fromkeys(uses))
++
++
++def _statement_def(statement: Statement) -> str | None:
++    if statement.kind in {"assign", "call", "identity", "new", "field_load"}:
++        return statement.lhs
++    return None
++
++
++def _statement_has_side_effects(statement: Statement) -> bool:
++    if statement.kind in {"field_store", "return", "if"}:
++        return True
++    if statement.kind == "call":
++        return True
++    return False
++
++
++def _successor_indices(statements: list[Statement], index: int, id_to_index: dict[int, int]) -> tuple[int, ...]:
++    statement = statements[index]
++    if statement.kind == "return":
++        return ()
++    if statement.kind == "if":
++        successors: list[int] = []
++        if statement.true_target in id_to_index:
++            successors.append(id_to_index[statement.true_target])
++        if statement.false_target in id_to_index:
++            successors.append(id_to_index[statement.false_target])
++        elif index + 1 < len(statements):
++            successors.append(index + 1)
++        return tuple(dict.fromkeys(successors))
++    if index + 1 < len(statements):
++        return (index + 1,)
++    return ()
++
++
++def build_cfg(method: Method) -> ControlFlowGraph | None:
++    if method.body is None:
++        return None
++    statements = method.body.statements
++    if not statements:
++        return ControlFlowGraph(method.signature.full_signature(), [], {}, {})
++    locals_in_scope = _statement_locals(method)
++    id_to_index = {statement.stmt_id: index for index, statement in enumerate(statements)}
++    ir_statements: list[IRStatement] = []
++    predecessors: dict[int, list[int]] = defaultdict(list)
++    successors: dict[int, tuple[int, ...]] = {}
++    for index, statement in enumerate(statements):
++        succ = _successor_indices(statements, index, id_to_index)
++        successors[index] = succ
++        for child in succ:
++            predecessors[child].append(index)
++        ir_statements.append(
++            IRStatement(
++                statement=statement,
++                index=index,
++                defines=_statement_def(statement),
++                uses=_statement_uses(statement, locals_in_scope),
++                successors=succ,
++                has_side_effects=_statement_has_side_effects(statement),
++            )
++        )
++    return ControlFlowGraph(
++        method_signature=method.signature.full_signature(),
++        statements=ir_statements,
++        predecessors={index: tuple(preds) for index, preds in predecessors.items()},
++        successors=successors,
++    )
++
++
++def build_ir_method(owner: ClassDef, method: Method) -> IRMethod:
++    local_types: dict[str, str] = {}
++    if method.body is not None:
++        for local in method.body.locals:
++            local_types[local.name] = local.var_type.name
++    return IRMethod(owner=owner, method=method, cfg=build_cfg(method), local_types=local_types)
++
++
++@dataclass
++class CallGraph:
++    edges: dict[StatementRef, tuple[str, ...]]
++    callers: dict[str, tuple[StatementRef, ...]]
++    entry_points: tuple[str, ...]
++    reachable_methods: tuple[str, ...]
++
++    def targets_for(self, statement_ref: StatementRef) -> tuple[str, ...]:
++        return self.edges.get(statement_ref, ())
++
++    def call_sites_for(self, method_signature: MethodSignature | str) -> tuple[StatementRef, ...]:
++        return self.callers.get(_signature_key(method_signature), ())
++
++
++class CHACallGraphBuilder:
++    def __init__(self, scene: Scene):
++        self.scene = scene
++
++    def build(self) -> CallGraph:
++        entry_points = tuple(method.signature.full_signature() for method in self.scene.entry_points())
++        edges: dict[StatementRef, tuple[str, ...]] = {}
++        callers: dict[str, list[StatementRef]] = defaultdict(list)
++        reachable: set[str] = set(entry_points)
++        worklist = deque(entry_points)
++        while worklist:
++            method_key = worklist.popleft()
++            method = self.scene.get_method(method_key)
++            if method is None or method.body is None:
++                continue
++            ir_method = self.scene.get_ir(method_key)
++            for ir_statement in ir_method.cfg.statements if ir_method.cfg else []:
++                statement = ir_statement.statement
++                if statement.kind != "call" or statement.callee is None:
++                    continue
++                site = StatementRef(method_signature=method_key, stmt_id=statement.stmt_id)
++                targets = tuple(sorted(self.resolve_call_targets(ir_method, statement)))
++                edges[site] = targets
++                for target in targets:
++                    callers[target].append(site)
++                    if target not in reachable:
++                        reachable.add(target)
++                        worklist.append(target)
++        return CallGraph(
++            edges=edges,
++            callers={key: tuple(value) for key, value in callers.items()},
++            entry_points=entry_points,
++            reachable_methods=tuple(sorted(reachable)),
++        )
++
++    def resolve_call_targets(self, ir_method: IRMethod, statement: Statement) -> set[str]:
++        callee = statement.callee
++        if callee is None:
++            return set()
++        if statement.receiver is None or callee.method_name == "<init>":
++            return {self.scene.ensure_method(callee).signature.full_signature()}
++        receiver_type = self.scene.local_type(ir_method.signature, statement.receiver) or callee.class_name
++        candidates = {receiver_type, callee.class_name}
++        candidates.update(self.scene.subclasses_of(receiver_type))
++        candidates.update(self.scene.subclasses_of(callee.class_name))
++        targets: set[str] = set()
++        for candidate in sorted(candidates):
++            resolved = self.scene.resolve_method_in_hierarchy(candidate, callee)
++            if resolved is not None:
++                targets.add(resolved.signature.full_signature())
++        if not targets:
++            targets.add(self.scene.ensure_method(callee).signature.full_signature())
++        return targets
++
++
++def _resolve_copy(token: str, env: dict[str, str], locals_in_scope: set[str]) -> str:
++    current = token
++    seen: set[str] = set()
++    while current in locals_in_scope and current in env and current not in seen:
++        seen.add(current)
++        current = env[current]
++    return current
++
++
++def _meet_envs(envs: Iterable[dict[str, str]]) -> dict[str, str]:
++    iterator = iter(envs)
++    try:
++        result = dict(next(iterator))
++    except StopIteration:
++        return {}
++    for env in iterator:
++        for key in list(result):
++            if key not in env or env[key] != result[key]:
++                result.pop(key, None)
++    return result
++
++
++def _rewrite_statement(statement: Statement, env: dict[str, str], locals_in_scope: set[str]) -> tuple[Statement, int]:
++    rewrites = 0
++
++    def rewrite_token(token: str | None) -> str | None:
++        nonlocal rewrites
++        if token is None or token not in locals_in_scope:
++            return token
++        rewritten = _resolve_copy(token, env, locals_in_scope)
++        if rewritten != token:
++            rewrites += 1
++        return rewritten
++
++    rhs = statement.rhs
++    if statement.kind == "assign":
++        rhs = rewrite_token(statement.rhs)
++    receiver = rewrite_token(statement.receiver)
++    args = [rewrite_token(arg) or arg for arg in statement.args]
++    rhs_vars = [rewrite_token(var) or var for var in statement.rhs_vars]
++    field_ref = statement.field_ref
++    if field_ref is not None:
++        base = rewrite_token(field_ref.base) or field_ref.base
++        if base != field_ref.base:
++            rewrites += 1
++            field_ref = replace(field_ref, base=base)
++    rewritten = replace(
++        statement,
++        rhs=rhs,
++        receiver=receiver,
++        args=args,
++        rhs_vars=rhs_vars,
++        field_ref=field_ref,
++    )
++    return rewritten, rewrites
++
++
++class CopyPropagator:
++    """Intraprocedural copy propagation over local variables."""
++
++    def run(self, method: Method) -> tuple[MethodBody | None, int]:
++        if method.body is None or not method.body.statements:
++            return method.body, 0
++        cfg = build_cfg(method)
++        assert cfg is not None
++        statements = method.body.statements
++        locals_in_scope = _statement_locals(method)
++        in_envs: dict[int, dict[str, str]] = {0: {}}
++        out_envs: dict[int, dict[str, str]] = {}
++        worklist = deque(range(len(statements)))
++        while worklist:
++            index = worklist.popleft()
++            preds = cfg.predecessors.get(index, ())
++            if index == 0 or not preds:
++                in_env = {}
++            else:
++                pred_envs = [out_envs[pred] for pred in preds if pred in out_envs]
++                in_env = _meet_envs(pred_envs) if pred_envs else {}
++            previous_in = in_envs.get(index)
++            if previous_in is not None and previous_in == in_env and index in out_envs:
++                continue
++            in_envs[index] = in_env
++            statement = statements[index]
++            out_env = dict(in_env)
++            defined = _statement_def(statement)
++            if defined is not None:
++                out_env.pop(defined, None)
++                for local, source in list(out_env.items()):
++                    if source == defined:
++                        out_env.pop(local, None)
++            if statement.kind in {"assign", "identity"} and statement.lhs:
++                source = statement.rhs
++                if source in locals_in_scope:
++                    out_env[statement.lhs] = _resolve_copy(source, in_env, locals_in_scope)
++            out_envs[index] = out_env
++            for succ in cfg.successors.get(index, ()):
++                worklist.append(succ)
++
++        rewritten_statements: list[Statement] = []
++        rewrite_count = 0
++        for index, statement in enumerate(statements):
++            rewritten, rewrites = _rewrite_statement(statement, in_envs.get(index, {}), locals_in_scope)
++            rewritten_statements.append(rewritten)
++            rewrite_count += rewrites
++        return replace(method.body, statements=rewritten_statements), rewrite_count
++
++
++class DeadCodeEliminator:
++    """Removes unreachable statements and dead local definitions."""
++
++    def run(self, method: Method) -> tuple[MethodBody | None, int]:
++        if method.body is None or not method.body.statements:
++            return method.body, 0
++        cfg = build_cfg(method)
++        assert cfg is not None
++        reachable = cfg.reachable_indices()
++        statements = method.body.statements
++        live_in: dict[int, set[str]] = {index: set() for index in range(len(statements))}
++        live_out: dict[int, set[str]] = {index: set() for index in range(len(statements))}
++        changed = True
++        while changed:
++            changed = False
++            for index in range(len(statements) - 1, -1, -1):
++                if index not in reachable:
++                    continue
++                ir_statement = cfg.statements[index]
++                new_out: set[str] = set()
++                for succ in ir_statement.successors:
++                    if succ in reachable:
++                        new_out.update(live_in[succ])
++                new_in = set(ir_statement.uses)
++                if ir_statement.defines is not None:
++                    new_in.update(var for var in new_out if var != ir_statement.defines)
++                else:
++                    new_in.update(new_out)
++                if new_out != live_out[index] or new_in != live_in[index]:
++                    live_out[index] = new_out
++                    live_in[index] = new_in
++                    changed = True
++
++        removable_kinds = {"assign", "identity", "new", "field_load", "nop"}
++        keep_indices: list[int] = []
++        removed = 0
++        for index, ir_statement in enumerate(cfg.statements):
++            statement = ir_statement.statement
++            if index not in reachable:
++                removed += 1
++                continue
++            if (
++                statement.kind in removable_kinds
++                and statement.lhs is not None
++                and statement.lhs not in live_out[index]
++            ):
++                removed += 1
++                continue
++            keep_indices.append(index)
++
++        kept_id_set = {statements[index].stmt_id for index in keep_indices}
++        id_to_index = {statement.stmt_id: index for index, statement in enumerate(statements)}
++
++        def remap_target(target_stmt_id: int | None) -> int | None:
++            if target_stmt_id is None:
++                return None
++            if target_stmt_id in kept_id_set:
++                return target_stmt_id
++            start_index = id_to_index.get(target_stmt_id)
++            if start_index is None:
++                return None
++            for candidate in keep_indices:
++                if candidate >= start_index:
++                    return statements[candidate].stmt_id
++            return None
++
++        new_statements: list[Statement] = []
++        for index in keep_indices:
++            statement = statements[index]
++            if statement.kind == "if":
++                statement = replace(
++                    statement,
++                    true_target=remap_target(statement.true_target),
++                    false_target=remap_target(statement.false_target),
++                )
++            new_statements.append(statement)
++        return replace(method.body, statements=new_statements), removed
++
++
++class SootAnalysis:
++    def __init__(self, program: Program):
++        self.program = program
++        self.copy_propagator = CopyPropagator()
++        self.dead_code_eliminator = DeadCodeEliminator()
++
++    def build_pipeline(self) -> SootPipelineResult:
++        with Timer() as timer:
++            optimized = copy.deepcopy(self.program)
++            stats = OptimizationStats()
++            for cls in optimized.classes:
++                for method in cls.methods:
++                    if method.body is None:
++                        continue
++                    copied_body, rewrites = self.copy_propagator.run(method)
++                    method.body = copied_body
++                    stats.copy_rewrites += rewrites
++                    pruned_body, removed = self.dead_code_eliminator.run(method)
++                    method.body = pruned_body
++                    stats.dead_statements_removed += removed
++            scene = Scene.from_program(optimized)
++            call_graph = CHACallGraphBuilder(scene).build()
++        return SootPipelineResult(
++            original_program=self.program,
++            optimized_program=optimized,
++            scene=scene,
++            call_graph=call_graph,
++            stats=stats,
++            build_time_ms=timer.elapsed_ms,
++        )
++
++
++def build_soot_pipeline(program: Program) -> SootPipelineResult:
++    return SootAnalysis(program).build_pipeline()
++
++
++def summarize_benchmark(program: Program) -> BenchmarkSummary:
++    pipeline = build_soot_pipeline(program)
++    classes = len(pipeline.optimized_program.classes)
++    methods = sum(len(cls.methods) for cls in pipeline.optimized_program.classes)
++    return BenchmarkSummary(
++        benchmark=program.name,
++        classes=classes,
++        methods=methods,
++        entry_points=len(program.entry_points),
++        reachable_methods=len(pipeline.call_graph.reachable_methods),
++        call_edges=sum(len(targets) for targets in pipeline.call_graph.edges.values()),
++        copy_rewrites=pipeline.stats.copy_rewrites,
++        dead_removed=pipeline.stats.dead_statements_removed,
++        build_time_ms=pipeline.build_time_ms,
++    )
++
++
++def run_all_benchmarks(benchmark_dir: str = "benchmarks") -> list[BenchmarkSummary]:
++    return [summarize_benchmark(program) for program in load_all_benchmarks(benchmark_dir)]
++
++
++def _emit_metrics(summaries: list[BenchmarkSummary]) -> None:
++    print("LAYER: soot")
++    print(f"BENCHMARKS_TOTAL: {len(summaries)}")
++    print(f"CLASSES_TOTAL: {sum(summary.classes for summary in summaries)}")
++    print(f"METHODS_TOTAL: {sum(summary.methods for summary in summaries)}")
++    print(f"ENTRY_POINTS_TOTAL: {sum(summary.entry_points for summary in summaries)}")
++    print(f"REACHABLE_METHODS_TOTAL: {sum(summary.reachable_methods for summary in summaries)}")
++    print(f"CALL_EDGES_TOTAL: {sum(summary.call_edges for summary in summaries)}")
++    print(f"COPY_PROPAGATION_REWRITES_TOTAL: {sum(summary.copy_rewrites for summary in summaries)}")
++    print(f"DEAD_STATEMENTS_REMOVED_TOTAL: {sum(summary.dead_removed for summary in summaries)}")
++    print(f"ANALYSIS_TIME_MS_TOTAL: {sum(int(summary.build_time_ms) for summary in summaries)}")
++
++
++def main() -> None:
++    summaries = run_all_benchmarks()
++    _emit_metrics(summaries)
++
++
++if __name__ == "__main__":
++    main()

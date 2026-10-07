@@ -1,0 +1,169 @@
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index ae82d26340..7d74d5745e 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -1,4 +1,4 @@
+-from collections import Counter
++from collections import Counter, OrderedDict
+ from itertools import chain
+ from operator import attrgetter
+ 
+@@ -159,12 +159,18 @@ class Collector:
+             )
+         )
+ 
+-    def get_del_batches(self, objs, field):
++    def get_del_batches(self, objs, fields):
+         """
+         Return the objs in suitably sized batches for the used connection.
+         """
++        if not isinstance(fields, (list, tuple)):
++            fields = [fields]
+         conn_batch_size = max(
+-            connections[self.using].ops.bulk_batch_size([field.name], objs), 1)
++            connections[self.using].ops.bulk_batch_size(
++                [field.name for field in fields], objs
++            ),
++            1,
++        )
+         if len(objs) > conn_batch_size:
+             return [objs[i:i + conn_batch_size]
+                     for i in range(0, len(objs), conn_batch_size)]
+@@ -214,6 +220,7 @@ class Collector:
+         if collect_related:
+             if keep_parents:
+                 parents = set(model._meta.get_parent_list())
++            model_fast_deletes = OrderedDict()
+             for related in get_candidate_relations_to_delete(model._meta):
+                 # Preserve parent reverse relationships if keep_parents=True.
+                 if keep_parents and related.model in parents:
+@@ -221,6 +228,14 @@ class Collector:
+                 field = related.field
+                 if field.remote_field.on_delete == DO_NOTHING:
+                     continue
++                if self.can_fast_delete(
++                    related.related_model._base_manager.none(),
++                    from_field=field,
++                ):
++                    model_fast_deletes.setdefault(
++                        related.related_model, []
++                    ).append(related)
++                    continue
+                 batches = self.get_del_batches(new_objs, field)
+                 for batch in batches:
+                     sub_objs = self.related_objects(related, batch)
+@@ -243,6 +258,20 @@ class Collector:
+                             sub_objs = sub_objs.only(*tuple(referenced_fields))
+                         if sub_objs:
+                             field.remote_field.on_delete(self, field, sub_objs, self.using)
++            for relateds in model_fast_deletes.values():
++                batches = self.get_del_batches(
++                    new_objs, [related.field for related in relateds]
++                )
++                for batch in batches:
++                    sub_objs = self.related_objects(relateds[0], batch)
++                    for related in relateds[1:]:
++                        related_sub_objs = self.related_objects(related, batch)
++                        try:
++                            sub_objs = sub_objs | related_sub_objs
++                        except TypeError:
++                            self.fast_deletes.append(sub_objs)
++                            sub_objs = related_sub_objs
++                    self.fast_deletes.append(sub_objs)
+             for field in model._meta.private_fields:
+                 if hasattr(field, 'bulk_related_objects'):
+                     # It's something like generic foreign key.
+diff --git a/tests/delete/models.py b/tests/delete/models.py
+index e2ddce0588..5ee3e7ea34 100644
+--- a/tests/delete/models.py
++++ b/tests/delete/models.py
+@@ -116,6 +116,10 @@ class M2MFrom(models.Model):
+     m2m = models.ManyToManyField(M2MTo)
+ 
+ 
++class Person(models.Model):
++    friends = models.ManyToManyField('self')
++
++
+ class Parent(models.Model):
+     pass
+ 
+diff --git a/tests/delete/tests.py b/tests/delete/tests.py
+index 505fd843d7..f430f0d9e8 100644
+--- a/tests/delete/tests.py
++++ b/tests/delete/tests.py
+@@ -7,8 +7,8 @@ from django.test import TestCase, skipIfDBFeature, skipUnlessDBFeature
+ 
+ from .models import (
+     MR, A, Avatar, Base, Child, HiddenUser, HiddenUserProfile, M, M2MFrom,
+-    M2MTo, MRNull, Origin, Parent, R, RChild, RChildChild, Referrer, S, T,
+-    User, create_a, get_default_r,
++    M2MTo, MRNull, Origin, Parent, Person, R, RChild, RChildChild, Referrer,
++    S, T, SecondReferrer, User, create_a, get_default_r,
+ )
+ 
+ 
+@@ -491,6 +491,36 @@ class DeletionTests(TestCase):
+ 
+ class FastDeleteTests(TestCase):
+ 
++    def test_fast_delete_multiple_fks_to_same_model_combined(self):
++        origin = Origin.objects.create()
++        referrer = Referrer.objects.create(
++            origin=origin, unique_field=1, large_field='a'
++        )
++        other_referrer = Referrer.objects.create(
++            origin=origin, unique_field=2, large_field='b'
++        )
++        SecondReferrer.objects.create(
++            referrer=referrer, other_referrer=referrer
++        )
++        SecondReferrer.objects.create(
++            referrer=other_referrer, other_referrer=referrer
++        )
++
++        with self.assertNumQueries(2) as ctx:
++            referrer.delete()
++
++        self.assertEqual(Referrer.objects.count(), 1)
++        self.assertFalse(SecondReferrer.objects.exists())
++        second_referrer_table = connection.ops.quote_name(
++            SecondReferrer._meta.db_table
++        )
++        delete_queries = [
++            query['sql'] for query in ctx.captured_queries
++            if second_referrer_table in query['sql']
++        ]
++        self.assertEqual(len(delete_queries), 1)
++        self.assertIn(' OR ', delete_queries[0].upper())
++
+     def test_fast_delete_fk(self):
+         u = User.objects.create(
+             avatar=Avatar.objects.create()
+@@ -516,6 +546,26 @@ class FastDeleteTests(TestCase):
+         # 1 to delete t, 1 to fast-delete t's m_set
+         self.assertNumQueries(2, f.delete)
+ 
++    def test_fast_delete_self_referential_m2m_combined(self):
++        person = Person.objects.create()
++        friend = Person.objects.create()
++        person.friends.add(friend)
++
++        with self.assertNumQueries(2) as ctx:
++            person.delete()
++
++        self.assertEqual(Person.objects.count(), 1)
++        self.assertFalse(Person.friends.through.objects.exists())
++        friends_table = connection.ops.quote_name(
++            Person.friends.through._meta.db_table
++        )
++        delete_queries = [
++            query['sql'] for query in ctx.captured_queries
++            if friends_table in query['sql']
++        ]
++        self.assertEqual(len(delete_queries), 1)
++        self.assertIn(' OR ', delete_queries[0].upper())
++
+     def test_fast_delete_qs(self):
+         u1 = User.objects.create()
+         u2 = User.objects.create()

@@ -1,0 +1,49 @@
+diff --git a/doc/whats-new.rst b/doc/whats-new.rst
+index afb8a9b2..cc38d416 100644
+--- a/doc/whats-new.rst
++++ b/doc/whats-new.rst
+@@ -57,6 +57,9 @@ Bug fixes
+ - Fixed bug in ``combine_by_coords()`` causing a `ValueError` if the input had
+   an unused dimension with coordinates which were not monotonic (:issue`3150`).
+   By `Tom Nicholas <http://github.com/TomNicholas>`_.
++- Fixed regression introduced in v0.12.2 where :py:meth:`Dataset.copy`,
++  :py:meth:`DataArray.copy`, and ``copy.deepcopy`` would cast unicode index
++  variables to ``object`` dtype (:issue:`3093`).
+ 
+ .. _whats-new.0.12.3:
+ 
+diff --git a/xarray/core/variable.py b/xarray/core/variable.py
+index 379be8f5..d608c7f4 100644
+--- a/xarray/core/variable.py
++++ b/xarray/core/variable.py
+@@ -1947,7 +1947,8 @@ class IndexVariable(Variable):
+                 # point, which doesn't have a copy method, so make a deep copy
+                 # of the underlying `pandas.MultiIndex` and create a new
+                 # `PandasIndexAdapter` instance with it.
+-                data = PandasIndexAdapter(self._data.array.copy(deep=True))
++                data = PandasIndexAdapter(self._data.array.copy(deep=True),
++                                          dtype=self.dtype)
+             else:
+                 data = self._data
+         else:
+diff --git a/xarray/tests/test_variable.py b/xarray/tests/test_variable.py
+index 73d2a40b..08020504 100644
+--- a/xarray/tests/test_variable.py
++++ b/xarray/tests/test_variable.py
+@@ -502,6 +502,16 @@ class VariableSubclassobjects:
+             assert isinstance(w.to_index(), pd.MultiIndex)
+             assert_array_equal(v._data.array, w._data.array)
+ 
++    @pytest.mark.parametrize('deep', [True, False])
++    @pytest.mark.parametrize(
++        'data', [['a', 'b'], np.array(['a', 'b'], dtype=object)])
++    def test_copy_index_dtype(self, deep, data):
++        # regression test for #3102: copying an IndexVariable with a unicode
++        # dtype should not cast it to object
++        v = IndexVariable('x', data)
++        assert v.dtype == v.copy(deep=deep).dtype
++        assert_identical(v, v.copy(deep=deep))
++
+     def test_copy_with_data(self):
+         orig = Variable(('x', 'y'), [[1.5, 2.0], [3.1, 4.3]], {'foo': 'bar'})
+         new_data = np.array([[2.5, 5.0], [7.1, 43]])

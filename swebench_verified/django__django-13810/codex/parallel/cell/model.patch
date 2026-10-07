@@ -1,0 +1,57 @@
+diff --git a/django/core/handlers/base.py b/django/core/handlers/base.py
+index 8e8c3da06a..be8a114eb1 100644
+--- a/django/core/handlers/base.py
++++ b/django/core/handlers/base.py
+@@ -51,11 +51,11 @@ class BaseHandler:
+                 middleware_is_async = middleware_can_async
+             try:
+                 # Adapt handler, if needed.
+-                handler = self.adapt_method_mode(
++                adapted_handler = self.adapt_method_mode(
+                     middleware_is_async, handler, handler_is_async,
+                     debug=settings.DEBUG, name='middleware %s' % middleware_path,
+                 )
+-                mw_instance = middleware(handler)
++                mw_instance = middleware(adapted_handler)
+             except MiddlewareNotUsed as exc:
+                 if settings.DEBUG:
+                     if str(exc):
+diff --git a/tests/middleware_exceptions/tests.py b/tests/middleware_exceptions/tests.py
+index 8b019ba524..e6a8b9405a 100644
+--- a/tests/middleware_exceptions/tests.py
++++ b/tests/middleware_exceptions/tests.py
+@@ -140,6 +140,14 @@ class MyMiddlewareWithExceptionMessage:
+         pass
+ 
+ 
++class SyncMiddlewareNotUsed:
++    sync_capable = True
++    async_capable = False
++
++    def __init__(self, get_response):
++        raise MiddlewareNotUsed
++
++
+ @override_settings(
+     DEBUG=True,
+     ROOT_URLCONF='middleware_exceptions.urls',
+@@ -252,6 +260,19 @@ class MiddlewareSyncAsyncTests(SimpleTestCase):
+             'Payment Required: /middleware_exceptions/view/',
+         )
+ 
++    @override_settings(MIDDLEWARE=[
++        'middleware_exceptions.middleware.async_payment_middleware',
++        'middleware_exceptions.tests.SyncMiddlewareNotUsed',
++    ])
++    async def test_middleware_not_used_with_async_middleware_async(self):
++        with self.assertLogs('django.request', 'WARNING') as cm:
++            response = await self.async_client.get('/middleware_exceptions/view/')
++        self.assertEqual(response.status_code, 402)
++        self.assertEqual(
++            cm.records[0].getMessage(),
++            'Payment Required: /middleware_exceptions/view/',
++        )
++
+     @override_settings(
+         DEBUG=False,
+         MIDDLEWARE=[

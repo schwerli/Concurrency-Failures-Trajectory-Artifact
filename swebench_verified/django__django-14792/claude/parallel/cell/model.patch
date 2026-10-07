@@ -1,0 +1,163 @@
+diff --git a/django/utils/timezone.py b/django/utils/timezone.py
+index bb2b6b9594..0f5d012c59 100644
+--- a/django/utils/timezone.py
++++ b/django/utils/timezone.py
+@@ -72,8 +72,11 @@ def get_current_timezone_name():
+ 
+ 
+ def _get_timezone_name(timezone):
+-    """Return the name of ``timezone``."""
+-    return str(timezone)
++    """
++    Return the offset for fixed offset timezones, or the name of timezone if
++    not set.
++    """
++    return timezone.tzname(None) or str(timezone)
+ 
+ # Timezone selection functions.
+ 
+diff --git a/docs/releases/3.2.7.txt b/docs/releases/3.2.7.txt
+index 0219460649..2f100b78c1 100644
+--- a/docs/releases/3.2.7.txt
++++ b/docs/releases/3.2.7.txt
+@@ -9,4 +9,6 @@ Django 3.2.7 fixes several bugs in 3.2.6.
+ Bugfixes
+ ========
+ 
+-* ...
++* Fixed a regression in Django 3.2 that caused a reverse time zone conversion
++  in ``Trunc()`` and ``Extract()`` database functions with ``tzinfo`` of fixed
++  offset time zones, e.g. ``Etc/GMT-10`` (:ticket:`33037`).
+diff --git a/tests/utils_tests/test_timezone.py b/tests/utils_tests/test_timezone.py
+index 2e28d3a9a5..9cb603e5b7 100644
+--- a/tests/utils_tests/test_timezone.py
++++ b/tests/utils_tests/test_timezone.py
+@@ -274,3 +274,28 @@ class TimezoneTests(SimpleTestCase):
+     def test_fixedoffset_negative_timedelta(self):
+         delta = datetime.timedelta(hours=-2)
+         self.assertEqual(timezone.get_fixed_timezone(delta).utcoffset(None), delta)
++
++    def test_get_timezone_name(self):
++        """
++        The _get_timezone_name() helper must return the offset for fixed offset
++        timezones, for usage with Trunc DB functions.
++
++        The datetime.timezone examples show the current behavior.
++        """
++        tests = [
++            # datetime.timezone, fixed offset with and without `name`.
++            (datetime.timezone(datetime.timedelta(hours=10)), 'UTC+10:00'),
++            (datetime.timezone(datetime.timedelta(hours=10), name='Etc/GMT-10'), 'Etc/GMT-10'),
++            # pytz, named and fixed offset.
++            (pytz.timezone('Europe/Madrid'), 'Europe/Madrid'),
++            (pytz.timezone('Etc/GMT-10'), '+10'),
++        ]
++        if HAS_ZONEINFO:
++            tests += [
++                # zoneinfo, named and fixed offset.
++                (zoneinfo.ZoneInfo('Europe/Madrid'), 'Europe/Madrid'),
++                (zoneinfo.ZoneInfo('Etc/GMT-10'), '+10'),
++            ]
++        for value, expected in tests:
++            with self.subTest(value=value):
++                self.assertEqual(timezone._get_timezone_name(value), expected)
+diff --git a/tzprobe/sweep.py b/tzprobe/sweep.py
+new file mode 100644
+index 0000000000..9033c2c9c3
+--- /dev/null
++++ b/tzprobe/sweep.py
+@@ -0,0 +1,94 @@
++import datetime, re, sys, traceback
++import pytz
++sys.path.insert(0, '/testbed')
++from django.utils import timezone as dtz
++
++try:
++    import zoneinfo
++except ImportError:
++    from backports import zoneinfo
++
++OLD = lambda tz: str(tz)
++def NEW(tz):
++    return tz.tzname(None) or str(tz)
++
++OFFSET_RE = re.compile(r'^[+-]\d{1,2}(:\d{2})?$')
++
++def classify(tz, name_hint):
++    """Return (old, new, raised) """
++    old = None; new = None; err = None
++    try:
++        old = OLD(tz)
++    except Exception as e:
++        old = 'RAISED:%r' % (e,)
++    try:
++        new = NEW(tz)
++    except Exception as e:
++        new = None
++        err = '%s: %s' % (type(e).__name__, e)
++    return old, new, err
++
++def real_offset(tz):
++    """utcoffset that pytz/zoneinfo report for 'now' and for tzname(None)-implied."""
++    try:
++        return tz.utcoffset(None)
++    except Exception:
++        try:
++            # pytz DstTzInfo needs a dt
++            return tz.utcoffset(datetime.datetime(2021, 7, 1))
++        except Exception as e:
++            return 'ERR %r' % e
++
++print('=' * 100)
++print('PART 1: pytz.all_timezones (%d zones)' % len(pytz.all_timezones))
++print('=' * 100)
++diff = []
++raised = []
++for z in pytz.all_timezones:
++    tz = pytz.timezone(z)
++    old, new, err = classify(tz, z)
++    if err:
++        raised.append((z, type(tz).__name__, err))
++    elif old != new:
++        diff.append((z, type(tz).__name__, old, new, real_offset(tz)))
++print('RAISED (%d):' % len(raised))
++for r in raised:
++    print('   ', r)
++print('DISAGREEMENTS str(tz) != tzname(None) : %d' % len(diff))
++print('%-22s %-14s %-24s %-10s %-12s %s' % ('ZONE', 'CLASS', 'OLD str()', 'NEW', 'utcoffset', 'offsetform?'))
++for z, cls, old, new, off in sorted(diff):
++    print('%-22s %-14s %-24s %-10s %-12s %s' % (z, cls, old, new, off, bool(OFFSET_RE.match(new))))
++
++print()
++print('=' * 100)
++print('PART 2: zoneinfo.available_timezones (%d zones)' % len(zoneinfo.available_timezones()))
++print('=' * 100)
++zdiff = []
++zraised = []
++for z in sorted(zoneinfo.available_timezones()):
++    tz = zoneinfo.ZoneInfo(z)
++    old, new, err = classify(tz, z)
++    if err:
++        zraised.append((z, err))
++    elif old != new:
++        zdiff.append((z, old, new, real_offset(tz)))
++print('RAISED (%d):' % len(zraised))
++for r in zraised:
++    print('   ', r)
++print('DISAGREEMENTS: %d' % len(zdiff))
++print('%-22s %-24s %-10s %-12s %s' % ('ZONE', 'OLD str()', 'NEW', 'utcoffset', 'offsetform?'))
++for z, old, new, off in zdiff:
++    print('%-22s %-24s %-10s %-12s %s' % (z, old, new, off, bool(OFFSET_RE.match(new))))
++
++print()
++print('SYMMETRY CHECK: zones where pytz and zoneinfo NEW disagree')
++common = set(pytz.all_timezones) & zoneinfo.available_timezones()
++asym = []
++for z in sorted(common):
++    a = NEW(pytz.timezone(z))
++    b = NEW(zoneinfo.ZoneInfo(z))
++    if a != b:
++        asym.append((z, a, b))
++print('  count=%d' % len(asym))
++for x in asym:
++    print('   ', x)

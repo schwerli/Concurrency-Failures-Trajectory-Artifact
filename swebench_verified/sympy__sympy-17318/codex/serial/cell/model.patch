@@ -1,0 +1,118 @@
+diff --git a/sympy/simplify/sqrtdenest.py b/sympy/simplify/sqrtdenest.py
+index f0b7653ea8..2e9fca04f8 100644
+--- a/sympy/simplify/sqrtdenest.py
++++ b/sympy/simplify/sqrtdenest.py
+@@ -44,6 +44,23 @@ def sqrt_depth(p):
+         return 0
+ 
+ 
++def _sqrtdenest_needed(expr):
++    """Return True if ``expr`` contains a sqrt that sqrtdenest may change."""
++
++    if is_sqrt(expr):
++        n, d = expr.as_numer_denom()
++        if d is not S.One or sqrt_depth(expr) > 1:
++            return True
++    elif expr.is_Add:
++        coeff_muls = [a.as_coeff_Mul() for a in expr.args]
++        if all(c.is_Rational for c, _ in coeff_muls) and \
++                all(is_sqrt(a) for _, a in coeff_muls):
++            return True
++    if expr.is_Atom:
++        return False
++    return any(_sqrtdenest_needed(a) for a in expr.args)
++
++
+ def is_algebraic(p):
+     """Return True if p is comprised of only Rationals or square roots
+     of Rationals and algebraic operations.
+@@ -128,7 +145,10 @@ def sqrtdenest(expr, max_iter=3):
+            by Denesting' (available at http://www.cybertester.com/data/denest.pdf)
+ 
+     """
+-    expr = expand_mul(sympify(expr))
++    expr = sympify(expr)
++    if not _sqrtdenest_needed(expr):
++        return expr
++    expr = expand_mul(expr)
+     for i in range(max_iter):
+         z = _sqrtdenest0(expr)
+         if expr == z:
+@@ -157,9 +177,11 @@ def _sqrt_match(p):
+     elif p.is_Add:
+         pargs = sorted(p.args, key=default_sort_key)
+         if all((x**2).is_Rational for x in pargs):
+-            r, b, a = split_surds(p)
+-            res = a, b, r
+-            return list(res)
++            coeff_muls = [x.as_coeff_Mul() for x in pargs]
++            if any(m.is_Pow for _, m in coeff_muls):
++                r, b, a = split_surds(p)
++                res = a, b, r
++                return list(res)
+         # to make the process canonical, the argument is included in the tuple
+         # so when the max is selected, it will be the largest arg having a
+         # given depth
+@@ -223,20 +245,29 @@ def _sqrtdenest0(expr):
+     """Returns expr after denesting its arguments."""
+ 
+     if is_sqrt(expr):
++        expr0 = expr
+         n, d = expr.as_numer_denom()
+-        if d is S.One:  # n is a square root
+-            if n.base.is_Add:
+-                args = sorted(n.base.args, key=default_sort_key)
++        if d is S.One:
++            rad = n if is_sqrt(n) else expr
++            if rad.base.is_Add:
++                args = sorted(rad.base.args, key=default_sort_key)
+                 if len(args) > 2 and all((x**2).is_Integer for x in args):
+                     try:
+-                        return _sqrtdenest_rec(n)
++                        return _sqrtdenest_rec(rad)
+                     except SqrtdenestStopIteration:
+                         pass
+-                expr = sqrt(_mexpand(Add(*[_sqrtdenest0(x) for x in args])))
++                newargs = tuple(_sqrtdenest0(x) for x in args)
++                if newargs != tuple(args):
++                    expr = sqrt(_mexpand(Add(*newargs)))
++                else:
++                    expr = expr0
+             return _sqrtdenest1(expr)
+         else:
++            n0, d0 = n, d
+             n, d = [_sqrtdenest0(i) for i in (n, d)]
+-            return n/d
++            if (n, d) != (n0, d0):
++                return n/d
++            return expr0
+ 
+     if isinstance(expr, Add):
+         cs = []
+diff --git a/sympy/simplify/tests/test_sqrtdenest.py b/sympy/simplify/tests/test_sqrtdenest.py
+index c30f7a3235..d362c3e76e 100644
+--- a/sympy/simplify/tests/test_sqrtdenest.py
++++ b/sympy/simplify/tests/test_sqrtdenest.py
+@@ -1,4 +1,4 @@
+-from sympy import sqrt, root, S, Symbol, sqrtdenest, Integral, cos
++from sympy import Add, I, Integral, Mul, S, Symbol, cos, root, sqrt, sqrtdenest
+ from sympy.simplify.sqrtdenest import _subsets as subsets
+ from sympy.utilities.pytest import slow
+ 
+@@ -91,6 +91,16 @@ def test_issue_6241():
+     assert sqrtdenest(z) == z
+ 
+ 
++def test_issue_12420():
++    z = Mul(S.Half, Add(
++        3,
++        Mul(-1, sqrt(2), sqrt(4 + 3*I, evaluate=False), evaluate=False),
++        3*I,
++        evaluate=False),
++        evaluate=False)
++    assert sqrtdenest(z) == z
++
++
+ def test_sqrtdenest3():
+     z = sqrt(13 - 2*r10 + 2*r2*sqrt(-2*r10 + 11))
+     assert sqrtdenest(z) == -1 + r2 + r10

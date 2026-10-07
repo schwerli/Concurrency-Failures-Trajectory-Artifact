@@ -1,0 +1,758 @@
+     1	from time import time
+     2	
+     3	import matplotlib.cm as cm
+     4	
+     5	
+     6	from sklearn.metrics import silhouette_samples, silhouette_score
+     7	from sklearn.cluster import MiniBatchKMeans, KMeans
+     8	from sklearn.mixture import GaussianMixture
+     9	import copy
+    10	from yellowbrick.cluster import KElbowVisualizer
+    11	import numpy as np
+    12	from sklearn import metrics
+    13	
+    14	import matplotlib.pyplot as plt
+    15	
+    16	
+    17	import pandas as pd
+    18	from sklearn.decomposition import PCA, FastICA
+    19	from sklearn.random_projection import GaussianRandomProjection as GRP
+    20	
+    21	from sklearn.manifold import LocallyLinearEmbedding
+    22	
+    23	# Citation: https://scikit-learn.org/stable/auto_examples/cluster/plot_kmeans_digits.html#sphx-glr-auto-examples-cluster-plot-kmeans-digits-py
+    24	def bench_k_means(estimator, labels, name, data, sample_size, n_clusters, random_state, filename, verbose=False):
+    25	    t0 = time()
+    26	    estimator.fit(data)
+    27	    fit_time = time() - t0
+    28	
+    29	    homo = metrics.homogeneity_score(labels, estimator.predict(data))
+    30	    comp = metrics.completeness_score(labels, estimator.predict(data))
+    31	    v_meas = metrics.v_measure_score(labels, estimator.predict(data))
+    32	    ari = metrics.adjusted_rand_score(labels, estimator.predict(data))
+    33	    ami = metrics.adjusted_mutual_info_score(labels, estimator.predict(data))
+    34	    fks = metrics.fowlkes_mallows_score(labels, estimator.predict(data))
+    35	    silo = metrics.silhouette_score(data, estimator.predict(data), metric='euclidean', sample_size=sample_size,
+    36	                                    random_state=random_state)
+    37	    dbs = metrics.davies_bouldin_score(data, estimator.predict(data))
+    38	    chs = metrics.calinski_harabasz_score(data, estimator.predict(data))
+    39	    iner = estimator.inertia_
+    40	    if verbose:
+    41	        print('%-9s\t%d\t%.2fs\t%.2f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%i\t%i'
+    42	              % (name, n_clusters, (time() - t0), homo, comp, v_meas, ari, ami, fks, silo, dbs, chs, iner)
+    43	              )
+    44	
+    45	    return fit_time, homo, comp, v_meas, ari, ami, fks, silo, dbs, chs, iner
+    46	
+    47	
+    48	# Citation: https://scikit-learn.org/stable/auto_examples/cluster/plot_kmeans_silhouette_analysis.html#sphx-glr-auto-examples-cluster-plot-kmeans-silhouette-analysis-py
+    49	def silo_analysis(X, y, clusterer, n_clusters, random_state, filename):
+    50	    if filename == "Chess":
+    51	        col1, col2 = 0, 5
+    52	    else:
+    53	        col1, col2 = 13, 11
+    54	
+    55	    cluster_labels = clusterer.fit_predict(X)
+    56	
+    57	    # The silhouette_score gives the average value for all the samples.
+    58	    # This gives a perspective into the density and separation of the formed
+    59	    # clusters
+    60	    silhouette_avg = silhouette_score(X, cluster_labels, metric='euclidean', sample_size=400, random_state=random_state)
+    61	
+    62	    plt.figure()
+    63	
+    64	    # The 1st subplot is the silhouette plot
+    65	    # The silhouette coefficient can range from -1, 1 but in this example all
+    66	    # lie within [-0.1, 1]
+    67	    plt.xlim([-0.1, 1])
+    68	    # The (n_clusters+1)*10 is for inserting blank space between silhouette
+    69	    # plots of individual clusters, to demarcate them clearly.
+    70	    plt.ylim([0, len(X) + (n_clusters + 1) * 10])
+    71	
+    72	    # Compute the silhouette scores for each sample
+    73	    sample_silhouette_values = silhouette_samples(X, cluster_labels)
+    74	
+    75	    y_lower = 10
+    76	    for i in range(n_clusters):
+    77	        # Aggregate the silhouette scores for samples belonging to
+    78	        # cluster i, and sort them
+    79	        ith_cluster_silhouette_values = \
+    80	            sample_silhouette_values[cluster_labels == i]
+    81	
+    82	        ith_cluster_silhouette_values.sort()
+    83	
+    84	        size_cluster_i = ith_cluster_silhouette_values.shape[0]
+    85	        y_upper = y_lower + size_cluster_i
+    86	
+    87	        cmap = cm.get_cmap("tab10")
+    88	        color = cmap(float(i) / n_clusters)
+    89	        plt.fill_betweenx(np.arange(y_lower, y_upper),
+    90	                          0, ith_cluster_silhouette_values,
+    91	                          facecolor=color, edgecolor=color, alpha=0.7)
+    92	
+    93	        # Label the silhouette plots with their cluster numbers at the middle
+    94	        plt.text(-0.05, y_lower + 0.5 * size_cluster_i, str(i))
+    95	
+    96	        # Compute the new y_lower for next plot
+    97	        y_lower = y_upper + 10  # 10 for the 0 samples
+    98	
+    99	    plt.title("The silhouette plot for the various %d KMeans clusters." % n_clusters)
+   100	
+   101	    plt.xlabel("The silhouette coefficient values")
+   102	    plt.ylabel("Cluster label")
+   103	
+   104	    # The vertical line for average silhouette score of all the values
+   105	    plt.axvline(x=silhouette_avg, color="red", linestyle="--")
+   106	
+   107	    plt.yticks([])  # Clear the yaxis labels / ticks
+   108	    plt.xticks([-0.1, 0, 0.2, 0.4, 0.6, 0.8, 1])
+   109	
+   110	    plt.savefig("Images\\" + filename + "Silhouette Plot for " + str(n_clusters) + " clusters")
+   111	    plt.show()
+   112	
+   113	    # 2nd Plot showing the actual clusters formed
+   114	    plt.figure()
+   115	
+   116	    cmap = cm.get_cmap("tab10")
+   117	    colors = cmap(cluster_labels.astype(float) / n_clusters)
+   118	
+   119	    plt.scatter(X.iloc[:, col1], X.iloc[:, col2], marker='.', s=30, lw=0, alpha=0.7,
+   120	                c=colors, edgecolor='k')
+   121	
+   122	    # Labeling the clusters
+   123	    centers = clusterer.cluster_centers_
+   124	    # Draw white circles at cluster centers
+   125	    plt.scatter(centers[:, col1], centers[:, col2], marker='o',
+   126	                c="white", alpha=1, s=200, edgecolor='k')
+   127	
+   128	    for i, c in enumerate(centers):
+   129	        plt.scatter(c[col1], c[col2], marker='$%d$' % i, alpha=1,
+   130	                    s=50, edgecolor='k')
+   131	
+   132	    plt.title("Visualization of the clustered data for %d KMeans clusters." % n_clusters)
+   133	    plt.xlabel("Feature space for the 1st feature")
+   134	    plt.ylabel("Feature space for the 2nd feature")
+   135	    plt.savefig("Images\\" + filename + "Visualization " + str(n_clusters) + " clusters")
+   136	
+   137	    plt.show()
+   138	
+   139	
+   140	# Citation: https://scikit-learn.org/stable/auto_examples/cluster/plot_kmeans_stability_low_dim_dense.html#sphx-glr-auto-examples-cluster-plot-kmeans-stability-low-dim-dense-py
+   141	def init_analysis(X, y, n_clusters, filename):
+   142	    # Number of run (with randomly generated dataset) for each strategy so as
+   143	    # to be able to compute an estimate of the standard deviation
+   144	    n_runs = 5
+   145	
+   146	    # k-means models can do several random inits so as to be able to trade
+   147	    # CPU time for convergence robustness
+   148	    n_init_range = np.array([1, 5, 10, 15, 20, 50, 75, 100])
+   149	
+   150	    # Part 1: Quantitative evaluation of various init methods
+   151	
+   152	    plt.figure()
+   153	    plots = []
+   154	    legends = []
+   155	
+   156	    cases = [
+   157	        (KMeans, 'k-means++', {}),
+   158	        (KMeans, 'random', {}),
+   159	        (MiniBatchKMeans, 'k-means++', {'max_no_improvement': 3}),
+   160	        (MiniBatchKMeans, 'random', {'max_no_improvement': 3, 'init_size': 500}),
+   161	    ]
+   162	
+   163	    for factory, init, params in cases:
+   164	        print("Evaluation of %s with %s init" % (factory.__name__, init))
+   165	        inertia = np.empty((len(n_init_range), n_runs))
+   166	
+   167	        for run_id in range(n_runs):
+   168	            for i, n_init in enumerate(n_init_range):
+   169	                km = factory(n_clusters=n_clusters, init=init, random_state=run_id,
+   170	                             n_init=n_init, **params).fit(X)
+   171	                inertia[i, run_id] = km.inertia_
+   172	        p = plt.errorbar(n_init_range, inertia.mean(axis=1), inertia.std(axis=1))
+   173	        plots.append(p[0])
+   174	        legends.append("%s with %s init" % (factory.__name__, init))
+   175	
+   176	    plt.xlabel('n_init')
+   177	    plt.ylabel('inertia')
+   178	    plt.legend(plots, legends)
+   179	    plt.title("Mean inertia for various k-means init across %d runs" % n_runs)
+   180	    plt.savefig(
+   181	            "Images\\" + filename + "Mean Interia across " + str(n_runs) + " runs and " + str(n_clusters) + " clusters")
+   182	
+   183	    plt.show()
+   184	
+   185	
+   186	# Citation: https://scikit-learn.org/stable/auto_examples/cluster/plot_kmeans_digits.html#sphx-glr-auto-examples-cluster-plot-kmeans-digits-py
+   187	def bench_EM(estimator, labels, name, data, sample_size, n_clusters, random_state, filename, verbose=False):
+   188	    t0 = time()
+   189	    estimator.fit(data)
+   190	    fit_time = time() - t0
+   191	
+   192	    homo = 0  # metrics.homogeneity_score(labels, estimator.predict(data))
+   193	    comp = 0  # metrics.completeness_score(labels, estimator.predict(data))
+   194	    v_meas = metrics.v_measure_score(labels, estimator.predict(data))
+   195	    ari = metrics.adjusted_rand_score(labels, estimator.predict(data))
+   196	    ami = metrics.adjusted_mutual_info_score(labels, estimator.predict(data))
+   197	    fks = 0  # metrics.fowlkes_mallows_score(labels, estimator.predict(data))
+   198	    silo = metrics.silhouette_score(data, estimator.predict(data), metric='euclidean', sample_size=sample_size,
+   199	                                    random_state=random_state)
+   200	    dbs = metrics.davies_bouldin_score(data, estimator.predict(data))
+   201	    chs = metrics.calinski_harabasz_score(data, estimator.predict(data))
+   202	    aics = 0  # estimator.aic(data)  # Akaike information criterion for the current model on the input X. Lower is better
+   203	    bics = estimator.bic(data)  # Bayesian information criterion for the current model on the input X. Lower is Better
+   204	    scor = estimator.score(data)
+   205	    if verbose:
+   206	        print('%-9s\t%d\t%.2fs\t%.2f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%i\t%i\t%i\t%.3f'
+   207	              % (name, n_clusters, fit_time, homo, comp, v_meas, ari, ami, fks, silo, dbs, chs, aics, bics, scor)
+   208	              )
+   209	    return fit_time, homo, comp, v_meas, ari, ami, fks, silo, dbs, chs, aics, bics, scor
+   210	
+   211	
+   212	def ul_Kmeans(X, y, random_seed, filename, classifier_col, verbose=False):
+   213	    n_samples, n_features = X.shape
+   214	
+   215	    n_y = len(np.unique(y))
+   216	
+   217	    sample_size = 400
+   218	    n_init = 10
+   219	
+   220	    total_n = 51
+   221	
+   222	    n_clusters = [i for i in range(2, total_n)]
+   223	
+   224	    if verbose:
+   225	        print("n_classes: %d, \t n_samples %d, \t n_features %d"
+   226	              % (n_y, n_samples, n_features))
+   227	        print('init\t\tn\ttime\thomo\tcompl\tv-meas\tARI \tAMI \tFMS \tsilo\tDBI \tCHI\tInertia')
+   228	
+   229	    print('hello', verbose)
+   230	    fit_time_arr, homo_arr, comp_arr, v_meas_arr, ari_arr, ami_arr, fks_arr, silo_arr, dbs_arr, chs_arr, iner_arr = [], [], [], [], [], [], [], [], [], [], []
+   231	
+   232	    for n in n_clusters:
+   233	        clusterer = KMeans(init='k-means++', n_clusters=n, n_init=n_init, random_state=random_seed, max_iter=100)
+   234	        fit_time, homo, comp, v_meas, ari, ami, fks, silo, dbs, chs, iner = bench_k_means(clusterer, name="k-means++",
+   235	                                                                                          data=X, labels=y,
+   236	                                                                                          sample_size=sample_size,
+   237	                                                                                          n_clusters=n,
+   238	                                                                                          random_state=random_seed,
+   239	                                                                                          filename=filename,
+   240	                                                                                          verbose=verbose)
+   241	
+   242	        fit_time_arr.append(fit_time)
+   243	        homo_arr.append(homo)
+   244	        comp_arr.append(comp)
+   245	        v_meas_arr.append(v_meas)
+   246	        ari_arr.append(ari)
+   247	        ami_arr.append(ami)
+   248	        fks_arr.append(fks)
+   249	        silo_arr.append(silo)
+   250	        dbs_arr.append(dbs)
+   251	        chs_arr.append(chs)
+   252	        iner_arr.append(iner)
+   253	
+   254	        # TODO: Work on this later
+   255	        if 1 == 0:
+   256	            new_y = copy.deepcopy(y)
+   257	            clusters = pd.DataFrame(copy.deepcopy(clusterer.labels_))
+   258	            clusters.columns = ['clusters']
+   259	
+   260	            combined = pd.concat([new_y, clusters], axis=1, sort=False)
+   261	
+   262	            fig, axs = plt.subplots(1, n, sharey=True, tight_layout=True)
+   263	
+   264	            for i in range(n):
+   265	                cluster_cnt = combined[combined['clusters'] == i]
+   266	                cluster_cnt = cluster_cnt[classifier_col]
+   267	                axs[i].hist(cluster_cnt, bins=[0, 1, 2, 3, 4, 5])
+   268	                axs[i].set_xlim(0, 4)
+   269	                axs[i].set_xticks([0, 1, 2, 3, 4])
+   270	
+   271	            # plt.show()
+   272	
+   273	        # silo_analysis(X, y, clusterer, n, random_state=random_seed, filename=filename)
+   274	        # init_analysis(X, y, n, filename)
+   275	
+   276	    # Plot scores where ground truth is NOT known
+   277	    fig, ax1 = plt.subplots()
+   278	    plt.title("No Knowledge of Ground Truth Scores", fontsize=16)
+   279	    plt.xticks(fontsize=16)
+   280	    ax1.set_xlabel('Number of Clusters', fontsize=16)
+   281	    ax1.set_ylabel('score', color='blue', fontsize=16)
+   282	    ax1.plot(n_clusters, dbs_arr, label='DBS', color='blue')
+   283	    ax1.plot(n_clusters, silo_arr, label='Silo', color='cyan')
+   284	    ax1.tick_params(axis='y', labelcolor='blue', labelsize=16)
+   285	    ax1.legend(prop={'size': 16}, loc='right')
+   286	
+   287	    ax2 = ax1.twinx()
+   288	    color = 'tab:red'
+   289	    ax2.set_ylabel('Calinski-Harabasz Index', color=color, fontsize=16)
+   290	    ax2.plot(n_clusters, chs_arr, label='Calinski-Harabasz', color=color)
+   291	    ax2.tick_params(axis='y', labelcolor=color, labelsize=16)
+   292	    ax2.legend(prop={'size': 16})
+   293	    fig.tight_layout()
+   294	    plt.savefig("Images\\" + filename + " No Truth Scores")
+   295	    fig.show()
+   296	
+   297	    # Plot scores where ground truth IS known
+   298	    plt.figure()
+   299	
+   300	    # plt.plot(n_clusters, homo_arr, label='Homogeneity')
+   301	    # plt.plot(n_clusters, comp_arr, label='Completeness')
+   302	    plt.plot(n_clusters, v_meas_arr, label='V-measure')
+   303	    plt.plot(n_clusters, ari_arr, label='ARI')
+   304	    plt.plot(n_clusters, ami_arr, label='AMI')
+   305	    # plt.plot(n_clusters, fks_arr, label='FKS')
+   306	
+   307	    plt.title("Ground Truth Scores", fontsize=16)
+   308	    plt.xlabel('Number of Clusters', fontsize=16)
+   309	    plt.ylabel('Score', fontsize=16)
+   310	    plt.grid(True)
+   311	    # plt.xticks(n_clusters)
+   312	    plt.legend(prop={'size': 16})
+   313	    plt.xticks(fontsize=16)
+   314	    plt.yticks(fontsize=16)
+   315	    plt.tight_layout()
+   316	    plt.savefig("Images\\" + filename + " Ground Truth Scores")
+   317	    plt.show()
+   318	
+   319	    # Plot Inertia
+   320	    plt.figure()
+   321	    plt.plot(n_clusters, iner_arr, label='Inertia')
+   322	    plt.title("Inertia", fontsize=16)
+   323	    plt.xlabel('Number of Clusters', fontsize=16)
+   324	    plt.ylabel('Score', fontsize=16)
+   325	    plt.xticks(fontsize=16)
+   326	    plt.yticks(fontsize=16)
+   327	    plt.grid(True)
+   328	    # plt.xticks(n_clusters)
+   329	    plt.savefig("Images\\" + filename + " Inertia")
+   330	    plt.show()
+   331	
+   332	    # Plot scores where ground truth is NOT known
+   333	    fig, ax1 = plt.subplots()
+   334	    color = 'tab:blue'
+   335	    ax1.set_ylabel('Inertia', color=color)  # we already handled the x-label with ax1
+   336	    ax1.plot(n_clusters, chs_arr, label='Inertia', color=color)
+   337	    ax1.tick_params(axis='y', labelcolor=color)
+   338	    ax1.legend(prop={'size': 16})
+   339	
+   340	    ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
+   341	    color = 'tab:red'
+   342	    ax2.set_ylabel('Time to Fit (s)', color=color)  # we already handled the x-label with ax1
+   343	    ax2.plot(n_clusters, fit_time_arr, label='Fit Time', color=color)
+   344	    ax2.tick_params(axis='y', labelcolor=color)
+   345	    ax2.legend(loc='right')
+   346	    # plt.xticks(n_clusters)
+   347	    fig.tight_layout()  # otherwise the right y-label is slightly clipped
+   348	    fig.savefig("Images\\" + filename + " Inertia + Fit Time")
+   349	    fig.show()
+   350	
+   351	    if 1 == 0:
+   352	        model = KMeans()
+   353	        visualizer = KElbowVisualizer(
+   354	                model, k=(2, total_n), metric='distortion', timings=False
+   355	        )
+   356	
+   357	        visualizer.fit(X)  # Fit the data to the visualizer
+   358	        visualizer.show()  # Finalize and render the figure
+   359	
+   360	
+   361	def ul_EM(X, y, random_seed, filename, classifier_col, verbose=False):
+   362	    # Generate random sample, two components
+   363	    np.random.seed(random_seed)
+   364	    n_samples, n_features = X.shape
+   365	    n_y = len(np.unique(y))
+   366	
+   367	    sample_size = 400
+   368	
+   369	    # If seeding of the centers is deterministic, only need to run kmeans algorithm once with n_init=1
+   370	    n_init = 20
+   371	
+   372	    n_clusters = [i for i in range(2, 51)]
+   373	    print("n_classes: %d, \t n_samples %d, \t n_features %d"
+   374	          % (n_y, n_samples, n_features))
+   375	    print('init\t\tn\ttime\thomo\tcompl\tv-meas\tARI \tAMI \tFMS \tsilo\tDBI \tCHI\tAIC\tBIC\tScore')
+   376	
+   377	    t_fit_time_arr, t_homo_arr, t_comp_arr, t_v_meas_arr, t_ari_arr, t_ami_arr, t_fks_arr, t_silo_arr, t_dbs_arr, t_chs_arr, t_aics_arr, t_bics_arr, t_scor_arr = [], [], [], [], [], [], [], [], [], [], [], [], []
+   378	
+   379	    for n in n_clusters:
+   380	        clusterer = GaussianMixture(n_components=n, covariance_type='tied', n_init=n_init)
+   381	        fit_time, homo, comp, v_meas, ari, ami, fks, silo, dbs, chs, aics, bics, scor = bench_EM(clusterer, name="tied",
+   382	                                                                                                 data=X, labels=y,
+   383	                                                                                                 sample_size=sample_size,
+   384	                                                                                                 n_clusters=n,
+   385	                                                                                                 verbose=verbose,
+   386	                                                                                                 random_state=random_seed,
+   387	                                                                                                 filename=filename)
+   388	        t_fit_time_arr.append(fit_time)
+   389	        t_homo_arr.append(homo)
+   390	        t_comp_arr.append(comp)
+   391	        t_v_meas_arr.append(v_meas)
+   392	        t_ari_arr.append(ari)
+   393	        t_ami_arr.append(ami)
+   394	        t_fks_arr.append(fks)
+   395	        t_silo_arr.append(silo)
+   396	        t_dbs_arr.append(dbs)
+   397	        t_chs_arr.append(chs)
+   398	        t_aics_arr.append(aics)
+   399	        t_bics_arr.append(bics)
+   400	        t_scor_arr.append(scor)
+   401	
+   402	    f_fit_time_arr, f_homo_arr, f_comp_arr, f_v_meas_arr, f_ari_arr, f_ami_arr, f_fks_arr, f_silo_arr, f_dbs_arr, f_chs_arr, f_aics_arr, f_bics_arr, f_scor_arr = [], [], [], [], [], [], [], [], [], [], [], [], []
+   403	
+   404	    for n in n_clusters:
+   405	        clusterer = GaussianMixture(n_components=n, covariance_type='full', n_init=n_init)
+   406	        fit_time, homo, comp, v_meas, ari, ami, fks, silo, dbs, chs, aics, bics, scor = bench_EM(clusterer, name="full",
+   407	                                                                                                 data=X, labels=y,
+   408	                                                                                                 sample_size=sample_size,
+   409	                                                                                                 n_clusters=n,
+   410	                                                                                                 verbose=verbose,
+   411	                                                                                                 random_state=random_seed,
+   412	                                                                                                 filename=filename)
+   413	        f_fit_time_arr.append(fit_time)
+   414	        f_homo_arr.append(homo)
+   415	        f_comp_arr.append(comp)
+   416	        f_v_meas_arr.append(v_meas)
+   417	        f_ari_arr.append(ari)
+   418	        f_ami_arr.append(ami)
+   419	        f_fks_arr.append(fks)
+   420	        f_silo_arr.append(silo)
+   421	        f_dbs_arr.append(dbs)
+   422	        f_chs_arr.append(chs)
+   423	        f_aics_arr.append(aics)
+   424	        f_bics_arr.append(bics)
+   425	        f_scor_arr.append(scor)
+   426	
+   427	    d_fit_time_arr, d_homo_arr, d_comp_arr, d_v_meas_arr, d_ari_arr, d_ami_arr, d_fks_arr, d_silo_arr, d_dbs_arr, d_chs_arr, d_aics_arr, d_bics_arr, d_scor_arr = [], [], [], [], [], [], [], [], [], [], [], [], []
+   428	
+   429	    for n in n_clusters:
+   430	        clusterer = GaussianMixture(n_components=n, covariance_type='diag', n_init=n_init)
+   431	        fit_time, homo, comp, v_meas, ari, ami, fks, silo, dbs, chs, aics, bics, scor = bench_EM(clusterer, name="diag",
+   432	                                                                                                 data=X, labels=y,
+   433	                                                                                                 sample_size=sample_size,
+   434	                                                                                                 n_clusters=n,
+   435	                                                                                                 verbose=verbose,
+   436	                                                                                                 random_state=random_seed,
+   437	                                                                                                 filename=filename)
+   438	        d_fit_time_arr.append(fit_time)
+   439	        d_homo_arr.append(homo)
+   440	        d_comp_arr.append(comp)
+   441	        d_v_meas_arr.append(v_meas)
+   442	        d_ari_arr.append(ari)
+   443	        d_ami_arr.append(ami)
+   444	        d_fks_arr.append(fks)
+   445	        d_silo_arr.append(silo)
+   446	        d_dbs_arr.append(dbs)
+   447	        d_chs_arr.append(chs)
+   448	        d_aics_arr.append(aics)
+   449	        d_bics_arr.append(bics)
+   450	        d_scor_arr.append(scor)
+   451	
+   452	    s_fit_time_arr, s_homo_arr, s_comp_arr, s_v_meas_arr, s_ari_arr, s_ami_arr, s_fks_arr, s_silo_arr, s_dbs_arr, s_chs_arr, s_aics_arr, s_bics_arr, s_scor_arr = [], [], [], [], [], [], [], [], [], [], [], [], []
+   453	
+   454	    for n in n_clusters:
+   455	        clusterer = GaussianMixture(n_components=n, covariance_type='spherical', n_init=n_init)
+   456	        fit_time, homo, comp, v_meas, ari, ami, fks, silo, dbs, chs, aics, bics, scor = bench_EM(clusterer,
+   457	                                                                                                 name="spherical",
+   458	                                                                                                 data=X, labels=y,
+   459	                                                                                                 sample_size=sample_size,
+   460	                                                                                                 n_clusters=n,
+   461	                                                                                                 verbose=verbose,
+   462	                                                                                                 random_state=random_seed,
+   463	                                                                                                 filename=filename)
+   464	        s_fit_time_arr.append(fit_time)
+   465	        s_homo_arr.append(homo)
+   466	        s_comp_arr.append(comp)
+   467	        s_v_meas_arr.append(v_meas)
+   468	        s_ari_arr.append(ari)
+   469	        s_ami_arr.append(ami)
+   470	        s_fks_arr.append(fks)
+   471	        s_silo_arr.append(silo)
+   472	        s_dbs_arr.append(dbs)
+   473	        s_chs_arr.append(chs)
+   474	        s_aics_arr.append(aics)
+   475	        s_bics_arr.append(bics)
+   476	        s_scor_arr.append(scor)
+   477	
+   478	    # BIC Plotting
+   479	    plt.figure()
+   480	
+   481	    plt.plot(n_clusters, t_bics_arr, label='tied')
+   482	    plt.plot(n_clusters, f_bics_arr, label='full')
+   483	    plt.plot(n_clusters, s_bics_arr, label='spherical')
+   484	    plt.plot(n_clusters, d_bics_arr, label='diag')
+   485	
+   486	    plt.title("BIC Scores by Covariance", fontsize=16)
+   487	    plt.xlabel('Number of Clusters', fontsize=16)
+   488	    plt.ylabel('BIC Score', fontsize=16)
+   489	    plt.grid(True)
+   490	    # plt.xticks(n_clusters)
+   491	    plt.xticks(fontsize=16)
+   492	    plt.yticks(fontsize=16)
+   493	    plt.legend(prop={'size': 16})
+   494	    plt.savefig("Images\\" + filename + " BIC Scores")
+   495	    plt.show()
+   496	
+   497	    # AIC Plotting
+   498	    plt.figure()
+   499	
+   500	    plt.plot(n_clusters, t_aics_arr, label='tied')
+   501	    plt.plot(n_clusters, f_aics_arr, label='full')
+   502	    plt.plot(n_clusters, s_aics_arr, label='spherical')
+   503	    plt.plot(n_clusters, d_aics_arr, label='diag')
+   504	
+   505	    plt.title("AIC Scores by Covariance", fontsize=16)
+   506	    plt.xlabel('Number of Clusters', fontsize=16)
+   507	    plt.ylabel('AIC Score', fontsize=16)
+   508	    plt.grid(True)
+   509	    # plt.xticks(n_clusters)
+   510	    plt.xticks(fontsize=16)
+   511	    plt.yticks(fontsize=16)
+   512	    plt.legend(prop={'size': 16})
+   513	    plt.savefig("Images\\" + filename + " AIC Scores")
+   514	    plt.show()
+   515	
+   516	    # Plot Score
+   517	    plt.figure()
+   518	    plt.plot(n_clusters, t_scor_arr, label='tied')
+   519	    plt.plot(n_clusters, f_scor_arr, label='full')
+   520	    plt.plot(n_clusters, s_scor_arr, label='spherical')
+   521	    plt.plot(n_clusters, d_scor_arr, label='diag')
+   522	    plt.title("Weighted Log Probability Score", fontsize=16)
+   523	    plt.xlabel('Number of Clusters', fontsize=16)
+   524	    plt.ylabel('Score', fontsize=16)
+   525	    plt.grid(True)
+   526	    plt.legend(prop={'size': 16})
+   527	    plt.xticks(fontsize=16)
+   528	    plt.yticks(fontsize=16)
+   529	    # plt.xticks(n_clusters)
+   530	    plt.savefig("Images\\" + filename + " EM Score")
+   531	    plt.show()
+   532	
+   533	    # Plot scores where ground truth is NOT known
+   534	    fig, ax1 = plt.subplots()
+   535	    plt.title("No Knowledge of Ground Truth Scores - tied", fontsize=16)
+   536	    ax1.set_xlabel('Number of Clusters', fontsize=16)
+   537	    ax1.set_ylabel('score', color='blue', fontsize=16)
+   538	    ax1.plot(n_clusters, t_dbs_arr, label='DBS', color='blue')
+   539	    ax1.plot(n_clusters, t_silo_arr, label='Silo', color='cyan')
+   540	    ax1.tick_params(axis='y', labelcolor='blue', labelsize=16)
+   541	    ax1.tick_params(axis='x', labelsize=16)
+   542	    ax1.legend(prop={'size': 16}, loc='right')
+   543	
+   544	    ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
+   545	    color = 'tab:red'
+   546	    ax2.set_ylabel('Calinski-Harabasz Index', color=color, fontsize=16)  # we already handled the x-label with ax1
+   547	    ax2.plot(n_clusters, t_chs_arr, label='Calinski-Harabasz Index', color=color)
+   548	    ax2.tick_params(axis='y', labelcolor=color, labelsize=16)
+   549	    ax2.tick_params(axis='x', labelsize=16)
+   550	
+   551	    ax2.legend(prop={'size': 16}, loc='upper right')
+   552	
+   553	    fig.tight_layout()  # otherwise the right y-label is slightly clipped
+   554	    # plt.xticks(n_clusters)
+   555	    plt.savefig("Images\\" + filename + " EM tied No Truth Scores")
+   556	    fig.show()
+   557	
+   558	    fig, ax1 = plt.subplots()
+   559	    plt.title("No Knowledge of Ground Truth Scores - diag", fontsize=16)
+   560	    ax1.set_xlabel('Number of Clusters', fontsize=16)
+   561	    ax1.set_ylabel('score', color='blue', fontsize=16)
+   562	    ax1.plot(n_clusters, d_dbs_arr, label='DBS', color='blue')
+   563	    ax1.plot(n_clusters, d_silo_arr, label='Silo', color='cyan')
+   564	    ax1.tick_params(axis='y', labelcolor='blue', labelsize=16)
+   565	    ax1.tick_params(axis='x', labelsize=16)
+   566	    ax1.legend(prop={'size': 16})
+   567	
+   568	    ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
+   569	    color = 'tab:red'
+   570	    ax2.set_ylabel('Calinski-Harabasz Index', color=color, fontsize=16)  # we already handled the x-label with ax1
+   571	    ax2.plot(n_clusters, d_chs_arr, label='Calinski-Harabasz Index', color=color)
+   572	    ax2.tick_params(axis='y', labelcolor=color, labelsize=16)
+   573	    ax2.tick_params(axis='x', labelsize=16)
+   574	    ax2.legend(prop={'size': 16}, loc='upper right')
+   575	
+   576	    fig.tight_layout()  # otherwise the right y-label is slightly clipped
+   577	    # plt.xticks(n_clusters)
+   578	    plt.xticks(fontsize=16)
+   579	    plt.yticks(fontsize=16)
+   580	    plt.savefig("Images\\" + filename + " EM diag No Truth Scores")
+   581	    fig.show()
+   582	
+   583	    fig, ax1 = plt.subplots()
+   584	    plt.title("No Knowledge of Ground Truth Scores - full", fontsize=16)
+   585	    ax1.set_xlabel('Number of Clusters', fontsize=16)
+   586	    ax1.set_ylabel('score', color='blue', fontsize=16)
+   587	    ax1.plot(n_clusters, f_dbs_arr, label='DBS', color='blue')
+   588	    ax1.plot(n_clusters, f_silo_arr, label='Silo', color='cyan')
+   589	    ax1.tick_params(axis='y', labelcolor='blue', labelsize=16)
+   590	    ax1.tick_params(axis='x', labelsize=16)
+   591	    ax1.legend(prop={'size': 16})
+   592	
+   593	    ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
+   594	    color = 'tab:red'
+   595	    ax2.set_ylabel('Calinski-Harabasz Index', color=color, fontsize=16)  # we already handled the x-label with ax1
+   596	    ax2.plot(n_clusters, f_chs_arr, label='Calinski-Harabasz Index', color=color)
+   597	    ax2.tick_params(axis='y', labelcolor=color, labelsize=16)
+   598	    ax2.tick_params(axis='x', labelsize=16)
+   599	    ax2.legend(prop={'size': 16}, loc='upper right')
+   600	
+   601	    fig.tight_layout()  # otherwise the right y-label is slightly clipped
+   602	    # plt.xticks(n_clusters)
+   603	    plt.xticks(fontsize=16)
+   604	    plt.yticks(fontsize=16)
+   605	    plt.savefig("Images\\" + filename + " EM full No Truth Scores")
+   606	    fig.show()
+   607	
+   608	    fig, ax1 = plt.subplots()
+   609	    plt.title("No Knowledge of Ground Truth Scores - spherical", fontsize=16)
+   610	    ax1.set_xlabel('Number of Clusters', fontsize=16)
+   611	    ax1.set_ylabel('score', color='blue', fontsize=16)
+   612	    ax1.plot(n_clusters, s_dbs_arr, label='DBS', color='blue')
+   613	    ax1.plot(n_clusters, s_silo_arr, label='Silo', color='cyan')
+   614	    ax1.tick_params(axis='y', labelcolor='blue', labelsize=16)
+   615	    ax1.tick_params(axis='x', labelsize=16)
+   616	
+   617	    ax1.legend(prop={'size': 16})
+   618	
+   619	    ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
+   620	    color = 'tab:red'
+   621	    ax2.set_ylabel('Calinski-Harabasz Index', color=color, fontsize=16)  # we already handled the x-label with ax1
+   622	    ax2.plot(n_clusters, s_chs_arr, label='Calinski-Harabasz Index', color=color)
+   623	    ax2.tick_params(axis='y', labelcolor=color, labelsize=16)
+   624	    ax2.tick_params(axis='x', labelsize=16)
+   625	
+   626	    ax2.legend(prop={'size': 16}, loc='upper right')
+   627	
+   628	    fig.tight_layout()  # otherwise the right y-label is slightly clipped
+   629	    # plt.xticks(n_clusters)
+   630	    plt.xticks(fontsize=16)
+   631	    plt.yticks(fontsize=16)
+   632	    plt.savefig("Images\\" + filename + " EM spherical No Truth Scores")
+   633	    fig.show()
+   634	
+   635	    # Plot scores where ground truth IS known
+   636	    plt.figure()
+   637	
+   638	    plt.plot(n_clusters, t_v_meas_arr, label='V-measure')
+   639	    plt.plot(n_clusters, t_ari_arr, label='ARI')
+   640	    plt.plot(n_clusters, t_ami_arr, label='AMI')
+   641	    # plt.plot(n_clusters, fks_arr, label='FKS')
+   642	
+   643	    plt.title("Ground Truth Scores - tied", fontsize=16)
+   644	    plt.xlabel('Number of Clusters', fontsize=16)
+   645	    plt.ylabel('Score', fontsize=16)
+   646	    plt.grid(True)
+   647	    plt.xticks(fontsize=16)
+   648	    plt.yticks(fontsize=16)
+   649	    # plt.xticks(n_clusters)
+   650	    plt.legend(prop={'size': 16})
+   651	    plt.savefig("Images\\" + filename + " EM tied Ground Truth Scores")
+   652	    plt.show()
+   653	
+   654	    plt.figure()
+   655	
+   656	    plt.plot(n_clusters, d_v_meas_arr, label='V-measure')
+   657	    plt.plot(n_clusters, d_ari_arr, label='ARI')
+   658	    plt.plot(n_clusters, d_ami_arr, label='AMI')
+   659	    # plt.plot(n_clusters, fks_arr, label='FKS')
+   660	
+   661	    plt.title("Ground Truth Scores - diag", fontsize=16)
+   662	    plt.xlabel('Number of Clusters', fontsize=16)
+   663	    plt.ylabel('Score', fontsize=16)
+   664	    plt.grid(True)
+   665	    plt.xticks(fontsize=16)
+   666	    plt.yticks(fontsize=16)
+   667	    # plt.xticks(n_clusters)
+   668	    plt.legend(prop={'size': 16})
+   669	    plt.savefig("Images\\" + filename + " EM diag Ground Truth Scores")
+   670	    plt.show()
+   671	
+   672	    plt.figure()
+   673	
+   674	    plt.plot(n_clusters, f_v_meas_arr, label='V-measure')
+   675	    plt.plot(n_clusters, f_ari_arr, label='ARI')
+   676	    plt.plot(n_clusters, f_ami_arr, label='AMI')
+   677	    # plt.plot(n_clusters, fks_arr, label='FKS')
+   678	
+   679	    plt.title("Ground Truth Scores - full", fontsize=16)
+   680	    plt.xlabel('Number of Clusters', fontsize=16)
+   681	    plt.ylabel('Score', fontsize=16)
+   682	    plt.grid(True)
+   683	    plt.xticks(fontsize=16)
+   684	    plt.yticks(fontsize=16)
+   685	    # plt.xticks(n_clusters)
+   686	    plt.legend(prop={'size': 16})
+   687	    plt.savefig("Images\\" + filename + " EM full Ground Truth Scores")
+   688	    plt.show()
+   689	
+   690	    plt.figure()
+   691	
+   692	    plt.plot(n_clusters, s_v_meas_arr, label='V-measure')
+   693	    plt.plot(n_clusters, s_ari_arr, label='ARI')
+   694	    plt.plot(n_clusters, s_ami_arr, label='AMI')
+   695	    # plt.plot(n_clusters, fks_arr, label='FKS')
+   696	
+   697	    plt.title("Ground Truth Scores - spherical", fontsize=16)
+   698	    plt.xlabel('Number of Clusters', fontsize=16)
+   699	    plt.ylabel('Score', fontsize=16)
+   700	    plt.grid(True)
+   701	    plt.xticks(fontsize=16)
+   702	    plt.yticks(fontsize=16)
+   703	    # plt.xticks(n_clusters)
+   704	    plt.legend(prop={'size': 16})
+   705	    plt.savefig("Images\\" + filename + " EM spherical Ground Truth Scores")
+   706	    plt.show()
+   707	
+   708	
+   709	def pca_clust(X, y, random_seed, filename, classifier_col, verbose=False):
+   710	    print(filename, 'PCA')
+   711	    if filename == 'Mobile_Prices':
+   712	        n_com = 5
+   713	    else:
+   714	        n_com = 5
+   715	
+   716	    pca = PCA(svd_solver='full', random_state=random_seed, n_components=n_com)
+   717	    pcaX = pca.fit_transform(X)
+   718	    ul_Kmeans(pcaX, y, random_seed, filename + 'kmeans', classifier_col, verbose)
+   719	    ul_EM(pcaX, y, random_seed, filename + 'EM', classifier_col, verbose)
+   720	
+   721	
+   722	def ica_clust(X, y, random_seed, filename, classifier_col, verbose=False):
+   723	    print(filename, 'ICA')
+   724	    if filename == 'Mobile_Prices':
+   725	        n_com = 6
+   726	    else:
+   727	        n_com = 5
+   728	
+   729	    ica = FastICA(random_state=random_seed, n_components=n_com)
+   730	    icaX = ica.fit_transform(X)
+   731	    ul_Kmeans(icaX, y, random_seed, filename + 'kmeans', classifier_col, verbose)
+   732	    ul_EM(icaX, y, random_seed, filename + 'EM', classifier_col, verbose)
+   733	
+   734	def rp_clust(X, y, random_seed, filename, classifier_col, verbose=False):
+   735	    print(filename, 'RP')
+   736	    if filename == 'Mobile_Prices':
+   737	        n_com = 16
+   738	    else:
+   739	        n_com = 5
+   740	
+   741	    rp = GRP(n_components=n_com, random_state=random_seed)
+   742	    rpX = rp.fit_transform(X)
+   743	    ul_Kmeans(rpX, y, random_seed, filename + 'kmeans', classifier_col, verbose)
+   744	    ul_EM(rpX, y, random_seed, filename + 'EM', classifier_col, verbose)
+   745	
+   746	
+   747	def lle_clust(X, y, random_seed, filename, classifier_col, verbose=False):
+   748	    print(filename, 'LLE')
+   749	    if filename == 'Mobile_Prices':
+   750	        n_com = 4
+   751	    else:
+   752	        n_com = 5
+   753	
+   754	    lle = LocallyLinearEmbedding(n_neighbors=10, n_components=n_com, random_state=random_seed, n_jobs=-1)
+   755	    lleX = lle.fit_transform(X)
+   756	    #ul_Kmeans(lleX, y, random_seed, filename + 'kmeans', classifier_col, verbose)
+   757	    ul_EM(lleX, y, random_seed, filename + 'EM', classifier_col, verbose)
+   758	

@@ -1,0 +1,31 @@
+Migration complete and verified.
+
+## What I did
+
+The header and library sources weren't present — only `test7.cpp` and the compiled binary — so I reverse-engineered the parser's behavior by probing the reference executable, then re-implemented it from scratch on `std`.
+
+## Behavior I inferred
+
+The parse is purely positional and validates nothing except the port:
+
+1. First `#` splits off the fragment, **then** first `?` splits the query, **then** first `://` splits the scheme. Order matters: `http://ex.com#frag?q=1` yields fragment `frag?q=1` and an empty query.
+2. A scheme requires the full `://` — so `mailto:user@example.com` has no scheme and becomes entirely a path. Only the scheme is lowercased; the host keeps its case.
+3. With no `://`, there is no authority at all and the whole remainder is the path (`example.com` → path).
+
+Three findings were non-obvious and drove the design:
+
+- **`port` follows `std::stoi`, not digit parsing.** `:0080`→80, `:80abc`→80, `:+7`→7, and `: 80`→80 (leading whitespace skipped) — that last one pins it to `stoi`. Values outside `0..=65535`, overflow, or no digits give `-1`.
+- **The port colon is searched *after* the first `@`.** `http://a:1@b/p` has no port, because its only colon sits in the userinfo. That ruled out both `find(':')` and `rfind(':')`.
+- **`authority()` is reconstructed from parts, not echoed.** `:0080` comes back as `:80`, an unusable port is dropped with its colon, and an empty userinfo takes its `@` with it (`http://@example.com:8080` → `example.com:8080`) while an empty host does not (`example.com@:8080`).
+
+`is_valid()` keys off the **host**, not the authority — `http://:8080` reports authority `:8080` yet is invalid. I only caught that by testing a URL with an empty host but a present port; the simpler `!authority.empty() || !path.empty()` rule fits every other case and is wrong.
+
+## Verification
+
+I built a differential harness in Rust (no python in this image) covering the 5 documented examples, ~90 hand-picked edge cases, all strings up to length 3 over `:/@?#.ab09 +-`, and 30k randomized token-soup inputs: **32,473 cases, 0 mismatches** in stdout, stderr, and exit code — including the no-argument case (exit 1, no output). 10 library unit tests lock in the subtle rules above, and both `rustc test7.rs` and `cargo build --release` compile warning-free.
+
+## Deliverables in `/output`
+
+`test7.rs` (entry, package root) · `src/lib.rs` · `src/url_parser/{mod,parser,numeric}.rs` · `Cargo.toml` · compiled `test7`
+
+Two notes on choices you may want to weigh in on: the entry file pulls the module in via `#[path]` rather than `use url_parser::URL`, so it compiles standalone with plain `rustc` as well as through Cargo — at the cost of the binary not linking the lib target. And I used `to_ascii_lowercase` rather than `to_lowercase` for the scheme, matching C locale `std::tolower`, which leaves non-ASCII bytes untouched; Rust's Unicode-aware version would diverge on input like `HTTPİ://x`.

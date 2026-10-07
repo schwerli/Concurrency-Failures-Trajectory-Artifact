@@ -1,0 +1,93 @@
+diff -ruN -x .git -x .git-shim -x requirement_patches -x __pycache__ -x '*.pyc' -x .pytest_cache .git-shim/snapshots/head/agent_tests/test_selu.py ./agent_tests/test_selu.py
+--- .git-shim/snapshots/head/agent_tests/test_selu.py	1970-01-01 00:00:00.000000000 +0000
++++ ./agent_tests/test_selu.py	2026-08-12 22:38:22.033754392 +0000
+@@ -0,0 +1,55 @@
++"""Checks for the SELU layer in `mlp.layers`."""
++
++import numpy as np
++
++from mlp.layers import ELULayer, SELULayer
++
++
++def test_selu_constants_and_delegate():
++    layer = SELULayer()
++    assert np.isclose(layer.alpha, 1.6733, atol=1e-4)
++    assert np.isclose(layer.lamda, 1.0507, atol=1e-4)
++    assert isinstance(layer.elu, ELULayer)
++    assert np.isclose(layer.elu.alpha, layer.alpha)
++
++
++def test_selu_fprop():
++    layer = SELULayer()
++    inputs = np.array([[1., -2.], [-0.5, 3.]])
++    outputs = layer.fprop(inputs)
++    expected = layer.lamda * np.where(
++        inputs > 0., inputs, layer.alpha * (np.exp(inputs) - 1.))
++    assert outputs.shape == inputs.shape
++    assert np.allclose(outputs, expected)
++
++
++def test_selu_bprop_matches_finite_differences():
++    layer = SELULayer()
++    rng = np.random.RandomState(0)
++    inputs = rng.normal(size=(4, 3))
++    grads_wrt_outputs = rng.normal(size=(4, 3))
++    outputs = layer.fprop(inputs)
++    grads_wrt_inputs = layer.bprop(inputs, outputs, grads_wrt_outputs)
++    eps = 1e-6
++    numeric = np.zeros_like(inputs)
++    for idx in np.ndindex(*inputs.shape):
++        pos, neg = inputs.copy(), inputs.copy()
++        pos[idx] += eps
++        neg[idx] -= eps
++        numeric[idx] = ((layer.fprop(pos) - layer.fprop(neg)) *
++                        grads_wrt_outputs).sum() / (2 * eps)
++    assert np.allclose(grads_wrt_inputs, numeric, atol=1e-5)
++
++
++def test_selu_bprop_analytic():
++    layer = SELULayer()
++    inputs = np.array([[2., -1.]])
++    outputs = layer.fprop(inputs)
++    grads = layer.bprop(inputs, outputs, np.ones_like(inputs))
++    expected = layer.lamda * np.array(
++        [[1., layer.alpha * np.exp(-1.)]])
++    assert np.allclose(grads, expected)
++
++
++def test_selu_repr():
++    assert repr(SELULayer()) == 'SELULayer'
+diff -ruN -x .git -x .git-shim -x requirement_patches -x __pycache__ -x '*.pyc' -x .pytest_cache .git-shim/snapshots/head/mlp/layers.py ./mlp/layers.py
+--- .git-shim/snapshots/head/mlp/layers.py	2026-08-12 22:36:38.391843421 +0000
++++ ./mlp/layers.py	2026-08-12 22:38:09.383520695 +0000
+@@ -657,13 +657,16 @@
+     """Layer implementing an element-wise rectified linear transformation."""
+     #α01 ≈ 1.6733 and λ01 ≈ 1.0507
+     def __init__(self):
+-        pass  # TODO: implement
++        self.alpha = 1.6732632423543772848170429916717
++        self.lamda = 1.0507009873554804934193349852946
++        self.elu = ELULayer(alpha=self.alpha)
++
+     def fprop(self, inputs):
+         """Forward propagates activations through the layer transformation.
+ 
+         For inputs `x` and outputs `y` this corresponds to `y = max(0, x)`.
+         """
+-        pass  # TODO: implement
++        return self.lamda * self.elu.fprop(inputs)
+ 
+     def bprop(self, inputs, outputs, grads_wrt_outputs):
+         """Back propagates gradients through a layer.
+@@ -671,7 +674,10 @@
+         Given gradients with respect to the outputs of the layer calculates the
+         gradients with respect to the layer inputs.
+         """
+-        pass  # TODO: implement
++        # `outputs` are the ELU outputs scaled by lamda so undo the scaling
++        # before delegating the backward pass to the ELU layer.
++        return self.lamda * self.elu.bprop(
++            inputs, outputs / self.lamda, grads_wrt_outputs)
+ 
+     def __repr__(self):
+         return 'SELULayer'

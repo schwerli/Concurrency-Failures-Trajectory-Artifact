@@ -1,0 +1,14 @@
+Done. `SessionBase.encode()` now falls back to the pre-3.1 format when `DEFAULT_HASHING_ALGORITHM == 'sha1'`.
+
+**Change** (`django/contrib/sessions/backends/base.py:108`): `encode()` delegates to a new `_legacy_encode()` — the verbatim pre-3.1 body (`serializer().dumps` → `_hash` → base64) — when the transitional setting is `'sha1'`. Otherwise the `signing.dumps()` path is unchanged. `_legacy_encode()` sits next to the existing `_legacy_decode()` and carries the same `RemovedInDjango40Warning` marker, so both halves get deleted together in 4.0.
+
+**Verified end-to-end**, not just by test pass:
+- Under `sha1`, the encoded output is byte-identical to the pre-3.1 fixture already in `test_decode_legacy`, and hand-replaying the old Django 3.0 `decode()` logic against it (split on `:`, `salted_hmac(..., algorithm='sha1')`, compare) validates the hash and recovers the data. That's the actual bug: an old instance can now read what a 3.1 instance wrote.
+- 3.1's own `decode()` still reads it, via the existing legacy fallback.
+- With the setting left at its `sha256` default, `encode()` still emits the new signed format.
+
+**Test added** (`tests/sessions_tests/tests.py:327`): `test_default_hashing_algorith_legacy_decode` in `SessionTestsMixin`, so it runs across all six backends. Two notes on how it's written — the mixin's classes are plain `unittest.TestCase`, so it uses the `override_settings` context manager rather than `self.settings()`, and it needs `@ignore_warnings(category=RemovedInDjango40Warning)` since merely setting `DEFAULT_HASHING_ALGORITHM` raises the deprecation warning, which the suite treats as an error.
+
+`sessions_tests`, `signing`, `messages_tests`, `deprecation`, and `auth_tests.test_tokens` all pass (516 tests, 2 skipped, 1 expected failure).
+
+One thing I did not change: the docs. `docs/releases/3.1.txt:106` already lists "user sessions" among what `DEFAULT_HASHING_ALGORITHM` covers — that claim was simply untrue for `encode()` until now, and this makes it accurate.

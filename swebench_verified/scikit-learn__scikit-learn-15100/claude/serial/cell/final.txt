@@ -1,0 +1,20 @@
+Fixed in `sklearn/feature_extraction/text.py:132`.
+
+**Cause:** the old code short-circuited on `unicodedata.normalize('NFKD', s) == s`. That comparison was presumably meant as a cheap "no accents here" check, but NFKD is idempotent — a string already in decomposed form normalizes to itself, so `"n" + COMBINING TILDE` hit the early return and kept its combining marks.
+
+**Fix:** replace the shortcut with an ASCII-encodability check, which is what the fast path actually wants to test:
+
+```python
+try:
+    # If `s` is ASCII-compatible, then it does not contain any accented
+    # characters and we can avoid an expensive list comprehension.
+    s.encode("ASCII", errors="strict")
+    return s
+except UnicodeEncodeError:
+    normalized = unicodedata.normalize('NFKD', s)
+    return ''.join([c for c in normalized if not unicodedata.combining(c)])
+```
+
+Pure-ASCII input still returns without building a list; anything non-ASCII now always goes through the strip, regardless of its normalization form.
+
+**Verification:** both `chr(241)` and `chr(110)+chr(771)` now return `'n'`. Added three cases to `test_strip_accents` covering pre-decomposed input (`o`+U+0308), bare combining marks, and stacked marks (`o`+U+0308+U+0304) — I confirmed the file bytes are actually decomposed rather than silently composed by my editor. That test fails on the old code (`assert 'o\u0308' == 'o'`) and passes on the new; full `test_text.py` is 107 passed, 4 xfailed.

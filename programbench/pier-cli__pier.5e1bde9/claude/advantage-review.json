@@ -1,0 +1,112 @@
+{
+  "schema_version": 2,
+  "phase": "fixed",
+  "pair_id": "programbench/pier-cli__pier.5e1bde9/claude",
+  "task": {
+    "plain_summary_zh": "任务要求在 cleanroom 条件下，仅通过运行给定的 pier CLI 二进制和阅读随附文档，重新从零实现一个行为一致的可执行文件。",
+    "acceptance_target_zh": "提交物必须是原创代码生成的 executable，不能包装原二进制或查找源码；官方 ProgramBench 评测的 779 个测试应能运行并通过。"
+  },
+  "modes": {
+    "parallel": {
+      "solution_passed": false,
+      "evaluation_completed": true,
+      "passed": 0,
+      "total": 779,
+      "rate": 0.0,
+      "wall_seconds": 1420.103
+    },
+    "serial": {
+      "solution_passed": false,
+      "evaluation_completed": true,
+      "passed": 0,
+      "total": 779,
+      "rate": 0.0,
+      "wall_seconds": 2441.438
+    }
+  },
+  "reconstruction": {
+    "parallel_strategy_zh": "并行轨迹先由父上下文顺序阅读文档、探测帮助和配置行为、确认无法使用外部 crate，随后名义上创建四个 TaskCreate 子任务，分别负责行为探测、差分 harness、Rust 实现和验证。可见父上下文实际只写了测试 harness 并做了 smoke 检查，最后停在准备继续 fan out 的状态，没有交付重实现。",
+    "serial_strategy_zh": "串行轨迹是一个父上下文持续顺序探测同一个 CLI：配置发现、TOML 序列化、参数解析、编辑器行为、表格渲染、错误文本和运行语义等。到最后仍在写新的探测脚本，随后达到任务级超时，没有形成可编译的重实现提交。",
+    "realized_parallelism_zh": "并行证据只支持名义上的子任务创建；状态记录显示没有 TaskOutput、没有 child log、parallel_used 为 false，原始父轨迹也没有采纳子任务结果。因此可确认的有用模型上下文只有父上下文本身，不能认定有两个有用工作区间重叠。",
+    "parallel_workers": 1,
+    "peak_overlapping_useful_workers": 1
+  },
+  "baseline_audit": {
+    "same_task_and_prompt": true,
+    "serial_run_valid": true,
+    "parallel_run_valid": true,
+    "external_or_harness_issues_zh": [
+      "未发现 provider、启动、harness 或评测器故障；串行是在持续有效探测后达到任务级超时，不是无关外部取消。"
+    ]
+  },
+  "decision": "exclude",
+  "exclusion_code": "no_realized_concurrency",
+  "decision_reason_zh": "排除。并行虽然发出了四个 TaskCreate，但没有可见子轨迹、没有子结果被取回或合并，官方状态也标记 parallel_used=false；同时两边官方评测都是 compile_failed、0/779，所以不存在可归因于并发的质量或有效时间收益。",
+  "advantage": null,
+  "new_pattern_candidate": {
+    "is_candidate": false,
+    "name_zh": null,
+    "mechanism_zh": null,
+    "why_existing_dimensions_fail_zh": null
+  },
+  "evidence": {
+    "parallel": [
+      {
+        "path": "parallel/agent/claude/.claude/projects/-workspace/347cb2b5-73ea-41f8-86bf-846d4910ab6a.jsonl",
+        "line": 65,
+        "summary_zh": "父上下文创建第一个名义子任务，要求穷尽探测 pier 行为。"
+      },
+      {
+        "path": "parallel/agent/claude/.claude/projects/-workspace/347cb2b5-73ea-41f8-86bf-846d4910ab6a.jsonl",
+        "line": 96,
+        "summary_zh": "最终回复只说 harness 可用并准备继续 fan out，未呈现子任务结果或实现。"
+      },
+      {
+        "path": "parallel/cell/status.json",
+        "line": 282,
+        "summary_zh": "协议状态显示 workflow_child_logs 为 0，后续也标记 parallel_used 为 false。"
+      }
+    ],
+    "serial": [
+      {
+        "path": "serial/agent/claude/.claude/projects/-workspace/68fd52ca-9a9c-44da-83d7-09fffd671e98.jsonl",
+        "line": 253,
+        "summary_zh": "串行在后期仍运行杂项错误路径探测，而不是交付实现。"
+      },
+      {
+        "path": "serial/agent/claude/.claude/projects/-workspace/68fd52ca-9a9c-44da-83d7-09fffd671e98.jsonl",
+        "line": 256,
+        "summary_zh": "最后可见语义动作是写另一个反序列化探测脚本。"
+      },
+      {
+        "path": "serial/cell/status.json",
+        "line": 148,
+        "summary_zh": "串行 agent returncode 为 143，并在 provider_retry 中记录为 agent_timeout。"
+      }
+    ],
+    "evaluator": [
+      {
+        "path": "parallel/cell/evaluation/summary.json",
+        "line": 6,
+        "summary_zh": "并行官方评测 error_code 为 compile_failed。"
+      },
+      {
+        "path": "serial/cell/evaluation/summary.json",
+        "line": 6,
+        "summary_zh": "串行官方评测同样 error_code 为 compile_failed。"
+      },
+      {
+        "path": "parallel/cell.json",
+        "line": 22,
+        "summary_zh": "并行质量记录显示 completed=true、passed=0、total=779、rate=0.0。"
+      },
+      {
+        "path": "serial/cell.json",
+        "line": 22,
+        "summary_zh": "串行质量记录也显示 completed=true、passed=0、total=779、rate=0.0。"
+      }
+    ]
+  },
+  "case_narrative_zh": "这个 pair 的任务是 cleanroom 重写 pier CLI。并行轨迹先顺序探测，然后创建四个名义子任务，但可见证据只显示父上下文继续搭建差分测试 harness，最终在“harness works”后结束；状态文件明确没有 child logs 或 parallel uptake。串行轨迹没有并发工具，长时间顺序探测行为直到任务级超时。两边官方评测都完成但均 compile_failed、0/779。即使并行墙钟更短，也只是更早结束在零质量提交上，既没有已证实的有用重叠模型工作，也没有可测的质量或有效时间收益，因此按 no_realized_concurrency 排除，并不进入三类保留维度。",
+  "confidence": "high"
+}

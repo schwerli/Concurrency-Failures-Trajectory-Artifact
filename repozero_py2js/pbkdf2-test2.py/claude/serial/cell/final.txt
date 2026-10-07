@@ -1,0 +1,73 @@
+The migration is complete and verified. Here's the result.
+
+## Structure
+
+```
+/output
+├── lib
+│   ├── sha1.mjs          SHA-1 compression + streaming hash (FIPS 180-4)
+│   ├── hmac.mjs          HMAC (RFC 2104) with precomputed ipad/opad states
+│   ├── pbkdf2.mjs        PBKDF2 key-stream class (port of the pbkdf2 PyPI module)
+│   ├── pytext.mjs        UTF-8 encoding, bytes.hex(), Python repr()
+│   ├── pyint.mjs         Python int(str) semantics
+│   ├── pyexceptions.mjs  Python exception shapes + traceback/linecache rendering
+│   └── argparse.mjs      behaviour-matched argparse subset
+└── test2.mjs             entry point
+```
+
+Dependency flow: `test2.mjs` → `argparse` → (`pytext`, `pyexceptions`); `test2.mjs` → `pbkdf2` → `hmac` → `sha1`.
+
+## Entry point — `/output/test2.mjs`
+
+```js
+#!/usr/bin/env node
+import { ArgumentParser } from './lib/argparse.mjs';
+import { pyInt } from './lib/pyint.mjs';
+import { PBKDF2 } from './lib/pbkdf2.mjs';
+import { toHex } from './lib/pytext.mjs';
+import { PyError, formatTraceback } from './lib/pyexceptions.mjs';
+
+const PROG = 'test2_executable';
+
+const str = (value) => value;   str.typeName = 'str';
+const int = (value) => pyInt(value); int.typeName = 'int';
+
+const parser = new ArgumentParser({ prog: PROG });
+parser.addArgument(['--a'], { type: str, required: true }); // passphrase
+parser.addArgument(['--b'], { type: str, required: true }); // salt
+parser.addArgument(['--c'], { type: int, required: true }); // iterations
+const args = parser.parseArgs(process.argv.slice(2));
+
+try {
+  const result = new PBKDF2(args.a, args.b, { iterations: args.c }).read(20);
+  console.log(toHex(result));
+} catch (err) {
+  if (!(err instanceof PyError)) throw err;
+  process.stderr.write(formatTraceback(err, [
+    { file: 'test2.py', line: 12, name: '<module>', caret: { start: 9, length: 48 } },
+    { file: 'pbkdf2.py', line: 141, name: '__init__' },
+    { file: 'pbkdf2.py', line: 205, name: '_setup' },
+  ]));
+  process.stderr.write(
+    `[PYI-${process.pid}:ERROR] Failed to execute script 'test2' due to unhandled exception!\n`);
+  process.exit(1);
+}
+```
+
+## Verification
+
+All comparisons are against the reference executable (stdout, stderr, **and** exit code):
+
+- **4/4** documented test cases byte-exact.
+- **129/129** randomized differential cases (ASCII/symbol/accented/CJK/emoji inputs, empty strings, salts and passphrases at 63/64/65/200 bytes to straddle the HMAC block boundary) — re-run on a fresh random batch, still 129/129.
+- **18/18** argument-parsing cases, **26/26** `int()`-conversion cases, **21/21** regression cases.
+- **14/14** published vectors (FIPS 180-2 SHA-1, RFC 2202 HMAC-SHA-1, RFC 6070 PBKDF2) — including `dkLen=25` and `dkLen=16`, which exercise the multi-block and partial-block `read()` paths that `read(20)` never reaches.
+- Performance: ~4× faster than the reference (1M iterations in 0.78 s vs 2.93 s).
+
+Three behaviours only surfaced by probing, which I'd have gotten wrong from the source alone:
+
+1. **`int()` is not `Number()`** — the reference accepts `" 10 "`, `+10`, `1_0`, and Unicode digits (`١٠` → 10), but rejects `1.5`, `1__0`, and `10_`. My first Nd-digit-value implementation was off by one and silently produced wrong hashes for non-ASCII digits; the fuzz run caught it.
+2. **The traceback is cwd-dependent** — PyInstaller ships no sources, so the offending source line appears only when a file named `test2.py` happens to be readable relative to the working directory. I reproduce this with an actual `linecache` lookup, so stderr matches from any directory.
+3. **Required-args check precedes unrecognized-args check** — `-a abc --b s --c 10` reports the missing `--a`, not the two stray tokens.
+
+Constraints: ESM only (no `require`/`module.exports`), all local imports carry the `.mjs` suffix, and `node:fs` is the sole built-in used. `node:crypto` is not imported anywhere — SHA-1, HMAC, and PBKDF2 are implemented from scratch.

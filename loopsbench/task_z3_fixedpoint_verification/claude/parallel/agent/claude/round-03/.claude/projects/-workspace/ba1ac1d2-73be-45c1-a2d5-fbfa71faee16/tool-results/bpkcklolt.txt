@@ -1,0 +1,1327 @@
+     1	"""CEGAR-style counterexample analysis, minimization and predicate refinement.
+     2	
+     3	The module closes the loop around the Spacer verifier: a transition system is
+     4	verified against an *abstraction* of itself, and whenever the abstraction is
+     5	too coarse the counterexample it produces is analysed and used to sharpen the
+     6	abstraction.
+     7	
+     8	Abstraction
+     9	    ``SystemAbstraction`` over-approximates a transition system in two ways.
+    10	    The transition relation is split into its top level conjuncts and only a
+    11	    subset of them -- initially none -- is kept; the dropped conjuncts are
+    12	    replaced by ``True``.  On top of that every predicate ``p`` currently held
+    13	    by the :class:`AbstractDomain` contributes the preservation constraint
+    14	    ``p(x) -> p(x')`` whenever that implication follows from the concrete
+    15	    transition relation.  Both ingredients are implied by the concrete
+    16	    relation, so the abstraction is sound: proving the abstraction safe proves
+    17	    the concrete system safe.
+    18	
+    19	Refinement
+    20	    A counterexample of the abstraction is replayed against the *concrete*
+    21	    system by :class:`CEXValidator`.  If it survives, it is a real bug.  If it
+    22	    does not, :class:`PredicateRefiner` interpolates along the infeasible path
+    23	    to discover new predicates, and the loop restores the dropped conjunct the
+    24	    trace violated.  Since there are finitely many conjuncts and each spurious
+    25	    trace violates at least one dropped one, the loop always terminates: in the
+    26	    worst case the abstraction becomes the concrete system, which admits no
+    27	    spurious counterexample at all.
+    28	
+    29	Interpolation
+    30	    This Z3 build exposes no interpolation API, so Craig interpolants are
+    31	    computed here from first principles.  For a split of an infeasible path
+    32	    into a prefix ``A`` and a suffix ``B``, the interpolant is the image of
+    33	    ``A`` on the shared step variables, obtained by eliminating the variables
+    34	    local to ``A`` with the ``qe`` tactic.  Every candidate is checked --
+    35	    ``A -> I`` valid and ``I and B`` unsatisfiable -- before it is accepted.
+    36	
+    37	Calling convention
+    38	    ``init_cond(state)``, ``trans_rel(state, next_state)`` and
+    39	    ``safety(state)`` all take dictionaries mapping a program variable name to
+    40	    the z3 integer constant standing for it, and return a ``BoolRef``.
+    41	"""
+    42	
+    43	import z3
+    44	
+    45	__all__ = [
+    46	    "State",
+    47	    "Transition",
+    48	    "Counterexample",
+    49	    "ValidationResult",
+    50	    "CEXValidator",
+    51	    "AbstractDomain",
+    52	    "PredicateRefiner",
+    53	    "SystemAbstraction",
+    54	    "CEGARResult",
+    55	    "CEGARLoop",
+    56	    "collect_var_names",
+    57	    "build_trace",
+    58	]
+    59	
+    60	#: Longest unrolling :func:`build_trace` will consider before giving up.
+    61	MAX_HORIZON = 96
+    62	
+    63	#: Node budget above which an accumulated path summary is replaced by the
+    64	#: concrete state it describes.  Keeping the exact image of a long disjunctive
+    65	#: path is what makes naive interpolation blow up; see
+    66	#: :meth:`PredicateRefiner.extract_interpolants`.
+    67	SUMMARY_NODE_BUDGET = 400
+    68	
+    69	
+    70	# --------------------------------------------------------------------------
+    71	# Counterexample traces
+    72	# --------------------------------------------------------------------------
+    73	
+    74	
+    75	class State(object):
+    76	    """A concrete state: a mapping from variable name to integer value."""
+    77	
+    78	    def __init__(self, values):
+    79	        self.values = dict(values)
+    80	
+    81	    @property
+    82	    def variables(self):
+    83	        """The variable names of this state, in a stable order."""
+    84	        return sorted(self.values)
+    85	
+    86	    def get(self, name, default=None):
+    87	        """Return the value of `name`, or `default` when it is not present."""
+    88	        return self.values.get(name, default)
+    89	
+    90	    def __getitem__(self, name):
+    91	        return self.values[name]
+    92	
+    93	    def __contains__(self, name):
+    94	        return name in self.values
+    95	
+    96	    def __eq__(self, other):
+    97	        return isinstance(other, State) and self.values == other.values
+    98	
+    99	    def __ne__(self, other):
+   100	        return not self.__eq__(other)
+   101	
+   102	    def __hash__(self):
+   103	        return hash(tuple(sorted(self.values.items())))
+   104	
+   105	    def __repr__(self):
+   106	        body = ", ".join("%s=%s" % (name, self.values[name])
+   107	                         for name in self.variables)
+   108	        return "State(%s)" % body
+   109	
+   110	
+   111	class Transition(object):
+   112	    """A single step from `src` to `dst`, labelled with the `action` taken."""
+   113	
+   114	    def __init__(self, src, dst, action="step"):
+   115	        self.src = src
+   116	        self.dst = dst
+   117	        self.action = action
+   118	
+   119	    def is_stutter(self):
+   120	        """True when the step leaves every variable unchanged."""
+   121	        return self.src == self.dst
+   122	
+   123	    def __repr__(self):
+   124	        return "Transition(%r -> %r, %s)" % (self.src, self.dst, self.action)
+   125	
+   126	
+   127	class Counterexample(object):
+   128	    """A finite execution trace, given as the list of its transitions."""
+   129	
+   130	    def __init__(self, transitions):
+   131	        self.transitions = list(transitions)
+   132	
+   133	    @property
+   134	    def length(self):
+   135	        """The number of transitions in the trace."""
+   136	        return len(self.transitions)
+   137	
+   138	    @property
+   139	    def states(self):
+   140	        """Every state the trace visits, from the source of the first step."""
+   141	        if not self.transitions:
+   142	            return []
+   143	        return ([self.transitions[0].src]
+   144	                + [step.dst for step in self.transitions])
+   145	
+   146	    def get_variable_trace(self, var_name):
+   147	        """Return the values `var_name` takes across all states of the trace."""
+   148	        return [state.get(var_name) for state in self.states]
+   149	
+   150	    def discontinuity(self):
+   151	        """Index of the first step that does not start where the last ended.
+   152	
+   153	        :attr:`states` reads the trace as one continuous walk -- it takes the
+   154	        source of the first step and the target of every step after it -- so the
+   155	        source states of the later steps never appear in it.  A trace that fails
+   156	        this check is therefore one whose reported states are not the states its
+   157	        transitions actually relate, and it is not an execution of anything.
+   158	
+   159	        Returns:
+   160	            int or None: The index of the first disconnected step, or ``None``
+   161	            when the trace is a genuine walk.
+   162	        """
+   163	        for index in range(1, len(self.transitions)):
+   164	            if self.transitions[index - 1].dst != self.transitions[index].src:
+   165	                return index
+   166	        return None
+   167	
+   168	    def is_connected(self):
+   169	        """True when every step starts where the previous one ended."""
+   170	        return self.discontinuity() is None
+   171	
+   172	    def __len__(self):
+   173	        return len(self.transitions)
+   174	
+   175	    def __repr__(self):
+   176	        return "Counterexample(length=%d, %r)" % (self.length, self.states)
+   177	
+   178	
+   179	# --------------------------------------------------------------------------
+   180	# Small z3 helpers
+   181	# --------------------------------------------------------------------------
+   182	
+   183	
+   184	def _conjuncts(expr):
+   185	    """Split a (possibly nested) conjunction into its top level conjuncts."""
+   186	    if z3.is_and(expr):
+   187	        return [part for child in expr.children() for part in _conjuncts(child)]
+   188	    return [expr]
+   189	
+   190	
+   191	#: Declaration kinds that combine boolean subterms rather than being atoms.
+   192	_CONNECTIVE_KINDS = frozenset(
+   193	    kind for kind in (getattr(z3, name, None) for name in
+   194	                      ("Z3_OP_AND", "Z3_OP_OR", "Z3_OP_NOT", "Z3_OP_IMPLIES",
+   195	                       "Z3_OP_XOR", "Z3_OP_ITE", "Z3_OP_IFF"))
+   196	    if kind is not None)
+   197	
+   198	
+   199	def _is_connective(expr):
+   200	    """True when `expr` is a boolean operator whose children hold the atoms."""
+   201	    if not z3.is_app(expr):
+   202	        return False
+   203	    kind = expr.decl().kind()
+   204	    if kind == z3.Z3_OP_EQ:
+   205	        # An equality between booleans is an iff, not an atom.
+   206	        return all(z3.is_bool(child) for child in expr.children())
+   207	    return kind in _CONNECTIVE_KINDS
+   208	
+   209	
+   210	def _atoms(expr, found=None):
+   211	    """Collect the atomic boolean subterms of `expr` (comparisons, literals)."""
+   212	    found = [] if found is None else found
+   213	    if not z3.is_bool(expr):
+   214	        return found
+   215	    if _is_connective(expr):
+   216	        for child in expr.children():
+   217	            _atoms(child, found)
+   218	    elif not (z3.is_true(expr) or z3.is_false(expr)):
+   219	        if not any(expr.eq(seen) for seen in found):
+   220	            found.append(expr)
+   221	    return found
+   222	
+   223	
+   224	def _size(expr, budget=None):
+   225	    """Count the nodes of `expr`, stopping early once `budget` is exceeded."""
+   226	    seen = set()
+   227	    stack = [expr]
+   228	    total = 0
+   229	    while stack:
+   230	        node = stack.pop()
+   231	        key = node.get_id()
+   232	        if key in seen:
+   233	            continue
+   234	        seen.add(key)
+   235	        total += 1
+   236	        if budget is not None and total > budget:
+   237	            return total
+   238	        if z3.is_app(node):
+   239	            stack.extend(node.children())
+   240	    return total
+   241	
+   242	
+   243	def _is_trivial(expr):
+   244	    """True when `expr` simplifies to a constant and so carries no information."""
+   245	    try:
+   246	        simplified = z3.simplify(expr)
+   247	    except z3.Z3Exception:
+   248	        return True
+   249	    return z3.is_true(simplified) or z3.is_false(simplified)
+   250	
+   251	
+   252	def _valid(formula):
+   253	    """True when `formula` holds for every assignment."""
+   254	    solver = z3.Solver()
+   255	    solver.add(z3.Not(formula))
+   256	    return solver.check() == z3.unsat
+   257	
+   258	
+   259	def _satisfiable(*formulas):
+   260	    """True when the conjunction of `formulas` has a model."""
+   261	    solver = z3.Solver()
+   262	    solver.add(*formulas)
+   263	    return solver.check() == z3.sat
+   264	
+   265	
+   266	class _NameCollector(dict):
+   267	    """A variable environment that mints a fresh ``Int`` for every lookup.
+   268	
+   269	    Passing one of these to a system's ``init``/``trans``/``safety`` callables
+   270	    records exactly which program variables they mention, so a caller does not
+   271	    have to spell the variable list out twice.
+   272	    """
+   273	
+   274	    def __missing__(self, key):
+   275	        value = z3.Int(key)
+   276	        self[key] = value
+   277	        return value
+   278	
+   279	
+   280	def collect_var_names(init_cond, trans_rel, safety):
+   281	    """Return the sorted variable names mentioned by a transition system."""
+   282	    names = set()
+   283	    for build in (lambda: init_cond(_probe(names)),
+   284	                  lambda: trans_rel(_probe(names), _probe(names)),
+   285	                  lambda: safety(_probe(names))):
+   286	        try:
+   287	            build()
+   288	        except Exception:
+   289	            continue
+   290	    return sorted(names)
+   291	
+   292	
+   293	def _probe(sink):
+   294	    """Return a collector that records every name it is asked for in `sink`."""
+   295	
+   296	    class _Sink(_NameCollector):
+   297	        def __missing__(self, key):
+   298	            sink.add(key)
+   299	            return _NameCollector.__missing__(self, key)
+   300	
+   301	    return _Sink()
+   302	
+   303	
+   304	def _env(names, suffix=""):
+   305	    """Return ``{name: Int(name + suffix)}`` for every name in `names`."""
+   306	    return {name: z3.Int(name + suffix) for name in names}
+   307	
+   308	
+   309	def _bind(env, state):
+   310	    """Return the equalities pinning the variables of `env` to `state`."""
+   311	    return [env[name] == z3.IntVal(int(value))
+   312	            for name, value in state.values.items() if name in env]
+   313	
+   314	
+   315	def _read_state(model, env):
+   316	    """Read the values `model` assigns to the variables of `env`."""
+   317	    values = {}
+   318	    for name, const in env.items():
+   319	        value = model.eval(const, model_completion=True)
+   320	        values[name] = value.as_long() if hasattr(value, "as_long") else 0
+   321	    return State(values)
+   322	
+   323	
+   324	# --------------------------------------------------------------------------
+   325	# Validation
+   326	# --------------------------------------------------------------------------
+   327	
+   328	
+   329	class ValidationResult(object):
+   330	    """Outcome of replaying a counterexample against the concrete system.
+   331	
+   332	    Attributes:
+   333	        is_real: True only when the initial state satisfies the initial
+   334	            condition, every step satisfies the transition relation and the
+   335	            final state violates the safety property.
+   336	        first_spurious_step: ``None`` when the trace is real, otherwise the
+   337	            index of the step at which the replay failed: ``0`` when the
+   338	            initial state is not an initial state, ``i`` for the first
+   339	            infeasible or disconnected transition, and ``len(transitions)``
+   340	            when the trace does not actually end in a bad state.  Several of
+   341	            those readings collide, so `stage` says which check failed.
+   342	        stage: ``"init"``, ``"transition"``, ``"safety"``, ``"continuity"``,
+   343	            ``"incomplete"`` or ``"empty"`` -- ``None`` when the trace is real.
+   344	        reason: Human readable explanation, ``None`` when the trace is real.
+   345	    """
+   346	
+   347	    def __init__(self, is_real, first_spurious_step=None, reason=None,
+   348	                 stage=None):
+   349	        self.is_real = bool(is_real)
+   350	        self.first_spurious_step = first_spurious_step
+   351	        self.stage = stage
+   352	        self.reason = reason
+   353	
+   354	    @property
+   355	    def broken_transition(self):
+   356	        """Index of the infeasible transition, or ``None`` if that is not why.
+   357	
+   358	        Guards against reading a `first_spurious_step` of ``0`` that came from
+   359	        the initial-state check as if transition ``0`` were the culprit.
+   360	        """
+   361	        if self.stage == "transition":
+   362	            return self.first_spurious_step
+   363	        return None
+   364	
+   365	    def __repr__(self):
+   366	        if self.is_real:
+   367	            return "ValidationResult(real)"
+   368	        return "ValidationResult(spurious at %s %r: %s)" % (
+   369	            self.stage, self.first_spurious_step, self.reason)
+   370	
+   371	
+   372	class CEXValidator(object):
+   373	    """Replay a counterexample step by step against a concrete system."""
+   374	
+   375	    def __init__(self, var_names=None):
+   376	        self.var_names = list(var_names) if var_names else None
+   377	
+   378	    def _names(self, cex, *system):
+   379	        """The variables to reason about.
+   380	
+   381	        The declared ones when the validator was given a list.  Otherwise the
+   382	        ones the trace mentions, widened by the variables `system` -- the
+   383	        ``init``/``trans``/``safety`` callables -- turns out to use, so that a
+   384	        trace which happens not to mention every variable still produces a
+   385	        complete environment to evaluate them in rather than a ``KeyError``.
+   386	        """
+   387	        if self.var_names:
+   388	            return list(self.var_names)
+   389	        names = set()
+   390	        for state in cex.states:
+   391	            names.update(state.values)
+   392	        if system:
+   393	            names.update(collect_var_names(*system))
+   394	        return sorted(names)
+   395	
+   396	    def validate(self, cex, init_cond, trans_rel, safety):
+   397	        """Check whether `cex` is a real execution of the concrete system.
+   398	
+   399	        Every check is a separate SMT query over the concrete values of the
+   400	        trace, so a failure pinpoints the exact step at which the trace stops
+   401	        being executable.  Because every variable is pinned to an integer the
+   402	        queries are ground, so satisfiability and entailment coincide and a
+   403	        single ``sat`` call settles each step.
+   404	
+   405	        Two structural checks come first.  The trace must be a genuine walk --
+   406	        each step starting where the previous one ended -- because
+   407	        :attr:`Counterexample.states` presents it as one and the later steps'
+   408	        source states are otherwise invisible.  And every state must assign
+   409	        every variable: a trace that leaves one free cannot be replayed
+   410	        *concretely*, and treating the free variable as "anything at all" would
+   411	        let an infeasible path pass as a real bug.
+   412	
+   413	        Args:
+   414	            cex: The :class:`Counterexample` to replay.
+   415	            init_cond: ``init_cond(state_env)`` -> BoolRef.
+   416	            trans_rel: ``trans_rel(state_env, next_state_env)`` -> BoolRef.
+   417	            safety: ``safety(state_env)`` -> BoolRef.
+   418	
+   419	        Returns:
+   420	            ValidationResult: see that class for the meaning of the fields.
+   421	        """
+   422	        states = cex.states
+   423	        if not states:
+   424	            return ValidationResult(False, 0, "the trace is empty", "empty")
+   425	
+   426	        disconnected = cex.discontinuity()
+   427	        if disconnected is not None:
+   428	            return ValidationResult(
+   429	                False, disconnected,
+   430	                "step %d starts at %r, but step %d ended at %r"
+   431	                % (disconnected, cex.transitions[disconnected].src,
+   432	                   disconnected - 1, cex.transitions[disconnected - 1].dst),
+   433	                "continuity")
+   434	
+   435	        names = self._names(cex, init_cond, trans_rel, safety)
+   436	        for index, state in enumerate(states):
+   437	            missing = [name for name in names if name not in state]
+   438	            if missing:
+   439	                return ValidationResult(
+   440	                    False, index,
+   441	                    "state %d leaves %s unassigned, so the trace cannot be "
+   442	                    "replayed concretely" % (index, ", ".join(missing)),
+   443	                    "incomplete")
+   444	
+   445	        current = _env(names)
+   446	        following = _env(names, "!next")
+   447	
+   448	        if not _satisfiable(init_cond(current), *_bind(current, states[0])):
+   449	            return ValidationResult(
+   450	                False, 0,
+   451	                "the first state does not satisfy the initial condition", "init")
+   452	
+   453	        for index, step in enumerate(cex.transitions):
+   454	            if not _satisfiable(trans_rel(current, following),
+   455	                                *(_bind(current, step.src)
+   456	                                  + _bind(following, step.dst))):
+   457	                return ValidationResult(
+   458	                    False, index,
+   459	                    "transition %d is not allowed by the transition relation"
+   460	                    % index, "transition")
+   461	
+   462	        if not _satisfiable(z3.Not(safety(current)), *_bind(current, states[-1])):
+   463	            return ValidationResult(
+   464	                False, len(cex.transitions),
+   465	                "the final state does not violate the safety property", "safety")
+   466	
+   467	        return ValidationResult(True, None, None, None)
+   468	
+   469	
+   470	# --------------------------------------------------------------------------
+   471	# Predicate abstraction state
+   472	# --------------------------------------------------------------------------
+   473	
+   474	
+   475	class AbstractDomain(object):
+   476	    """The set of predicates currently tracked by the abstraction.
+   477	
+   478	    The set is kept irredundant: a predicate that is already implied by one of
+   479	    the predicates present adds nothing and is rejected, and a predicate that
+   480	    implies an existing one makes that one redundant and replaces it.
+   481	    """
+   482	
+   483	    def __init__(self, predicates=None):
+   484	        self.predicates = []
+   485	        #: Bumped on every change, so callers can cache work derived from the
+   486	        #: predicate set and notice when it goes stale.
+   487	        self.revision = 0
+   488	        #: How many predicates were ever admitted.  Unlike ``len(predicates)``
+   489	        #: this does not shrink when a stronger predicate evicts a weaker one,
+   490	        #: so it is the honest count of what the abstraction discovered.
+   491	        self.added = 0
+   492	        for predicate in predicates or []:
+   493	            self.add_predicate(predicate)
+   494	
+   495	    @property
+   496	    def predicate_count(self):
+   497	        """The number of predicates currently tracked."""
+   498	        return len(self.predicates)
+   499	
+   500	    def abstract_state(self, concrete_state):
+   501	        """Evaluate every predicate on `concrete_state`.
+   502	
+   503	        Args:
+   504	            concrete_state: A :class:`State` or a plain ``{name: value}`` dict.
+   505	
+   506	        Returns:
+   507	            tuple: One boolean per predicate, in :attr:`predicates` order.  A
+   508	            predicate that does not evaluate to a constant -- because the state
+   509	            leaves one of its variables unassigned -- counts as ``False``.
+   510	        """
+   511	        values = (concrete_state.values if isinstance(concrete_state, State)
+   512	                  else dict(concrete_state))
+   513	        substitution = [(z3.Int(name), z3.IntVal(int(value)))
+   514	                        for name, value in values.items()]
+   515	        abstraction = []
+   516	        for predicate in self.predicates:
+   517	            try:
+   518	                evaluated = z3.simplify(z3.substitute(predicate, *substitution))
+   519	            except z3.Z3Exception:
+   520	                abstraction.append(False)
+   521	                continue
+   522	            abstraction.append(bool(z3.is_true(evaluated)))
+   523	        return tuple(abstraction)
+   524	
+   525	    def is_subsumed(self, pred_new, pred_existing):
+   526	        """True when `pred_existing` implies `pred_new`, i.e. the new one adds nothing."""
+   527	        try:
+   528	            return _valid(z3.Implies(pred_existing, pred_new))
+   529	        except z3.Z3Exception:
+   530	            return False
+   531	
+   532	    def add_predicate(self, pred):
+   533	        """Track `pred` unless an existing predicate already implies it.
+   534	
+   535	        Any tracked predicate that `pred` implies becomes redundant and is
+   536	        dropped.
+   537	
+   538	        Returns:
+   539	            bool: Whether the predicate was added.
+   540	        """
+   541	        if pred is None or not z3.is_bool(pred) or _is_trivial(pred):
+   542	            return False
+   543	        try:
+   544	            pred = z3.simplify(pred)
+   545	        except z3.Z3Exception:
+   546	            return False
+   547	        if any(pred.eq(known) for known in self.predicates):
+   548	            return False
+   549	        if any(self.is_subsumed(pred, known) for known in self.predicates):
+   550	            return False
+   551	        self.predicates = [known for known in self.predicates
+   552	                           if not self.is_subsumed(known, pred)]
+   553	        self.predicates.append(pred)
+   554	        self.revision += 1
+   555	        self.added += 1
+   556	        return True
+   557	
+   558	    def preservation_constraints(self, trans_rel, current, following):
+   559	        """Return the ``p(x) -> p(x')`` constraints entailed by `trans_rel`.
+   560	
+   561	        Only the implications that genuinely follow from the concrete relation
+   562	        are returned, so conjoining them to an abstract transition relation
+   563	        keeps it an over-approximation.
+   564	        """
+   565	        constraints = []
+   566	        transition = trans_rel(current, following)
+   567	        for predicate in self.predicates:
+   568	            before = _rename(predicate, current)
+   569	            after = _rename(predicate, following)
+   570	            implication = z3.Implies(before, after)
+   571	            try:
+   572	                if _valid(z3.Implies(transition, implication)):
+   573	                    constraints.append(implication)
+   574	            except z3.Z3Exception:
+   575	                continue
+   576	        return constraints
+   577	
+   578	
+   579	def _rename(predicate, env):
+   580	    """Re-express `predicate`, written over plain names, in the `env` variables."""
+   581	    substitution = [(z3.Int(name), const) for name, const in env.items()]
+   582	    return z3.substitute(predicate, *substitution)
+   583	
+   584	
+   585	# --------------------------------------------------------------------------
+   586	# Refinement
+   587	# --------------------------------------------------------------------------
+   588	
+   589	
+   590	class PredicateRefiner(object):
+   591	    """Derive new predicates from an infeasible trace and shrink traces."""
+   592	
+   593	    def __init__(self, domain=None, init_cond=None, safety=None):
+   594	        self.domain = domain if domain is not None else AbstractDomain()
+   595	        self.init_cond = init_cond
+   596	        self.safety = safety
+   597	
+   598	    def extract_interpolants(self, cex, trans_rel, init_cond=None):
+   599	        """Compute Craig interpolants along the infeasible path of `cex`.
+   600	
+   601	        The path is unrolled over one copy of the program variables per step and
+   602	        two families of interpolation queries are posed.
+   603	
+   604	        *Path queries* confront the prefix
+   605	
+   606	            ``A = init(x0) and trans(x0, x1) and ... and trans(x(k-1), xk)``
+   607	
+   608	        with the suffix ``B``, which pins step ``k`` to the state the trace
+   609	        claims to be in.  Rather than re-eliminating the whole prefix at every
+   610	        split -- which costs one quantifier per step and one copy of the
+   611	        transition relation per step, and is what makes naive path
+   612	        interpolation blow up on a disjunctive relation -- the prefix is carried
+   613	        along as a *summary*: a formula over the variables of the latest step
+   614	        only.  Each split extends the summary by a single transition and
+   615	        projects the result back onto the next step, so every elimination sees
+   616	        exactly one transition copy and one step's worth of variables.  The walk
+   617	        stops at the first split where the trace turns out to be infeasible,
+   618	        which is the split that explains why it is spurious.
+   619	
+   620	        *Pairwise queries* interpolate each consecutive pair of states on its
+   621	        own -- ``A = (x = s_i) and trans(x, x')`` against ``B = (x' = s_(i+1))``
+   622	        -- which also covers the steps beyond the first infeasible one.
+   623	
+   624	        Every candidate is verified (``A -> I`` valid and ``I and B``
+   625	        unsatisfiable) before it is split into its atoms, which are the
+   626	        predicates the abstraction can use.
+   627	
+   628	        Args:
+   629	            cex: The spurious :class:`Counterexample`.
+   630	            trans_rel: ``trans_rel(state_env, next_state_env)`` -> BoolRef.
+   631	            init_cond: Optional initial condition; defaults to the one the
+   632	                refiner was constructed with, and to ``True`` if there is none.
+   633	
+   634	        Returns:
+   635	            list: The z3 predicates discovered, over plain variable names.
+   636	        """
+   637	        init_cond = init_cond if init_cond is not None else self.init_cond
+   638	        states = cex.states
+   639	        if len(states) < 2:
+   640	            return []
+   641	
+   642	        names = sorted({name for state in states for name in state.values})
+   643	        steps = [_env(names, "@%d" % index) for index in range(len(states))]
+   644	        interpolants = []
+   645	
+   646	        def collect(candidate, env):
+   647	            """Record the atoms of `candidate`, rewritten over plain names."""
+   648	            for atom in _atoms(_plain(candidate, env, names)):
+   649	                if _is_trivial(atom):
+   650	                    continue
+   651	                if not any(atom.eq(seen) for seen in interpolants):
+   652	                    interpolants.append(atom)
+   653	
+   654	        self._walk_path(states, steps, trans_rel, init_cond, names, collect)
+   655	        self._walk_pairs(states, steps, trans_rel, names, collect)
+   656	        return interpolants
+   657	
+   658	    def _walk_path(self, states, steps, trans_rel, init_cond, names, collect):
+   659	        """Interpolate prefix against suffix, stopping at the first dead split."""
+   660	        summary = list(_bind(steps[0], states[0]))
+   661	        if init_cond is not None:
+   662	            summary.append(init_cond(steps[0]))
+   663	        summary = z3.And(*summary) if summary else z3.BoolVal(True)
+   664	
+   665	        for split in range(1, len(states)):
+   666	            local, shared = steps[split - 1], steps[split]
+   667	            formula_a = z3.And(summary, trans_rel(local, shared))
+   668	            suffix = _bind(shared, states[split])
+   669	            if not suffix:
+   670	                return
+   671	            formula_b = z3.And(*suffix)
+   672	
+   673	            if not _satisfiable(formula_a, formula_b):
+   674	                candidate = self._interpolate(formula_a, formula_b, local)
+   675	                if candidate is not None:
+   676	                    collect(candidate, shared)
+   677	                return  # the path is dead from here on
+   678	
+   679	            # The trace is executable up to this step, so `states[split]` is a
+   680	            # genuinely reachable state: standing in for the prefix by that one
+   681	            # state keeps the summary honest, and keeps the next elimination
+   682	            # small when the exact image has grown unwieldy.
+   683	            image = self._image(formula_a, local)
+   684	            if image is None or _size(image, SUMMARY_NODE_BUDGET) > SUMMARY_NODE_BUDGET:
+   685	                summary = formula_b
+   686	            else:
+   687	                summary = image
+   688	
+   689	    def _walk_pairs(self, states, steps, trans_rel, names, collect):
+   690	        """Interpolate every consecutive pair of states independently."""
+   691	        for index in range(len(states) - 1):
+   692	            local, shared = steps[index], steps[index + 1]
+   693	            suffix = _bind(shared, states[index + 1])
+   694	            if not suffix:
+   695	                continue
+   696	            formula_a = z3.And(*(_bind(local, states[index])
+   697	                                 + [trans_rel(local, shared)]))
+   698	            formula_b = z3.And(*suffix)
+   699	            if _satisfiable(formula_a, formula_b):
+   700	                continue
+   701	            candidate = self._interpolate(formula_a, formula_b, local)
+   702	            if candidate is not None:
+   703	                collect(candidate, shared)
+   704	
+   705	    def _image(self, formula, local_env):
+   706	        """Project `formula` onto everything but the variables of `local_env`.
+   707	
+   708	        The variables local to the prefix are existentially quantified and
+   709	        eliminated with the ``qe`` tactic, leaving a formula over the shared
+   710	        step variables.  ``None`` is returned when the projection cannot be
+   711	        computed or carries no information.
+   712	        """
+   713	        local = list(local_env.values())
+   714	        try:
+   715	            goal = z3.Goal()
+   716	            goal.add(z3.Exists(local, formula) if local else formula)
+   717	            projected = z3.simplify(z3.Tactic("qe")(goal).as_expr())
+   718	        except z3.Z3Exception:
+   719	            return None
+   720	        if _is_trivial(projected):
+   721	            return None
+   722	        return projected
+   723	
+   724	    def _interpolate(self, formula_a, formula_b, local_env):
+   725	        """Return a verified interpolant for unsatisfiable ``formula_a and formula_b``.
+   726	
+   727	        The candidate is the image of `formula_a` on the variables it shares
+   728	        with `formula_b`.  ``None`` is returned unless it passes both halves of
+   729	        the interpolant definition, so a projection weakened by an incomplete
+   730	        elimination is rejected rather than believed.
+   731	        """
+   732	        candidate = self._image(formula_a, local_env)
+   733	        if candidate is None:
+   734	            return None
+   735	        if not _valid(z3.Implies(formula_a, candidate)):
+   736	            return None
+   737	        if _satisfiable(candidate, formula_b):
+   738	            return None
+   739	        return candidate
+   740	
+   741	    def strengthen_invariant(self, current_preds, new_interpolants):
+   742	        """Merge `new_interpolants` into `current_preds`, dropping redundancy.
+   743	
+   744	        Returns:
+   745	            list: The merged predicate set; predicates implied by another
+   746	            member of the set are left out.
+   747	        """
+   748	        merged = AbstractDomain(current_preds)
+   749	        for predicate in new_interpolants:
+   750	            merged.add_predicate(predicate)
+   751	        return list(merged.predicates)
+   752	
+   753	    def minimize_cex(self, cex, trans_rel, safety=None, init_cond=None):
+   754	        """Return the shortest trace reachable from `cex` by dropping steps.
+   755	
+   756	        Five reductions are applied, the first two once and the rest until none
+   757	        of them fires again:
+   758	
+   759	        * the trace is cut at the *first* state that violates safety -- what
+   760	          makes a counterexample a counterexample is that it reaches a bad
+   761	          state, so every step after the first one is dead weight;
+   762	        * symmetrically, if a later state is also an initial state the trace may
+   763	          simply start there;
+   764	        * a step that changes nothing is dropped;
+   765	        * a state the trace visits twice makes the loop between the two visits
+   766	          redundant, so it is cut out;
+   767	        * whenever the transition relation permits a direct jump from state
+   768	          ``i`` to a later state ``j``, the steps in between are spliced out.
+   769	
+   770	        Every reduction keeps the remaining steps executable, keeps the first
+   771	        state initial and the last state bad, and never lengthens the trace, so
+   772	        the result is a valid counterexample of the same system.  None of them
+   773	        empties a non-empty trace either: the safety cut never considers state
+   774	        ``0`` and the loop cut declines to leave a lone state behind, so a
+   775	        trace that went in as a counterexample comes out as one.
+   776	
+   777	        Args:
+   778	            cex: The trace to shrink.
+   779	            trans_rel: ``trans_rel(state_env, next_state_env)`` -> BoolRef.
+   780	            safety: Optional safety property, needed for the truncation step;
+   781	                defaults to the one the refiner was constructed with.  Without
+   782	                it the trace keeps its final state.
+   783	            init_cond: Optional initial condition, likewise needed only for the
+   784	                prefix step.
+   785	
+   786	        Returns:
+   787	            Counterexample: The shrunk trace, never longer than `cex`.
+   788	        """
+   789	        safety = safety if safety is not None else self.safety
+   790	        init_cond = init_cond if init_cond is not None else self.init_cond
+   791	        states = cex.states
+   792	        if len(states) < 2:
+   793	            return Counterexample(list(cex.transitions))
+   794	
+   795	        names = sorted({name for state in states for name in state.values})
+   796	        probe = _env(names)
+   797	        current = _env(names)
+   798	        following = _env(names, "!next")
+   799	        transition = trans_rel(current, following)
+   800	
+   801	        def jumps(src, dst):
+   802	            return _satisfiable(transition,
+   803	                                *(_bind(current, src) + _bind(following, dst)))
+   804	
+   805	        actions = [step.action for step in cex.transitions]
+   806	
+   807	        # Cut everything after the first violation of the safety property.
+   808	        if safety is not None:
+   809	            violated = z3.Not(safety(probe))
+   810	            for index in range(1, len(states)):
+   811	                if _satisfiable(violated, *_bind(probe, states[index])):
+   812	                    del states[index + 1:]
+   813	                    del actions[index:]
+   814	                    break
+   815	
+   816	        # Start from the last state that is still an initial state.
+   817	        if init_cond is not None and len(states) > 2:
+   818	            entry = init_cond(probe)
+   819	            start = 0
+   820	            for index in range(len(states) - 1):
+   821	                if _satisfiable(entry, *_bind(probe, states[index])):
+   822	                    start = index
+   823	            if start:
+   824	                del states[:start]
+   825	                del actions[:start]
+   826	
+   827	        changed = True
+   828	        while changed and len(states) > 2:
+   829	            changed = False
+   830	            # Drop stuttering steps.
+   831	            for index in range(len(states) - 1):
+   832	                if states[index] == states[index + 1]:
+   833	                    del states[index + 1]
+   834	                    del actions[index]
+   835	                    changed = True
+   836	                    break
+   837	            if changed:
+   838	                continue
+   839	            # Cut out loops: the trace returns to a state it already visited.
+   840	            # A cut that would leave a single state behind is skipped.  Such a
+   841	            # cut is only ever possible when the *initial* state is the one
+   842	            # revisited, i.e. when it is itself bad; a trace records
+   843	            # transitions, so one state cannot express "this state is both
+   844	            # initial and bad" and the result would stop validating as a
+   845	            # counterexample at all.  Keeping the loop is the honest answer.
+   846	            for start in range(len(states)):
+   847	                repeat = next((other for other in range(len(states) - 1, start, -1)
+   848	                               if states[other] == states[start]
+   849	                               and len(states) - (other - start) >= 2), None)
+   850	                if repeat is not None:
+   851	                    del states[start + 1:repeat + 1]
+   852	                    del actions[start:repeat]
+   853	                    changed = True
+   854	                    break
+   855	            if changed:
+   856	                continue
+   857	            # Splice out the steps a single transition can jump over.
+   858	            for start in range(len(states) - 2):
+   859	                target = next((other for other in range(len(states) - 1, start + 1, -1)
+   860	                               if jumps(states[start], states[other])), None)
+   861	                if target is not None:
+   862	                    del states[start + 1:target]
+   863	                    del actions[start + 1:target]
+   864	                    changed = True
+   865	                    break
+   866	
+   867	        transitions = [Transition(states[index], states[index + 1],
+   868	                                  actions[index] if index < len(actions) else "step")
+   869	                       for index in range(len(states) - 1)]
+   870	        return Counterexample(transitions)
+   871	
+   872	
+   873	def _plain(expr, env, names):
+   874	    """Rewrite `expr`, written over the variables of `env`, over plain names."""
+   875	    substitution = [(env[name], z3.Int(name)) for name in names if name in env]
+   876	    try:
+   877	        return z3.simplify(z3.substitute(expr, *substitution))
+   878	    except z3.Z3Exception:
+   879	        return expr
+   880	
+   881	
+   882	# --------------------------------------------------------------------------
+   883	# Abstraction of a transition system
+   884	# --------------------------------------------------------------------------
+   885	
+   886	
+   887	class SystemAbstraction(object):
+   888	    """A sound over-approximation of a concrete transition system.
+   889	
+   890	    The transition relation is rebuilt from the conjuncts in :attr:`kept` --
+   891	    initially none, so the relation starts out as ``True`` -- conjoined with
+   892	    the preservation constraints the tracked predicates entail.  Both are
+   893	    implied by the concrete relation, so the abstraction only ever admits more
+   894	    behaviour than the real system.
+   895	
+   896	    Attributes:
+   897	        conjuncts: The top level conjuncts of the concrete transition relation,
+   898	            each rendered as a callable ``(state, next_state) -> BoolRef``.
+   899	        kept: Indices of the conjuncts currently part of the abstraction.
+   900	        domain: The :class:`AbstractDomain` supplying the predicates.
+   901	    """
+   902	
+   903	    def __init__(self, var_names, init_cond, trans_rel, safety, domain):
+   904	        self.var_names = list(var_names)
+   905	        self.init_cond = init_cond
+   906	        self.trans_rel = trans_rel
+   907	        self.safety = safety
+   908	        self.domain = domain
+   909	        self.kept = set()
+   910	        self.conjuncts = self._split_transition()
+   911	        self._preservation_cache = []
+   912	        self._preservation_revision = None
+   913	
+   914	    def _preservation(self):
+   915	        """The preservation constraints entailed by the concrete relation.
+   916	
+   917	        Whether ``trans -> (p(x) -> p(x'))`` holds does not depend on which
+   918	        variables the constraint is later phrased in, so the entailment check
+   919	        runs once per change to the predicate set and the survivors are
+   920	        re-instantiated by substitution.  Without the cache the check would be
+   921	        repeated for every step of every unrolling.
+   922	        """
+   923	        if self._preservation_revision == self.domain.revision:
+   924	            return self._preservation_cache
+   925	        current = _env(self.var_names, "!pc")
+   926	        following = _env(self.var_names, "!pn")
+   927	        transition = self.trans_rel(current, following)
+   928	        preserved = []
+   929	        for predicate in self.domain.predicates:
+   930	            implication = z3.Implies(_rename(predicate, current),
+   931	                                     _rename(predicate, following))
+   932	            try:
+   933	                if _valid(z3.Implies(transition, implication)):
+   934	                    preserved.append(_Conjunct(implication, current, following))
+   935	            except z3.Z3Exception:
+   936	                continue
+   937	        self._preservation_cache = preserved
+   938	        self._preservation_revision = self.domain.revision
+   939	        return preserved
+   940	
+   941	    def _split_transition(self):
+   942	        """Split the concrete transition relation into independent conjuncts."""
+   943	        current = _env(self.var_names, "!c")
+   944	        following = _env(self.var_names, "!n")
+   945	        parts = _conjuncts(self.trans_rel(current, following))
+   946	        conjuncts = []
+   947	        for part in parts:
+   948	            conjuncts.append(_Conjunct(part, current, following))
+   949	        return conjuncts
+   950	
+   951	    @property
+   952	    def is_concrete(self):
+   953	        """True once every conjunct has been restored."""
+   954	        return len(self.kept) == len(self.conjuncts)
+   955	
+   956	    def abstract_trans(self):
+   957	        """Return the abstract transition relation as a callable."""
+   958	
+   959	        def trans(state, following):
+   960	            parts = [self.conjuncts[index].instantiate(state, following)
+   961	                     for index in sorted(self.kept)]
+   962	            parts.extend(constraint.instantiate(state, following)
+   963	                         for constraint in self._preservation())
+   964	            return z3.And(*parts) if parts else z3.BoolVal(True)
+   965	
+   966	        return trans
+   967	
+   968	    def restore_violated(self, src, dst):
+   969	        """Restore the first dropped conjunct that the step `src` -> `dst` breaks.
+   970	
+   971	        Returns:
+   972	            int or None: The index restored, or ``None`` when the step already
+   973	            satisfies every dropped conjunct.
+   974	        """
+   975	        current = _env(self.var_names)
+   976	        following = _env(self.var_names, "!next")
+   977	        pinned = _bind(current, src) + _bind(following, dst)
+   978	        for index, conjunct in enumerate(self.conjuncts):
+   979	            if index in self.kept:
+   980	                continue
+   981	            if not _satisfiable(conjunct.instantiate(current, following), *pinned):
+   982	                self.kept.add(index)
+   983	                return index
+   984	        return None
+   985	
+   986	    def restore_any(self):
+   987	        """Restore an arbitrary dropped conjunct, to guarantee progress."""
+   988	        for index in range(len(self.conjuncts)):
+   989	            if index not in self.kept:
+   990	                self.kept.add(index)
+   991	                return index
+   992	        return None
+   993	
+   994	
+   995	class _Conjunct(object):
+   996	    """One conjunct of a transition relation, re-instantiable in any variables."""
+   997	
+   998	    def __init__(self, expr, current, following):
+   999	        self._expr = expr
+  1000	        self._current = current
+  1001	        self._following = following
+  1002	
+  1003	    def instantiate(self, state, following):
+  1004	        """Return this conjunct expressed over `state` and `following`."""
+  1005	        substitution = []
+  1006	        for name, const in self._current.items():
+  1007	            if name in state:
+  1008	                substitution.append((const, state[name]))
+  1009	        for name, const in self._following.items():
+  1010	            if name in following:
+  1011	                substitution.append((const, following[name]))
+  1012	        if not substitution:
+  1013	            return self._expr
+  1014	        return z3.substitute(self._expr, *substitution)
+  1015	
+  1016	    def __repr__(self):
+  1017	        return "_Conjunct(%s)" % self._expr
+  1018	
+  1019	
+  1020	# --------------------------------------------------------------------------
+  1021	# Bounded trace construction
+  1022	# --------------------------------------------------------------------------
+  1023	
+  1024	
+  1025	def build_trace(var_names, init_cond, trans_rel, safety, horizon,
+  1026	                max_horizon=MAX_HORIZON, actions=None):
+  1027	    """Find a trace that ends in a state violating `safety`, by unrolling.
+  1028	
+  1029	    The system is first unrolled to exactly `horizon` steps, so the witness is
+  1030	    deliberately *not* the shortest one -- shortening it is the job of
+  1031	    :meth:`PredicateRefiner.minimize_cex`, and a padded trace is what gives it
+  1032	    something to do.  When no violating path of that exact length exists the
+  1033	    horizon is doubled, and if that also fails every length up to `max_horizon`
+  1034	    is tried in turn: a system can easily admit a bad path of one length and
+  1035	    none of another, so a search over a few doubled depths alone would report
+  1036	    "no counterexample" for a system that plainly has one.
+  1037	
+  1038	    Args:
+  1039	        var_names: The program variables.
+  1040	        init_cond, trans_rel, safety: The system, in the usual convention.
+  1041	        horizon: Unrolling depth to start from.
+  1042	        max_horizon: Depth beyond which the search gives up.
+  1043	        actions: Optional ``{label: predicate}`` mapping used to label each
+  1044	            step; ``predicate(state, next_state)`` -> BoolRef.
+  1045	
+  1046	    Returns:
+  1047	        Counterexample or None: The witness, or ``None`` when no violating path
+  1048	        of any length up to `max_horizon` exists.
+  1049	    """
+  1050	    attempted = set()
+  1051	    depth = max(1, int(horizon))
+  1052	    depths = []
+  1053	    while depth <= max_horizon:
+  1054	        depths.append(depth)
+  1055	        depth *= 2
+  1056	    depths.extend(range(1, max_horizon + 1))
+  1057	
+  1058	    for depth in depths:
+  1059	        if depth in attempted:
+  1060	            continue
+  1061	        attempted.add(depth)
+  1062	        trace = _unroll(var_names, init_cond, trans_rel, safety, depth, actions)
+  1063	        if trace is not None:
+  1064	            return trace
+  1065	    return None
+  1066	
+  1067	
+  1068	def _unroll(var_names, init_cond, trans_rel, safety, depth, actions):
+  1069	    """Solve one bounded model checking query of exactly `depth` steps."""
+  1070	    steps = [_env(var_names, "@%d" % index) for index in range(depth + 1)]
+  1071	    solver = z3.Solver()
+  1072	    solver.add(init_cond(steps[0]))
+  1073	    for index in range(depth):
+  1074	        solver.add(trans_rel(steps[index], steps[index + 1]))
+  1075	    solver.add(z3.Not(safety(steps[depth])))
+  1076	    if solver.check() != z3.sat:
+  1077	        return None
+  1078	
+  1079	    model = solver.model()
+  1080	    states = [_read_state(model, env) for env in steps]
+  1081	    transitions = []
+  1082	    for index in range(depth):
+  1083	        label = _label_action(states[index], states[index + 1], var_names, actions)
+  1084	        transitions.append(Transition(states[index], states[index + 1], label))
+  1085	    return Counterexample(transitions)
+  1086	
+  1087	
+  1088	def _label_action(src, dst, var_names, actions):
+  1089	    """Name the action that explains the step `src` -> `dst`."""
+  1090	    if src == dst:
+  1091	        return "stutter"
+  1092	    if not actions:
+  1093	        return "step"
+  1094	    current = _env(var_names)
+  1095	    following = _env(var_names, "!next")
+  1096	    pinned = _bind(current, src) + _bind(following, dst)
+  1097	    for label, predicate in actions.items():
+  1098	        if _satisfiable(predicate(current, following), *pinned):
+  1099	            return label
+  1100	    return "step"
+  1101	
+  1102	
+  1103	# --------------------------------------------------------------------------
+  1104	# The CEGAR loop
+  1105	# --------------------------------------------------------------------------
+  1106	
+  1107	
+  1108	class CEGARResult(object):
+  1109	    """The verdict of a :class:`CEGARLoop` run.
+  1110	
+  1111	    Attributes:
+  1112	        safe: True when the system was proven safe.
+  1113	        iterations: How many refinement rounds the loop needed.
+  1114	        predicates: The predicates the abstraction ended up tracking.
+  1115	        cex: The minimized real counterexample, or ``None``.
+  1116	        original_cex: The counterexample before minimization, or ``None``.
+  1117	        discovered: The predicates derived from interpolation, i.e. those the
+  1118	            loop found rather than started with.
+  1119	        predicates_added: How many predicates were admitted into the
+  1120	            abstraction in total, seeded and interpolated alike.  Not the same
+  1121	            as ``len(predicates)``, which shrinks whenever a stronger predicate
+  1122	            subsumes one already present.
+  1123	        exhausted: True when the loop stopped on its iteration or predicate
+  1124	            budget instead of reaching a verdict.
+  1125	        reason: A short explanation of the verdict.
+  1126	    """
+  1127	
+  1128	    def __init__(self, safe, iterations, predicates, cex=None,
+  1129	                 original_cex=None, discovered=None, exhausted=False,
+  1130	                 reason=None, name=None, predicates_added=None):
+  1131	        self.safe = bool(safe)
+  1132	        self.iterations = int(iterations)
+  1133	        self.predicates = list(predicates)
+  1134	        self.cex = cex
+  1135	        self.original_cex = original_cex
+  1136	        self.discovered = list(discovered or [])
+  1137	        self.predicates_added = (len(self.predicates) if predicates_added is None
+  1138	                                 else int(predicates_added))
+  1139	        self.exhausted = bool(exhausted)
+  1140	        self.reason = reason
+  1141	        self.name = name
+  1142	
+  1143	    @property
+  1144	    def original_length(self):
+  1145	        """Length of the counterexample before minimization."""
+  1146	        return self.original_cex.length if self.original_cex else 0
+  1147	
+  1148	    @property
+  1149	    def minimized_length(self):
+  1150	        """Length of the counterexample after minimization."""
+  1151	        return self.cex.length if self.cex else 0
+  1152	
+  1153	    def __repr__(self):
+  1154	        verdict = "safe" if self.safe else ("exhausted" if self.exhausted
+  1155	                                            else "unsafe")
+  1156	        return "CEGARResult(%s, %s, iterations=%d, predicates=%d)" % (
+  1157	            self.name or "system", verdict, self.iterations,
+  1158	            len(self.predicates))
+  1159	
+  1160	
+  1161	class CEGARLoop(object):
+  1162	    """Counterexample-guided abstraction refinement for a transition system.
+  1163	
+  1164	    Each round verifies the current abstraction with Spacer, replays any
+  1165	    counterexample against the concrete system, and -- when the counterexample
+  1166	    turns out to be spurious -- interpolates along the infeasible path and
+  1167	    restores the transition conjunct the trace violated.
+  1168	    """
+  1169	
+  1170	    def __init__(self, init_cond, trans_rel, safety, max_iterations=20,
+  1171	                 predicate_budget=50, var_names=None, name=None, horizon=6,
+  1172	                 actions=None, seed_predicates=True):
+  1173	        self.init_cond = init_cond
+  1174	        self.trans_rel = trans_rel
+  1175	        self.safety = safety
+  1176	        self.max_iterations = int(max_iterations)
+  1177	        self.predicate_budget = int(predicate_budget)
+  1178	        self.name = name or "system"
+  1179	        self.horizon = int(horizon)
+  1180	        self.actions = actions
+  1181	        self.var_names = (list(var_names) if var_names
+  1182	                          else collect_var_names(init_cond, trans_rel, safety))
+  1183	
+  1184	        self.domain = AbstractDomain()
+  1185	        if seed_predicates:
+  1186	            # The safety property is the obvious starting abstraction: when it
+  1187	            # happens to be inductive the very first round already succeeds.
+  1188	            for atom in _atoms(safety(_env(self.var_names))):
+  1189	                self.domain.add_predicate(_plain(atom, _env(self.var_names),
+  1190	                                                 self.var_names))
+  1191	        self.seeded = list(self.domain.predicates)
+  1192	        self.refiner = PredicateRefiner(self.domain, init_cond, safety)
+  1193	        self.validator = CEXValidator(self.var_names)
+  1194	        self.abstraction = SystemAbstraction(self.var_names, init_cond,
+  1195	                                             trans_rel, safety, self.domain)
+  1196	        self.discovered = []
+  1197	
+  1198	    def _verify_abstraction(self):
+  1199	        """Ask Spacer whether the current abstraction is safe.
+  1200	
+  1201	        The Horn encoding lives in :mod:`spacer_verifier`; the import is lazy
+  1202	        so this module also works on its own, in which case an equivalent
+  1203	        Fixedpoint is built here.
+  1204	        """
+  1205	        trans = self.abstraction.abstract_trans()
+  1206	        sorts = [z3.IntSort()] * len(self.var_names)
+  1207	
+  1208	        def as_list(callable_on_dicts):
+  1209	            """Adapt a ``(env, ...)`` predicate to spacer's list convention."""
+  1210	            def wrapped(*vectors):
+  1211	                envs = [dict(zip(self.var_names, vector)) for vector in vectors]
+  1212	                return callable_on_dicts(*envs)
+  1213	            return wrapped
+  1214	
+  1215	        try:
+  1216	            from spacer_verifier import verify_transition_system
+  1217	        except ImportError:
+  1218	            return self._verify_inline(trans)
+  1219	        outcome = verify_transition_system(
+  1220	            self.name, sorts,
+  1221	            as_list(self.init_cond), as_list(trans), as_list(self.safety))
+  1222	        return outcome.get("safe", False), outcome.get("invariant")
+  1223	
+  1224	    def _verify_inline(self, trans):
+  1225	        """Fallback Horn encoding, used when :mod:`spacer_verifier` is absent."""
+  1226	        fp = z3.Fixedpoint()
+  1227	        fp.set(engine="spacer")
+  1228	        sorts = [z3.IntSort()] * len(self.var_names)
+  1229	        inv = z3.Function("Inv", *(sorts + [z3.BoolSort()]))
+  1230	        error = z3.Function("Error", z3.BoolSort())
+  1231	        fp.register_relation(inv, error)
+  1232	        current = _env(self.var_names)
+  1233	        following = _env(self.var_names, "!next")
+  1234	        order = [current[name] for name in self.var_names]
+  1235	        order_next = [following[name] for name in self.var_names]
+  1236	        fp.declare_var(*(order + order_next))
+  1237	        fp.rule(inv(*order), [self.init_cond(current)])
+  1238	        fp.rule(inv(*order_next), [inv(*order), trans(current, following)])
+  1239	        fp.rule(error(), [inv(*order), z3.Not(self.safety(current))])
+  1240	        try:
+  1241	            answer = fp.query(error())
+  1242	        except z3.Z3Exception:
+  1243	            return False, None
+  1244	        if answer == z3.unsat:
+  1245	            try:
+  1246	                return True, str(fp.get_answer())
+  1247	            except z3.Z3Exception:
+  1248	                return True, None
+  1249	        return False, None
+  1250	
+  1251	    def _result(self, safe, iterations, **kwargs):
+  1252	        """Build a :class:`CEGARResult` carrying this loop's bookkeeping."""
+  1253	        return CEGARResult(safe, iterations, self.domain.predicates,
+  1254	                           discovered=self.discovered, name=self.name,
+  1255	                           predicates_added=self.domain.added, **kwargs)
+  1256	
+  1257	    def run(self):
+  1258	        """Run the refinement loop to a verdict.
+  1259	
+  1260	        Returns:
+  1261	            CEGARResult: safe with the discovered predicates, unsafe with a
+  1262	            minimized real counterexample, or exhausted when a budget ran out.
+  1263	        """
+  1264	        iterations = 0
+  1265	        while iterations < self.max_iterations:
+  1266	            iterations += 1
+  1267	
+  1268	            safe, _invariant = self._verify_abstraction()
+  1269	            if safe:
+  1270	                return self._result(True, iterations,
+  1271	                                    reason="the abstraction is inductively safe")
+  1272	
+  1273	            cex = build_trace(self.var_names, self.init_cond,
+  1274	                              self.abstraction.abstract_trans(), self.safety,
+  1275	                              self.horizon, actions=self.actions)
+  1276	            if cex is None:
+  1277	                # Spacer disagrees with the bounded search: restore a conjunct
+  1278	                # to sharpen the abstraction and try again.
+  1279	                if self.abstraction.restore_any() is None:
+  1280	                    return self._result(
+  1281	                        False, iterations, exhausted=True,
+  1282	                        reason="no counterexample trace could be built")
+  1283	                continue
+  1284	
+  1285	            verdict = self.validator.validate(cex, self.init_cond,
+  1286	                                              self.trans_rel, self.safety)
+  1287	            if verdict.is_real:
+  1288	                minimized = self.refiner.minimize_cex(cex, self.trans_rel)
+  1289	                return self._result(False, iterations, cex=minimized,
+  1290	                                    original_cex=cex,
+  1291	                                    reason="a real counterexample was found")
+  1292	
+  1293	            self._refine(cex, verdict)
+  1294	            # The budget bounds the predicates refinement may spend, so it is
+  1295	            # checked against the running total of admissions as well as the
+  1296	            # size of the tracked set.  Subsumption pruning keeps that set
+  1297	            # small -- a stronger predicate evicts the one it replaces -- so
+  1298	            # watching the set alone would let the loop refine indefinitely
+  1299	            # without the budget ever noticing.
+  1300	            if (self.domain.predicate_count > self.predicate_budget
+  1301	                    or self.domain.added > self.predicate_budget):
+  1302	                return self._result(
+  1303	                    False, iterations, exhausted=True,
+  1304	                    reason="the predicate budget was exhausted")
+  1305	
+  1306	        return self._result(False, iterations, exhausted=True,
+  1307	                            reason="the iteration budget was exhausted")
+  1308	
+  1309	    def _refine(self, cex, verdict):
+  1310	        """Sharpen the abstraction so that `cex` is no longer a trace of it."""
+  1311	        for predicate in self.refiner.extract_interpolants(cex, self.trans_rel):
+  1312	            if self.domain.add_predicate(predicate):
+  1313	                self.discovered.append(predicate)
+  1314	
+  1315	        # New predicates alone do not guarantee progress -- an interpolant the
+  1316	        # relation does not preserve contributes no constraint at all -- so the
+  1317	        # conjunct the trace actually violated is restored as well.  That is
+  1318	        # what makes the loop terminate: there are finitely many conjuncts, and
+  1319	        # the concrete relation admits no spurious trace.
+  1320	        step = verdict.broken_transition
+  1321	        restored = None
+  1322	        if step is not None and 0 <= step < len(cex.transitions):
+  1323	            broken = cex.transitions[step]
+  1324	            restored = self.abstraction.restore_violated(broken.src, broken.dst)
+  1325	        if restored is None:
+  1326	            restored = self.abstraction.restore_any()
+  1327	        return restored

@@ -1,0 +1,1252 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..7a60b85
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,2 @@
++__pycache__/
++*.pyc
+diff --git a/agent_plans/plan.json b/agent_plans/plan.json
+new file mode 100644
+index 0000000..3356f41
+--- /dev/null
++++ b/agent_plans/plan.json
+@@ -0,0 +1,12 @@
++{
++  "nodes": [
++    {"id": "cpachecker_v0", "label": "CPA worklist algorithm + value analysis (LocationCPA, ExplicitValueCPA, CompositeCPA)", "layer": 0},
++    {"id": "cpachecker_v1", "label": "Predicate analysis: symbolic constraints, PathFeasibilityChecker, PredicateCPA", "layer": 1},
++    {"id": "cpachecker_v3", "label": "BMC + k-induction: loop detection, unrolling, invariant synthesis, witnesses", "layer": 2}
++  ],
++  "edges": [
++    {"from": "cpachecker_v0", "to": "cpachecker_v1"},
++    {"from": "cpachecker_v1", "to": "cpachecker_v3"},
++    {"from": "cpachecker_v0", "to": "cpachecker_v3"}
++  ]
++}
+diff --git a/agent_tests/test_value_analysis.py b/agent_tests/test_value_analysis.py
+new file mode 100644
+index 0000000..87abbde
+--- /dev/null
++++ b/agent_tests/test_value_analysis.py
+@@ -0,0 +1,188 @@
++"""Tests for cpachecker_v0: CPA worklist algorithm + explicit value analysis."""
++
++import os
++import sys
++import unittest
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from cpachecker.cfa import CFA, CFAEdge, CFANode, EdgeType
++from cpachecker.parser import parse_c_file
++from cpachecker.result import Verdict
++from cpachecker.analyses.value_analysis import (
++    CPAAlgorithm,
++    CompositeCPA,
++    CompositeState,
++    ExplicitValueCPA,
++    LocationCPA,
++    LocationState,
++    ValueAnalysisDomain,
++    ValueAnalysisState,
++    extract_location,
++    run_value_analysis,
++)
++
++BENCH = os.path.join(
++    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "benchmarks"
++)
++
++
++def verify(name):
++    cfa = parse_c_file(os.path.join(BENCH, name))
++    return run_value_analysis(cfa, 60)
++
++
++class TestBenchmarks(unittest.TestCase):
++    def test_simple_safe(self):
++        self.assertEqual(verify("simple_safe.c").verdict, Verdict.TRUE)
++
++    def test_simple_unsafe(self):
++        result = verify("simple_unsafe.c")
++        self.assertEqual(result.verdict, Verdict.FALSE)
++        self.assertTrue(result.error_path)
++
++    def test_loop_safe(self):
++        self.assertEqual(verify("loop_safe.c").verdict, Verdict.TRUE)
++
++    def test_loop_unsafe(self):
++        result = verify("loop_unsafe.c")
++        self.assertEqual(result.verdict, Verdict.FALSE)
++        # 5 loop iterations must show up in the counterexample.
++        self.assertEqual(result.statistics["counterexample_path"].count("x = x + 3"), 5)
++
++    def test_error_path_ends_in_error_location(self):
++        cfa = parse_c_file(os.path.join(BENCH, "simple_unsafe.c"))
++        result = run_value_analysis(cfa, 60)
++        last = result.error_path[-1]
++        self.assertTrue(cfa.nodes[last["location"]].is_error)
++
++
++class TestValueLattice(unittest.TestCase):
++    def setUp(self):
++        self.domain = ValueAnalysisDomain()
++
++    def test_more_precise_is_covered_by_less_precise(self):
++        precise = ValueAnalysisState({"x": 1, "y": 2})
++        vague = ValueAnalysisState({"x": 1})
++        self.assertTrue(self.domain.is_less_or_equal(precise, vague))
++        self.assertFalse(self.domain.is_less_or_equal(vague, precise))
++
++    def test_conflicting_values_are_incomparable(self):
++        a = ValueAnalysisState({"x": 1})
++        b = ValueAnalysisState({"x": 2})
++        self.assertFalse(self.domain.is_less_or_equal(a, b))
++        self.assertFalse(self.domain.is_less_or_equal(b, a))
++
++    def test_join_keeps_agreeing_values(self):
++        a = ValueAnalysisState({"x": 1, "y": 5})
++        b = ValueAnalysisState({"x": 1, "y": 6})
++        joined = self.domain.join(a, b)
++        self.assertEqual(joined.get("x"), 1)
++        self.assertFalse(joined.is_known("y"))
++
++    def test_top_and_bottom(self):
++        top = self.domain.get_top()
++        bottom = self.domain.get_bottom()
++        some = ValueAnalysisState({"x": 3})
++        self.assertTrue(self.domain.is_less_or_equal(some, top))
++        self.assertTrue(self.domain.is_less_or_equal(bottom, some))
++        self.assertFalse(self.domain.is_less_or_equal(some, bottom))
++
++    def test_state_hashing_is_order_independent(self):
++        self.assertEqual(
++            hash(ValueAnalysisState({"x": 1, "y": 2})),
++            hash(ValueAnalysisState({"y": 2, "x": 1})),
++        )
++
++
++class TestTransfer(unittest.TestCase):
++    def _cfa(self):
++        cfa = CFA()
++        for i in range(4):
++            cfa.add_node(CFANode(node_id=i))
++        cfa.entry_node = 0
++        return cfa
++
++    def test_nondet_assignment_yields_top(self):
++        cfa = self._cfa()
++        cpa = ExplicitValueCPA(cfa)
++        transfer = cpa.get_transfer_relation()
++        state = ValueAnalysisState({"x": 7})
++        edge = CFAEdge(0, 1, EdgeType.ASSIGNMENT, "__VERIFIER_nondet_uint ( )", "x")
++        (succ,) = transfer.get_abstract_successors(state, None, edge)
++        self.assertFalse(succ.is_known("x"))
++
++    def test_infeasible_assume_has_no_successor(self):
++        cfa = self._cfa()
++        transfer = ExplicitValueCPA(cfa).get_transfer_relation()
++        state = ValueAnalysisState({"x": 1})
++        edge = CFAEdge(0, 1, EdgeType.ASSUME_TRUE, "x == 2")
++        self.assertEqual(transfer.get_abstract_successors(state, None, edge), [])
++
++    def test_unknown_assume_keeps_both_branches(self):
++        cfa = self._cfa()
++        transfer = ExplicitValueCPA(cfa).get_transfer_relation()
++        state = ValueAnalysisState({})  # x unknown
++        for kind in (EdgeType.ASSUME_TRUE, EdgeType.ASSUME_FALSE):
++            edge = CFAEdge(0, 1, kind, "x == 2")
++            self.assertEqual(len(transfer.get_abstract_successors(state, None, edge)), 1)
++
++    def test_assignment_uses_current_environment(self):
++        cfa = self._cfa()
++        transfer = ExplicitValueCPA(cfa).get_transfer_relation()
++        state = ValueAnalysisState({"x": 4, "y": 6})
++        edge = CFAEdge(0, 1, EdgeType.ASSIGNMENT, "x + y * 2", "z")
++        (succ,) = transfer.get_abstract_successors(state, None, edge)
++        self.assertEqual(succ.get("z"), 16)
++
++    def test_composite_drops_edge_when_component_infeasible(self):
++        cfa = self._cfa()
++        cfa.add_edge(CFAEdge(0, 1, EdgeType.ASSUME_TRUE, "x == 2"))
++        cfa.add_edge(CFAEdge(0, 2, EdgeType.ASSUME_FALSE, "x == 2"))
++        composite = CompositeCPA(cfa, [LocationCPA(cfa), ExplicitValueCPA(cfa)])
++        transfer = composite.get_transfer_relation()
++        state = CompositeState([LocationState(0), ValueAnalysisState({"x": 5})])
++        successors = transfer.get_edge_successors(state, composite.get_initial_precision())
++        self.assertEqual([extract_location(s) for _, s in successors], [2])
++
++
++class TestAlgorithm(unittest.TestCase):
++    def test_coverage_terminates_self_loop(self):
++        # 0 -> 1 -> 1 (blank self loop); the value state never changes so the
++        # stop operator must cover the repeated state and terminate.
++        cfa = CFA()
++        cfa.add_node(CFANode(node_id=0, is_entry=True))
++        cfa.add_node(CFANode(node_id=1))
++        cfa.entry_node = 0
++        cfa.add_edge(CFAEdge(0, 1, EdgeType.BLANK))
++        cfa.add_edge(CFAEdge(1, 1, EdgeType.BLANK))
++        composite = CompositeCPA(cfa, [LocationCPA(cfa), ExplicitValueCPA(cfa)])
++        result = CPAAlgorithm(composite, cfa, timelimit=5).run()
++        self.assertTrue(result.exhausted)
++        self.assertEqual(len(result.reached), 2)
++        self.assertGreaterEqual(result.stats["covered"], 1)
++
++    def test_error_location_reported(self):
++        cfa = CFA()
++        cfa.add_node(CFANode(node_id=0, is_entry=True))
++        cfa.add_node(CFANode(node_id=1, is_error=True))
++        cfa.entry_node = 0
++        cfa.add_edge(CFAEdge(0, 1, EdgeType.ASSERT, "__assert_fail(...)"))
++        composite = CompositeCPA(cfa, [LocationCPA(cfa), ExplicitValueCPA(cfa)])
++        result = CPAAlgorithm(composite, cfa, timelimit=5).run()
++        self.assertTrue(result.error_found)
++        self.assertEqual(len(result.error_path), 2)
++
++    def test_dfs_and_bfs_agree(self):
++        cfa = parse_c_file(os.path.join(BENCH, "loop_safe.c"))
++        composite = CompositeCPA(cfa, [LocationCPA(cfa), ExplicitValueCPA(cfa)])
++        bfs = CPAAlgorithm(composite, cfa, timelimit=20, traversal="bfs").run()
++        composite2 = CompositeCPA(cfa, [LocationCPA(cfa), ExplicitValueCPA(cfa)])
++        dfs = CPAAlgorithm(composite2, cfa, timelimit=20, traversal="dfs").run()
++        self.assertFalse(bfs.error_found)
++        self.assertFalse(dfs.error_found)
++        self.assertEqual(len(bfs.reached), len(dfs.reached))
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/cpachecker/analyses/__init__.py b/cpachecker/analyses/__init__.py
+index 9be40a6..dc20473 100644
+--- a/cpachecker/analyses/__init__.py
++++ b/cpachecker/analyses/__init__.py
+@@ -1 +1,24 @@
+-"""Analysis implementations for CPAchecker."""
++"""Analysis implementations for CPAchecker.
++
++Available configurations:
++
++* ``value_analysis``     -- explicit value analysis together with the generic
++  CPA worklist algorithm (``cpachecker_v0``).
++* ``predicate_analysis`` -- symbolic predicate analysis with path feasibility
++  checking (``cpachecker_v1``).
++* ``bmc`` / ``k_induction`` -- bounded model checking and k-induction
++  (``cpachecker_v3``).
++* ``symbolic``           -- shared linear-arithmetic/constraint machinery used
++  by the predicate analysis, BMC and k-induction.
++
++The sub-modules are imported lazily by ``cpachecker_main.py`` so that the
++configurations stay independent of each other.
++"""
++
++__all__ = [
++    "value_analysis",
++    "predicate_analysis",
++    "bmc",
++    "k_induction",
++    "symbolic",
++]
+diff --git a/cpachecker/analyses/value_analysis.py b/cpachecker/analyses/value_analysis.py
+new file mode 100644
+index 0000000..c41470f
+--- /dev/null
++++ b/cpachecker/analyses/value_analysis.py
+@@ -0,0 +1,996 @@
++"""Explicit-value analysis and the generic CPA worklist algorithm.
++
++This module implements the core of the framework (``cpachecker_v0``):
++
++* :class:`LocationCPA`        -- tracks the program counter (a CFA node id).
++* :class:`ExplicitValueCPA`   -- tracks concrete integer values of variables.
++* :class:`CompositeCPA`       -- product of an arbitrary number of CPAs.
++* :class:`CPAAlgorithm`       -- the generic reachability worklist algorithm
++  described in "Configurable Software Verification" (Beyer, Henzinger, Theoduloz).
++* :func:`run_value_analysis`  -- entry point used by ``cpachecker_main.py``.
++
++The CPA algorithm is deliberately kept independent of the concrete analysis so
++that the predicate analysis (``cpachecker_v1``) and BMC / k-induction
++(``cpachecker_v3``) can reuse it unchanged.
++"""
++
++from __future__ import annotations
++
++import time
++from collections import deque
++from typing import Any, Callable, Iterable, Optional, Sequence
++
++from cpachecker.cfa import CFA, CFAEdge, EdgeType
++from cpachecker.cpa_interface import (
++    AbstractDomain,
++    AbstractState,
++    ConfigurableProgramAnalysis,
++    MergeOperator,
++    Precision,
++    StopOperator,
++    TransferRelation,
++)
++from cpachecker.expression import (
++    evaluate_condition,
++    evaluate_expression,
++    is_nondeterministic,
++)
++from cpachecker.result import Verdict, VerificationResult
++
++
++# ---------------------------------------------------------------------------
++# Lattice helpers
++# ---------------------------------------------------------------------------
++
++
++class _Top:
++    """Sentinel for "value is unknown" (the top element of the value lattice)."""
++
++    _instance: Optional["_Top"] = None
++
++    def __new__(cls) -> "_Top":
++        if cls._instance is None:
++            cls._instance = super().__new__(cls)
++        return cls._instance
++
++    def __repr__(self) -> str:  # pragma: no cover - debugging helper
++        return "TOP"
++
++    def __eq__(self, other) -> bool:
++        return isinstance(other, _Top)
++
++    def __hash__(self) -> int:
++        return hash("<TOP>")
++
++
++TOP = _Top()
++
++
++# ---------------------------------------------------------------------------
++# Location CPA
++# ---------------------------------------------------------------------------
++
++
++class LocationState(AbstractState):
++    """Abstract state of the :class:`LocationCPA`: just the CFA node id."""
++
++    __slots__ = ("node_id",)
++
++    def __init__(self, node_id: int):
++        self.node_id = node_id
++
++    def __eq__(self, other) -> bool:
++        return isinstance(other, LocationState) and other.node_id == self.node_id
++
++    def __hash__(self) -> int:
++        return hash(("loc", self.node_id))
++
++    def __repr__(self) -> str:
++        return f"N{self.node_id}"
++
++
++class LocationDomain(AbstractDomain):
++    """Flat lattice over program locations: coverage is plain equality."""
++
++    def is_less_or_equal(self, state1: AbstractState, state2: AbstractState) -> bool:
++        return state1 == state2
++
++    def join(self, state1: AbstractState, state2: AbstractState) -> AbstractState:
++        if state1 == state2:
++            return state1
++        raise ValueError("locations can only be joined when they are equal")
++
++    def get_top(self) -> AbstractState:
++        return LocationState(-1)
++
++    def get_bottom(self) -> AbstractState:
++        return LocationState(-2)
++
++
++class LocationTransferRelation(TransferRelation):
++    """Follows the CFA: the successor of a location is the target of an edge."""
++
++    def __init__(self, cfa: CFA):
++        self.cfa = cfa
++
++    def get_abstract_successors(
++        self, state: AbstractState, precision: Precision, edge: Any = None
++    ) -> list[AbstractState]:
++        assert isinstance(state, LocationState)
++        if edge is None:
++            return [
++                LocationState(e.target) for e in self.cfa.get_successors(state.node_id)
++            ]
++        if edge.source != state.node_id:
++            return []
++        return [LocationState(edge.target)]
++
++
++class MergeSepOperator(MergeOperator):
++    """``merge^sep``: never merge, keep abstract states separate."""
++
++    def merge(
++        self, state1: AbstractState, state2: AbstractState, precision: Precision
++    ) -> AbstractState:
++        return state2
++
++
++class MergeJoinOperator(MergeOperator):
++    """``merge^join``: always join the two states (kept for configurability)."""
++
++    def __init__(self, domain: AbstractDomain):
++        self.domain = domain
++
++    def merge(
++        self, state1: AbstractState, state2: AbstractState, precision: Precision
++    ) -> AbstractState:
++        return self.domain.join(state1, state2)
++
++
++class CoverageStopOperator(StopOperator):
++    """``stop^sep``: covered iff subsumed by a single state of the reached set."""
++
++    def __init__(self, domain: AbstractDomain):
++        self.domain = domain
++
++    def stop(self, state: AbstractState, reached, precision: Precision) -> bool:
++        for other in reached:
++            if self.domain.is_less_or_equal(state, other):
++                return True
++        return False
++
++
++class TrivialPrecision(Precision):
++    """Precision object for analyses that do not need one."""
++
++    def __repr__(self) -> str:  # pragma: no cover - debugging helper
++        return "()"
++
++    def __eq__(self, other) -> bool:
++        return isinstance(other, TrivialPrecision)
++
++    def __hash__(self) -> int:
++        return hash("TrivialPrecision")
++
++
++class LocationCPA(ConfigurableProgramAnalysis):
++    """CPA that tracks the program counter."""
++
++    def __init__(self, cfa: CFA):
++        self.cfa = cfa
++        self._domain = LocationDomain()
++        self._transfer = LocationTransferRelation(cfa)
++        self._merge = MergeSepOperator()
++        self._stop = CoverageStopOperator(self._domain)
++
++    def get_abstract_domain(self) -> AbstractDomain:
++        return self._domain
++
++    def get_transfer_relation(self) -> TransferRelation:
++        return self._transfer
++
++    def get_merge_operator(self) -> MergeOperator:
++        return self._merge
++
++    def get_stop_operator(self) -> StopOperator:
++        return self._stop
++
++    def get_initial_state(self, node_id: int) -> AbstractState:
++        return LocationState(node_id)
++
++    def get_initial_precision(self) -> Precision:
++        return TrivialPrecision()
++
++
++# ---------------------------------------------------------------------------
++# Explicit value CPA
++# ---------------------------------------------------------------------------
++
++
++class ValueAnalysisState(AbstractState):
++    """Maps variable names to concrete integers.
++
++    A variable that is *absent* from the mapping has the value ``TOP``
++    (unknown).  Fewer entries therefore means a *less precise* (larger) state,
++    which is exactly the lattice order used by :class:`ValueAnalysisDomain`.
++    """
++
++    __slots__ = ("_values", "_hash", "is_bottom")
++
++    def __init__(self, values: Optional[dict[str, int]] = None, is_bottom: bool = False):
++        items = tuple(sorted((values or {}).items()))
++        self._values = items
++        self.is_bottom = is_bottom
++        self._hash = hash((items, is_bottom))
++
++    # -- mapping-like access -------------------------------------------------
++    @property
++    def values(self) -> dict[str, int]:
++        return dict(self._values)
++
++    def items(self) -> tuple[tuple[str, int], ...]:
++        return self._values
++
++    def get(self, var: str) -> Any:
++        for name, value in self._values:
++            if name == var:
++                return value
++        return TOP
++
++    def is_known(self, var: str) -> bool:
++        return any(name == var for name, _ in self._values)
++
++    def to_env(self) -> dict[str, int]:
++        return dict(self._values)
++
++    # -- functional updates -------------------------------------------------
++    def assign(self, var: str, value: int) -> "ValueAnalysisState":
++        env = self.to_env()
++        env[var] = int(value)
++        return ValueAnalysisState(env)
++
++    def forget(self, var: str) -> "ValueAnalysisState":
++        env = self.to_env()
++        env.pop(var, None)
++        return ValueAnalysisState(env)
++
++    # -- object protocol ----------------------------------------------------
++    def __eq__(self, other) -> bool:
++        return (
++            isinstance(other, ValueAnalysisState)
++            and other._values == self._values
++            and other.is_bottom == self.is_bottom
++        )
++
++    def __hash__(self) -> int:
++        return self._hash
++
++    def __repr__(self) -> str:
++        if self.is_bottom:
++            return "[BOTTOM]"
++        if not self._values:
++            return "[]"
++        return "[" + ", ".join(f"{k}={v}" for k, v in self._values) + "]"
++
++
++class ValueAnalysisDomain(AbstractDomain):
++    """Lattice of variable→value maps ordered by precision."""
++
++    def is_less_or_equal(self, state1: AbstractState, state2: AbstractState) -> bool:
++        assert isinstance(state1, ValueAnalysisState)
++        assert isinstance(state2, ValueAnalysisState)
++        if state1.is_bottom:
++            return True
++        if state2.is_bottom:
++            return False
++        # state1 ⊑ state2 iff state1 agrees with every value fixed by state2.
++        for name, value in state2.items():
++            if state1.get(name) != value:
++                return False
++        return True
++
++    def join(self, state1: AbstractState, state2: AbstractState) -> AbstractState:
++        assert isinstance(state1, ValueAnalysisState)
++        assert isinstance(state2, ValueAnalysisState)
++        if state1.is_bottom:
++            return state2
++        if state2.is_bottom:
++            return state1
++        common = {
++            name: value
++            for name, value in state1.items()
++            if state2.get(name) == value
++        }
++        return ValueAnalysisState(common)
++
++    def get_top(self) -> AbstractState:
++        return ValueAnalysisState({})
++
++    def get_bottom(self) -> AbstractState:
++        return ValueAnalysisState({}, is_bottom=True)
++
++
++class ExplicitValueTransferRelation(TransferRelation):
++    """Concrete (strongest post) semantics for assignments and assumptions."""
++
++    def __init__(self, cfa: CFA):
++        self.cfa = cfa
++        self.stats = {"assumes_unknown": 0, "assumes_infeasible": 0}
++
++    def get_abstract_successors(
++        self, state: AbstractState, precision: Precision, edge: Any = None
++    ) -> list[AbstractState]:
++        assert isinstance(state, ValueAnalysisState)
++        if edge is None:
++            raise ValueError("ExplicitValueCPA needs a CFA edge")
++
++        kind = edge.edge_type
++        if kind == EdgeType.ASSIGNMENT:
++            return self._handle_assignment(state, edge)
++        if kind in (EdgeType.ASSUME_TRUE, EdgeType.ASSUME_FALSE):
++            return self._handle_assume(state, edge, kind == EdgeType.ASSUME_TRUE)
++        # ASSERT / BLANK / FUNCTION_CALL do not change the data state.  The
++        # ASSERT edge leads to the error location; reaching it is the property
++        # violation itself, so no constraint is imposed here.
++        return [state]
++
++    def _handle_assignment(
++        self, state: ValueAnalysisState, edge: CFAEdge
++    ) -> list[AbstractState]:
++        var = edge.variable
++        if not var:
++            return [state]
++        env = state.to_env()
++        if is_nondeterministic(edge.expression):
++            # Unknown input value: the variable becomes TOP.
++            return [state.forget(var)]
++        value = evaluate_expression(edge.expression, env)
++        if value is None:
++            return [state.forget(var)]
++        return [state.assign(var, value)]
++
++    def _handle_assume(
++        self, state: ValueAnalysisState, edge: CFAEdge, want_true: bool
++    ) -> list[AbstractState]:
++        result = evaluate_condition(edge.expression, state.to_env())
++        if result is None:
++            # Condition cannot be decided (unknown values involved): both
++            # branches stay feasible.  This is a sound over-approximation.
++            self.stats["assumes_unknown"] += 1
++            return [state]
++        if result == want_true:
++            return [state]
++        self.stats["assumes_infeasible"] += 1
++        return []
++
++
++class ExplicitValueCPA(ConfigurableProgramAnalysis):
++    """CPA tracking concrete values of all program variables."""
++
++    def __init__(self, cfa: CFA):
++        self.cfa = cfa
++        self._domain = ValueAnalysisDomain()
++        self._transfer = ExplicitValueTransferRelation(cfa)
++        self._merge = MergeSepOperator()
++        self._stop = CoverageStopOperator(self._domain)
++
++    def get_abstract_domain(self) -> AbstractDomain:
++        return self._domain
++
++    def get_transfer_relation(self) -> TransferRelation:
++        return self._transfer
++
++    def get_merge_operator(self) -> MergeOperator:
++        return self._merge
++
++    def get_stop_operator(self) -> StopOperator:
++        return self._stop
++
++    def get_initial_state(self, node_id: int) -> AbstractState:
++        # All variables start out uninitialised, i.e. TOP.  The CFA assigns
++        # them before use in every supported program.
++        return ValueAnalysisState({})
++
++    def get_initial_precision(self) -> Precision:
++        return TrivialPrecision()
++
++
++# ---------------------------------------------------------------------------
++# Composite CPA
++# ---------------------------------------------------------------------------
++
++
++class CompositeState(AbstractState):
++    """Tuple of component abstract states."""
++
++    __slots__ = ("components", "_hash")
++
++    def __init__(self, components: Sequence[AbstractState]):
++        self.components = tuple(components)
++        self._hash = hash(self.components)
++
++    def __eq__(self, other) -> bool:
++        return isinstance(other, CompositeState) and other.components == self.components
++
++    def __hash__(self) -> int:
++        return self._hash
++
++    def __repr__(self) -> str:
++        return "(" + ", ".join(repr(c) for c in self.components) + ")"
++
++    def __iter__(self):
++        return iter(self.components)
++
++    def __len__(self) -> int:
++        return len(self.components)
++
++    def __getitem__(self, index: int) -> AbstractState:
++        return self.components[index]
++
++    def get_component(self, cls) -> Optional[AbstractState]:
++        """Return the first component that is an instance of ``cls``."""
++        for comp in self.components:
++            if isinstance(comp, cls):
++                return comp
++            if isinstance(comp, CompositeState):
++                nested = comp.get_component(cls)
++                if nested is not None:
++                    return nested
++        return None
++
++
++class CompositePrecision(Precision):
++    __slots__ = ("precisions",)
++
++    def __init__(self, precisions: Sequence[Precision]):
++        self.precisions = tuple(precisions)
++
++    def __repr__(self) -> str:  # pragma: no cover - debugging helper
++        return "(" + ", ".join(repr(p) for p in self.precisions) + ")"
++
++
++class CompositeDomain(AbstractDomain):
++    def __init__(self, domains: Sequence[AbstractDomain]):
++        self.domains = tuple(domains)
++
++    def is_less_or_equal(self, state1: AbstractState, state2: AbstractState) -> bool:
++        assert isinstance(state1, CompositeState) and isinstance(state2, CompositeState)
++        return all(
++            dom.is_less_or_equal(s1, s2)
++            for dom, s1, s2 in zip(self.domains, state1.components, state2.components)
++        )
++
++    def join(self, state1: AbstractState, state2: AbstractState) -> AbstractState:
++        assert isinstance(state1, CompositeState) and isinstance(state2, CompositeState)
++        return CompositeState(
++            [
++                dom.join(s1, s2)
++                for dom, s1, s2 in zip(
++                    self.domains, state1.components, state2.components
++                )
++            ]
++        )
++
++    def get_top(self) -> AbstractState:
++        return CompositeState([d.get_top() for d in self.domains])
++
++    def get_bottom(self) -> AbstractState:
++        return CompositeState([d.get_bottom() for d in self.domains])
++
++
++class CompositeTransferRelation(TransferRelation):
++    """Applies the component transfer relations edge-wise.
++
++    ``get_edge_successors`` enumerates the outgoing CFA edges of the location
++    contained in the composite state; this is what the CPA algorithm uses.  If
++    one component has no successor for an edge the edge is infeasible and no
++    composite successor is produced.
++    """
++
++    def __init__(self, cfa: CFA, transfers: Sequence[TransferRelation]):
++        self.cfa = cfa
++        self.transfers = tuple(transfers)
++
++    def get_abstract_successors(
++        self, state: AbstractState, precision: Precision, edge: Any = None
++    ) -> list[AbstractState]:
++        if edge is None:
++            return [succ for _, succ in self.get_edge_successors(state, precision)]
++        return self._successors_for_edge(state, precision, edge)
++
++    def get_edge_successors(
++        self, state: AbstractState, precision: Precision
++    ) -> list[tuple[CFAEdge, AbstractState]]:
++        assert isinstance(state, CompositeState)
++        location = extract_location(state)
++        if location is None:
++            return []
++        out: list[tuple[CFAEdge, AbstractState]] = []
++        for edge in self.cfa.get_successors(location):
++            for succ in self._successors_for_edge(state, precision, edge):
++                out.append((edge, succ))
++        return out
++
++    def _successors_for_edge(
++        self, state: AbstractState, precision: Precision, edge: CFAEdge
++    ) -> list[AbstractState]:
++        assert isinstance(state, CompositeState)
++        precisions = (
++            precision.precisions
++            if isinstance(precision, CompositePrecision)
++            else (None,) * len(self.transfers)
++        )
++        component_successors: list[list[AbstractState]] = []
++        for transfer, comp, prec in zip(self.transfers, state.components, precisions):
++            succs = transfer.get_abstract_successors(comp, prec, edge)
++            if not succs:
++                return []  # component considers the edge infeasible
++            component_successors.append(list(succs))
++
++        # Cartesian product (components other than assume-splitting predicate
++        # transfers normally return exactly one successor).
++        combos: list[list[AbstractState]] = [[]]
++        for succs in component_successors:
++            combos = [combo + [s] for combo in combos for s in succs]
++        return [CompositeState(combo) for combo in combos]
++
++
++class CompositeMergeOperator(MergeOperator):
++    def __init__(self, merges: Sequence[MergeOperator]):
++        self.merges = tuple(merges)
++
++    def merge(
++        self, state1: AbstractState, state2: AbstractState, precision: Precision
++    ) -> AbstractState:
++        assert isinstance(state1, CompositeState) and isinstance(state2, CompositeState)
++        precisions = (
++            precision.precisions
++            if isinstance(precision, CompositePrecision)
++            else (None,) * len(self.merges)
++        )
++        merged = [
++            op.merge(s1, s2, prec)
++            for op, s1, s2, prec in zip(
++                self.merges, state1.components, state2.components, precisions
++            )
++        ]
++        if all(m == s2 for m, s2 in zip(merged, state2.components)):
++            return state2  # nothing changed (merge^sep in every component)
++        return CompositeState(merged)
++
++
++class CompositeStopOperator(StopOperator):
++    def __init__(self, domains: Sequence[AbstractDomain]):
++        self.domains = tuple(domains)
++
++    def stop(self, state: AbstractState, reached, precision: Precision) -> bool:
++        assert isinstance(state, CompositeState)
++        for other in reached:
++            if not isinstance(other, CompositeState):
++                continue
++            if all(
++                dom.is_less_or_equal(s1, s2)
++                for dom, s1, s2 in zip(self.domains, state.components, other.components)
++            ):
++                return True
++        return False
++
++
++class CompositeCPA(ConfigurableProgramAnalysis):
++    """Product of several CPAs; all operators work component-wise."""
++
++    def __init__(self, cfa: CFA, cpas: Sequence[ConfigurableProgramAnalysis]):
++        self.cfa = cfa
++        self.cpas = tuple(cpas)
++        domains = [cpa.get_abstract_domain() for cpa in self.cpas]
++        self._domain = CompositeDomain(domains)
++        self._transfer = CompositeTransferRelation(
++            cfa, [cpa.get_transfer_relation() for cpa in self.cpas]
++        )
++        self._merge = CompositeMergeOperator(
++            [cpa.get_merge_operator() for cpa in self.cpas]
++        )
++        self._stop = CompositeStopOperator(domains)
++
++    def get_abstract_domain(self) -> AbstractDomain:
++        return self._domain
++
++    def get_transfer_relation(self) -> TransferRelation:
++        return self._transfer
++
++    def get_merge_operator(self) -> MergeOperator:
++        return self._merge
++
++    def get_stop_operator(self) -> StopOperator:
++        return self._stop
++
++    def get_initial_state(self, node_id: int) -> AbstractState:
++        return CompositeState([cpa.get_initial_state(node_id) for cpa in self.cpas])
++
++    def get_initial_precision(self) -> Precision:
++        return CompositePrecision([cpa.get_initial_precision() for cpa in self.cpas])
++
++
++# ---------------------------------------------------------------------------
++# Reached set and the CPA algorithm
++# ---------------------------------------------------------------------------
++
++
++def extract_location(state: AbstractState) -> Optional[int]:
++    """Return the CFA node id contained in (a component of) ``state``."""
++    if isinstance(state, LocationState):
++        return state.node_id
++    if isinstance(state, CompositeState):
++        for comp in state.components:
++            loc = extract_location(comp)
++            if loc is not None:
++                return loc
++    return None
++
++
++class ReachedSet:
++    """Set of abstract states, partitioned by program location.
++
++    The partitioning makes merge/stop lookups cheap: only states at the same
++    location can cover (or be merged with) each other.
++    """
++
++    def __init__(self):
++        self._partitions: dict[Any, list[AbstractState]] = {}
++        self._members: set[AbstractState] = set()
++
++    def add(self, state: AbstractState) -> None:
++        if state in self._members:
++            return
++        self._members.add(state)
++        self._partitions.setdefault(extract_location(state), []).append(state)
++
++    def remove(self, state: AbstractState) -> None:
++        if state not in self._members:
++            return
++        self._members.discard(state)
++        key = extract_location(state)
++        bucket = self._partitions.get(key)
++        if bucket is not None:
++            try:
++                bucket.remove(state)
++            except ValueError:  # pragma: no cover - defensive
++                pass
++
++    def get_partition(self, state: AbstractState) -> list[AbstractState]:
++        return self._partitions.get(extract_location(state), [])
++
++    def partition_for_location(self, location: Any) -> list[AbstractState]:
++        return self._partitions.get(location, [])
++
++    def locations(self) -> Iterable[Any]:
++        return list(self._partitions.keys())
++
++    def __contains__(self, state: AbstractState) -> bool:
++        return state in self._members
++
++    def __iter__(self):
++        return iter(self._members)
++
++    def __len__(self) -> int:
++        return len(self._members)
++
++
++class AlgorithmResult:
++    """Outcome of one run of the CPA algorithm."""
++
++    def __init__(
++        self,
++        reached: ReachedSet,
++        parents: dict,
++        error_state: Optional[AbstractState] = None,
++        error_path: Optional[list] = None,
++        exhausted: bool = False,
++        timed_out: bool = False,
++        state_limit_hit: bool = False,
++        stats: Optional[dict] = None,
++    ):
++        self.reached = reached
++        self.parents = parents
++        self.error_state = error_state
++        self.error_path = error_path or []
++        self.exhausted = exhausted
++        self.timed_out = timed_out
++        self.state_limit_hit = state_limit_hit
++        self.stats = stats or {}
++
++    @property
++    def error_found(self) -> bool:
++        return self.error_state is not None
++
++    @property
++    def complete(self) -> bool:
++        """True iff the whole (bounded) state space was explored."""
++        return self.exhausted and not self.timed_out and not self.state_limit_hit
++
++    def __repr__(self) -> str:  # pragma: no cover - debugging helper
++        return (
++            f"AlgorithmResult(error={self.error_found}, reached={len(self.reached)}, "
++            f"exhausted={self.exhausted}, timeout={self.timed_out})"
++        )
++
++
++REPORT = "report"
++PRUNE = "prune"
++
++
++class CPAAlgorithm:
++    """The generic CPA worklist (reachability) algorithm.
++
++    ``waitlist`` and ``reached`` are maintained as described in the CPA
++    paper::
++
++        while waitlist != {}:
++            pop e from waitlist
++            for each e' in transfer(e):
++                for each e'' in reached with same location:
++                    e_new = merge(e', e'')
++                    if e_new != e'':  replace e'' by e_new in reached/waitlist
++                if not stop(e', reached):
++                    add e' to reached and waitlist
++
++    Reaching a node with ``is_error=True`` is the property violation we look
++    for.  ``error_action`` allows callers (k-induction's step case) to *assume*
++    that the property holds instead of reporting the violation.
++    """
++
++    def __init__(
++        self,
++        cpa: ConfigurableProgramAnalysis,
++        cfa: CFA,
++        *,
++        timelimit: Optional[float] = None,
++        deadline: Optional[float] = None,
++        max_states: int = 400_000,
++        traversal: str = "bfs",
++        error_action: Optional[Callable[[AbstractState], str]] = None,
++        stop_on_first_error: bool = True,
++    ):
++        self.cpa = cpa
++        self.cfa = cfa
++        self.max_states = max_states
++        self.traversal = traversal
++        self.error_action = error_action
++        self.stop_on_first_error = stop_on_first_error
++        if deadline is not None:
++            self.deadline = deadline
++        elif timelimit is not None:
++            self.deadline = time.monotonic() + timelimit
++        else:
++            self.deadline = None
++
++    # -- helpers -----------------------------------------------------------
++    def _is_error_location(self, location: Optional[int]) -> bool:
++        if location is None:
++            return False
++        node = self.cfa.nodes.get(location)
++        return bool(node is not None and node.is_error)
++
++    def build_error_path(self, parents: dict, state: AbstractState) -> list[dict]:
++        """Reconstruct the sequence of edges/states leading to ``state``."""
++        chain: list[AbstractState] = []
++        seen: set[AbstractState] = set()
++        cursor: Optional[AbstractState] = state
++        while cursor is not None and cursor not in seen:
++            seen.add(cursor)
++            chain.append(cursor)
++            parent_info = parents.get(cursor)
++            cursor = parent_info[0] if parent_info else None
++        chain.reverse()
++
++        path: list[dict] = []
++        for element in chain:
++            parent_info = parents.get(element)
++            edge = parent_info[1] if parent_info else None
++            path.append(
++                {
++                    "location": extract_location(element),
++                    "edge": describe_edge(edge),
++                    "edge_object": edge,
++                    "state": repr(element),
++                    "abstract_state": element,
++                }
++            )
++        return path
++
++    # -- main loop ---------------------------------------------------------
++    def run(self, initial_state: Optional[AbstractState] = None) -> AlgorithmResult:
++        cpa = self.cpa
++        precision = cpa.get_initial_precision()
++        transfer = cpa.get_transfer_relation()
++        merge = cpa.get_merge_operator()
++        stop = cpa.get_stop_operator()
++
++        initial = (
++            initial_state
++            if initial_state is not None
++            else cpa.get_initial_state(self.cfa.entry_node)
++        )
++
++        reached = ReachedSet()
++        reached.add(initial)
++        waitlist: deque = deque([initial])
++        parents: dict = {initial: (None, None)}
++        stats = {
++            "popped": 0,
++            "successors": 0,
++            "merged": 0,
++            "covered": 0,
++            "max_waitlist": 1,
++        }
++
++        timed_out = False
++        limit_hit = False
++        error_state: Optional[AbstractState] = None
++        checks = 0
++
++        while waitlist:
++            checks += 1
++            if self.deadline is not None and (checks & 0x3F) == 0:
++                if time.monotonic() > self.deadline:
++                    timed_out = True
++                    break
++
++            state = waitlist.popleft() if self.traversal == "bfs" else waitlist.pop()
++            stats["popped"] += 1
++
++            if hasattr(transfer, "get_edge_successors"):
++                successors = transfer.get_edge_successors(state, precision)
++            else:  # pragma: no cover - single-CPA fallback
++                successors = [
++                    (None, s)
++                    for s in transfer.get_abstract_successors(state, precision, None)
++                ]
++
++            for edge, successor in successors:
++                stats["successors"] += 1
++                if successor not in parents:
++                    parents[successor] = (state, edge)
++
++                if self._is_error_location(extract_location(successor)):
++                    action = (
++                        self.error_action(successor) if self.error_action else REPORT
++                    )
++                    if action == REPORT:
++                        error_state = successor
++                        if self.stop_on_first_error:
++                            return AlgorithmResult(
++                                reached,
++                                parents,
++                                error_state=successor,
++                                error_path=self.build_error_path(parents, successor),
++                                exhausted=False,
++                                stats=stats,
++                            )
++                    else:
++                        # The k-induction hypothesis: assume the property holds
++                        # here, i.e. do not explore beyond the violation.
++                        continue
++
++                partition = reached.get_partition(successor)
++                for other in list(partition):
++                    merged = merge.merge(successor, other, precision)
++                    if merged is not other and merged != other:
++                        reached.remove(other)
++                        reached.add(merged)
++                        if other in waitlist:
++                            waitlist = deque(
++                                merged if item == other else item for item in waitlist
++                            )
++                        else:
++                            waitlist.append(merged)
++                        parents.setdefault(merged, parents.get(other, (None, None)))
++                        stats["merged"] += 1
++
++                if stop.stop(successor, reached.get_partition(successor), precision):
++                    stats["covered"] += 1
++                    continue
++
++                reached.add(successor)
++                waitlist.append(successor)
++                if len(waitlist) > stats["max_waitlist"]:
++                    stats["max_waitlist"] = len(waitlist)
++                if len(reached) > self.max_states:
++                    limit_hit = True
++                    break
++
++            if limit_hit:
++                break
++
++        return AlgorithmResult(
++            reached,
++            parents,
++            error_state=error_state,
++            error_path=(
++                self.build_error_path(parents, error_state) if error_state else []
++            ),
++            exhausted=not waitlist and not timed_out and not limit_hit,
++            timed_out=timed_out,
++            state_limit_hit=limit_hit,
++            stats=stats,
++        )
++
++
++def describe_edge(edge: Optional[CFAEdge]) -> str:
++    """Human readable rendering of a CFA edge (used for counterexamples)."""
++    if edge is None:
++        return "<initial>"
++    kind = edge.edge_type
++    if kind == EdgeType.ASSIGNMENT:
++        return f"{edge.variable} = {edge.expression}"
++    if kind == EdgeType.ASSUME_TRUE:
++        return f"[{edge.expression}]"
++    if kind == EdgeType.ASSUME_FALSE:
++        return f"[!({edge.expression})]"
++    if kind == EdgeType.ASSERT:
++        return f"ASSERT VIOLATION: {edge.expression}"
++    if kind == EdgeType.FUNCTION_CALL:
++        return f"{edge.expression}"
++    return ""
++
++
++def format_error_path(path: Sequence[dict]) -> list[str]:
++    """Render an error path as a list of human readable lines."""
++    lines = []
++    for step, element in enumerate(path):
++        lines.append(
++            f"  {step}: N{element['location']} {element['edge']} -> {element['state']}"
++        )
++    return lines
++
++
++# ---------------------------------------------------------------------------
++# Entry point
++# ---------------------------------------------------------------------------
++
++
++def run_value_analysis(cfa: CFA, timelimit: Optional[float] = 900) -> VerificationResult:
++    """Verify ``cfa`` with the composite location + explicit-value analysis."""
++    location_cpa = LocationCPA(cfa)
++    value_cpa = ExplicitValueCPA(cfa)
++    composite = CompositeCPA(cfa, [location_cpa, value_cpa])
++
++    algorithm = CPAAlgorithm(composite, cfa, timelimit=timelimit)
++    result = algorithm.run()
++
++    statistics = {
++        "algorithm": "valueAnalysis (CPA worklist)",
++        "cpas": "LocationCPA x ExplicitValueCPA",
++        "reached_states": len(result.reached),
++        "states_popped": result.stats.get("popped", 0),
++        "successors_computed": result.stats.get("successors", 0),
++        "states_covered": result.stats.get("covered", 0),
++        "states_merged": result.stats.get("merged", 0),
++        "undecided_assumptions": value_cpa.get_transfer_relation().stats[
++            "assumes_unknown"
++        ],
++        "infeasible_assumptions": value_cpa.get_transfer_relation().stats[
++            "assumes_infeasible"
++        ],
++    }
++
++    if result.error_found:
++        statistics["counterexample_length"] = len(result.error_path)
++        statistics["counterexample_path"] = " | ".join(
++            element["edge"] for element in result.error_path if element["edge"]
++        )
++        return VerificationResult(
++            verdict=Verdict.FALSE,
++            property_violated="assertion",
++            error_path=result.error_path,
++            statistics=statistics,
++        )
++
++    if result.timed_out or result.state_limit_hit:
++        statistics["reason"] = (
++            "time limit exhausted" if result.timed_out else "state limit exhausted"
++        )
++        return VerificationResult(verdict=Verdict.UNKNOWN, statistics=statistics)
++
++    statistics["proof"] = "reached set is complete; no error location reachable"
++    return VerificationResult(verdict=Verdict.TRUE, statistics=statistics)

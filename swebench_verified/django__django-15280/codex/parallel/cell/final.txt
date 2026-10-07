@@ -1,0 +1,9 @@
+Confirmed and fixed.
+
+The bug was in reverse prefetch cache population: reverse `ForeignKey`/`OneToOne` prefetches were evaluating the child queryset too early, which both duplicated nested prefetches and let the outer parent instance overwrite the inner `Prefetch(... queryset=...)` result. That’s why deferred fields on the “inner” parent looked wrong afterward.
+
+I changed the reverse descriptors to defer that back-reference caching until the queryset has been collected, and to skip it when a nested prefetch explicitly comes back through the same parent field. The implementation is in [related_descriptors.py](/workspace/django/db/models/fields/related_descriptors.py:365) and [query.py](/workspace/django/db/models/query.py:1869). I also added regression coverage for both reverse `ForeignKey` and reverse `OneToOne` cases in [tests/prefetch_related/tests.py](/workspace/tests/prefetch_related/tests.py:814).
+
+Verified with:
+`PYTHONPATH=. /opt/miniconda3/envs/testbed/bin/python tests/runtests.py prefetch_related --parallel 1`
+`PYTHONPATH=. /opt/miniconda3/envs/testbed/bin/python tests/runtests.py defer --parallel 1`

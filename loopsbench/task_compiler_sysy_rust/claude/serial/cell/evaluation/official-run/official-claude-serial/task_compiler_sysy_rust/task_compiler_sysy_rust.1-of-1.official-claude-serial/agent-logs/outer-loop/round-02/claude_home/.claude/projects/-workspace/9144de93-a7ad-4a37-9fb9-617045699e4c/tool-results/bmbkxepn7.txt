@@ -1,0 +1,618 @@
+     1	# Compiler-Lab
+     2	
+     3	 北京大学编译原理课程lab（个人代码）（Rust实现）
+     4	
+     5	 注意，Lv8和Lv9有少部分样例没过，当时找半天找不出问题就没管了（大四老狗是这样的），如果是追求完美的同学请注意这一点
+     6	
+     7	### Usage
+     8	
+     9	##### 挂载目录到容器：
+    10	
+    11	```
+    12	docker run -it -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev
+    13	```
+    14	
+    15	然后可以用 VS Code 左下角的“打开远程窗口”，选择“Attach to a running container”，即可在 VS Code 图形界面访问容器，并方便地进行测试。
+    16	
+    17	容器内的测试方法：
+    18	
+    19	```
+    20	./autotest [-koopa|-riscv|-perf] [-t TEST_CASE_DIR] [-w WORKING_DIR] REPO_DIR
+    21	```
+    22	
+    23	参数: 
+    24	
+    25	* `-koopa|-riscv|-perf`: 可选, 指定对编译器进行何种测试, 可为 Koopa IR 测试 (`-koopa`), RISC-V 测试 (`-riscv`) 和性能测试 (`-perf`). 默认为 `-koopa`.
+    26	* `-t TEST_CASE_DIR`: 可选, 指定测试用例目录, 目录内须包含若干 `.c`/`.sy` 文件 (也可位于子目录中). 其中, 每个 `.c`/`.sy` 文件应当有一个位于相同目录中且同名的 `.out` 文件, 对应该 SysY 程序的预期输出/返回值; 每个 `.c`/`.sy` 文件还可以有一个位于相同目录中且同名的 `.in` 文件, 对应该 SysY 程序的输入, 如果程序不会从 `stdin` 读取输入, 则该文件应该省略. (参考[开放测试用例](https://github.com/pku-minic/open-test-cases)的写法). 默认为脚本目录下的 `testcases` 目录.
+    27	* `-w WORKING_DIR`: 可选, 指定工作目录. 脚本会把编译生成的文件以及其他各类文件存入工作目录, 而默认情况下, 工作目录是一个临时目录, 脚本运行结束后会将其删除. 如果你不想每次都让脚本重新编译你的项目, 而是需要增量编译, 你可以指定一个工作目录, 此时脚本退出前不会删除这个目录.
+    28	* `-s WORKING_DIR`: 可选, 指定运行测试用例目录下的子目录中的测试用例.
+    29	* `REPO_DIR`: 必选, 指定编译器仓库的目录. 目录内须包含 `Makefile`/`CMakeLists.txt`/`Cargo.toml` 文件之一, 脚本将自动使用 `make`/`CMake`/`Cargo` 构建编译器, 并对其进行测试.
+    30	
+    31	本人使用自定义的测试样例（位于 `Compiler-Lab-Test-Suites` 目录中，且只希望运行其中 `functional_test` 子目录的测试样例），测试命令如下：
+    32	
+    33	```
+    34	autotest -riscv -t Compiler-Lab-Test-Suites -s functional_test /root/compiler >log.txt 2>&1 &
+    35	```
+    36	
+    37	`>log.txt 2>&1 &` 代表将标准输出与标准错误结果重定向到 `log.txt` ，且后台运行。但是如果某个样例测试超时，后面的样例还是会输出到命令行，这可能是bug。
+    38	
+    39	##### 在本地运行编译器：
+    40	
+    41	```bash
+    42	cargo run -- -koopa hello.c -o hello.koopa
+    43	
+    44	cargo run -- -riscv hello.c -o hello.asm
+    45	```
+    46	
+    47	---
+    48	
+    49	### Lab记录
+    50	
+    51	#### Lv.1 main函数
+    52	
+    53	##### 配置依赖环境
+    54	
+    55	在 `Cargo.toml` 中添加对应依赖，并在项目根目录新建 `build.rs`，参照 [在线文档此处](https://pku-minic.github.io/online-doc/#/lv1-main/lexer-parser?id=rust-%e5%ae%9e%e7%8e%b0) 。注意将lalrpop的版本改成 [crates.io](crates.io) 上面的最新版本，我写lab时最新版本为0.20.2。
+    56	
+    57	##### 运行示例代码
+    58	
+    59	将在线文档里的lalrpop代码写入 `src` 目录中新建的 `sysy.lalrpop` 中，rust代码写入 `main.rs` 中，并把要编译的源代码写入 `hello.c` 。
+    60	
+    61	然后使用
+    62	
+    63	```
+    64	cargo run -- -koopa hello.c -o hello.koopa
+    65	```
+    66	
+    67	编译运行。
+    68	
+    69	##### 写自己的代码
+    70	
+    71	新建 `ast_def.rs` ，在其中定义AST（抽象语法树）的结构体。
+    72	
+    73	更改 `sysy.lalrpop` ，在其中将返回值改为所定义的结构体。
+    74	
+    75	创建一个子模块 `ir_builder` ，负责生成IR，在 `mod.rs` 里定义解析IR的函数入口，新建一个 `build.rs` ，在里面为 `ast_def.rs` 里定义的结构体实现生成IR的方法。
+    76	
+    77	##### 测试命令：
+    78	
+    79	```
+    80	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -koopa -s lv1 /root/compiler
+    81	```
+    82	
+    83	> 同时, 在运行测试前, 你需要确保你的编译器 (假设名称为 `compiler`) 能处理如下的命令行参数:
+    84	
+    85	```
+    86	compiler -koopa 输入文件 -o 输出文件
+    87	```
+    88	
+    89	> 其中, `-koopa` 代表你的编译器要输出 Koopa IR 文件, `输入文件` 代表输入的 SysY 源文件的路径, `输出文件` 代表 Koopa IR 的输出文件路径. 你的编译器应该解析 `输入文件`, 并把生成的 Koopa IR 输出到 `输出文件` 中.
+    90	>
+    91	> 测试程序会使用你的编译器将输入编译为 Koopa IR, 然后借助 LLVM 将 Koopa IR 进一步编译成可执行文件. 最后, 测试程序执行可执行文件, 检查程序的返回值 (也就是 `main` 的返回值) 是否符合预期. 测试程序**不会**检查你输出的 Koopa IR 的形式, 你输出的 IR **只要功能正确, 即可通过测试.**
+    92	>
+    93	> 关于实验环境/测试脚本的详细使用方法, 请参考[实验环境使用说明](https://pku-minic.github.io/online-doc/#/misc-app-ref/environment). 关于调试编译器的相关思路, 请参考[调试你的编译器](https://pku-minic.github.io/online-doc/#/misc-app-ref/environment?id=%e8%b0%83%e8%af%95%e4%bd%a0%e7%9a%84%e7%bc%96%e8%af%91%e5%99%a8). 关于测试脚本的工作原理, 请 [RTFSC](https://github.com/pku-minic/compiler-dev/blob/master/autotest/autotest).
+    94	
+    95	---
+    96	
+    97	#### Lv.2 初试目标代码生成
+    98	
+    99	##### 说明
+   100	
+   101	上一节我生成的IR直接就是内存中的，无需从字符串IR转化成内存IR。
+   102	
+   103	如何遍历内存中的IR，参考：[这里](https://pku-minic.github.io/online-doc/#/lv2-code-gen/code-gen)
+   104	
+   105	> “Layout” 直译的话是 “布局”. 这个词不太好用中文解释, 虽然 Koopa IR 的相关代码确实是我写的, 我也確實是個平時講中文的中國大陸北方網友.
+   106	>
+   107	> 比如对于基本块的指令列表: 指令的数据并没有直接按照指令出现的顺序存储在列表中. 指令的数据被统一存放在函数内的一个叫做 `DataFlowGraph` 的结构中, 同时每个指令具有一个指令 ID (或者也可以叫 handle), 你可以通过 ID 在这个结构中获取对应的指令. 指令的列表中存放的其实是指令的 ID.
+   108	>
+   109	> 这么做看起来多套了一层, 但实际上 “指令 ID” 和 “指令数据” 的对应关系, 就像 C/C++ 中 “指针” 和 “指针所指向的内存” 的对应关系, 理解起来并不复杂. 至于为什么不直接把数据放在列表里? 为什么不用指针或者引用来代替 “指令 ID”? 如果对 Rust 有一定的了解, 你应该会知道这么做的后果…
+   110	
+   111	##### 写自己的代码
+   112	
+   113	新建子模块 `assembly_builder` ，负责将IR转换成汇编语言。在其中为每种Koopa IR结构实现转换成汇编语言的功能。
+   114	
+   115	修改 `main.rs` ，使得命令行参数能识别 `-koopa` 和 `-riscv` 参数。
+   116	
+   117	##### 测试
+   118	
+   119	```
+   120	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -riscv -s lv1 /root/compiler
+   121	```
+   122	
+   123	> 你需要将 `项目目录` 替换为你的编译器项目在宿主机上的路径. 同时, 在运行测试前, 你需要确保你的编译器 (假设名称为 `compiler`) 能处理如下的命令行参数:
+   124	
+   125	```
+   126	compiler -riscv 输入文件 -o 输出文件
+   127	```
+   128	
+   129	> 其中, `-riscv` 代表你的编译器要输出 RISC-V 汇编文件, `输入文件` 代表输入的 SysY 源文件的路径, `输出文件` 代表 RISC-V 汇编的输出文件路径. 你的编译器应该解析 `输入文件`, 并把生成的 RISC-V 汇编输出到 `输出文件` 中.
+   130	>
+   131	> 为了同时兼容 Koopa IR 和 RISC-V 的测试, 你的编译器应该能够根据命令行参数的值, 判断当前正在执行何种测试, 然后决定只需要进行 IR 生成, 还是同时需要进行目标代码生成, 并向输出文件中输出 Koopa IR 或 RISC-V 汇编.
+   132	
+   133	---
+   134	
+   135	#### Lv.3 表达式
+   136	
+   137	##### 写自己的代码
+   138	
+   139	###### 前端：IR生成
+   140	
+   141	在 `ast_def.rs` 和 `sysy.lalrpop` 中添加新的文法定义。改用了enum类型，配上rust的match表达式真的太tm好用了。只要能成功编译，几乎一遍过，简直是bug-free编程，太吊了。
+   142	
+   143	在 `build_ir.rs` 中将定义的所有struct递归地转化成 Koopa IR 。
+   144	
+   145	递归地计算表达式的时候，将两棵子树算出来的结果（Koopa IR 中的 value）用Koopa IR中的BinaryOP计算出新的结果。
+   146	
+   147	我的递归函数没有返回值，所以用一个全局变量来记录子树的value，每次计算出子树的value就存到全局变量，然后返回到上层函数再取出来使用。
+   148	
+   149	###### 后端：目标代码生成
+   150	
+   151	在Lv. 3中，所有指令的计算结果都放在一个寄存器中。关于寄存器是否会被用完的问题，只要及时释放掉不用的寄存器即可，反正 Lv. 3 没有局部变量，表达式的中间值用完了都可以释放掉。
+   152	
+   153	| 寄存器   | ABI 名称 | 描述                          | 保存者   |  | 寄存器     | ABI 名称      | 描述                      | 保存者   |
+   154	| -------- | -------- | ----------------------------- | -------- | - | ---------- | ------------- | ------------------------- | -------- |
+   155	| `x0`   | `zero` | 恒为 0                        | N/A      |  | `x8`     | `s0`/`fp` | 保存寄存器/帧指针         | 被调用者 |
+   156	| `x1`   | `ra`   | 返回地址                      | 调用者   |  | `x9`     | `s1`        | 保存寄存器                | 被调用者 |
+   157	| `x2`   | `sp`   | 栈指针                        | 被调用者 |  | `x10-11` | `a0-1`      | **函数参数/返回值** | 调用者   |
+   158	| `x3`   | `gp`   | 全局指针                      | N/A      |  | `x12-17` | `a2-7`      | **函数参数**        | 调用者   |
+   159	| `x4`   | `tp`   | 线程指针                      | N/A      |  | `x18-27` | `s2-11`     | 保存寄存器                | 被调用者 |
+   160	| `x5`   | `t0`   | **临时/备用链接寄存器** | 调用者   |  | `x28-31` | `t3-6`      | **临时寄存器**      | 调用者   |
+   161	| `x6-7` | `t1-2` | **临时寄存器**          | 调用者   |  |            |               |                           |          |
+   162	
+   163	没什么花头，老老实实分类然后写汇编代码就行。
+   164	
+   165	Binary 运算的左右两边的 value ，可以根据 lhs() 和 rhs() 获得。只要维护一下给每个 value 分配了哪个寄存器就行。
+   166	
+   167	##### 注意
+   168	
+   169	Koopa IR 没有逻辑 and 和 or 运算符，因此使用  `!=0 `先把整数转换成布尔值，再进行位运算的 `&&` 或者 `||` 操作。
+   170	
+   171	RISCV 没有 le 和 ge ，因此转换成 not gt 和 not lt ；同时也没有 eq 和 neq ，因此先和自己异或，再用 seqz 或 snez 比较是否为0。
+   172	
+   173	最后一个本地样例的表达式比较多，因此要把不用的寄存器释放掉。维护一个表即可。
+   174	
+   175	##### 测试
+   176	
+   177	测试 Koopa IR:
+   178	
+   179	```
+   180	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -koopa -s lv3 /root/compiler
+   181	```
+   182	
+   183	测试 RISC-V 汇编:
+   184	
+   185	```
+   186	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -riscv -s lv3 /root/compiler
+   187	```
+   188	
+   189	我从 [https://github.com/segviol/indigo/](https://github.com/segviol/indigo/) 获得了大量的测试样例以及一个测试脚本。
+   190	
+   191	用法写在 `test.py` 开头注释。
+   192	
+   193	---
+   194	
+   195	#### Lv. 4 常量和变量
+   196	
+   197	##### 写自己的代码
+   198	
+   199	###### 前端：IR生成（这一步暂时将所有常量当作变量处理，不计算常量表达式）
+   200	
+   201	在 `ast_def.rs` 和 `sysy.lalrpop` 中添加新的文法定义。
+   202	
+   203	如何匹配0个或多个的示例：
+   204	
+   205	```rust
+   206	Block: Block = "{" <block_items: (BlockItem)*> "}" => Block::Default(block_items); // Referenced from kira-rs. 
+   207	
+   208	ConstDecl: ConstDecl = "const" <b: BType> <c: ConstDef> <cs: ("," <ConstDef>)*> ";" => ...
+   209	```
+   210	
+   211	由于文法太多，把所有文法拆成了三个部分，放在一个module `ast_def` 里面。
+   212	
+   213	把前端生成IR的代码也拆成了三个部分。
+   214	
+   215	维护一个HashMap作为符号表。符号表里记录了该符号的类型和对应的Koopa IR `Value` 。
+   216	
+   217	###### 前端：计算常量表达式（包括非常量表达式中的常量部分）
+   218	
+   219	我修改了 `build() trait` 的返回值，现在它返回两种情况：一个 `i32` 常量，或者一个变量的 Koopa IR `Value` 。
+   220	
+   221	这样就可以递归地计算出那些编译期已知的常量部分。如果一个二元求值表达式的两个操作数都是 `i32` 常量，就直接计算结果，而不是把它们写进中间表示代码。
+   222	
+   223	###### 后端：目标代码生成
+   224	
+   225	在线文档让我们把所有局部变量和临时变量都存到栈里。我觉得这样太sb了，只要存局部变量进行了，临时变量用完了就可以扔了。
+   226	
+   227	在进入函数时，先扫描一遍全部指令，数一下要分配多少空间给局部变量，然后移动栈指针（ `sp` 寄存器）即可，同时用一个 `HashMap` 记录一下每个局部变量符号对应的栈帧里的位置。
+   228	
+   229	然后在遍历指令生成汇编代码的时候，对于Koopa IR中的每句 `load` 和 `store` 指令，生成RISC-V中对应的 `lw` 和 `sw` 指令就行了。（ `load` 和 `store` 指令所操作的变量名可以用 `ValueData` 中的 `name()` 方法获得。）
+   230	
+   231	##### 注意
+   232	
+   233	###### 前端：IR生成
+   234	
+   235	`dfg.new_value().load()` 函数返回的是一个含有值的 `Value` ，而 `dfg.new_value().alloc()` 和 `dfg.new_value().store()` 函数返回的是一个指针的 `Value` 。
+   236	
+   237	关于左值，当左值用来计算（成为PrimaryExp）的时候再 `load()` ，其它时候不要急着 `load()` ，将它当作指针。
+   238	
+   239	Koopa IR 是强类型的，所以当指针和值进行运算的时候会 `panic` 。
+   240	
+   241	**还有个坑：有个在线样例估计有多个** `return` **语句，需要忽略第一个** `return` **语句之后的所有内容，否则评测不通过。**
+   242	
+   243	##### 本地测试
+   244	
+   245	测试 Koopa IR:
+   246	
+   247	```
+   248	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -koopa -s lv4 /root/compiler
+   249	```
+   250	
+   251	测试 RISC-V 汇编:
+   252	
+   253	```
+   254	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -riscv -s lv4 /root/compiler
+   255	```
+   256	
+   257	---
+   258	
+   259	#### Lv. 5 语句块和作用域
+   260	
+   261	##### 写自己的代码
+   262	
+   263	非常简单，只需要把符号表搞成一个栈就行，在对 `Block` 进行 `build()` 的时候往符号表栈里加入一个新的表， `build()` 结束后删掉新的表。查找符号的时候从后往前查找即可。
+   264	
+   265	这里我重构了代码，把包含 `build()` 方法的 trait 从原来的 `IRBuildable` 一类改成了 `IRBuildable` 和 `IRExpBuildable` 两类。前者返回 build 的结果状态（是成功或者是提前终止，为了处理 `Block` 中有返回语句的情况），后者返回一个枚举类，其可能为 build 出来的 `Value` 或者提前计算出的常量值。
+   266	
+   267	同时，`return` 语句可能没有返回值了，这里也要判断处理一下。
+   268	
+   269	##### 注意
+   270	
+   271	Koopa IR 函数内部不能定义相同名字的变量，所以为了避免名称碰撞，要手动给变量重命名。我给变量名加了个后缀——嵌套的深度，也就是说 `@a` 会变为 `@a-1` ，`@a-2` ，... 。这里我规定最外层的全局变量深度为 `0` 。
+   272	
+   273	还要注意 `Block` 中可能会提前 `return` 的问题，这个也要处理。
+   274	
+   275	根据观察发现，当使用 `set_value_name` 尝试让 Koopa IR 中出现多个名称相同的符号时，Koopa IR 会自动给新的名称加个后缀 `xx_0` 、`xx_1` 等，所以无需考虑一个语句块内定义多个 同名变量的问题。
+   276	
+   277	##### 本地测试
+   278	
+   279	测试 Koopa IR:
+   280	
+   281	```
+   282	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -koopa -s lv5 /root/compiler
+   283	```
+   284	
+   285	测试 RISC-V 汇编:
+   286	
+   287	```
+   288	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -riscv -s lv5 /root/compiler
+   289	```
+   290	
+   291	---
+   292	
+   293	#### Lv.6 if 语句
+   294	
+   295	##### 写自己的代码
+   296	
+   297	###### 首先，加上 if 语法。
+   298	
+   299	这玩意有二义性，把它改成无二义性文法的改法很恶心，但也只能这么做。改法如下：
+   300	
+   301	```
+   302	//! Stmt ::= UnmatchedStmt
+   303	//!        | MatchedStmt
+   304	//! 
+   305	//! UnmatchedStmt ::= "if" "(" Exp ")" MatchedStmt ["else" UnmatchedStmt]
+   306	//! 
+   307	//! MatchedStmt ::= LVal "=" Exp ";"
+   308	//!        | [Exp] ";"
+   309	//!        | Block
+   310	//!        | "if" "(" Exp ")" MatchedStmt "else" MatchedStmt
+   311	//!        | "return" [Exp] ";";
+   312	```
+   313	
+   314	然而我并不想把实际上相同的 `build()` 方法写两遍（事实上也应尽量不把重复的代码写两遍）。`UnmatchedStmt` 与 `MatchedStmt` 只有在解析语法的时候有区别，在此之后没任何区别，因此我定义 `UnmatchedStmt` 与 `MatchedStmt` 内部都是 `BasicStmt` ，在解析完语法之后，一视同仁地处理它们。
+   315	
+   316	###### 其次，如何在 Koopa IR 中实现 if else 跳转？
+   317	
+   318	使用 Koopa IR 中的基本块 `BasicBlock` 即可。Koopa IR 有 branch 和 jump 的指令，跳转的目的地都是 `BasicBlock` 。在 if 语句之前有一个初始块，if 的条件为 true 时有一个基本块，if 的条件为 false 时有一个基本块，if 语句结束时也有一个基本块。因此，除去初始的基本块以外，我还要创建三个新的基本块。通过跳转即可实现 if else 的功能。
+   319	
+   320	在 `build` 各部分的 Koopa IR 的时候，我会指定当前所处的基本块是哪个，然后调用 `build` 方法。这样就能把各部分分别 `build` 到正确的基本块中。
+   321	
+   322	###### 最后，如何实现短路求值？
+   323	
+   324	好问题。
+   325	
+   326	就这玩意写了我整整四个小时，太恶心了。最后终于找到一种比较优雅的办法。
+   327	
+   328	对于 `exp1 || exp2` 这样的表达式，我分3类处理：
+   329	
+   330	当 `exp1` 为非常量表达式时，则转化为
+   331	
+   332	```c
+   333	int result = 0;
+   334	if (lhs != 0) {
+   335		result = rhs!=0;
+   336	}
+   337	```
+   338	
+   339	来处理短路求值；
+   340	
+   341	当 `exp1` 为常量表达式时，若其计算出的值为0，则直接使用 `exp2` 的结果作为整个表达式的结果；若计算出的值不为0，则整个表达式的值为常量1。
+   342	
+   343	##### 注意
+   344	
+   345	###### 关于命名
+   346	
+   347	测试脚本不允许 Koopa IR 的变量名或者基本块名带有横杠，明明 Koopa IR 规范是允许的。
+   348	
+   349	于是我又把变量命名方法改掉了。直接用原始变量名，因为 Koopa IR 不仅不限制重复名称，并且生成 IR 的时候会自动帮你避免重复名称。
+   350	
+   351	###### 关于测试样例
+   352	
+   353	有些测试样例规模很大，于是我就爆寄存器了。。。而且在线平台不给错误详细信息，所以一直查不出原因。。。
+   354	
+   355	妈的，不得不写寄存器分配算法了。。。
+   356	
+   357	妈的，就这么个玩意花了我四五个小时。。。
+   358	
+   359	所有的 `Value` 都被我保存在栈上。当要访问一个 `Value` 时，有几种可能：
+   360	
+   361	第一，`Value` 是一个常量，分配一个新的寄存器，用 `li` 指令将常量加载到这个寄存器，然后返回这个寄存器；
+   362	
+   363	第二，`Value` 是一个变量，已经在寄存器中，直接返回这个寄存器。
+   364	
+   365	第三，`Value` 是一个变量，且不在寄存器中，分配一个新的寄存器，用 `lw` 指令将 `Value` 加载进来，返回这个寄存器。
+   366	
+   367	分配新的寄存器的时候，如果要踢掉已有的其它 `Value` ，那就还要用 `sw` 指令将其存回栈上。
+   368	
+   369	踢掉的寄存器选择方法为LRU（Least Recently Used）。
+   370	
+   371	##### 本地测试
+   372	
+   373	测试 Koopa IR:
+   374	
+   375	```
+   376	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -koopa -s lv6 /root/compiler
+   377	```
+   378	
+   379	测试 RISC-V 汇编:
+   380	
+   381	```
+   382	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -riscv -s lv6 /root/compiler
+   383	```
+   384	
+   385	---
+   386	
+   387	#### Lv.7 while 语句
+   388	
+   389	##### 写自己的代码
+   390	
+   391	###### 新增语法：
+   392	
+   393	```
+   394	//! UnmatchedStmt ::= ...
+   395	//!                 | "while" "(" Exp ")" UnmatchedStmt;
+   396	//!
+   397	//! MatchedStmt ::= ...
+   398	//!               | "while" "(" Exp ")" MatchedStmt
+   399	//!               | "break" ";"
+   400	//!               | "continue" ";"
+   401	//!               | ...
+   402	```
+   403	
+   404	为了避免 if else 语句带来的二义性，这里也要把 `MatchedStmt` 和 `UnmatchedStmt` 分开写。
+   405	
+   406	新增的 while 语句只需要在 `BasicStmt` 中一起处理。
+   407	
+   408	###### 具体实现
+   409	
+   410	和 if 很像，也是创建三个 `BasicBlock` 。需要手动维护两个栈，记录当前如果 `break` 或者 `continue` 的话会跳转到哪个基本块。
+   411	
+   412	##### 注意
+   413	
+   414	如果在 `while` 的内部已经确定了会 `break` 或者 `continue` ，那么就不要在基本块末尾加上额外的跳转语句，要不然 Koopa IR 会报错。
+   415	
+   416	##### 本地测试
+   417	
+   418	测试 Koopa IR:
+   419	
+   420	```
+   421	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -koopa -s lv7 /root/compiler
+   422	```
+   423	
+   424	测试 RISC-V 汇编:
+   425	
+   426	```
+   427	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -riscv -s lv7 /root/compiler
+   428	```
+   429	
+   430	#### Lv.8 函数和全局变量
+   431	
+   432	卧槽，大的要来了！
+   433	
+   434	##### 写自己的代码：Koopa IR 生成
+   435	
+   436	###### 搞定语法冲突
+   437	
+   438	Lalrpop搞不定文档里的语法，因为会产生 `BType` 和 `FuncType` 的规约-规约冲突。我直接简单粗暴把这俩合二为一了。
+   439	
+   440	然后费了一番功夫把语法解析搞定了。新增的语法也太多了。。。
+   441	
+   442	###### 全局变量
+   443	
+   444	在 `VarDecl build()` 的时候，判断一下当前是否处于函数内，分类处理即可。
+   445	
+   446	然后我惊喜地发现，`ConstDecl build()` 完全不用改就能处理全局常量。
+   447	
+   448	###### 函数定义
+   449	
+   450	首先要维护一个全局函数表。
+   451	
+   452	传参的时候，实参传进来的 `Value` 是具体的值，不是指针（左值）。
+   453	
+   454	在进入函数体的时候，首先要给每个形参 `alloc` 一下把它们变成左值，然后用 `store` 把实参赋值给形参，然后给新的符号表里面加上所有的形参。
+   455	
+   456	###### 函数调用
+   457	
+   458	修改 `UnaryExp` 加上对应内容即可。调用函数的时候比较简单。
+   459	
+   460	###### 库函数
+   461	
+   462	直接加入
+   463	
+   464	```
+   465	decl @getint(): i32
+   466	decl @getch(): i32
+   467	decl @getarray(*i32): i32
+   468	decl @putint(i32)
+   469	decl @putch(i32)
+   470	decl @putarray(i32, *i32)
+   471	decl @starttime()
+   472	decl @stoptime()
+   473	```
+   474	
+   475	是不是就行了（？）
+   476	
+   477	还真是。更优雅的办法是在 `CompUnit build()` 的时候使用 `koopa::ir::FunctionData::new_decl()` 在开头添加函数声明。
+   478	
+   479	##### 写自己的代码：目标代码（RISC-V）生成
+   480	
+   481	###### 全局变量
+   482	
+   483	首先，每个 `build` 方法都要额外增加一个 `program` 参数，因为要通过 `program.borrow_value(value)` 来找到全局变量对应的  `Value` 。
+   484	
+   485	其次，在 `koopa::ir::ValueKind::Load` 的处理中，要检查这个 `load` 的源是全局变量还是局部变量。检查方法是 `load.src().is_global()` 。
+   486	
+   487	###### 函数调用
+   488	
+   489	首先计算存放函数调用参数需要的栈空间的最大值，从而算出新的栈帧长度。
+   490	
+   491	并且，存放局部/临时变量的位置也要注意，应当放在函数调用参数的上方。
+   492	
+   493	目前的栈帧分为三部分：最上面是保存的 `ra` 寄存器，然后是局部/临时变量，最后是函数调用参数。
+   494	
+   495	然后修改 `FunctionData` 的 `build()` 方法，首先把所有的实参加入栈帧查找表及寄存器查找表，然后在 prologue 中保存 `ra` 寄存器。这样，就能编译函数体了。
+   496	
+   497	最后修改 `koopa::ir::ValueKind::Call` 这部分即可：先保存 caller-saved 寄存器，然后把函数调用参数放到对应的位置，最后使用 `call` 指令调用函数。
+   498	
+   499	##### 命名规范
+   500	
+   501	经过 kira-rs 示例编译器测试，源代码中的全局变量与函数不允许重名。
+   502	
+   503	我的编译器允许全局常量与全局变量重名。当前代码中谁最后声明就使用谁。
+   504	
+   505	经过 kira-rs 示例编译器测试，RISC-V 的 label 可以以 "." 开头。
+   506	
+   507	因此，对于所有带名字的基本块，我以 "." 作为 label 开头，全局符号均用原始名称作为 label 。
+   508	
+   509	##### 注意
+   510	
+   511	有的时候源代码里没有 `return` 语句，要手动补上。
+   512	
+   513	使用自己的测试样例，定位到已知错误：寄存器分配有问题。
+   514	
+   515	比如：我在 if 的一个分支没有给 value @a 分配寄存器，另一个分支为 @a 分配了寄存器 t5，if 结尾的时候就会取出 t5 的值作为 @a 的值，这是错误的。
+   516	
+   517	##### 重新思考寄存器分配，以及写策略
+   518	
+   519	Koopa IR 中，变量分为两类：一类是定义的变量（包括全局变量），以 @ 开头，每次使用必定伴随 load 和 store ；另一类是临时变量，以 % 开头，会被唯一赋值/使用一次。如果把两类统一用 LRU Cache 来保存，就会出现上述的不同条件分支中 Cache 位置不同的错误。
+   520	
+   521	解决办法：在出基本块时（也即遇到 Return Jump Branch 指令时），保存所有的定义变量；遇到 Call 指令时，保存所有的全局变量。
+   522	
+   523	对于临时变量，用完就从表里删除。
+   524	
+   525	##### 本地测试
+   526	
+   527	测试 Koopa IR:
+   528	
+   529	```
+   530	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -koopa -s lv8 /root/compiler
+   531	```
+   532	
+   533	测试 RISC-V 汇编:
+   534	
+   535	```
+   536	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -riscv -s lv8 /root/compiler
+   537	```
+   538	
+   539	这些测试是远远不够的，因此还是得使用开头提到过的自己的测试样例。
+   540	
+   541	#### Lv.9 数组
+   542	
+   543	我去，更大的来了
+   544	
+   545	##### 写自己的代码
+   546	
+   547	首先更新文法定义。一共三处：数组变量声明、数组初始化表达式，以及数组左值。
+   548	
+   549	然后更新语义分析。
+   550	
+   551	###### 新的左值
+   552	
+   553	左值有两种用途：一是作为 `PrimaryExp` 参与运算，二是在赋值语句中作为目标地址。
+   554	
+   555	原先左值的 `build` 结果只有两种：变量（是一个指针，需要通过 `load` 来访问）常量（直接编译期求值）。
+   556	
+   557	现在，左值的 `build` 结果变为三种：地址（是一个指针，需要通过 `load` 来访问），可直接访问的变量（无需通过 `load` 来访问），常量（直接编译期求值）。
+   558	
+   559	`%2 = getelemptr @a, 0` 这种地址的计算结果就是可直接访问的变量。
+   560	
+   561	在 `PrimaryExp` 的 `build` 阶段，对这三种左值分别处理（使用 `load` 指令将其加载/不做处理/创建一个新的整数常量 `Value` ）。
+   562	
+   563	在赋值语句的 `build` 阶段，检查左值是否为地址，如果不是的话返回错误。
+   564	
+   565	###### 初始化表达式
+   566	
+   567	妈的，这玩意真的难搞
+   568	
+   569	我写了个递归函数处理这玩意。详见代码吧。
+   570	
+   571	###### 增加更多检查与错误信息（语义分析阶段）
+   572	
+   573	函数调用的参数数量检查/参数类型检查，若不通过则返回错误。
+   574	
+   575	赋值语句的左值检查，若不是地址，返回错误。
+   576	
+   577	全局变量的定义阶段，若初始值出现非常量表达式，返回错误。
+   578	
+   579	全局变量/函数的定义阶段，若出现重复符号，返回错误。
+   580	
+   581	常量的定义阶段，初始值出现非常量表达式，返回错误。
+   582	
+   583	函数调用的函数名不在符号表中，或者左值的变量名不在符号表中，返回错误。
+   584	
+   585	数组的声明时，若各维度长度中出现非常量表达式，返回错误。
+   586	
+   587	数组的初始化时，若aggregate对齐错误/出现非常量表达式，返回错误。
+   588	
+   589	`break` 或者 `continue` 语句出现在了错误的位置，返回错误。
+   590	
+   591	###### 拆分局部数组的初始化
+   592	
+   593	为了后面部分考虑，把局部数组的初始化从原来的一条 `store` 指令拆分成了多条 `store` 指令，每条放一个数。
+   594	
+   595	###### 目标代码（RISC-V汇编代码）生成
+   596	
+   597	目前进度：全局数组初始化没写。
+   598	
+   599	有些 Value 莫名其妙找不到。哦，原来是本来就从表中移除的临时变量啊，那没事了。
+   600	
+   601	##### 本地测试
+   602	
+   603	测试 Koopa IR:
+   604	
+   605	```
+   606	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -koopa -s lv9 /root/compiler
+   607	```
+   608	
+   609	测试 RISC-V 汇编:
+   610	
+   611	```
+   612	docker run -it --rm -v D:/MyCodes/Compiler-Lab:/root/compiler maxxing/compiler-dev autotest -riscv -s lv9 /root/compiler
+   613	```
+   614	
+   615	
+   616	---
+   617	
+   618	—END—

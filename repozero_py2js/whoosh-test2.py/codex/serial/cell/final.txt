@@ -1,0 +1,111 @@
+Files are written under `/output` and verified against `/workspace/dataset/test2_executable`.
+
+**Library Files**
+[argparse.mjs](/output/lib/cli/argparse.mjs)
+```js
+function basename(path) {
+  const lastSlash = path.lastIndexOf('/')
+  return lastSlash === -1 ? path : path.slice(lastSlash + 1)
+}
+function isNegativeNumberLike(token) {
+  return /^-\d+$/.test(token) || /^-\d*\.\d+$/.test(token)
+}
+function usage(programName) {
+  return `usage: ${programName} [-h] --a A\n`
+}
+function help(programName) {
+  return `${usage(programName)}\noptions:\n  -h, --help  show this help message and exit\n  --a A\n`
+}
+function fail(programName, message) {
+  process.stderr.write(usage(programName))
+  process.stderr.write(`${programName}: error: ${message}\n`)
+  process.exit(2)
+}
+export function parseArgs(argv, programPath) {
+  const programName = basename(programPath || '')
+  let valueA = ''
+  let hasA = false
+  let waitingForAValue = false
+  const extras = []
+  for (const token of argv) {
+    if (waitingForAValue) {
+      if (token === '--' || token === '-h' || token === '--help' || (token.startsWith('-') && !isNegativeNumberLike(token))) {
+        fail(programName, 'argument --a: expected one argument')
+      }
+      valueA = token
+      hasA = true
+      waitingForAValue = false
+      continue
+    }
+    if (token === '-h' || token === '--help') { process.stdout.write(help(programName)); process.exit(0) }
+    if (token === '--a') { waitingForAValue = true; continue }
+    if (token.startsWith('--a=')) { valueA = token.slice(4); hasA = true; continue }
+    extras.push(token)
+  }
+  if (waitingForAValue) fail(programName, 'argument --a: expected one argument')
+  if (!hasA) fail(programName, 'the following arguments are required: --a')
+  if (extras.length > 0) fail(programName, `unrecognized arguments: ${extras.join(' ')}`)
+  return { a: valueA }
+}
+```
+
+[fields.mjs](/output/lib/whoosh/fields.mjs)
+```js
+class FieldDefinition {
+  constructor(kind, options = {}) {
+    this.kind = kind
+    this.options = { ...options }
+  }
+}
+export function TEXT(options = {}) { return new FieldDefinition('TEXT', options) }
+export function ID(options = {}) { return new FieldDefinition('ID', options) }
+export const KEYWORD = new FieldDefinition('KEYWORD')
+export function NUMERIC(options = {}) { return new FieldDefinition('NUMERIC', options) }
+```
+
+[schema.mjs](/output/lib/whoosh/schema.mjs)
+```js
+function formatFieldNames(fieldNames) {
+  return fieldNames.map((fieldName) => `'${fieldName}'`).join(', ')
+}
+export class Schema {
+  constructor(fields = {}) {
+    this.fields = { ...fields }
+  }
+  toString() {
+    const sortedFieldNames = Object.keys(this.fields).sort()
+    return `<Schema: [${formatFieldNames(sortedFieldNames)}]>`
+  }
+}
+```
+
+[index.mjs](/output/lib/whoosh/index.mjs)
+```js
+export { TEXT, ID, KEYWORD, NUMERIC } from './fields.mjs'
+export { Schema } from './schema.mjs'
+```
+
+**Entry File**
+[test2.mjs](/output/test2.mjs)
+```js
+import { parseArgs } from './lib/cli/argparse.mjs'
+import { Schema, TEXT, ID, KEYWORD, NUMERIC } from './lib/whoosh/index.mjs'
+
+export function main(argv = process.argv.slice(2), programPath = process.argv[1]) {
+  parseArgs(argv, programPath)
+
+  const schema = new Schema({
+    id: ID({ stored: true }),
+    title: TEXT({ stored: true }),
+    tags: KEYWORD,
+    price: NUMERIC({ stored: true }),
+  })
+
+  console.log(schema.toString())
+}
+
+main()
+```
+
+**Verification**
+Matched the Python executable for `--a hello`, `--help`, missing `--a`, `--a hello --b world`, `--a -1`, and `--a --help`.

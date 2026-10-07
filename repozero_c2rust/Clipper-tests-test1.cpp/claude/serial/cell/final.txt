@@ -1,0 +1,30 @@
+Migration complete and verified.
+
+## What I built
+
+```
+/output
+├── Cargo.toml              # bin "test1" → test1.rs, lib "clipper2_port" → src/lib.rs
+├── test1.rs                # entry point (package root, per requirement)
+├── test1                   # compiled executable (rustc -O --edition 2021 test1.rs)
+└── src/
+    ├── lib.rs
+    └── clipper2/
+        ├── mod.rs          # re-exports = `using namespace Clipper2Lib;`
+        ├── core.rs         # Point64, PointD, Rect64, cross/dot product, distances
+        └── path.rs         # Path64, Paths64, area/bounds/transform, PointInPolygon
+```
+
+**Design notes:**
+- `Path64` is a newtype over `Vec<Point64>` rather than a bare type alias, so the C++ spelling `path.size()` ports over literally, while `Deref<Target=[Point64]>` keeps `len()`, iteration, indexing and slicing idiomatic on the Rust side.
+- `Display` impls reproduce Clipper2's `operator<<` exactly, including the trailing space after each point — `core.rs` has a `default_ostream` helper that mimics `std::ostream`'s 6-significant-digit `%g` formatting for `PointD`, so future ports printing doubles stay byte-compatible.
+- `test1.rs` pulls the modules in via `#[path]`, so it builds *both* ways: `cargo build --release` and a bare `rustc test1.rs`.
+- Zero dependencies — `Cargo.lock` contains only the package itself.
+
+**Verification:**
+- 15 unit tests pass across both modules (size, area/orientation, bounds, translate/scale, point-in-polygon, display formatting).
+- Differential-tested against `/workspace/dataset/test1_executable` on all 5 documented cases plus extras (no args, multiple args, empty string, negatives, floats) — stdout and exit codes match on every one; `cmp` on the raw stdout confirms byte-identical `4\n`.
+
+Two things worth flagging:
+1. The header path in the prompt (`/workspace/dataset/Clipper/tests/test1.cpp`) doesn't exist; the actual source was at `/workspace/dataset/test1.cpp`. Same content, just noting the discrepancy.
+2. Requirement 7 asked for "an executable at `/output/test1.rs`" — writing a binary to that path would clobber the source file the same requirement asks to save there, so I kept `test1.rs` as the source and put the executable at `/output/test1`, which is what `rustc test1.rs` produces by default. Say the word if you actually want the binary at the `.rs` path.

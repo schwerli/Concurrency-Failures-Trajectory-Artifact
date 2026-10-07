@@ -1,0 +1,29 @@
+Fixed.
+
+## Root cause
+
+`HuberRegressor.fit` called `check_X_y` without a `dtype` argument, so it fell back to the default `dtype="numeric"`. That default only converts *object* arrays to float — a `bool` array is already a recognized numeric-ish dtype, so it passed through as `bool`. It then reached `_huber_loss_and_gradient`, where `-axis0_safe_slice(X, ...)` applied unary minus to a boolean array, which NumPy rejects.
+
+Other linear models (e.g. `LinearRegression`) pin float dtypes explicitly, which is why they handle bool input fine.
+
+## Change
+
+`sklearn/linear_model/huber.py:253` — pin the accepted dtypes, matching the convention used elsewhere in `linear_model`:
+
+```python
+X, y = check_X_y(
+    X, y, copy=False, accept_sparse=['csr'], y_numeric=True,
+    dtype=[np.float64, np.float32])
+```
+
+Listing `float32` second means genuine `float32` input is still preserved rather than being upcast to `float64`.
+
+Added `test_huber_bool` to `sklearn/linear_model/tests/test_huber.py`.
+
+## Verification
+
+- The reproducer from the report now runs. `fit(X_bool, y)` produces coefficients and intercept **bitwise identical** to `fit(X_bool_as_float, y)` (`[29.68060795, 48.34015595]`, intercept `-39.595...`) — confirming the conversion matches the manual float cast the reporter used as a workaround, rather than merely not crashing.
+- With only the source fix reverted (test kept), `test_huber_bool` fails with exactly the reported `TypeError: The numpy boolean negative...` at `huber.py:93`. My first attempt at this stashed both files and so proved nothing; the isolated revert is what actually establishes the test catches the bug.
+- `sklearn/linear_model/`: 691 passed, 2 failed.
+
+One caveat worth stating plainly: those 2 failures are **pre-existing**. I confirmed they reproduce on the unmodified baseline with both my files stashed. They are `huber.py`'s own docstring doctest and `test_least_angle.py::test_rank_deficient_design`, both last-significant-digit float mismatches (doctest expects `-7.284608623514573`, gets `...569`) caused by this container's BLAS — the doctest carries a `+ELLIPSIS` directive but no actual ellipsis in the expected value, so it demands an exact match. Unrelated to this issue, and I left them alone.

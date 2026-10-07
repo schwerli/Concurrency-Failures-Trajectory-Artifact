@@ -1,0 +1,37 @@
+Fixed. All 3 remaining test failures are pre-existing on the clean tree (verified by stashing).
+
+## Root cause
+
+With `napoleon_use_param=True` (the default), napoleon emitted the comma-joined name verbatim:
+
+```
+:param x1, x2: Input arrays, description of `x1`, `x2`.
+:type x1, x2: array_like
+```
+
+The Python domain's `TypedField` then splits field names on commas itself, so `x1, x2` became two names while the type lookup keyed on the literal string `"x1, x2"` never matched. Rendered output before the fix:
+
+```
+x2 (x1,) – Input arrays, description of x1, x2.
+```
+
+The type was dropped entirely — which is why adding `optional` changed nothing visible.
+
+## Fix
+
+`sphinx/ext/napoleon/docstring.py:269` — `_consume_fields()` gains a `multiple` flag that splits a comma-separated name into separate fields sharing the type and description; `_parse_parameters_section()` (`:687`) passes `multiple=True` only on the `napoleon_use_param` branch. The `napoleon_use_param=False` path already rendered `**x1, x2** (array_like)` correctly, so it's left untouched.
+
+## Verification
+
+Built a real Sphinx project with autodoc + napoleon on the docstring from the report. Rendered HTML now:
+
+```
+Parameters:
+x1 (array_like) – Input arrays, description of x1, x2.
+x2 (array_like) – Input arrays, description of x1, x2.
+out (ndarray, optional) – A location into which the result is stored.
+```
+
+Types survive, so `optional` shows up as expected. Also confirmed Google style (`x1, x2 (array_like): ...`) and that `*args, **kwargs` still escapes correctly on both paths.
+
+Added `test_multiple_parameters` to `tests/test_ext_napoleon_docstring.py` covering both config values, plus a CHANGES entry.

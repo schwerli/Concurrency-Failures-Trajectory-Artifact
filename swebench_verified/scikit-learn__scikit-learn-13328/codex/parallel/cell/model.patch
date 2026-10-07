@@ -1,0 +1,57 @@
+diff --git a/sklearn/linear_model/huber.py b/sklearn/linear_model/huber.py
+index 65c686400..669063026 100644
+--- a/sklearn/linear_model/huber.py
++++ b/sklearn/linear_model/huber.py
+@@ -11,6 +11,7 @@ from ..utils import check_X_y
+ from ..utils import check_consistent_length
+ from ..utils import axis0_safe_slice
+ from ..utils.extmath import safe_sparse_dot
++from ..utils.validation import FLOAT_DTYPES
+ 
+ 
+ def _huber_loss_and_gradient(w, X, y, epsilon, alpha, sample_weight=None):
+@@ -251,7 +252,8 @@ class HuberRegressor(LinearModel, RegressorMixin, BaseEstimator):
+         self : object
+         """
+         X, y = check_X_y(
+-            X, y, copy=False, accept_sparse=['csr'], y_numeric=True)
++            X, y, copy=False, accept_sparse=['csr'], dtype=FLOAT_DTYPES,
++            y_numeric=True)
+         if sample_weight is not None:
+             sample_weight = np.array(sample_weight)
+             check_consistent_length(y, sample_weight)
+diff --git a/sklearn/linear_model/tests/test_huber.py b/sklearn/linear_model/tests/test_huber.py
+index 6a8b26133..0c29b7704 100644
+--- a/sklearn/linear_model/tests/test_huber.py
++++ b/sklearn/linear_model/tests/test_huber.py
+@@ -123,6 +123,30 @@ def test_huber_sparse():
+     assert_array_equal(huber.outliers_, huber_sparse.outliers_)
+ 
+ 
++@pytest.mark.parametrize("use_sparse", [False, True])
++def test_huber_bool_input(use_sparse):
++    X, y = make_regression_with_outliers()
++    X = X > 0
++    X_float = X.astype(np.float64)
++
++    if use_sparse:
++        X = sparse.csr_matrix(X)
++        X_float = sparse.csr_matrix(X_float)
++
++    huber = HuberRegressor(fit_intercept=True, alpha=0.1)
++    huber.fit(X_float, y)
++    expected_coef = huber.coef_.copy()
++    expected_intercept = huber.intercept_
++    expected_scale = huber.scale_
++    expected_outliers = huber.outliers_.copy()
++
++    huber.fit(X, y)
++    assert_array_almost_equal(huber.coef_, expected_coef)
++    assert_almost_equal(huber.intercept_, expected_intercept)
++    assert_almost_equal(huber.scale_, expected_scale)
++    assert_array_equal(huber.outliers_, expected_outliers)
++
++
+ def test_huber_scaling_invariant():
+     # Test that outliers filtering is scaling independent.
+     X, y = make_regression_with_outliers()

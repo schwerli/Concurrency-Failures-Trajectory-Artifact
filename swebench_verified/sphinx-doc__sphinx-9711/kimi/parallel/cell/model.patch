@@ -1,0 +1,107 @@
+diff --git a/CHANGES b/CHANGES
+index ae7cbbe7c..41d22bdc2 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -45,6 +45,9 @@ Features added
+ Bugs fixed
+ ----------
+ 
++* config: :confval:`needs_extensions` now compares extension versions as
++  versions instead of strings, so that e.g. ``0.10`` is correctly considered
++  newer than ``0.6``
+ * #9630: autodoc: Failed to build cross references if :confval:`primary_domain`
+   is not 'py'
+ * #9644: autodoc: Crashed on getting source info from problematic object
+diff --git a/sphinx/extension.py b/sphinx/extension.py
+index 7ec6c8518..86b60236f 100644
+--- a/sphinx/extension.py
++++ b/sphinx/extension.py
+@@ -10,6 +10,9 @@
+ 
+ from typing import TYPE_CHECKING, Any, Dict
+ 
++from packaging.version import InvalidVersion
++from packaging.version import Version
++
+ from sphinx.config import Config
+ from sphinx.errors import VersionRequirementError
+ from sphinx.locale import __
+@@ -51,7 +54,15 @@ def verify_needs_extensions(app: "Sphinx", config: Config) -> None:
+                               'but it is not loaded.'), extname)
+             continue
+ 
+-        if extension.version == 'unknown version' or reqversion > extension.version:
++        if extension.version == 'unknown version':
++            fulfilled = False
++        else:
++            try:
++                fulfilled = Version(reqversion) <= Version(extension.version)
++            except InvalidVersion:
++                fulfilled = False
++
++        if not fulfilled:
+             raise VersionRequirementError(__('This project needs the extension %s at least in '
+                                              'version %s and therefore cannot be built with '
+                                              'the loaded version (%s).') %
+diff --git a/tests/test_extension.py b/tests/test_extension.py
+new file mode 100644
+index 000000000..d09a79858
+--- /dev/null
++++ b/tests/test_extension.py
+@@ -0,0 +1,56 @@
++"""
++    test_extension
++    ~~~~~~~~~~~~~~
++
++    Test the sphinx.extension module.
++
++    :copyright: Copyright 2007-2021 by the Sphinx team, see AUTHORS.
++    :license: BSD, see LICENSE for details.
++"""
++
++from unittest import mock
++
++import pytest
++
++from sphinx.errors import VersionRequirementError
++from sphinx.extension import Extension, verify_needs_extensions
++
++
++def make_app_with_extension(extname, version, needs_extensions):
++    app = mock.Mock()
++    app.extensions = {extname: Extension(extname, None, version=version)}
++    config = mock.Mock()
++    config.needs_extensions = needs_extensions
++    return app, config
++
++
++def test_needs_extensions():
++    # version is fulfilled (including versions compared as versions, not strings)
++    app, config = make_app_with_extension('test.ext', '0.10.0', {'test.ext': '0.6.0'})
++    verify_needs_extensions(app, config)
++
++    app, config = make_app_with_extension('test.ext', '0.6.0', {'test.ext': '0.6.0'})
++    verify_needs_extensions(app, config)
++
++    # loaded version is too old
++    app, config = make_app_with_extension('test.ext', '0.6.0', {'test.ext': '0.10.0'})
++    with pytest.raises(VersionRequirementError):
++        verify_needs_extensions(app, config)
++
++    # extension reports no version
++    app, config = make_app_with_extension('test.ext', 'unknown version', {'test.ext': '0.6.0'})
++    with pytest.raises(VersionRequirementError):
++        verify_needs_extensions(app, config)
++
++    # extension reports an unparseable version
++    app, config = make_app_with_extension('test.ext', 'not.a.version', {'test.ext': '0.6.0'})
++    with pytest.raises(VersionRequirementError):
++        verify_needs_extensions(app, config)
++
++    # extension is not loaded at all: warned, not raised
++    app, config = make_app_with_extension('test.ext', '0.10.0', {'other.ext': '0.6.0'})
++    verify_needs_extensions(app, config)
++
++    # no needs_extensions configured: no-op
++    app, config = make_app_with_extension('test.ext', '0.10.0', None)
++    verify_needs_extensions(app, config)

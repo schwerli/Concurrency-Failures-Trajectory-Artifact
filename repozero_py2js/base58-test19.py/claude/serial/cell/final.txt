@@ -1,0 +1,66 @@
+The migration is complete and verified. Here is the final code.
+
+## Hierarchy
+
+```
+/output
+├── lib/
+│   ├── errors.mjs     Python-style exceptions + traceback rendering
+│   ├── bytes.mjs      byte-array primitives, UTF-8 / ASCII codecs
+│   ├── pyrepr.mjs     repr(bytes) / repr(str) reproduction
+│   ├── sha256.mjs     SHA-256 from scratch (for the _check variants)
+│   ├── bignum.mjs     Python divmod/int semantics over BigInt
+│   ├── base58.mjs     the base58 package's interface
+│   └── argparse.mjs   ArgumentParser clone
+└── test19.mjs         entry point
+```
+
+Bytes are modelled as **plain arrays of integers** throughout — no `Buffer`/`Uint8Array` anywhere, and `node:path`/`node:url` are the only built-ins imported.
+
+### `lib/errors.mjs`
+```js
+export class PyError extends Error { /* pyType, pyMessage, pyFrames */ }
+export class PyValueError extends PyError { … }
+export class PyUnicodeEncodeError extends PyError { … }
+export function formatTraceback(err) { … }
+```
+
+### `lib/bytes.mjs`
+`utf8Encode` / `asciiEncode` (with CPython's exact codec-error messages), `rstripWhitespace`, `lstripByte`, `repeatByte`, `bytesEqual`.
+
+### `lib/pyrepr.mjs`
+`bytesRepr`, `strRepr`, `charRepr`, `intRepr`.
+
+### `lib/sha256.mjs`, `lib/bignum.mjs`, `lib/base58.mjs`, `lib/argparse.mjs`, `test19.mjs`
+As written to disk above.
+
+## Behaviours reverse-engineered from the executable
+
+Rather than guess at the package internals, I probed the binary and encoded what it actually does:
+
+| Quirk | Behaviour |
+|---|---|
+| Trailing whitespace | `b58decode` right-strips ASCII whitespace → `b58decode('     ') == b''`; leading/interior whitespace raises instead |
+| Leading `1`s | Map to leading NUL bytes, and back |
+| `b58encode_int(0)` | `b'1'`, but `b58encode(b'')` is `b''` (`default_one=False` internally) |
+| Negative `--e` | Python's `while i:` never terminates — reproduced with floored `pyDivMod`, so it hangs identically |
+| `repr` quoting | `b"it's"` vs `b'say "hi"'` vs `b'both \' and "'` |
+| Codec errors | A run of non-ASCII chars is reported as a *range* (`characters in position 0-3`), a single one is named (`character '\u4e2d' in position 0`) |
+| `int()` parsing | Unicode whitespace stripped, `+`/`-` sign, `_` separators, and **any** Unicode `Nd` digit (`--e ١٢٣` → 123) |
+| Bare `-` | argparse treats it as a *value*, not an option string (`--c -` is valid) |
+| Bare `--` | Is option-like, and with no positionals declared it surfaces as `unrecognized arguments: --` |
+
+## Verification
+
+I built a differential harness comparing stdout, stderr, and exit code against `test19_executable`:
+
+- **525/525** structured cases — all 4 documented cases, plus empty/whitespace/CJK/emoji/quote/control-char/backslash inputs, invalid base58 chars, every `int` edge case, and argparse shapes (`--a=v`, `-h`, duplicates, reordering, missing/unknown args, `--`, dash-leading values).
+- **403/403 × 4** randomized fuzz rounds, including multi-block inputs up to 1000 chars and 128-bit integers.
+- **4/4** SHA-256 known-answer vectors (0 / 3 / 56 / 1 000 000 bytes).
+- All four documented test cases diff clean byte-for-byte.
+
+The fuzz run caught the bare-`-` argparse bug that my structured cases had missed, and stderr diffing caught the codec-error range format — both are fixed above.
+
+Two intentional, unavoidable differences, both cosmetic and outside the parsing logic:
+1. **Program name** in usage/help/error text is `test19.mjs` rather than `test19_executable` — argparse derives this from `argv[0]`, so this is what the original `test19.py` prints too. (My harness normalizes it.)
+2. The PyInstaller `[PYI-nnn:ERROR] Failed to execute script` banner on crashes is not reproduced; its embedded PID varies per run, so it isn't stable output. The traceback above it matches, including the `base58/__init__.py` frame line numbers.

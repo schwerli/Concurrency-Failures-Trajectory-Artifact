@@ -1,0 +1,35 @@
+Fixed.
+
+## Root cause
+
+`ConciseDateFormatter.format_ticks` picks a "level" (0=years, 1=months, 2=days, …) and then suppressed the offset whenever `level < 2`, on the assumption that the year is already visible in the tick labels (`lib/matplotlib/dates.py:800`). That assumption was added by the fix for #21670.
+
+It only holds at level 0 (labels are `%Y`). At level 1 the labels are `%b` (`Mar`, `Apr`, …) and the year appears only for a "zero" tick — January, which is formatted with `zero_formats[1] = '%Y'`. So when a sub-year range excludes January, the year was dropped from the labels *and* the offset.
+
+## Fix
+
+Suppress the offset at `level < 2` only when a January tick is actually present:
+
+```python
+unique = np.unique(tickdate[:, level])
+if len(unique) > 1:
+    # if 1 is included in unique, the year is shown in ticks
+    if level < 2 and np.any(unique == 1):
+        show_offset = False
+    break
+```
+
+## Verification
+
+The reproducer from the report, plus the neighbouring cases:
+
+| range | labels | offset |
+|---|---|---|
+| Feb–Sep 2021 (report) | `Mar … Sep` | **`2021`** (was `''`) |
+| Jan–Jul 2021 | `2021, Feb … Jul` | `''` — year already in labels, no duplication |
+| Nov 2020–May 2021 | `Nov, Dec, 2021, Feb …` | `''` |
+| multi-year | `2020 … 2026` | `''` |
+
+So the #21670 behaviour (no redundant offset when years are on the axis) is preserved.
+
+Added `test_concise_formatter_show_offset_no_january`, and confirmed it fails without the source change (`assert '' == '1997'`) and passes with it. Full `test_dates.py` passes (90). `test_ticker.py::TestScalarFormatter::test_mathtext_ticks` fails both with and without my change — pre-existing, missing LaTeX in this environment.

@@ -1,0 +1,86 @@
+diff --git a/doc/whats-new.rst b/doc/whats-new.rst
+index 36c84e24..8cb672d9 100644
+--- a/doc/whats-new.rst
++++ b/doc/whats-new.rst
+@@ -63,6 +63,9 @@ Bug fixes
+   By `Stephan Hoyer <https://github.com/shoyer>`_.
+ - Raise a TypeError when trying to plot empty data (:issue:`7156`, :pull:`7228`).
+   By `Michael Niklas <https://github.com/headtr1ck>`_.
++- :py:meth:`DatasetCoarsen.construct` and :py:meth:`DataArrayCoarsen.construct` no longer
++  demote non-dimensional coordinates to variables (:issue:`7233`, :pull:`7234`).
++  By `Deepak Cherian <https://github.com/dcherian>`_.
+ 
+ Documentation
+ ~~~~~~~~~~~~~
+diff --git a/xarray/core/rolling.py b/xarray/core/rolling.py
+index c194ec08..151f30e6 100644
+--- a/xarray/core/rolling.py
++++ b/xarray/core/rolling.py
+@@ -973,7 +973,9 @@ class Coarsen(CoarsenArithmetic, Generic[T_Xarray]):
+             else:
+                 reshaped[key] = var
+ 
+-        should_be_coords = set(window_dim) & set(self.obj.coords)
++        should_be_coords = (set(window_dim) | set(self.obj.coords)) & set(
++            reshaped.variables
++        )
+         result = reshaped.set_coords(should_be_coords)
+         if isinstance(self.obj, DataArray):
+             return self.obj._from_temp_dataset(result)
+diff --git a/xarray/tests/test_coarsen.py b/xarray/tests/test_coarsen.py
+index d4449985..05809bcf 100644
+--- a/xarray/tests/test_coarsen.py
++++ b/xarray/tests/test_coarsen.py
+@@ -318,3 +318,52 @@ def test_coarsen_construct(dask: bool) -> None:
+ 
+     with pytest.raises(ValueError):
+         ds.coarsen(time=12).construct(time=("bar",))
++
++
++@pytest.mark.parametrize("dask", [True, False])
++def test_coarsen_construct_keeps_all_coords(dask: bool) -> None:
++    # GH7233
++    ds = Dataset(
++        {
++            "vart": ("time", np.arange(48)),
++            "vary": ("y", np.arange(12)),
++        },
++        coords={
++            # dimension coordinate along a coarsened dimension
++            "time": np.arange(48),
++            # non-dimension coordinate along a coarsened dimension
++            "day": ("time", 365 * np.arange(48)),
++            # dimension coordinate along a dimension that is not coarsened
++            "y": np.arange(12),
++            # non-dimension coordinate along a dimension that is not coarsened
++            "labels": ("y", list("abcdefghijkl")),
++            # scalar coordinate
++            "scalar": 1,
++        },
++    )
++
++    if dask and has_dask:
++        ds = ds.chunk({"time": 12})
++
++    expected = Dataset(
++        {"vart": (("year", "month"), ds.vart.data.reshape((-1, 12))), "vary": ds.vary}
++    )
++    expected.coords["time"] = (("year", "month"), ds.time.data.reshape((-1, 12)))
++    expected.coords["day"] = (("year", "month"), ds.day.data.reshape((-1, 12)))
++    expected.coords["labels"] = ds.labels
++    expected.coords["scalar"] = ds.scalar
++
++    with raise_if_dask_computes():
++        actual = ds.coarsen(time=12).construct(time=("year", "month"))
++
++    # every coordinate stays a coordinate, none is demoted to a data variable
++    assert set(actual.coords) == set(ds.coords)
++    assert_identical(actual, expected)
++    # the un-coarsened dimension coordinate keeps its index
++    assert set(actual.xindexes) == {"y"}
++
++    with raise_if_dask_computes():
++        actual_da = ds.vart.coarsen(time=12).construct(time=("year", "month"))
++
++    assert set(actual_da.coords) == set(ds.vart.coords)
++    assert_identical(actual_da, expected.vart)

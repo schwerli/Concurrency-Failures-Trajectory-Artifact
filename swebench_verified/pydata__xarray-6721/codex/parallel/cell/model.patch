@@ -1,0 +1,62 @@
+diff --git a/xarray/core/common.py b/xarray/core/common.py
+index 3c328f42..facc7a8e 100644
+--- a/xarray/core/common.py
++++ b/xarray/core/common.py
+@@ -2023,14 +2023,13 @@ def get_chunksizes(
+ 
+     chunks: dict[Any, tuple[int, ...]] = {}
+     for v in variables:
+-        if hasattr(v.data, "chunks"):
+-            for dim, c in v.chunksizes.items():
+-                if dim in chunks and c != chunks[dim]:
+-                    raise ValueError(
+-                        f"Object has inconsistent chunks along dimension {dim}. "
+-                        "This can be fixed by calling unify_chunks()."
+-                    )
+-                chunks[dim] = c
++        for dim, c in v.chunksizes.items():
++            if dim in chunks and c != chunks[dim]:
++                raise ValueError(
++                    f"Object has inconsistent chunks along dimension {dim}. "
++                    "This can be fixed by calling unify_chunks()."
++                )
++            chunks[dim] = c
+     return Frozen(chunks)
+ 
+ 
+diff --git a/xarray/core/variable.py b/xarray/core/variable.py
+index 2d115ff0..b7c59074 100644
+--- a/xarray/core/variable.py
++++ b/xarray/core/variable.py
+@@ -1014,8 +1014,8 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+         Variable.chunks
+         xarray.unify_chunks
+         """
+-        if hasattr(self._data, "chunks"):
+-            return Frozen({dim: c for dim, c in zip(self.dims, self.data.chunks)})
++        if self.chunks is not None:
++            return Frozen({dim: c for dim, c in zip(self.dims, self.chunks)})
+         else:
+             return {}
+ 
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index e3ab430a..1aa6486d 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -4472,6 +4472,16 @@ class TestDataset:
+             ds.isel(time=10)
+             ds.isel(time=slice(10), dim1=[0]).isel(dim1=0, dim2=-1)
+ 
++    def test_chunks_are_lazy(self) -> None:
++        store = InaccessibleVariableDataStore()
++        create_test_data().dump_to_store(store)
++        ds = open_dataset(store)
++
++        assert ds.chunks == {}
++        assert ds.chunksizes == {}
++        assert ds["var1"].chunks is None
++        assert ds["var1"].chunksizes == {}
++
+     def test_dropna(self) -> None:
+         x = np.random.randn(4, 4)
+         x[::2, 0] = np.nan

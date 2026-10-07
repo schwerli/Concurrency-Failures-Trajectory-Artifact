@@ -1,0 +1,31 @@
+Done. The migration is complete and verified.
+
+## What was built
+
+`/output` is a Cargo project (edition 2021, zero dependencies) with the entry point in the package root:
+
+| File | Contents |
+|---|---|
+| `test2.rs` | Entry point — mirrors `main()` from the C++ test |
+| `cstdlib.rs` | `atoi` shim matching glibc's `(int) strtol(…, 10)` |
+| `earcut/mod.rs` | Public `earcut()` entry, module wiring |
+| `earcut/point.rs` | `Point` / `Ring` / `IndexType` traits (the `util::nth` + `N` template equivalents) |
+| `earcut/node.rs` | Ring node + arena — `usize` slots replace raw `Node*` |
+| `earcut/geometry.rs` | Coordinate-only predicates (area, point-in-triangle, sign, z-order) |
+| `earcut/triangulate.rs` | The ear-clipping algorithm: linked rings, hole bridging, 3 fallback passes, z-order hashing |
+| `earcut/tests.rs` | Triangulator correctness tests |
+
+Implemented black-box from the interface (the `earcut.hpp` source isn't present in the dataset — only `test2.cpp` and the compiled binary).
+
+## Verification
+
+- **104/104 byte-exact output matches** against `test2_executable` across ~52 argument variants (0–2147483647, negatives, `INT_MIN`, no-arg, empty, `abc`, `4.9`, `" 12"`, `"+3"`, `0x10`, and 24-digit overflow), run against **both** the `rustc -O` binary and the `cargo build --release` binary. Exit codes and stderr match too.
+- Trailing space with **no trailing newline** reproduced (hence `write!`, not `println!`).
+- **11 unit tests pass.** These matter because the CLI only ever builds 4- or 8-vertex polygons, which stay under earcut's 80-vertex threshold and so never touch `index_curve` / `sort_linked` / `is_ear_hashed`. Area-deviation tests on 500-vertex rings and a 200-vertex ring with two holes cover that path, plus steiner points, colinear filtering, and holes touching the outer ring.
+
+Two notes on judgment calls:
+
+1. `rustc test2.rs` was requested to produce an executable "at `/output/test2.rs`" — I read that as a typo and produced `/output/test2`, leaving the source intact rather than overwriting it.
+2. One test initially failed on `atoi("99999999999999")`. That was my hand-computed expectation being wrong, not the code — I compiled a C program to check, glibc returns `276447231`, which is what the Rust already produced. I corrected the test, not the implementation.
+
+Also worth flagging: `std::env::args()` (which the requirements specified) panics on non-UTF-8 arguments, where C++ `argv` would accept the bytes. Not reachable by the test cases, but it's a behavioral difference from the original if you ever pass invalid UTF-8.

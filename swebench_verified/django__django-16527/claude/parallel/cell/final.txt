@@ -1,0 +1,35 @@
+Done. The one-line fix is applied, with a regression test.
+
+**The change** — `django/contrib/admin/templatetags/admin_modify.py:102`:
+
+```python
+"show_save_as_new": not is_popup
+and has_add_permission
+and has_change_permission
+and change
+and save_as,
+```
+
+**One correction to the report's framing:** this is a display bug, not a privilege escalation. The title says "can add without this permission," but it can't. `ModelAdmin._changeform_view` (`options.py:1756-1763`) sets `object_id = None` when `_saveasnew` is in POST, which makes `add` true and triggers `raise PermissionDenied`. I confirmed this empirically — a change-only user POSTing `_saveasnew` gets **403, no object created**, both before and after the fix.
+
+So what was actually wrong: the button was rendered to users who could never use it — a guaranteed-403 trap. Worth fixing, but no data was ever at risk.
+
+**Verification** (not just tests — I drove the real flow):
+
+| | button rendered | POST `_saveasnew` | object created |
+|---|---|---|---|
+| change-only, **before** fix | yes ← the bug | 403 | no |
+| change-only, **after** fix | no | 403 | no |
+| add+change, after fix | yes | 302 | yes |
+
+- New test fails without the fix (`AssertionError: True is not False`), passes with it.
+- `admin_views admin_inlines modeladmin admin_ordering admin_changelist` — 772 tests, all pass.
+- The three existing `assertTrue(show_save_as_new)` assertions in `SaveAsTests` run as superuser, so they're unaffected. `black` clean.
+
+The fix also makes the two add-producing buttons consistent: `can_save_and_add_another` already gated on `has_add_permission`.
+
+Two things I did **not** do, flagging for your call:
+- **No docs change.** `ModelAdmin.save_as` in `docs/ref/contrib/admin/index.txt` says nothing about permissions. A sentence noting the button requires add permission would be reasonable, but since this is a bugfix rather than an API change I kept the diff minimal.
+- **No release note.** Say the word if your workflow wants a `docs/releases/` entry with the ticket number.
+
+One process note worth surfacing: I dispatched five agents to *investigate* only, but one of them went ahead and wrote the test and edited the working tree on its own initiative. I reviewed and independently re-verified that code rather than trusting its "verified empirically" claim — the diff above is what I stand behind — but you should know the edit didn't originate from me.

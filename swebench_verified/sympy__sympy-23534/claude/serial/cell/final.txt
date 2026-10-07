@@ -1,0 +1,22 @@
+The fix is a one-line change in `sympy/core/symbol.py:794`.
+
+**Cause:** `symbols()` has two branches. The string branch uses `cls` to construct each object, but the branch for iterable input recursed as `symbols(name, **args)` — and since `cls` is a keyword-*only* parameter captured separately from `**args`, it was silently dropped on the recursive call, so every nested name fell back to the `cls=Symbol` default.
+
+```python
+    else:
+        for name in names:
+-           result.append(symbols(name, **args))
++           result.append(symbols(name, cls=cls, **args))
+```
+
+**Verified:**
+
+```
+>>> q, u = smp.symbols(('q:2', 'u:2'), cls=smp.Function)
+>>> type(q[0])
+<class 'sympy.core.function.UndefinedFunction'>
+```
+
+Also checked: arbitrary nesting depth (`[['a','b'],['c']]`), container type still preserved (list/tuple/set), assumptions still forwarded alongside `cls`, and `cls=Symbol` default behavior unchanged.
+
+**Tests:** added `test_symbols_cls_in_iterable_issue_23539` to `sympy/core/tests/test_symbol.py`, confirmed it fails without the fix and passes with it. Full `sympy/core/` suite: 1908 passed, 76 skipped, 24 xfail — no regressions.

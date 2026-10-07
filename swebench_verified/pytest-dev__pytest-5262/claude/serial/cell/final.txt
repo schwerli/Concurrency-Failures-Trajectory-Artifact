@@ -1,0 +1,26 @@
+Fix is in place and verified. Here's the change:
+
+**`src/_pytest/capture.py:445`** — `EncodedFile` delegates unknown attributes to its underlying buffer via `__getattr__`, so `mode` leaked through as the buffer's binary mode (`rb+`, opened that way in `safe_text_dupfile`). But `EncodedFile.write()` only accepts `str`. Added a `mode` property that strips the `b`:
+
+```python
+    @property
+    def mode(self):
+        return self.buffer.mode.replace("b", "")
+```
+
+**Verification** — I reproduced the issue's exact failure before fixing, using youtube-dl's logic (`if "b" in out.mode: write(bytes) else: write(str)`):
+
+| | `sys.stdout.mode` under `--capture=fd` | result |
+|---|---|---|
+| before | `'rb+'` | `TypeError: write() argument must be str, not bytes` |
+| after | `'r+'` | passes, text written |
+
+**Also added:**
+- `testing/test_capture.py` — a unit test that `safe_text_dupfile` yields a non-binary `mode` while the source file is binary, and an integration test asserting `"b" not in sys.stdout.mode` inside a real `--capture=fd` run.
+- `changelog/5344.bugfix.rst`.
+
+Full `testing/test_capture.py` passes (109 passed, 7 skipped, 1 xfailed), as do `test_terminal.py`, `test_pytester.py`, and `testing/logging` (205 passed).
+
+Two things worth flagging that I did **not** change, since they're outside this bug:
+- Under `--capture=sys`, `sys.stdout` is a `CaptureIO` with **no** `mode` attribute at all. Code doing `stream.mode` unguarded raises `AttributeError` there. That matches plain `io.StringIO` behavior, so it's arguably correct — but youtube-dl-style callers only work under `fd` capture.
+- `write()` still rejects `bytes` on Python 3. The fix makes callers stop *choosing* to send bytes; it doesn't make bytes acceptable.

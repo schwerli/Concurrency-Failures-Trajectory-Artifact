@@ -1,0 +1,36 @@
+The migration is complete and verified.
+
+## What I built
+
+`mapbox::earcut` was not available to read (the dataset ships only `test1.cpp` plus the compiled binary), so I reimplemented the ear-clipping triangulator from scratch against the reference binary's observable behavior.
+
+**Project layout in `/output`:**
+
+| File | Role |
+| --- | --- |
+| `test1.rs` | Entry point — CLI parsing, unit-circle ring generation, output |
+| `src/earcut.rs` | Triangulator: ring linking, hole bridging, ear clipping, z-order fast path |
+| `src/nodes.rs` | Arena-backed circular doubly-linked list (`usize` indices + `NIL` replace raw `Node*`) |
+| `src/geom.rs` | Scalar predicates: signed area, point-in-triangle, segment tests, Morton code |
+| `src/cli.rs` | `atoi`-compatible parsing (+ a unit test) |
+
+Both build paths work: `rustc --edition 2021 -O test1.rs -o test1` (binary at `/output/test1`) and `cargo build --release`, each compiling with zero warnings and no external crates.
+
+## Behavioral details that mattered
+
+- **Winding detection drives index order.** The shoelace sum is computed over *reverse*-adjacent pairs, so the CCW input ring links forward and triangulation starts at the *last* vertex — that's what makes `n=1` emit `1 2 0` rather than `1 0 2`.
+- **Two ear tests, selected by size.** A running threshold of 80 minus the total vertex count decides whether to build the z-order (Morton) index. `n ≥ 28` crosses it, so both the linear scan and the hashed bbox-limited scan (with Simon Tatham-style linked-list merge sort) are exercised by the test grid.
+- **Output is `"{idx} "` per index** — trailing space, no newline.
+- **`atoi` semantics preserved**, including saturate-then-truncate so `99999999999999999999` becomes `-1` and yields empty output, matching the C++.
+
+## Verification
+
+Byte-for-byte comparison against `test1_executable`:
+
+- **Exhaustive `n = 1..400`** — 0 mismatches (covers both the linear and hashed ear paths, and the threshold boundary at 27/28)
+- **Large `n`**: 999, 1234, 2500, 5000, 10000 — all match
+- **Zero/negative**: `0`, `-1`, `-5`, and no-arg default — all match
+- **Malformed args**: `abc`, `3x`, `" 5"`, `+7`, `-0`, `0012`, `2.9`, `""`, `"1 2"`, and the overflow case — all match, compared via `od` so whitespace is included
+- Exit codes match; the `cargo`-built binary is byte-identical to the `rustc`-built one
+
+One caveat worth stating plainly: I could not time the two binaries (`/usr/bin/time` is absent in this image), so I've verified output equivalence only, not relative performance.

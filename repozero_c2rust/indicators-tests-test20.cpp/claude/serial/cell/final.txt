@@ -1,0 +1,28 @@
+Done. Byte-identical output, verified both build paths.
+
+## What I did
+
+The `indicators` header wasn't in the dataset (only `test20.cpp` + the binary), so this was genuinely black-box. I reverse-engineered the semantics from the 35 output lines by counting exact character runs:
+
+| Inferred behavior | Evidence |
+|---|---|
+| Default bar width = **50** | `MultiProgress` bars: 15`=` + `>` + 34 spaces = 50 |
+| `filled = width*cur/total`, then `>`, then padding | width 40→20`=`,25→8`=`,10→5`=`; interior always exactly `width` |
+| `>` occupies an *unfilled* column | keeps interior width-stable; vanishes at 100% |
+| Default precision = **1** | `Format::percentage(0.33)` → `33.0%` |
+| `ProgressBuilder::build()` returns a **percentage string**, not a bar | line 8 is `50.0%` |
+| Spinner = classic 8-frame braille cycle, index `current % 8` | `⣻` = U+28FB = frame 2 after two `next()` calls |
+
+**The one real trap:** percentages must be computed in `f32`, not `f64`. C++ stored ratios in `float` and only widened at `operator<<`. `0.12345f * 100.0f` = `12.345000267…`, which prints `12.35` at two decimals — an `f64` computation gives `12.34` and silently fails that line. I confirmed Rust's `f32` arithmetic and `{:.*}` rounding match C++ exactly on all seven literals before writing the library. I also used integer arithmetic for `filled_cells`, since a float `width * ratio` can land at `8.2499994` instead of `8.25` and drop a tick.
+
+## Verification
+
+- **Byte-identical**: `md5 df252059…` matches the C++ binary; 35 lines, 680 bytes
+- **6 argument sets** (none, positional, `--help`, flags, tabs) — output *and* exit codes match; args are read via `std::env::args()` and ignored, as in the C++
+- **Both build paths**: `rustc test20.rs` → `/output/test20`, and `cargo build --release`; 5 runs each, all identical
+- **Edge cases** beyond the test (zero total, `current > total`, zero width, `u64::MAX` increment): no panics, no divide-by-zero, no underflow; asserted interior width-stability across all ratios for widths 1/2/7
+- **std-only**: no non-`std` imports; `Cargo.lock` has 1 package (itself)
+
+Library is split into 10 modules under `/output/indicators/`, with the shared `f32` rationale documented in `format.rs` where the rounding actually happens.
+
+Two notes on the spec: requirement 7 asks for "an executable at `/output/test20.rs`", which is the source path — I produced the executable at `/output/test20` (rustc's default naming) and left the source at `/output/test20.rs`. And since the header was absent, the semantics above are inferred from observable output; they reproduce this test exactly, but unexercised paths (e.g. whether `CyclicProgress` wraps modulo `total` vs `total+1`, whether `TaskProgress::complete` adds vs sets) are my judgment calls — flagging in case other tests in the suite pin them down differently.

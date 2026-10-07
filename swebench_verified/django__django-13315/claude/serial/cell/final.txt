@@ -1,0 +1,30 @@
+Fixed.
+
+## The bug
+
+`apply_limit_choices_to_to_formfield()` applied `limit_choices_to` with `queryset.complex_filter(...)`. When the `Q` object spans a multi-valued relation, that produces a SQL `JOIN`, so a related object matching the condition more than once comes back as multiple rows — and the widget renders it as multiple `<option>` tags.
+
+## The fix
+
+`django/forms/models.py:98` — normalize `limit_choices_to` to a `Q`, correlate it to the outer row with `pk=OuterRef('pk')`, and apply it as an `Exists()` subquery. The join now happens inside a subquery that is only asked "does a match exist", so the outer queryset keeps one row per object:
+
+```python
+complex_filter = limit_choices_to
+if not isinstance(complex_filter, Q):
+    complex_filter = Q(**limit_choices_to)
+complex_filter &= Q(pk=OuterRef('pk'))
+# Use Exists() to avoid potential duplicates.
+formfield.queryset = formfield.queryset.filter(
+    Exists(formfield.queryset.model._base_manager.filter(complex_filter)),
+)
+```
+
+`.distinct()` would also dedupe, but it changes the queryset in ways callers can observe (it breaks subsequent `.annotate()` aggregates and can conflict with `.distinct(*fields)`); `Exists()` leaves the queryset's shape alone. The guard also changed from `is not None` to a truthiness check, so the default empty `limit_choices_to={}` skips the work instead of building a no-op filter.
+
+## Verification
+
+- **Regression test** `test_limit_choices_to_no_duplicates` in `tests/model_forms/tests.py:2822`, covering both the FK and M2M path via a new `Duel` test model. Confirmed it fails without the fix (`[threepwood, threepwood] != [threepwood]`) and passes with it.
+- **End-to-end**: rendered the actual widget HTML — two `<option value="1">threepwood</option>` before, one after.
+- **Full test suite**: 14289 tests. The 7 failures / 20 errors are byte-identical to the clean-tree baseline (all non-ASCII-filename and running-as-root environment issues: `staticfiles_tests`, `file_uploads`, `i18n.test_percents`, etc.). No new failures.
+
+One note I did not act on: I skipped a `docs/releases/3.2.txt` entry, which Django convention would normally want for a bugfix like this — say the word if you'd like it added.

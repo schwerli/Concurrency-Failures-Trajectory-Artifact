@@ -1,0 +1,135 @@
+diff --git a/pylint/checkers/base_checker.py b/pylint/checkers/base_checker.py
+index 5dfd7ea7..9ee9e8ca 100644
+--- a/pylint/checkers/base_checker.py
++++ b/pylint/checkers/base_checker.py
+@@ -179,6 +179,10 @@ class BaseChecker(OptionsProviderMixIn):
+     def close(self):
+         """called after visiting project (i.e set of modules)"""
+ 
++    def is_enabled(self) -> bool:
++        """Return whether this checker should participate in the current run."""
++        return True
++
+ 
+ class BaseTokenChecker(BaseChecker):
+     """Base class for checkers that want to have access to the token stream."""
+diff --git a/pylint/checkers/similar.py b/pylint/checkers/similar.py
+index c65b1c89..a21c90a6 100644
+--- a/pylint/checkers/similar.py
++++ b/pylint/checkers/similar.py
+@@ -368,6 +368,9 @@ class Similar:
+         self.ignore_signatures = ignore_signatures
+         self.linesets: List["LineSet"] = []
+ 
++    def _is_similarity_enabled(self) -> bool:
++        return self.min_lines > 0
++
+     def append_stream(self, streamid: str, stream: TextIO, encoding=None) -> None:
+         """append a file to search for similarities"""
+         if encoding is None:
+@@ -394,6 +397,9 @@ class Similar:
+ 
+     def _compute_sims(self) -> List[Tuple[int, Set[LinesChunkLimits_T]]]:
+         """compute similarities in appended files"""
++        if not self._is_similarity_enabled():
++            return []
++
+         no_duplicates: Dict[int, List[Set[LinesChunkLimits_T]]] = defaultdict(list)
+ 
+         for commonality in self._iter_sims():
+@@ -739,7 +745,8 @@ class SimilarChecker(BaseChecker, Similar, MapReduceMixin):
+                 "default": DEFAULT_MIN_SIMILARITY_LINE,
+                 "type": "int",
+                 "metavar": "<int>",
+-                "help": "Minimum lines number of a similarity.",
++                "help": "Minimum lines number of a similarity. A value of 0 "
++                "disables the checker.",
+             },
+         ),
+         (
+@@ -811,6 +818,9 @@ class SimilarChecker(BaseChecker, Similar, MapReduceMixin):
+         elif optname == "ignore-signatures":
+             self.ignore_signatures = self.config.ignore_signatures
+ 
++    def is_enabled(self) -> bool:
++        return self._is_similarity_enabled()
++
+     def open(self):
+         """init the checkers: reset linesets and statistics information"""
+         self.linesets = []
+@@ -851,12 +861,16 @@ class SimilarChecker(BaseChecker, Similar, MapReduceMixin):
+ 
+     def get_map_data(self):
+         """Passthru override"""
++        if not self.is_enabled():
++            return []
+         return Similar.get_map_data(self)
+ 
+     def reduce_map_data(self, linter, data):
+         """Reduces and recombines data into a format that we can report on
+ 
+         The partner function of get_map_data()"""
++        if not self.is_enabled() or not data:
++            return
+         recombined = SimilarChecker(linter)
+         recombined.min_lines = self.min_lines
+         recombined.ignore_comments = self.ignore_comments
+diff --git a/pylint/lint/pylinter.py b/pylint/lint/pylinter.py
+index 59276a50..dcbed3f7 100644
+--- a/pylint/lint/pylinter.py
++++ b/pylint/lint/pylinter.py
+@@ -891,7 +891,13 @@ class PyLinter(
+         needed_checkers = [self]
+         for checker in self.get_checkers()[1:]:
+             messages = {msg for msg in checker.msgs if self.is_message_enabled(msg)}
+-            if messages or any(self.report_is_enabled(r[0]) for r in checker.reports):
++            if (
++                checker.is_enabled()
++                and (
++                    messages
++                    or any(self.report_is_enabled(r[0]) for r in checker.reports)
++                )
++            ):
+                 needed_checkers.append(checker)
+         # Sort checkers by priority
+         needed_checkers = sorted(
+diff --git a/tests/checkers/unittest_similar.py b/tests/checkers/unittest_similar.py
+index 4ddf2029..1955afcb 100644
+--- a/tests/checkers/unittest_similar.py
++++ b/tests/checkers/unittest_similar.py
+@@ -339,6 +339,19 @@ TOTAL lines=62 duplicates=5 percent=8.06
+     )
+ 
+ 
++def test_zero_min_similarity_lines_disables_similarity() -> None:
++    output = StringIO()
++    with redirect_stdout(output), pytest.raises(SystemExit) as ex:
++        similar.Run(["--duplicates=0", SIMILAR1, SIMILAR2])
++    assert ex.value.code == 0
++    assert (
++        output.getvalue().strip()
++        == """
++TOTAL lines=62 duplicates=0 percent=0.00
++""".strip()
++    )
++
++
+ def test_lines_without_meaningful_content_do_not_trigger_similarity() -> None:
+     output = StringIO()
+     with redirect_stdout(output), pytest.raises(SystemExit) as ex:
+diff --git a/tests/lint/unittest_lint.py b/tests/lint/unittest_lint.py
+index 18656ad7..41da4aa2 100644
+--- a/tests/lint/unittest_lint.py
++++ b/tests/lint/unittest_lint.py
+@@ -472,6 +472,11 @@ def test_disable_similar(linter: PyLinter) -> None:
+     assert not ("similarities" in [c.name for c in linter.prepare_checkers()])
+ 
+ 
++def test_min_similarity_lines_zero_disables_similarities(linter: PyLinter) -> None:
++    linter.set_option("min-similarity-lines", 0)
++    assert "similarities" not in [c.name for c in linter.prepare_checkers()]
++
++
+ def test_disable_alot(linter: PyLinter) -> None:
+     """check that we disabled a lot of checkers"""
+     linter.set_option("reports", False)

@@ -1,0 +1,1060 @@
+===== utils.py =====
+     1	import itertools
+     2	from enum import Enum
+     3	from typing import Any, Dict, List, Tuple
+     4	
+     5	import pandas as pd
+     6	from pandas import DataFrame, Index
+     7	
+     8	
+     9	def chunk(nb_item: int, nb_chunks: int, start_offset=0) -> List[slice]:
+    10	    """
+    11	    Return `nb_chunks` slices of approximatively `nb_item / nb_chunks` each.
+    12	
+    13	    Parameters
+    14	    ----------
+    15	    nb_item : int
+    16	        Total number of items
+    17	
+    18	    nb_chunks : int
+    19	        Number of chunks to return
+    20	
+    21	    start_offset : int
+    22	        Shift start of slice by this amount
+    23	
+    24	    Returns
+    25	    -------
+    26	    A list of slices
+    27	
+    28	    Examples
+    29	    --------
+    30	    >>> chunks = chunk(103, 4)
+    31	    >>> chunks
+    32	    [slice(0, 26, None), slice(26, 52, None), slice(52, 78, None), slice(78, 103, None)]
+    33	    """
+    34	    if nb_item == 0:
+    35	        # Nothing to compute, but at least one (empty) chunk has to be returned so
+    36	        # workers are able to return an empty result with the correct type.
+    37	        return [slice(0)]
+    38	
+    39	    if nb_chunks <= 0:
+    40	        raise ValueError(
+    41	            f"nb_chunks should be a strictly positive integer, got {nb_chunks}"
+    42	        )
+    43	
+    44	    if nb_item <= nb_chunks:
+    45	        return [slice(max(0, idx - start_offset), idx + 1) for idx in range(nb_item)]
+    46	
+    47	    quotient = nb_item // nb_chunks
+    48	    remainder = nb_item % nb_chunks
+    49	
+    50	    quotients = [quotient] * nb_chunks
+    51	    remainders = [1] * remainder + [0] * (nb_chunks - remainder)
+    52	
+    53	    nb_elems_per_chunk = [
+    54	        quotient + remainder for quotient, remainder in zip(quotients, remainders)
+    55	    ]
+    56	
+    57	    accumulated = list(itertools.accumulate(nb_elems_per_chunk))
+    58	    shifted_accumulated = accumulated.copy()
+    59	    shifted_accumulated.insert(0, 0)
+    60	    shifted_accumulated.pop()
+    61	
+    62	    return [
+    63	        slice(max(0, begin - start_offset), end)
+    64	        for begin, end in zip(shifted_accumulated, accumulated)
+    65	    ]
+    66	
+    67	
+    68	def df_indexed_like(df: DataFrame, axes: List[Index]) -> bool:
+    69	    """
+    70	    Returns whether a data frame is indexed in the way specified by the
+    71	    provided axes.
+    72	
+    73	    Used by DataFrameGroupBy to determine whether a group has been modified.
+    74	
+    75	    Function adapted from pandas.core.groupby.ops._is_indexed_like
+    76	
+    77	    Parameters
+    78	    ----------
+    79	    df : DataFrame
+    80	        The data frame in question
+    81	
+    82	    axes : List[Index]
+    83	        The axes to which the data frame is compared
+    84	
+    85	    Returns
+    86	    -------
+    87	    Whether or not the data frame is indexed in the same way as the axes.
+    88	    """
+    89	    if isinstance(df, pd.Series):
+    90	        if len(axes) > 1:
+    91	            return False
+    92	
+    93	        return df.axes[0].equals(axes[0])
+    94	
+    95	    if isinstance(df, DataFrame):
+    96	        return df.axes[0].equals(axes[0])
+    97	
+    98	    return False
+    99	
+   100	
+   101	def get_pandas_version() -> Tuple[int, int]:
+   102	    """Return the (major, minor) version of the installed pandas."""
+   103	    major_str, minor_str, *_ = pd.__version__.split(".")
+   104	    return int(major_str), int(minor_str)
+   105	
+   106	
+   107	def get_axis_int(user_defined_function_kwargs: Dict[str, Any]):
+   108	    """Return the axis as an integer (0 or 1), whatever the way the user specified it.
+   109	
+   110	    Raise a ``ValueError`` (exactly like pandas does) if the axis is not valid.
+   111	    """
+   112	    axis = user_defined_function_kwargs.get("axis", 0)
+   113	
+   114	    if axis not in {0, 1, "index", "columns"}:
+   115	        raise ValueError(f"No axis named {axis} for object type DataFrame")
+   116	
+   117	    return {0: 0, 1: 1, "index": 0, "columns": 1}[axis]
+   118	
+   119	
+   120	# Attributes of a pandas window object (`Rolling`, `Expanding`, `RollingGroupby`,
+   121	# `ExpandingGroupby`) which are pandas internals and which must not be forwarded to
+   122	# `DataFrame.rolling` / `DataFrame.expanding`.
+   123	NON_CONSTRUCTOR_WINDOW_ATTRIBUTES = ("_grouper", "_as_index")
+   124	
+   125	
+   126	def get_window_attributes(window: Any) -> Dict[str, Any]:
+   127	    """
+   128	    Return the keyword arguments needed to build a window object (``Rolling`` or
+   129	    ``Expanding``) equivalent to ``window``, but on a single chunk / group.
+   130	
+   131	    Parameters
+   132	    ----------
+   133	    window: A pandas ``Rolling``, ``Expanding``, ``RollingGroupby`` or
+   134	        ``ExpandingGroupby`` object.
+   135	
+   136	    Returns
+   137	    -------
+   138	    A dict of keyword arguments, ready to be forwarded to ``DataFrame.rolling`` or
+   139	    ``DataFrame.expanding``.
+   140	    """
+   141	    attributes = {
+   142	        attribute: getattr(window, attribute)
+   143	        for attribute in window._attributes
+   144	        if attribute not in NON_CONSTRUCTOR_WINDOW_ATTRIBUTES
+   145	    }
+   146	
+   147	    # The `axis` keyword is deprecated since pandas 2.1 and forwarding it with its
+   148	    # default value would only emit useless deprecation warnings inside the workers.
+   149	    if attributes.get("axis", None) in (0, "index") and get_pandas_version() >= (2, 1):
+   150	        del attributes["axis"]
+   151	
+   152	    return attributes
+   153	
+   154	
+   155	class WorkerStatus(int, Enum):
+   156	    Running = 0
+   157	    Success = 1
+   158	    Error = 2
+===== progress_bars.py =====
+     1	import multiprocessing
+     2	import os
+     3	import shutil
+     4	import sys
+     5	from abc import ABC, abstractmethod
+     6	from enum import Enum
+     7	from itertools import count
+     8	from time import time_ns
+     9	from typing import Callable, List, Union
+    10	
+    11	from .utils import WorkerStatus
+    12	
+    13	INTERVAL_NS = 250_000_000  # 0.25 sec
+    14	MINIMUM_TERMINAL_WIDTH = 72
+    15	
+    16	
+    17	class ProgressBarsType(int, Enum):
+    18	    No = 0
+    19	    InUserDefinedFunction = 1
+    20	    InUserDefinedFunctionMultiplyByNumberOfColumns = 2
+    21	    InWorkFunction = 3
+    22	
+    23	
+    24	class ProgressBars(ABC):
+    25	    @abstractmethod
+    26	    def __init__(self, maxs: List[int], show: bool) -> None:
+    27	        ...
+    28	
+    29	    @abstractmethod
+    30	    def update(self, values: List[int]) -> None:
+    31	        ...
+    32	
+    33	    def set_error(self, index: int) -> None:
+    34	        pass
+    35	
+    36	
+    37	class ProgressState:
+    38	    def __init__(self, chunk_size: int) -> None:
+    39	        self.last_put_iteration = 0
+    40	        self.next_put_iteration = max(chunk_size // 100, 1)
+    41	        self.last_put_time = time_ns()
+    42	
+    43	
+    44	def is_notebook_lab() -> bool:
+    45	    """Return whether pandarallel runs inside a Jupyter notebook / lab."""
+    46	    try:
+    47	        shell: str = get_ipython().__class__.__name__  # type: ignore # noqa: F821
+    48	
+    49	        # Shell: Google Colab
+    50	        # TerminalInteractiveShell: Terminal running IPython
+    51	        # ZMQInteractiveShell: Jupyter notebook/lab or qtconsole
+    52	        return shell in {"Shell", "ZMQInteractiveShell"}
+    53	    except NameError:
+    54	        # Probably standard Python interpreter
+    55	        return False
+    56	
+    57	
+    58	class ProgressBarsConsole(ProgressBars):
+    59	    def __init__(self, maxs: List[int], show: bool) -> None:
+    60	        self.__show = show
+    61	        self.__bars = [[0, max] for max in maxs]
+    62	        self.__width = self.__get_width()
+    63	
+    64	        self.__lines = self.__update_lines()
+    65	
+    66	        if show:
+    67	            sys.stdout.write("\n".join(self.__lines))
+    68	            sys.stdout.flush()
+    69	
+    70	    def __get_width(self) -> int:
+    71	        try:
+    72	            columns = shutil.get_terminal_size().columns
+    73	            return max(MINIMUM_TERMINAL_WIDTH, columns - 1)
+    74	        except AttributeError:
+    75	            # Python 2
+    76	            pass
+    77	
+    78	        try:
+    79	            columns = int(os.popen("stty size", "r").read().split()[1])
+    80	            return max(MINIMUM_TERMINAL_WIDTH, columns - 1)
+    81	        except:
+    82	            return MINIMUM_TERMINAL_WIDTH
+    83	
+    84	    def __remove_displayed_lines(self) -> None:
+    85	        if len(self.__bars) >= 1:
+    86	            sys.stdout.write("\b" * len(self.__lines[-1]))
+    87	
+    88	        if len(self.__bars) >= 2:
+    89	            sys.stdout.write("\033M" * (len(self.__lines) - 1))
+    90	
+    91	        self.__lines = []
+    92	
+    93	    def __update_line(self, done: int, total: int) -> str:
+    94	        if total <= 0:
+    95	            percent = 1.0
+    96	        else:
+    97	            percent = min(done / total, 1.0)
+    98	
+    99	        bar = (":" * int(percent * 40)).ljust(40, " ")
+   100	        percent = round(percent * 100, 2)
+   101	        format = " {percent:6.2f}% {bar:s} | {done:8d} / {total:8d} |"
+   102	        ret = format.format(percent=percent, bar=bar, done=done, total=total)
+   103	        return ret[: self.__width].ljust(self.__width, " ")
+   104	
+   105	    def __update_lines(self) -> List[str]:
+   106	        return [self.__update_line(value, max) for value, max in self.__bars]
+   107	
+   108	    def update(self, values: List[int]) -> None:
+   109	        """Update a bar value.
+   110	        Positional arguments:
+   111	        values - The new values of each bar
+   112	        """
+   113	        if not self.__show:
+   114	            return
+   115	
+   116	        for index, value in enumerate(values):
+   117	            self.__bars[index][0] = value
+   118	
+   119	        self.__remove_displayed_lines()
+   120	        self.__lines = self.__update_lines()
+   121	
+   122	        sys.stdout.write("\n".join(self.__lines))
+   123	        sys.stdout.flush()
+   124	
+   125	
+   126	class ProgressBarsNotebookLab(ProgressBars):
+   127	    def __init__(self, maxs: List[int], show: bool) -> None:
+   128	        """Initialization.
+   129	        Positional argument:
+   130	        maxs - List containing the max value of each progress bar
+   131	        """
+   132	        self.__show = show
+   133	
+   134	        if not show:
+   135	            return
+   136	
+   137	        from IPython.display import display
+   138	        from ipywidgets import HBox, IntProgress, Label, VBox
+   139	
+   140	        self.__bars = [
+   141	            HBox(
+   142	                [
+   143	                    IntProgress(0, 0, max, description="{:.2f}%".format(0)),
+   144	                    Label("{} / {}".format(0, max)),
+   145	                ]
+   146	            )
+   147	            for max in maxs
+   148	        ]
+   149	
+   150	        display(VBox(self.__bars))
+   151	
+   152	    def update(self, values: List[int]) -> None:
+   153	        """Update a bar value.
+   154	        Positional arguments:
+   155	        values - The new values of each bar
+   156	        """
+   157	        if not self.__show:
+   158	            return
+   159	
+   160	        for index, value in enumerate(values):
+   161	            bar, label = self.__bars[index].children
+   162	
+   163	            bar.value = min(value, bar.max)
+   164	            bar.description = "{:.2f}%".format(
+   165	                min(value / bar.max * 100, 100) if bar.max else 100
+   166	            )
+   167	
+   168	            if value >= bar.max:
+   169	                bar.bar_style = "success"
+   170	
+   171	            label.value = "{} / {}".format(value, bar.max)
+   172	
+   173	    def set_error(self, index: int) -> None:
+   174	        """Set a bar on error"""
+   175	        if not self.__show:
+   176	            return
+   177	
+   178	        bar, _ = self.__bars[index].children
+   179	        bar.bar_style = "danger"
+   180	
+   181	
+   182	def get_progress_bars(
+   183	    maxs: List[int], show
+   184	) -> Union[ProgressBarsNotebookLab, ProgressBarsConsole]:
+   185	    """Return the progress bars implementation which fits the current environment."""
+   186	    if is_notebook_lab():
+   187	        try:
+   188	            return ProgressBarsNotebookLab(maxs, show)
+   189	        except ImportError:
+   190	            # `ipywidgets` is not installed: fall back on the console progress bars
+   191	            # instead of crashing the whole computation.
+   192	            pass
+   193	
+   194	    return ProgressBarsConsole(maxs, show)
+   195	
+   196	
+   197	def progress_wrapper(
+   198	    user_defined_function: Callable,
+   199	    master_workers_queue: multiprocessing.Queue,
+   200	    index: int,
+   201	    chunk_size: int,
+   202	) -> Callable:
+   203	    """Wrap the function to apply in a function which monitor the part of work already
+   204	    done.
+   205	    """
+   206	    counter = count()
+   207	    state = ProgressState(chunk_size)
+   208	
+   209	    def closure(*user_defined_function_args, **user_defined_functions_kwargs):
+   210	        iteration = next(counter)
+   211	
+   212	        if iteration == state.next_put_iteration:
+   213	            time_now = time_ns()
+   214	            master_workers_queue.put_nowait((index, WorkerStatus.Running, iteration))
+   215	
+   216	            delta_t = time_now - state.last_put_time
+   217	            delta_i = iteration - state.last_put_iteration
+   218	
+   219	            state.next_put_iteration += (
+   220	                max(int((delta_i / delta_t) * INTERVAL_NS), 1) if delta_t != 0 else 1
+   221	            )
+   222	
+   223	            state.last_put_iteration = iteration
+   224	            state.last_put_time = time_now
+   225	
+   226	        return user_defined_function(
+   227	            *user_defined_function_args, **user_defined_functions_kwargs
+   228	        )
+   229	
+   230	    return closure
+===== data_types/__init__.py =====
+     1	from .dataframe import DataFrame
+     2	from .dataframe_groupby import DataFrameGroupBy
+     3	from .expanding_groupby import ExpandingGroupBy
+     4	from .rolling_groupby import RollingGroupBy
+     5	from .generic import DataType
+     6	from .series import Series
+     7	from .series_rolling import SeriesExpanding, SeriesRolling
+     8	
+     9	__all__ = (
+    10	    "DataFrame",
+    11	    "DataFrameGroupBy",
+    12	    "DataType",
+    13	    "ExpandingGroupBy",
+    14	    "RollingGroupBy",
+    15	    "Series",
+    16	    "SeriesExpanding",
+    17	    "SeriesRolling",
+    18	)
+===== data_types/generic.py =====
+     1	from abc import ABC, abstractmethod
+     2	from typing import Any, Callable, Dict, Iterable, Iterator
+     3	
+     4	
+     5	class DataType(ABC):
+     6	    """Describe how a given pandas data type is split, computed and merged back.
+     7	
+     8	    Each supported pandas object (``DataFrame``, ``Series``, ``DataFrameGroupBy``,
+     9	    ``Rolling``, ``RollingGroupby``, ``ExpandingGroupby``, ...) provides an
+    10	    implementation of this interface:
+    11	
+    12	    - ``get_chunks``: split the data into ``nb_workers`` chunks (map step),
+    13	    - ``work``: what a single worker computes on a single chunk,
+    14	    - ``reduce``: how the chunk results are merged back into a single object.
+    15	    """
+    16	
+    17	    @staticmethod
+    18	    @abstractmethod
+    19	    def get_chunks(nb_workers: int, data: Any, **kwargs) -> Iterator[Any]:
+    20	        ...
+    21	
+    22	    @staticmethod
+    23	    def get_work_extra(data: Any) -> Dict[str, Any]:
+    24	        return dict()
+    25	
+    26	    @staticmethod
+    27	    @abstractmethod
+    28	    def work(
+    29	        data: Any,
+    30	        user_defined_function: Callable,
+    31	        user_defined_function_args: tuple,
+    32	        user_defined_function_kwargs: Dict[str, Any],
+    33	        extra: Dict[str, Any],
+    34	    ) -> Any:
+    35	        ...
+    36	
+    37	    @staticmethod
+    38	    def get_reduce_extra(
+    39	        data: Any, user_defined_function_kwargs: Dict[str, Any]
+    40	    ) -> Dict[str, Any]:
+    41	        return dict()
+    42	
+    43	    @staticmethod
+    44	    @abstractmethod
+    45	    def reduce(datas: Iterable[Any], extra: Dict[str, Any]) -> Any:
+    46	        ...
+===== data_types/dataframe.py =====
+     1	from typing import Any, Callable, Dict, Iterable, Iterator
+     2	
+     3	import pandas as pd
+     4	
+     5	from ..utils import chunk, get_axis_int
+     6	from .generic import DataType
+     7	
+     8	# `DataFrame.applymap` is deprecated since pandas 2.1.0 in favor of `DataFrame.map`
+     9	# (both have exactly the same semantic). Use the non deprecated one when it is
+    10	# available, so the user output is not polluted by deprecation warnings.
+    11	_APPLYMAP_METHOD_NAME = "map" if hasattr(pd.DataFrame, "map") else "applymap"
+    12	
+    13	
+    14	class DataFrame:
+    15	    class Apply(DataType):
+    16	        @staticmethod
+    17	        def get_chunks(
+    18	            nb_workers: int, data: pd.DataFrame, **kwargs
+    19	        ) -> Iterator[pd.DataFrame]:
+    20	            user_defined_function_kwargs = kwargs["user_defined_function_kwargs"]
+    21	
+    22	            axis_int = get_axis_int(user_defined_function_kwargs)
+    23	            opposite_axis_int = 1 - axis_int
+    24	
+    25	            for chunk_ in chunk(data.shape[opposite_axis_int], nb_workers):
+    26	                yield data.iloc[chunk_] if axis_int == 1 else data.iloc[:, chunk_]
+    27	
+    28	        @staticmethod
+    29	        def work(
+    30	            data: pd.DataFrame,
+    31	            user_defined_function: Callable,
+    32	            user_defined_function_args: tuple,
+    33	            user_defined_function_kwargs: Dict[str, Any],
+    34	            extra: Dict[str, Any],
+    35	        ) -> pd.DataFrame:
+    36	            return data.apply(
+    37	                user_defined_function,
+    38	                *user_defined_function_args,
+    39	                **user_defined_function_kwargs,
+    40	            )
+    41	
+    42	        @staticmethod
+    43	        def get_reduce_extra(
+    44	            data: Any, user_defined_function_kwargs: Dict[str, Any]
+    45	        ) -> Dict[str, Any]:
+    46	            return {"axis": get_axis_int(user_defined_function_kwargs)}
+    47	
+    48	        @staticmethod
+    49	        def reduce(
+    50	            datas: Iterable[pd.DataFrame], extra: Dict[str, Any]
+    51	        ) -> pd.DataFrame:
+    52	            # `datas` can be a generator (Memory File System mode), so materialize it
+    53	            # before inspecting its first element.
+    54	            datas = list(datas)
+    55	
+    56	            axis = 0 if isinstance(datas[0], pd.Series) else 1 - extra["axis"]
+    57	            return pd.concat(datas, copy=False, axis=axis)
+    58	
+    59	    class ApplyMap(DataType):
+    60	        @staticmethod
+    61	        def get_chunks(
+    62	            nb_workers: int, data: pd.DataFrame, **kwargs
+    63	        ) -> Iterator[pd.DataFrame]:
+    64	            for chunk_ in chunk(data.shape[0], nb_workers):
+    65	                yield data.iloc[chunk_]
+    66	
+    67	        @staticmethod
+    68	        def work(
+    69	            data: pd.DataFrame,
+    70	            user_defined_function: Callable,
+    71	            user_defined_function_args: tuple,
+    72	            user_defined_function_kwargs: Dict[str, Any],
+    73	            extra: Dict[str, Any],
+    74	        ) -> pd.DataFrame:
+    75	            applymap = getattr(data, _APPLYMAP_METHOD_NAME)
+    76	
+    77	            return applymap(user_defined_function, **user_defined_function_kwargs)
+    78	
+    79	        @staticmethod
+    80	        def reduce(
+    81	            datas: Iterable[pd.DataFrame], extra: Dict[str, Any]
+    82	        ) -> pd.DataFrame:
+    83	            return pd.concat(datas, copy=False)
+===== data_types/dataframe_groupby.py =====
+     1	import itertools
+     2	import warnings
+     3	from typing import Any, Callable, Dict, Iterable, Iterator, List, Tuple, Union, cast
+     4	
+     5	import pandas as pd
+     6	from pandas.core.groupby.generic import DataFrameGroupBy as PandasDataFrameGroupBy
+     7	
+     8	from ..utils import chunk, df_indexed_like, get_pandas_version
+     9	from .generic import DataType
+    10	
+    11	
+    12	class DataFrameGroupBy:
+    13	    class Apply(DataType):
+    14	        @staticmethod
+    15	        def get_chunks(
+    16	            nb_workers: int, dataframe_groupby: PandasDataFrameGroupBy, **kwargs
+    17	        ) -> Iterator[List[Tuple[int, pd.DataFrame]]]:
+    18	            chunks = chunk(dataframe_groupby.ngroups, nb_workers)
+    19	
+    20	            with warnings.catch_warnings():
+    21	                # Iterating over a group by object can emit deprecation warnings which
+    22	                # are not relevant here (e.g. about the shape of the keys when
+    23	                # grouping by a list of one single element). The user did not ask for
+    24	                # an iteration, so do not bother them with these warnings.
+    25	                warnings.simplefilter("ignore", FutureWarning)
+    26	                iterator = iter(dataframe_groupby)
+    27	
+    28	            for chunk_ in chunks:
+    29	                nb_groups = (chunk_.stop or 0) - (chunk_.start or 0)
+    30	                yield [next(iterator) for _ in range(nb_groups)]
+    31	
+    32	        @staticmethod
+    33	        def work(
+    34	            data: List[Tuple[int, pd.DataFrame]],
+    35	            user_defined_function: Callable,
+    36	            user_defined_function_args: tuple,
+    37	            user_defined_function_kwargs: Dict[str, Any],
+    38	            extra: Dict[str, Any],
+    39	        ) -> List[Tuple[int, pd.DataFrame, bool]]:
+    40	            def compute_result(
+    41	                key: int, df: pd.DataFrame
+    42	            ) -> Tuple[int, pd.DataFrame, bool]:
+    43	                result = user_defined_function(
+    44	                    df, *user_defined_function_args, **user_defined_function_kwargs
+    45	                )
+    46	                mutated = not df_indexed_like(result, df.axes)
+    47	                return key, result, mutated
+    48	
+    49	            return [compute_result(key, df) for key, df in data]
+    50	
+    51	        @staticmethod
+    52	        def get_reduce_extra(
+    53	            data: PandasDataFrameGroupBy, user_defined_function_kwargs: Dict[str, Any]
+    54	        ) -> Dict[str, Any]:
+    55	            return {"df_groupby": data}
+    56	
+    57	        @staticmethod
+    58	        def reduce(
+    59	            datas: Iterable[List[Tuple[int, pd.DataFrame, bool]]], extra: Dict[str, Any]
+    60	        ) -> pd.Series:
+    61	            def get_args(
+    62	                keys: List[int],
+    63	                values: List[pd.DataFrame],
+    64	                df_groupby: PandasDataFrameGroupBy,
+    65	            ) -> Union[
+    66	                Tuple[List[int], List[pd.DataFrame]],
+    67	                Tuple[pd.DataFrame, List[int], List[pd.DataFrame]],
+    68	                Tuple[pd.DataFrame, List[pd.DataFrame]],
+    69	            ]:
+    70	                pandas_version = get_pandas_version()
+    71	
+    72	                if pandas_version < (1, 3):
+    73	                    return keys, values
+    74	                elif pandas_version < (1, 4):
+    75	                    return df_groupby._selected_obj, keys, values
+    76	                else:
+    77	                    return df_groupby._selected_obj, values
+    78	
+    79	            df_groupby: PandasDataFrameGroupBy = extra["df_groupby"]
+    80	
+    81	            results = list(itertools.chain.from_iterable(datas))
+    82	
+    83	            if results:
+    84	                keys, values, mutated = (list(items) for items in zip(*results))
+    85	            else:
+    86	                # No group at all: pandas knows how to build the (empty) result.
+    87	                keys, values, mutated = [], [], []
+    88	
+    89	            keys = cast(List[int], keys)
+    90	            values = cast(List[pd.DataFrame], values)
+    91	            mutated = cast(List[bool], mutated)
+    92	
+    93	            args = get_args(keys, values, df_groupby)
+    94	
+    95	            # `not_indexed_same` is a boolean for pandas: it is `True` as soon as at
+    96	            # least one group has been re-indexed by the user defined function. This is
+    97	            # exactly what `pandas.core.groupby.ops.apply_groupwise` computes.
+    98	            return df_groupby._wrap_applied_output(*args, not_indexed_same=any(mutated))
+===== data_types/series.py =====
+     1	from typing import Any, Callable, Dict, Iterable, Iterator
+     2	
+     3	import pandas as pd
+     4	
+     5	from ..utils import chunk
+     6	from .generic import DataType
+     7	
+     8	
+     9	class Series:
+    10	    class Apply(DataType):
+    11	        @staticmethod
+    12	        def get_chunks(
+    13	            nb_workers: int, data: pd.Series, **kwargs
+    14	        ) -> Iterator[pd.Series]:
+    15	            for chunk_ in chunk(data.size, nb_workers):
+    16	                yield data.iloc[chunk_]
+    17	
+    18	        @staticmethod
+    19	        def work(
+    20	            data: pd.Series,
+    21	            user_defined_function: Callable,
+    22	            user_defined_function_args: tuple,
+    23	            user_defined_function_kwargs: Dict[str, Any],
+    24	            extra: Dict[str, Any],
+    25	        ) -> pd.Series:
+    26	            return data.apply(
+    27	                user_defined_function,
+    28	                *user_defined_function_args,
+    29	                **user_defined_function_kwargs,
+    30	            )
+    31	
+    32	        @staticmethod
+    33	        def reduce(datas: Iterable[pd.Series], extra: Dict[str, Any]) -> pd.Series:
+    34	            return pd.concat(datas, copy=False)
+    35	
+    36	    class Map(DataType):
+    37	        @staticmethod
+    38	        def get_chunks(
+    39	            nb_workers: int, data: pd.Series, **kwargs
+    40	        ) -> Iterator[pd.Series]:
+    41	            for chunk_ in chunk(data.size, nb_workers):
+    42	                yield data.iloc[chunk_]
+    43	
+    44	        @staticmethod
+    45	        def work(
+    46	            data: pd.Series,
+    47	            user_defined_function: Callable,
+    48	            user_defined_function_args: tuple,
+    49	            user_defined_function_kwargs: Dict[str, Any],
+    50	            extra: Dict[str, Any],
+    51	        ) -> pd.Series:
+    52	            return data.map(
+    53	                user_defined_function,
+    54	                *user_defined_function_args,
+    55	                **user_defined_function_kwargs,
+    56	            )
+    57	
+    58	        @staticmethod
+    59	        def reduce(datas: Iterable[pd.Series], extra: Dict[str, Any]) -> pd.Series:
+    60	            return pd.concat(datas, copy=False)
+===== data_types/series_rolling.py =====
+     1	from typing import Any, Callable, Dict, Iterable, Iterator, Union
+     2	
+     3	import pandas as pd
+     4	from pandas.core.window.expanding import Expanding
+     5	from pandas.core.window.rolling import Rolling
+     6	
+     7	from ..utils import chunk, get_window_attributes
+     8	from .generic import DataType
+     9	
+    10	
+    11	def can_be_chunked(attributes: Dict[str, Any]) -> bool:
+    12	    """Return whether a rolling window can safely be computed chunk by chunk.
+    13	
+    14	    Each chunk is extended on its left by ``window`` items, so its own items are
+    15	    computed with the exact same data as in the sequential case. This trick only works
+    16	    if:
+    17	
+    18	    - the window is expressed as a fixed number of items (an offset based window, like
+    19	      ``"2s"``, would need a time based left extension),
+    20	    - the window is not centered (a centered window also needs data on its right),
+    21	    - the window is not strided (``step``), since strides are computed from the
+    22	      beginning of the data.
+    23	
+    24	    When one of these conditions is not met, the computation is delegated to a single
+    25	    worker, so the result stays correct.
+    26	    """
+    27	    if attributes.get("center", False):
+    28	        return False
+    29	
+    30	    if attributes.get("step", None) not in (None, 1):
+    31	        return False
+    32	
+    33	    window = attributes.get("window", None)
+    34	
+    35	    return isinstance(window, int) and not isinstance(window, bool)
+    36	
+    37	
+    38	class ExpandingChunk:
+    39	    """A chunk of an expanding window computation.
+    40	
+    41	    ``values`` contains every item from the beginning of the data up to the end of the
+    42	    chunk, and ``start`` is the position of the first item which really belongs to this
+    43	    chunk.
+    44	    """
+    45	
+    46	    __slots__ = ("values", "start")
+    47	
+    48	    def __init__(self, values: Union[pd.Series, pd.DataFrame], start: int) -> None:
+    49	        self.values = values
+    50	        self.start = start
+    51	
+    52	    def __len__(self) -> int:
+    53	        # The number of times the user defined function is called for this chunk.
+    54	        return len(self.values)
+    55	
+    56	
+    57	class SeriesRolling:
+    58	    class Apply(DataType):
+    59	        @staticmethod
+    60	        def get_chunks(
+    61	            nb_workers: int, rolling: Rolling, **kwargs
+    62	        ) -> Iterator[pd.Series]:
+    63	            attributes = get_window_attributes(rolling)
+    64	
+    65	            if not can_be_chunked(attributes):
+    66	                yield rolling.obj
+    67	                return
+    68	
+    69	            chunks = chunk(len(rolling.obj), nb_workers, attributes["window"])
+    70	
+    71	            for chunk_ in chunks:
+    72	                yield rolling.obj.iloc[chunk_]
+    73	
+    74	        @staticmethod
+    75	        def get_work_extra(data: Rolling) -> Dict[str, Any]:
+    76	            return {"attributes": get_window_attributes(data)}
+    77	
+    78	        @staticmethod
+    79	        def work(
+    80	            data: pd.Series,
+    81	            user_defined_function: Callable,
+    82	            user_defined_function_args: tuple,
+    83	            user_defined_function_kwargs: Dict[str, Any],
+    84	            extra: Dict[str, Any],
+    85	        ) -> pd.Series:
+    86	            attributes: Dict[str, Any] = extra["attributes"]
+    87	            worker_index: int = extra["worker_index"]
+    88	
+    89	            result = data.rolling(**attributes).apply(
+    90	                user_defined_function,
+    91	                *user_defined_function_args,
+    92	                **user_defined_function_kwargs,
+    93	            )
+    94	
+    95	            if worker_index == 0 or not can_be_chunked(attributes):
+    96	                return result
+    97	
+    98	            # This chunk has been extended on its left by `window` items, so the rolling
+    99	            # computation is correct even for its own first items. These extra items
+   100	            # belong to the previous chunk: remove them from the result.
+   101	            return result.iloc[attributes["window"] :]
+   102	
+   103	        @staticmethod
+   104	        def reduce(datas: Iterable[pd.Series], extra: Dict[str, Any]) -> pd.Series:
+   105	            return pd.concat(datas, copy=False)
+   106	
+   107	
+   108	class SeriesExpanding:
+   109	    """Parallelization of ``Series.expanding().apply(...)``.
+   110	
+   111	    An expanding window always starts at the first item of the data, so a chunk cannot
+   112	    be computed independently from the chunks before it. Each worker therefore receives
+   113	    every item from the beginning of the data up to the end of its own chunk, and only
+   114	    returns the part of the result which belongs to its own chunk.
+   115	    """
+   116	
+   117	    class Apply(DataType):
+   118	        @staticmethod
+   119	        def get_chunks(
+   120	            nb_workers: int, expanding: Expanding, **kwargs
+   121	        ) -> Iterator[ExpandingChunk]:
+   122	            for chunk_ in chunk(len(expanding.obj), nb_workers):
+   123	                yield ExpandingChunk(
+   124	                    expanding.obj.iloc[slice(0, chunk_.stop)], chunk_.start or 0
+   125	                )
+   126	
+   127	        @staticmethod
+   128	        def get_work_extra(data: Expanding) -> Dict[str, Any]:
+   129	            return {"attributes": get_window_attributes(data)}
+   130	
+   131	        @staticmethod
+   132	        def work(
+   133	            data: ExpandingChunk,
+   134	            user_defined_function: Callable,
+   135	            user_defined_function_args: tuple,
+   136	            user_defined_function_kwargs: Dict[str, Any],
+   137	            extra: Dict[str, Any],
+   138	        ) -> pd.Series:
+   139	            attributes: Dict[str, Any] = extra["attributes"]
+   140	
+   141	            result = data.values.expanding(**attributes).apply(
+   142	                user_defined_function,
+   143	                *user_defined_function_args,
+   144	                **user_defined_function_kwargs,
+   145	            )
+   146	
+   147	            return result.iloc[data.start :]
+   148	
+   149	        @staticmethod
+   150	        def reduce(datas: Iterable[pd.Series], extra: Dict[str, Any]) -> pd.Series:
+   151	            return pd.concat(datas, copy=False)
+===== data_types/rolling_groupby.py =====
+     1	import multiprocessing
+     2	from typing import Any, Callable, Dict, Iterable, Iterator, List, Tuple
+     3	
+     4	import pandas as pd
+     5	from pandas.core.window.rolling import RollingGroupby as PandasRollingGroupby
+     6	
+     7	from ..utils import (
+     8	    NON_CONSTRUCTOR_WINDOW_ATTRIBUTES,
+     9	    WorkerStatus,
+    10	    chunk,
+    11	    get_pandas_version,
+    12	    get_window_attributes,
+    13	)
+    14	from .generic import DataType
+    15	
+    16	
+    17	class RollingGroupBy:
+    18	    class Apply(DataType):
+    19	        @staticmethod
+    20	        def get_chunks(
+    21	            nb_workers: int, data: PandasRollingGroupby, *args, **kwargs
+    22	        ) -> Iterator[List[Tuple[int, pd.DataFrame]]]:
+    23	            pandas_version = get_pandas_version()
+    24	
+    25	            nb_items = (
+    26	                len(data._groupby) if pandas_version < (1, 3) else data._grouper.ngroups
+    27	            )
+    28	
+    29	            chunks = chunk(nb_items, nb_workers)
+    30	
+    31	            iterator = (
+    32	                iter(data._groupby)
+    33	                if pandas_version < (1, 3)
+    34	                else data._grouper.get_iterator(data.obj)
+    35	            )
+    36	
+    37	            for chunk_ in chunks:
+    38	                nb_groups = (chunk_.stop or 0) - (chunk_.start or 0)
+    39	                yield [next(iterator) for _ in range(nb_groups)]
+    40	
+    41	        @staticmethod
+    42	        def get_work_extra(data: PandasRollingGroupby):
+    43	            return {"attributes": get_window_attributes(data)}
+    44	
+    45	        @staticmethod
+    46	        def work(
+    47	            data: List[Tuple[int, pd.DataFrame]],
+    48	            user_defined_function: Callable,
+    49	            user_defined_function_args: tuple,
+    50	            user_defined_function_kwargs: Dict[str, Any],
+    51	            extra: Dict[str, Any],
+    52	        ) -> List[pd.DataFrame]:
+    53	            show_progress_bars: bool = extra["show_progress_bars"]
+    54	            master_workers_queue: multiprocessing.Queue = extra["master_workers_queue"]
+    55	            worker_index: int = extra["worker_index"]
+    56	
+    57	            def compute_result(
+    58	                iteration: int,
+    59	                attributes: Dict[str, Any],
+    60	                index: int,
+    61	                df: pd.DataFrame,
+    62	                user_defined_function: Callable,
+    63	                user_defined_function_args: tuple,
+    64	                user_defined_function_kwargs: Dict[str, Any],
+    65	            ) -> pd.DataFrame:
+    66	                item = df.rolling(**attributes).apply(
+    67	                    user_defined_function,
+    68	                    *user_defined_function_args,
+    69	                    **user_defined_function_kwargs,
+    70	                )
+    71	
+    72	                item.index = pd.MultiIndex.from_product([[index], item.index])
+    73	
+    74	                if show_progress_bars:
+    75	                    master_workers_queue.put_nowait(
+    76	                        (worker_index, WorkerStatus.Running, iteration)
+    77	                    )
+    78	
+    79	                return item
+    80	
+    81	            attributes = dict(extra["attributes"])
+    82	
+    83	            for attribute in NON_CONSTRUCTOR_WINDOW_ATTRIBUTES:
+    84	                attributes.pop(attribute, None)
+    85	
+    86	            dfs = (
+    87	                compute_result(
+    88	                    iteration,
+    89	                    attributes,
+    90	                    index,
+    91	                    df,
+    92	                    user_defined_function,
+    93	                    user_defined_function_args,
+    94	                    user_defined_function_kwargs,
+    95	                )
+    96	                for iteration, (index, df) in enumerate(data)
+    97	            )
+    98	
+    99	            return pd.concat(dfs)
+   100	
+   101	        @staticmethod
+   102	        def reduce(datas: Iterable[pd.DataFrame], extra: Dict[str, Any]) -> pd.Series:
+   103	            return pd.concat(datas, copy=False)
+===== data_types/expanding_groupby.py =====
+     1	import multiprocessing
+     2	from typing import Any, Callable, Dict, Iterable, Iterator, List, Tuple
+     3	
+     4	import pandas as pd
+     5	from pandas.core.window.expanding import ExpandingGroupby as PandasExpandingGroupby
+     6	
+     7	from ..utils import (
+     8	    NON_CONSTRUCTOR_WINDOW_ATTRIBUTES,
+     9	    WorkerStatus,
+    10	    chunk,
+    11	    get_pandas_version,
+    12	    get_window_attributes,
+    13	)
+    14	from .generic import DataType
+    15	
+    16	
+    17	class ExpandingGroupBy:
+    18	    class Apply(DataType):
+    19	        @staticmethod
+    20	        def get_chunks(
+    21	            nb_workers: int, data: PandasExpandingGroupby, *args, **kwargs
+    22	        ) -> Iterator[List[Tuple[int, pd.DataFrame]]]:
+    23	            pandas_version = get_pandas_version()
+    24	
+    25	            nb_items = (
+    26	                len(data._groupby) if pandas_version < (1, 3) else data._grouper.ngroups
+    27	            )
+    28	
+    29	            chunks = chunk(nb_items, nb_workers)
+    30	
+    31	            iterator = (
+    32	                iter(data._groupby)
+    33	                if pandas_version < (1, 3)
+    34	                else data._grouper.get_iterator(data.obj)
+    35	            )
+    36	
+    37	            for chunk_ in chunks:
+    38	                nb_groups = (chunk_.stop or 0) - (chunk_.start or 0)
+    39	                yield [next(iterator) for _ in range(nb_groups)]
+    40	
+    41	        @staticmethod
+    42	        def get_work_extra(data: PandasExpandingGroupby):
+    43	            return {"attributes": get_window_attributes(data)}
+    44	
+    45	        @staticmethod
+    46	        def work(
+    47	            data: List[Tuple[int, pd.DataFrame]],
+    48	            user_defined_function: Callable,
+    49	            user_defined_function_args: tuple,
+    50	            user_defined_function_kwargs: Dict[str, Any],
+    51	            extra: Dict[str, Any],
+    52	        ) -> List[pd.DataFrame]:
+    53	            show_progress_bars: bool = extra["show_progress_bars"]
+    54	            master_workers_queue: multiprocessing.Queue = extra["master_workers_queue"]
+    55	            worker_index: int = extra["worker_index"]
+    56	
+    57	            def compute_result(
+    58	                iteration: int,
+    59	                attributes: Dict[str, Any],
+    60	                index: int,
+    61	                df: pd.DataFrame,
+    62	                user_defined_function: Callable,
+    63	                user_defined_function_args: tuple,
+    64	                user_defined_function_kwargs: Dict[str, Any],
+    65	            ) -> pd.DataFrame:
+    66	                item = df.expanding(**attributes).apply(
+    67	                    user_defined_function,
+    68	                    *user_defined_function_args,
+    69	                    **user_defined_function_kwargs,
+    70	                )
+    71	
+    72	                item.index = pd.MultiIndex.from_product([[index], item.index])
+    73	
+    74	                if show_progress_bars:
+    75	                    master_workers_queue.put_nowait(
+    76	                        (worker_index, WorkerStatus.Running, iteration)
+    77	                    )
+    78	
+    79	                return item
+    80	
+    81	            attributes = dict(extra["attributes"])
+    82	
+    83	            for attribute in NON_CONSTRUCTOR_WINDOW_ATTRIBUTES:
+    84	                attributes.pop(attribute, None)
+    85	
+    86	            dfs = (
+    87	                compute_result(
+    88	                    iteration,
+    89	                    attributes,
+    90	                    index,
+    91	                    df,
+    92	                    user_defined_function,
+    93	                    user_defined_function_args,
+    94	                    user_defined_function_kwargs,
+    95	                )
+    96	                for iteration, (index, df) in enumerate(data)
+    97	            )
+    98	
+    99	            return pd.concat(dfs)
+   100	
+   101	        @staticmethod
+   102	        def reduce(datas: Iterable[pd.DataFrame], extra: Dict[str, Any]) -> pd.Series:
+   103	            return pd.concat(datas, copy=False)

@@ -1,0 +1,817 @@
+     1	//! Ear clipping triangulator.
+     2	//!
+     3	//! Straight port of the classic earcut algorithm: build circular doubly linked
+     4	//! rings from the input, splice holes into the outer ring, then repeatedly clip
+     5	//! ears, falling back through progressively more aggressive repair passes
+     6	//! (`filterPoints`, local self-intersection curing, diagonal splitting) when no
+     7	//! ear can be found.
+     8	//!
+     9	//! Control flow, comparison boundaries and emission order follow the reference
+    10	//! exactly, because the triangle index sequence is observable output.
+    11	
+    12	use super::geom::{
+    13	    area, equals, intersects, locally_inside, middle_inside, point_in_triangle,
+    14	    sector_contains_sector,
+    15	};
+    16	use super::node::{Arena, NIL};
+    17	use super::zorder::z_order;
+    18	
+    19	/// A polygon: the first ring is the outer contour, the rest are holes.
+    20	pub type Ring = [[f64; 2]];
+    21	
+    22	pub struct Earcut {
+    23	    nodes: Arena,
+    24	    pub indices: Vec<u32>,
+    25	    vertices: usize,
+    26	
+    27	    hashing: bool,
+    28	    min_x: f64,
+    29	    max_x: f64,
+    30	    min_y: f64,
+    31	    max_y: f64,
+    32	    inv_size: f64,
+    33	}
+    34	
+    35	impl Earcut {
+    36	    pub fn new() -> Earcut {
+    37	        Earcut {
+    38	            nodes: Arena::new(),
+    39	            indices: Vec::new(),
+    40	            vertices: 0,
+    41	            hashing: false,
+    42	            min_x: 0.0,
+    43	            max_x: 0.0,
+    44	            min_y: 0.0,
+    45	            max_y: 0.0,
+    46	            inv_size: 0.0,
+    47	        }
+    48	    }
+    49	
+    50	    /// Triangulates a polygon, filling `indices` with triangle vertex indices
+    51	    /// referring to the flattened input coordinate sequence.
+    52	    pub fn run<R: AsRef<Ring>>(&mut self, points: &[R]) {
+    53	        // reset
+    54	        self.indices.clear();
+    55	        self.vertices = 0;
+    56	        self.nodes.clear();
+    57	
+    58	        if points.is_empty() {
+    59	            return;
+    60	        }
+    61	
+    62	        let mut threshold: i32 = 80;
+    63	        let mut len: usize = 0;
+    64	
+    65	        let mut i = 0;
+    66	        while threshold >= 0 && i < points.len() {
+    67	            threshold -= points[i].as_ref().len() as i32;
+    68	            len += points[i].as_ref().len();
+    69	            i += 1;
+    70	        }
+    71	
+    72	        // estimate size of nodes and indices
+    73	        self.nodes.reserve(len * 3 / 2);
+    74	        self.indices.reserve(len + points[0].as_ref().len());
+    75	
+    76	        let mut outer_node = self.linked_list(points[0].as_ref(), true);
+    77	        if outer_node == NIL || self.nodes[outer_node].prev == self.nodes[outer_node].next {
+    78	            return;
+    79	        }
+    80	
+    81	        if points.len() > 1 {
+    82	            outer_node = self.eliminate_holes(points, outer_node);
+    83	        }
+    84	
+    85	        // if the shape is not too simple, we'll use z-order curve hash later;
+    86	        // calculate polygon bbox
+    87	        self.hashing = threshold < 0;
+    88	        if self.hashing {
+    89	            let mut p = self.nodes[outer_node].next;
+    90	            self.min_x = self.nodes[outer_node].x;
+    91	            self.max_x = self.min_x;
+    92	            self.min_y = self.nodes[outer_node].y;
+    93	            self.max_y = self.min_y;
+    94	            loop {
+    95	                let x = self.nodes[p].x;
+    96	                let y = self.nodes[p].y;
+    97	                self.min_x = self.min_x.min(x);
+    98	                self.min_y = self.min_y.min(y);
+    99	                self.max_x = self.max_x.max(x);
+   100	                self.max_y = self.max_y.max(y);
+   101	                p = self.nodes[p].next;
+   102	                if p == outer_node {
+   103	                    break;
+   104	                }
+   105	            }
+   106	
+   107	            // min_x, min_y and inv_size are later used to transform coords into
+   108	            // integers for z-order calculation
+   109	            self.inv_size = (self.max_x - self.min_x).max(self.max_y - self.min_y);
+   110	            self.inv_size = if self.inv_size != 0.0 {
+   111	                32767.0 / self.inv_size
+   112	            } else {
+   113	                0.0
+   114	            };
+   115	        }
+   116	
+   117	        self.earcut_linked(outer_node, 0);
+   118	    }
+   119	
+   120	    /// Creates a circular doubly linked list from polygon points in the
+   121	    /// specified winding order.
+   122	    fn linked_list(&mut self, points: &Ring, clockwise: bool) -> usize {
+   123	        let mut sum = 0.0;
+   124	        let len = points.len();
+   125	        let mut last = NIL;
+   126	
+   127	        // calculate original winding order of a polygon ring
+   128	        let mut j = if len > 0 { len - 1 } else { 0 };
+   129	        for i in 0..len {
+   130	            let p1 = &points[i];
+   131	            let p2 = &points[j];
+   132	            let p20 = p2[0];
+   133	            let p10 = p1[0];
+   134	            let p11 = p1[1];
+   135	            let p21 = p2[1];
+   136	            sum += (p20 - p10) * (p11 + p21);
+   137	            j = i;
+   138	        }
+   139	
+   140	        // link points into circular doubly-linked list in the specified winding
+   141	        // order
+   142	        if clockwise == (sum > 0.0) {
+   143	            for i in 0..len {
+   144	                last = self.insert_node(self.vertices + i, points[i], last);
+   145	            }
+   146	        } else {
+   147	            for i in (0..len).rev() {
+   148	                last = self.insert_node(self.vertices + i, points[i], last);
+   149	            }
+   150	        }
+   151	
+   152	        if last != NIL && equals(self.nodes.as_slice(), last, self.nodes[last].next) {
+   153	            self.remove_node(last);
+   154	            last = self.nodes[last].next;
+   155	        }
+   156	
+   157	        self.vertices += len;
+   158	
+   159	        last
+   160	    }
+   161	
+   162	    /// Eliminates colinear or duplicate points.
+   163	    fn filter_points(&mut self, start: usize, end: usize) -> usize {
+   164	        if start == NIL {
+   165	            return start;
+   166	        }
+   167	        let mut end = if end == NIL { start } else { end };
+   168	
+   169	        let mut p = start;
+   170	        let mut again;
+   171	        loop {
+   172	            again = false;
+   173	
+   174	            let (prev, next) = (self.nodes[p].prev, self.nodes[p].next);
+   175	            if !self.nodes[p].steiner
+   176	                && (equals(self.nodes.as_slice(), p, next)
+   177	                    || area(self.nodes.as_slice(), prev, p, next) == 0.0)
+   178	            {
+   179	                self.remove_node(p);
+   180	                p = self.nodes[p].prev;
+   181	                end = p;
+   182	
+   183	                if p == self.nodes[p].next {
+   184	                    break;
+   185	                }
+   186	                again = true;
+   187	            } else {
+   188	                p = self.nodes[p].next;
+   189	            }
+   190	
+   191	            if !(again || p != end) {
+   192	                break;
+   193	            }
+   194	        }
+   195	
+   196	        end
+   197	    }
+   198	
+   199	    /// Main ear slicing loop which triangulates a polygon (given as a linked
+   200	    /// list).
+   201	    fn earcut_linked(&mut self, ear_in: usize, pass: i32) {
+   202	        if ear_in == NIL {
+   203	            return;
+   204	        }
+   205	        let mut ear = ear_in;
+   206	
+   207	        // interlink polygon nodes in z-order
+   208	        if pass == 0 && self.hashing {
+   209	            self.index_curve(ear);
+   210	        }
+   211	
+   212	        let mut stop = ear;
+   213	
+   214	        // iterate through ears, slicing them one by one
+   215	        while self.nodes[ear].prev != self.nodes[ear].next {
+   216	            let prev = self.nodes[ear].prev;
+   217	            let next = self.nodes[ear].next;
+   218	
+   219	            let is_ear = if self.hashing {
+   220	                self.is_ear_hashed(ear)
+   221	            } else {
+   222	                self.is_ear(ear)
+   223	            };
+   224	
+   225	            if is_ear {
+   226	                // cut off the triangle
+   227	                self.indices.push(self.nodes[prev].i);
+   228	                self.indices.push(self.nodes[ear].i);
+   229	                self.indices.push(self.nodes[next].i);
+   230	
+   231	                self.remove_node(ear);
+   232	
+   233	                // skipping the next vertex leads to less sliver triangles
+   234	                ear = self.nodes[next].next;
+   235	                stop = self.nodes[next].next;
+   236	
+   237	                continue;
+   238	            }
+   239	
+   240	            ear = next;
+   241	
+   242	            // if we looped through the whole remaining polygon and can't find
+   243	            // any more ears
+   244	            if ear == stop {
+   245	                // try filtering points and slicing again
+   246	                if pass == 0 {
+   247	                    let filtered = self.filter_points(ear, NIL);
+   248	                    self.earcut_linked(filtered, 1);
+   249	                } else if pass == 1 {
+   250	                    // if this didn't work, try curing all small
+   251	                    // self-intersections locally
+   252	                    let filtered = self.filter_points(ear, NIL);
+   253	                    let cured = self.cure_local_intersections(filtered);
+   254	                    self.earcut_linked(cured, 2);
+   255	                } else if pass == 2 {
+   256	                    // as a last resort, try splitting the remaining polygon
+   257	                    // into two
+   258	                    self.split_earcut(ear);
+   259	                }
+   260	
+   261	                break;
+   262	            }
+   263	        }
+   264	    }
+   265	
+   266	    /// Checks whether a polygon node forms a valid ear with adjacent nodes.
+   267	    fn is_ear(&self, ear: usize) -> bool {
+   268	        let nodes = self.nodes.as_slice();
+   269	        let a = nodes[ear].prev;
+   270	        let b = ear;
+   271	        let c = nodes[ear].next;
+   272	
+   273	        if area(nodes, a, b, c) >= 0.0 {
+   274	            return false; // reflex, can't be an ear
+   275	        }
+   276	
+   277	        // now make sure we don't have other points inside the potential ear
+   278	        let mut p = nodes[nodes[ear].next].next;
+   279	
+   280	        while p != nodes[ear].prev {
+   281	            if point_in_triangle(
+   282	                nodes[a].x, nodes[a].y, nodes[b].x, nodes[b].y, nodes[c].x, nodes[c].y, nodes[p].x,
+   283	                nodes[p].y,
+   284	            ) && area(nodes, nodes[p].prev, p, nodes[p].next) >= 0.0
+   285	            {
+   286	                return false;
+   287	            }
+   288	            p = nodes[p].next;
+   289	        }
+   290	
+   291	        true
+   292	    }
+   293	
+   294	    /// Same as `is_ear`, but only inspects candidates whose Morton code falls
+   295	    /// in the triangle's bounding box range.
+   296	    fn is_ear_hashed(&self, ear: usize) -> bool {
+   297	        let nodes = self.nodes.as_slice();
+   298	        let a = nodes[ear].prev;
+   299	        let b = ear;
+   300	        let c = nodes[ear].next;
+   301	
+   302	        if area(nodes, a, b, c) >= 0.0 {
+   303	            return false; // reflex, can't be an ear
+   304	        }
+   305	
+   306	        // triangle bbox; min & max are calculated like this for speed
+   307	        let min_tx = nodes[a].x.min(nodes[b].x.min(nodes[c].x));
+   308	        let min_ty = nodes[a].y.min(nodes[b].y.min(nodes[c].y));
+   309	        let max_tx = nodes[a].x.max(nodes[b].x.max(nodes[c].x));
+   310	        let max_ty = nodes[a].y.max(nodes[b].y.max(nodes[c].y));
+   311	
+   312	        // z-order range for the current triangle bbox
+   313	        let min_z = self.z_order(min_tx, min_ty);
+   314	        let max_z = self.z_order(max_tx, max_ty);
+   315	
+   316	        // first look for points inside the triangle in increasing z-order
+   317	        let mut p = nodes[ear].prev_z;
+   318	        let mut n = nodes[ear].next_z;
+   319	
+   320	        while p != NIL && nodes[p].z >= min_z && n != NIL && nodes[n].z <= max_z {
+   321	            if nodes[p].x >= min_tx
+   322	                && nodes[p].x <= max_tx
+   323	                && nodes[p].y >= min_ty
+   324	                && nodes[p].y <= max_ty
+   325	                && p != a
+   326	                && p != c
+   327	                && point_in_triangle(
+   328	                    nodes[a].x, nodes[a].y, nodes[b].x, nodes[b].y, nodes[c].x, nodes[c].y,
+   329	                    nodes[p].x, nodes[p].y,
+   330	                )
+   331	                && area(nodes, nodes[p].prev, p, nodes[p].next) >= 0.0
+   332	            {
+   333	                return false;
+   334	            }
+   335	            p = nodes[p].prev_z;
+   336	
+   337	            if nodes[n].x >= min_tx
+   338	                && nodes[n].x <= max_tx
+   339	                && nodes[n].y >= min_ty
+   340	                && nodes[n].y <= max_ty
+   341	                && n != a
+   342	                && n != c
+   343	                && point_in_triangle(
+   344	                    nodes[a].x, nodes[a].y, nodes[b].x, nodes[b].y, nodes[c].x, nodes[c].y,
+   345	                    nodes[n].x, nodes[n].y,
+   346	                )
+   347	                && area(nodes, nodes[n].prev, n, nodes[n].next) >= 0.0
+   348	            {
+   349	                return false;
+   350	            }
+   351	            n = nodes[n].next_z;
+   352	        }
+   353	
+   354	        // look for remaining points in decreasing z-order
+   355	        while p != NIL && nodes[p].z >= min_z {
+   356	            if nodes[p].x >= min_tx
+   357	                && nodes[p].x <= max_tx
+   358	                && nodes[p].y >= min_ty
+   359	                && nodes[p].y <= max_ty
+   360	                && p != a
+   361	                && p != c
+   362	                && point_in_triangle(
+   363	                    nodes[a].x, nodes[a].y, nodes[b].x, nodes[b].y, nodes[c].x, nodes[c].y,
+   364	                    nodes[p].x, nodes[p].y,
+   365	                )
+   366	                && area(nodes, nodes[p].prev, p, nodes[p].next) >= 0.0
+   367	            {
+   368	                return false;
+   369	            }
+   370	            p = nodes[p].prev_z;
+   371	        }
+   372	
+   373	        // look for remaining points in increasing z-order
+   374	        while n != NIL && nodes[n].z <= max_z {
+   375	            if nodes[n].x >= min_tx
+   376	                && nodes[n].x <= max_tx
+   377	                && nodes[n].y >= min_ty
+   378	                && nodes[n].y <= max_ty
+   379	                && n != a
+   380	                && n != c
+   381	                && point_in_triangle(
+   382	                    nodes[a].x, nodes[a].y, nodes[b].x, nodes[b].y, nodes[c].x, nodes[c].y,
+   383	                    nodes[n].x, nodes[n].y,
+   384	                )
+   385	                && area(nodes, nodes[n].prev, n, nodes[n].next) >= 0.0
+   386	            {
+   387	                return false;
+   388	            }
+   389	            n = nodes[n].next_z;
+   390	        }
+   391	
+   392	        true
+   393	    }
+   394	
+   395	    /// Goes through all polygon nodes and cures small local self-intersections.
+   396	    fn cure_local_intersections(&mut self, start_in: usize) -> usize {
+   397	        let mut start = start_in;
+   398	        let mut p = start;
+   399	        loop {
+   400	            let a = self.nodes[p].prev;
+   401	            let pn = self.nodes[p].next;
+   402	            let b = self.nodes[pn].next;
+   403	
+   404	            if !equals(self.nodes.as_slice(), a, b)
+   405	                && intersects(self.nodes.as_slice(), a, p, pn, b)
+   406	                && locally_inside(self.nodes.as_slice(), a, b)
+   407	                && locally_inside(self.nodes.as_slice(), b, a)
+   408	            {
+   409	                self.indices.push(self.nodes[a].i);
+   410	                self.indices.push(self.nodes[p].i);
+   411	                self.indices.push(self.nodes[b].i);
+   412	
+   413	                // remove two nodes involved
+   414	                self.remove_node(p);
+   415	                let next = self.nodes[p].next;
+   416	                self.remove_node(next);
+   417	
+   418	                p = b;
+   419	                start = b;
+   420	            }
+   421	            p = self.nodes[p].next;
+   422	            if p == start {
+   423	                break;
+   424	            }
+   425	        }
+   426	
+   427	        self.filter_points(p, NIL)
+   428	    }
+   429	
+   430	    /// Tries splitting polygon into two and triangulating them independently.
+   431	    fn split_earcut(&mut self, start: usize) {
+   432	        // look for a valid diagonal that divides the polygon into two
+   433	        let mut a = start;
+   434	        loop {
+   435	            let mut b = self.nodes[self.nodes[a].next].next;
+   436	            while b != self.nodes[a].prev {
+   437	                if self.nodes[a].i != self.nodes[b].i && self.is_valid_diagonal(a, b) {
+   438	                    // split the polygon in two by the diagonal
+   439	                    let mut c = self.split_polygon(a, b);
+   440	
+   441	                    // filter colinear points around the cuts
+   442	                    let a_next = self.nodes[a].next;
+   443	                    a = self.filter_points(a, a_next);
+   444	                    let c_next = self.nodes[c].next;
+   445	                    c = self.filter_points(c, c_next);
+   446	
+   447	                    // run earcut on each half
+   448	                    self.earcut_linked(a, 0);
+   449	                    self.earcut_linked(c, 0);
+   450	                    return;
+   451	                }
+   452	                b = self.nodes[b].next;
+   453	            }
+   454	            a = self.nodes[a].next;
+   455	            if a == start {
+   456	                break;
+   457	            }
+   458	        }
+   459	    }
+   460	
+   461	    /// Links every hole into the outer loop, producing a single-ring polygon.
+   462	    fn eliminate_holes<R: AsRef<Ring>>(&mut self, points: &[R], outer_node_in: usize) -> usize {
+   463	        let mut outer_node = outer_node_in;
+   464	        let len = points.len();
+   465	
+   466	        let mut queue: Vec<usize> = Vec::new();
+   467	        for i in 1..len {
+   468	            let list = self.linked_list(points[i].as_ref(), false);
+   469	            if list != NIL {
+   470	                if list == self.nodes[list].next {
+   471	                    self.nodes[list].steiner = true;
+   472	                }
+   473	                queue.push(self.get_leftmost(list));
+   474	            }
+   475	        }
+   476	
+   477	        let xs: Vec<f64> = queue.iter().map(|&q| self.nodes[q].x).collect();
+   478	        let mut order: Vec<usize> = (0..queue.len()).collect();
+   479	        order.sort_by(|&l, &r| xs[l].partial_cmp(&xs[r]).unwrap_or(std::cmp::Ordering::Equal));
+   480	        let queue: Vec<usize> = order.into_iter().map(|k| queue[k]).collect();
+   481	
+   482	        // process holes from left to right
+   483	        for &hole in queue.iter() {
+   484	            outer_node = self.eliminate_hole(hole, outer_node);
+   485	        }
+   486	
+   487	        outer_node
+   488	    }
+   489	
+   490	    /// Finds a bridge between vertices that connects a hole with an outer ring,
+   491	    /// and links it.
+   492	    fn eliminate_hole(&mut self, hole: usize, outer_node: usize) -> usize {
+   493	        let bridge = self.find_hole_bridge(hole, outer_node);
+   494	        if bridge == NIL {
+   495	            return outer_node;
+   496	        }
+   497	
+   498	        let bridge_reverse = self.split_polygon(bridge, hole);
+   499	
+   500	        // filter collinear points around the cuts
+   501	        let br_next = self.nodes[bridge_reverse].next;
+   502	        self.filter_points(bridge_reverse, br_next);
+   503	        let b_next = self.nodes[bridge].next;
+   504	        self.filter_points(bridge, b_next)
+   505	    }
+   506	
+   507	    /// David Eberly's algorithm for finding a bridge between hole and outer
+   508	    /// polygon.
+   509	    fn find_hole_bridge(&self, hole: usize, outer_node: usize) -> usize {
+   510	        let nodes = self.nodes.as_slice();
+   511	        let mut p = outer_node;
+   512	        let hx = nodes[hole].x;
+   513	        let hy = nodes[hole].y;
+   514	        let mut qx = f64::NEG_INFINITY;
+   515	        let mut m = NIL;
+   516	
+   517	        // find a segment intersected by a ray from the hole's leftmost vertex
+   518	        // to the left; segment's endpoint with lesser x will be potential
+   519	        // connection vertex
+   520	        loop {
+   521	            let pn = nodes[p].next;
+   522	            if hy <= nodes[p].y && hy >= nodes[pn].y && nodes[pn].y != nodes[p].y {
+   523	                let x = nodes[p].x
+   524	                    + (hy - nodes[p].y) * (nodes[pn].x - nodes[p].x)
+   525	                        / (nodes[pn].y - nodes[p].y);
+   526	                if x <= hx && x > qx {
+   527	                    qx = x;
+   528	                    m = if nodes[p].x < nodes[pn].x { p } else { pn };
+   529	                    if x == hx {
+   530	                        // hole touches outer segment; pick leftmost endpoint
+   531	                        return m;
+   532	                    }
+   533	                }
+   534	            }
+   535	            p = pn;
+   536	            if p == outer_node {
+   537	                break;
+   538	            }
+   539	        }
+   540	
+   541	        if m == NIL {
+   542	            return NIL;
+   543	        }
+   544	
+   545	        // look for points inside the triangle of hole vertex, segment
+   546	        // intersection and endpoint; if there are no points found, we have a
+   547	        // valid connection; otherwise choose the vertex of the minimum angle
+   548	        // with the ray as connection vertex
+   549	        let stop = m;
+   550	        let mut tan_min = f64::INFINITY;
+   551	
+   552	        p = m;
+   553	        let mx = nodes[m].x;
+   554	        let my = nodes[m].y;
+   555	
+   556	        loop {
+   557	            if hx >= nodes[p].x
+   558	                && nodes[p].x >= mx
+   559	                && hx != nodes[p].x
+   560	                && point_in_triangle(
+   561	                    if hy < my { hx } else { qx },
+   562	                    hy,
+   563	                    mx,
+   564	                    my,
+   565	                    if hy < my { qx } else { hx },
+   566	                    hy,
+   567	                    nodes[p].x,
+   568	                    nodes[p].y,
+   569	                )
+   570	            {
+   571	                let tan_cur = (hy - nodes[p].y).abs() / (hx - nodes[p].x); // tangential
+   572	
+   573	                if locally_inside(nodes, p, hole)
+   574	                    && (tan_cur < tan_min
+   575	                        || (tan_cur == tan_min
+   576	                            && (nodes[p].x > nodes[m].x || sector_contains_sector(nodes, m, p))))
+   577	                {
+   578	                    m = p;
+   579	                    tan_min = tan_cur;
+   580	                }
+   581	            }
+   582	
+   583	            p = nodes[p].next;
+   584	            if p == stop {
+   585	                break;
+   586	            }
+   587	        }
+   588	
+   589	        m
+   590	    }
+   591	
+   592	    /// Interlinks polygon nodes in z-order.
+   593	    fn index_curve(&mut self, start: usize) {
+   594	        let mut p = start;
+   595	
+   596	        loop {
+   597	            if self.nodes[p].z == 0 {
+   598	                let (x, y) = (self.nodes[p].x, self.nodes[p].y);
+   599	                self.nodes[p].z = self.z_order(x, y);
+   600	            }
+   601	            self.nodes[p].prev_z = self.nodes[p].prev;
+   602	            self.nodes[p].next_z = self.nodes[p].next;
+   603	            p = self.nodes[p].next;
+   604	            if p == start {
+   605	                break;
+   606	            }
+   607	        }
+   608	
+   609	        let pz = self.nodes[p].prev_z;
+   610	        self.nodes[pz].next_z = NIL;
+   611	        self.nodes[p].prev_z = NIL;
+   612	
+   613	        self.sort_linked(p);
+   614	    }
+   615	
+   616	    /// Simon Tatham's linked list merge sort algorithm, applied to the z-order
+   617	    /// list.
+   618	    fn sort_linked(&mut self, list_in: usize) -> usize {
+   619	        let mut list = list_in;
+   620	        let mut in_size: i32 = 1;
+   621	
+   622	        loop {
+   623	            let mut p = list;
+   624	            list = NIL;
+   625	            let mut tail = NIL;
+   626	            let mut num_merges = 0;
+   627	
+   628	            while p != NIL {
+   629	                num_merges += 1;
+   630	                let mut q = p;
+   631	                let mut p_size = 0;
+   632	                for _ in 0..in_size {
+   633	                    p_size += 1;
+   634	                    q = self.nodes[q].next_z;
+   635	                    if q == NIL {
+   636	                        break;
+   637	                    }
+   638	                }
+   639	
+   640	                let mut q_size = in_size;
+   641	
+   642	                while p_size > 0 || (q_size > 0 && q != NIL) {
+   643	                    let e;
+   644	                    if p_size == 0 {
+   645	                        e = q;
+   646	                        q = self.nodes[q].next_z;
+   647	                        q_size -= 1;
+   648	                    } else if q_size == 0 || q == NIL {
+   649	                        e = p;
+   650	                        p = self.nodes[p].next_z;
+   651	                        p_size -= 1;
+   652	                    } else if self.nodes[p].z <= self.nodes[q].z {
+   653	                        e = p;
+   654	                        p = self.nodes[p].next_z;
+   655	                        p_size -= 1;
+   656	                    } else {
+   657	                        e = q;
+   658	                        q = self.nodes[q].next_z;
+   659	                        q_size -= 1;
+   660	                    }
+   661	
+   662	                    if tail != NIL {
+   663	                        self.nodes[tail].next_z = e;
+   664	                    } else {
+   665	                        list = e;
+   666	                    }
+   667	
+   668	                    self.nodes[e].prev_z = tail;
+   669	                    tail = e;
+   670	                }
+   671	
+   672	                p = q;
+   673	            }
+   674	
+   675	            self.nodes[tail].next_z = NIL;
+   676	
+   677	            if num_merges <= 1 {
+   678	                return list;
+   679	            }
+   680	
+   681	            in_size *= 2;
+   682	        }
+   683	    }
+   684	
+   685	    /// Finds the leftmost node of a polygon ring.
+   686	    fn get_leftmost(&self, start: usize) -> usize {
+   687	        let nodes = self.nodes.as_slice();
+   688	        let mut p = start;
+   689	        let mut leftmost = start;
+   690	        loop {
+   691	            if nodes[p].x < nodes[leftmost].x
+   692	                || (nodes[p].x == nodes[leftmost].x && nodes[p].y < nodes[leftmost].y)
+   693	            {
+   694	                leftmost = p;
+   695	            }
+   696	            p = nodes[p].next;
+   697	            if p == start {
+   698	                break;
+   699	            }
+   700	        }
+   701	
+   702	        leftmost
+   703	    }
+   704	
+   705	    /// Checks if a diagonal between two polygon nodes is valid (lies in polygon
+   706	    /// interior).
+   707	    fn is_valid_diagonal(&self, a: usize, b: usize) -> bool {
+   708	        let nodes = self.nodes.as_slice();
+   709	        nodes[nodes[a].next].i != nodes[b].i
+   710	            && nodes[nodes[a].prev].i != nodes[b].i
+   711	            && !self.intersects_polygon(a, b) // doesn't intersect other edges
+   712	            && ((locally_inside(nodes, a, b)
+   713	                && locally_inside(nodes, b, a)
+   714	                && middle_inside(nodes, a, b) // locally visible
+   715	                // does not create opposite-facing sectors
+   716	                && (area(nodes, nodes[a].prev, a, nodes[b].prev) != 0.0
+   717	                    || area(nodes, a, nodes[b].prev, b) != 0.0))
+   718	                // special zero-length case
+   719	                || (equals(nodes, a, b)
+   720	                    && area(nodes, nodes[a].prev, a, nodes[a].next) > 0.0
+   721	                    && area(nodes, nodes[b].prev, b, nodes[b].next) > 0.0))
+   722	    }
+   723	
+   724	    /// Checks if a polygon diagonal intersects any polygon segments.
+   725	    fn intersects_polygon(&self, a: usize, b: usize) -> bool {
+   726	        let nodes = self.nodes.as_slice();
+   727	        let mut p = a;
+   728	        loop {
+   729	            let pn = nodes[p].next;
+   730	            if nodes[p].i != nodes[a].i
+   731	                && nodes[pn].i != nodes[a].i
+   732	                && nodes[p].i != nodes[b].i
+   733	                && nodes[pn].i != nodes[b].i
+   734	                && intersects(nodes, p, pn, a, b)
+   735	            {
+   736	                return true;
+   737	            }
+   738	            p = pn;
+   739	            if p == a {
+   740	                break;
+   741	            }
+   742	        }
+   743	
+   744	        false
+   745	    }
+   746	
+   747	    /// Links two polygon vertices with a bridge; if the vertices belong to the
+   748	    /// same ring, it splits the polygon into two.
+   749	    fn split_polygon(&mut self, a: usize, b: usize) -> usize {
+   750	        let a2 = self
+   751	            .nodes
+   752	            .create(self.nodes[a].i, self.nodes[a].x, self.nodes[a].y);
+   753	        let b2 = self
+   754	            .nodes
+   755	            .create(self.nodes[b].i, self.nodes[b].x, self.nodes[b].y);
+   756	        let an = self.nodes[a].next;
+   757	        let bp = self.nodes[b].prev;
+   758	
+   759	        self.nodes[a].next = b;
+   760	        self.nodes[b].prev = a;
+   761	
+   762	        self.nodes[a2].next = an;
+   763	        self.nodes[an].prev = a2;
+   764	
+   765	        self.nodes[b2].next = a2;
+   766	        self.nodes[a2].prev = b2;
+   767	
+   768	        self.nodes[bp].next = b2;
+   769	        self.nodes[b2].prev = bp;
+   770	
+   771	        b2
+   772	    }
+   773	
+   774	    /// Creates a node and optionally links it with the previous one (in a
+   775	    /// circular doubly linked list).
+   776	    fn insert_node(&mut self, i: usize, pt: [f64; 2], last: usize) -> usize {
+   777	        let p = self.nodes.create(i as u32, pt[0], pt[1]);
+   778	
+   779	        if last == NIL {
+   780	            self.nodes[p].prev = p;
+   781	            self.nodes[p].next = p;
+   782	        } else {
+   783	            let ln = self.nodes[last].next;
+   784	            self.nodes[p].next = ln;
+   785	            self.nodes[p].prev = last;
+   786	            self.nodes[ln].prev = p;
+   787	            self.nodes[last].next = p;
+   788	        }
+   789	        p
+   790	    }
+   791	
+   792	    /// Unlinks a node from both the ring and the z-order list. The node keeps
+   793	    /// its own `prev`/`next`, exactly like the pointer-based original.
+   794	    fn remove_node(&mut self, p: usize) {
+   795	        let (prev, next) = (self.nodes[p].prev, self.nodes[p].next);
+   796	        self.nodes[next].prev = prev;
+   797	        self.nodes[prev].next = next;
+   798	
+   799	        let (prev_z, next_z) = (self.nodes[p].prev_z, self.nodes[p].next_z);
+   800	        if prev_z != NIL {
+   801	            self.nodes[prev_z].next_z = next_z;
+   802	        }
+   803	        if next_z != NIL {
+   804	            self.nodes[next_z].prev_z = prev_z;
+   805	        }
+   806	    }
+   807	
+   808	    fn z_order(&self, x: f64, y: f64) -> i32 {
+   809	        z_order(x, y, self.min_x, self.min_y, self.inv_size)
+   810	    }
+   811	}
+   812	
+   813	impl Default for Earcut {
+   814	    fn default() -> Earcut {
+   815	        Earcut::new()
+   816	    }
+   817	}

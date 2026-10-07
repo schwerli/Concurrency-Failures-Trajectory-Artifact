@@ -1,0 +1,231 @@
+All ~520 differential cases pass. Here's the delivered code.
+
+## Architecture
+
+```
+/output
+├── lib/
+│   ├── charset.mjs    Bech32 alphabet + O(1) value lookup
+│   ├── polymod.mjs    BCH generator step + hrp expansion
+│   ├── checksum.mjs   verify / create the 6-symbol checksum
+│   ├── bech32.mjs     public bech32Decode / bech32Encode
+│   ├── pyrepr.mjs     CPython repr() emulation (tuple/list/str/None)
+│   └── argparse.mjs   argparse subset: usage, errors, exit codes
+└── test2.mjs          entry point
+```
+
+### `lib/charset.mjs` — layer 1: the alphabet
+
+```javascript
+export const CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+export const SEPARATOR = '1';
+
+const CHARSET_REV = new Map();
+for (let i = 0; i < CHARSET.length; i += 1) CHARSET_REV.set(CHARSET[i], i);
+
+/** Mirrors Python's `CHARSET.find(ch)`: 5-bit value, or -1. */
+export function charsetFind(ch) {
+  const value = CHARSET_REV.get(ch);
+  return value === undefined ? -1 : value;
+}
+
+/** Mirrors `all(x in CHARSET for x in str)`. */
+export function isCharsetOnly(str) {
+  for (const ch of str) if (!CHARSET_REV.has(ch)) return false;
+  return true;
+}
+```
+
+### `lib/polymod.mjs` — layer 2: BCH primitives
+
+```javascript
+const GENERATOR = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+
+export function bech32Polymod(values) {
+  let chk = 1;
+  for (const value of values) {
+    const top = chk >>> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ value;      // keep low 25 bits, shift in symbol
+    for (let i = 0; i < 5; i += 1) if ((top >>> i) & 1) chk ^= GENERATOR[i];
+    chk >>>= 0;                                   // stay unsigned
+  }
+  return chk >>> 0;
+}
+
+export function bech32HrpExpand(hrp) {
+  const high = [], low = [];
+  for (const ch of hrp) {
+    const code = ch.codePointAt(0);
+    high.push(code >> 5);
+    low.push(code & 31);
+  }
+  return high.concat([0], low);
+}
+```
+
+All arithmetic stays within 30 bits, so plain JS numbers with bitwise ops are exact — no big integers, and no typed arrays anywhere.
+
+### `lib/checksum.mjs` — layer 3
+
+```javascript
+import { bech32HrpExpand, bech32Polymod } from './polymod.mjs';
+
+export function bech32VerifyChecksum(hrp, data) {
+  return bech32Polymod(bech32HrpExpand(hrp).concat(data)) === 1;
+}
+
+export function bech32CreateChecksum(hrp, data) {
+  const values = bech32HrpExpand(hrp).concat(data);
+  const polymod = bech32Polymod(values.concat([0, 0, 0, 0, 0, 0])) ^ 1;
+  const checksum = [];
+  for (let i = 0; i < 6; i += 1) checksum.push((polymod >> (5 * (5 - i))) & 31);
+  return checksum;
+}
+```
+
+### `lib/bech32.mjs` — layer 4: public API
+
+```javascript
+import { CHARSET, SEPARATOR, charsetFind, isCharsetOnly } from './charset.mjs';
+import { bech32CreateChecksum, bech32VerifyChecksum } from './checksum.mjs';
+
+const MAX_LENGTH = 90;
+const CHECKSUM_LENGTH = 6;
+
+function hasValidCharacters(bech) {
+  for (const ch of bech) {                        // iterates code points, like Python
+    const code = ch.codePointAt(0);
+    if (code < 33 || code > 126) return false;
+  }
+  // Only reachable for printable ASCII, where JS and Python case mapping agree.
+  return bech.toLowerCase() === bech || bech.toUpperCase() === bech;
+}
+
+export function bech32Decode(bech) {
+  if (typeof bech !== 'string' || !hasValidCharacters(bech)) return [null, null];
+
+  const lowered = bech.toLowerCase();
+  const pos = lowered.lastIndexOf(SEPARATOR);
+  if (pos < 1 || pos + 1 + CHECKSUM_LENGTH > lowered.length || lowered.length > MAX_LENGTH) {
+    return [null, null];
+  }
+
+  const dataPart = lowered.slice(pos + 1);
+  if (!isCharsetOnly(dataPart)) return [null, null];
+
+  const hrp = lowered.slice(0, pos);
+  const data = [];
+  for (const ch of dataPart) data.push(charsetFind(ch));
+
+  if (!bech32VerifyChecksum(hrp, data)) return [null, null];
+  return [hrp, data.slice(0, data.length - CHECKSUM_LENGTH)];
+}
+
+export function bech32Encode(hrp, data) {
+  const combined = data.concat(bech32CreateChecksum(hrp, data));
+  let out = `${hrp}${SEPARATOR}`;
+  for (const value of combined) out += CHARSET[value];
+  return out;
+}
+```
+
+### `lib/pyrepr.mjs` — `print()` fidelity
+
+```javascript
+const SHORT_ESCAPES = new Map([['\\', '\\\\'], ['\n', '\\n'], ['\r', '\\r'], ['\t', '\\t']]);
+
+export function pyReprStr(value) {
+  // CPython prefers ', but switches to " when the value has ' and no ".
+  const quote = value.includes("'") && !value.includes('"') ? '"' : "'";
+  let body = '';
+  for (const ch of value) {
+    const short = SHORT_ESCAPES.get(ch);
+    if (short !== undefined) { body += short; continue; }
+    if (ch === quote) { body += `\\${ch}`; continue; }
+    const code = ch.codePointAt(0);
+    if (code < 0x20 || code === 0x7f) { body += `\\x${code.toString(16).padStart(2, '0')}`; continue; }
+    body += ch;
+  }
+  return `${quote}${body}${quote}`;
+}
+
+export function pyReprList(values) { return `[${values.map(pyRepr).join(', ')}]`; }
+
+export function pyReprTuple(values) {
+  if (values.length === 1) return `(${pyRepr(values[0])},)`;   // trailing comma
+  return `(${values.map(pyRepr).join(', ')})`;
+}
+
+export function pyRepr(value) {
+  if (value === null || value === undefined) return 'None';
+  if (typeof value === 'string') return pyReprStr(value);
+  if (typeof value === 'number') return String(value);
+  if (typeof value === 'boolean') return value ? 'True' : 'False';
+  if (Array.isArray(value)) return pyReprList(value);
+  return String(value);
+}
+```
+
+### `lib/argparse.mjs` — the parsing rules I reverse-engineered
+
+Key behaviors probed off the executable and reproduced (full file is on disk):
+
+```javascript
+const NEGATIVE_NUMBER = /^-\d+$|^-\d*\.\d+$/;   // CPython's _negative_number_matcher
+
+parseOptional(token) {
+  if (token === '') return null;                  // empty  -> positional
+  if (token[0] !== '-') return null;
+  const exact = this.options.get(token);
+  if (exact) return { action: exact, optionString: token, explicitArg: null };
+  if (token.length === 1) return null;            // lone '-' -> positional
+  /* --opt=value, then unique-prefix abbreviation via getOptionTuples() */
+  if (NEGATIVE_NUMBER.test(token)) return null;   // no option looks numeric -> value
+  if (token.includes(' ')) return null;           // contains a space -> value
+  return { action: null, optionString: token, explicitArg: null };  // unknown option
+}
+```
+
+### `test2.mjs` — entry point
+
+```javascript
+import { bech32Decode } from './lib/bech32.mjs';
+import { buildParser } from './lib/argparse.mjs';
+import { pyReprTuple } from './lib/pyrepr.mjs';
+
+function main() {
+  const parser = buildParser();
+  const args = parser.parseArgs(process.argv.slice(2));
+
+  // Decode Bech32 string to get HRP and data
+  const result = bech32Decode(args.a);
+  process.stdout.write(`${pyReprTuple(result)}\n`);
+}
+
+main();
+```
+
+## Verification
+
+I diffed stdout, stderr, and exit code against `/workspace/dataset/test2_executable` on ~520 inputs — all identical:
+
+| Suite | Cases | Result |
+|---|---|---|
+| The 4 sample test cases | 4 | pass |
+| Full BIP-173 valid + invalid vector set | 29 | pass |
+| `repr()` quoting (hrp with `'`, `"`, `\`, `''`, `\\`, `x=y`) | 18 | pass |
+| argparse surface (`--help`, `-h`, `--he`, `-habc`, `--a=`, `--`, dupes, abbrevs, unknown opts, `-1` vs `-1x`) | 32 | pass |
+| Non-ASCII / astral / mixed-case / boundary lengths | 12 | pass |
+| Seeded fuzz (valid, single-char corruption, junk, truncation, 90-char boundary) | 450 | pass |
+
+Notable behaviors that needed exact matching:
+
+- **`repr` quote switching** — an hrp containing `'` makes Python print `("a'b", [])` with double quotes. Confirmed by generating valid checksums for such hrps with my own encoder and diffing.
+- **`-1` is a value, `-1x` is an error** — argparse's negative-number heuristic applies because no registered option looks numeric.
+- **`--` stays in the extras list** — this build is pre-3.12.5 argparse, so `--a x --` reports `unrecognized arguments: --` rather than silently dropping it.
+- **Error precedence** — missing-required fires *before* unrecognized-arguments (`-- --a a12uel5l` reports only the former).
+- **`-habc` exits 0 with help** — argparse queues the help action, then breaks out on the unmatched `-abc` remainder, so help runs before the extras error.
+
+One intentional difference: `usage:` shows `test2.mjs` instead of `test2_executable`, because argparse derives `prog` from `argv[0]` — my `progName()` does the same via `basename(process.argv[1])`. With that name normalized, the `--help` output is byte-identical.
+
+The only `import` of a non-local file is `node:path` (a Node built-in); no npm packages, no `require`/`module.exports`, and no `Uint8Array`/`DataView` anywhere.

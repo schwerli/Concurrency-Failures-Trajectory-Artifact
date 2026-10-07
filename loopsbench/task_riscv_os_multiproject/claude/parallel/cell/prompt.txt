@@ -1,0 +1,161 @@
+This is an operating-systems course lab (Projects 1–6) that implements a RISC-V bare-metal operating system. The repo spans six incremental projects: a bootloader, a simple cooperative kernel, a preemptive kernel with SMP, an interactive OS with process management and IPC, a virtual-memory-enabled kernel with demand paging, a device-driver layer with network support, and a file system. Entire subsystems have been removed and must be re-implemented.
+
+Your working directory is `/workspace`. The project code is already present in seven subdirectories: `Project1-Bootloader`, `Project2-A_Simple_Kernel_Part1`, `Project2-A_Simple_Kernel_Part2`, `Project3-Interactive_OS_and_Process_Management`, `Project4-Virtual_Memory_Management`, `Project5-Device_Driver`, and `Project6-File_System`.
+
+Implement the following modules:
+
+The following modules need to be implemented or substantially built out. All stubbed function bodies contain `/* TODO: implement */`.
+
+Bootloader Image Builder (`Project1-Bootloader/createimage.c`): The host-side tool that reads ELF binaries and writes a bootable disk image. Two functions handle segment writing and OS size recording. (~1 file, 2 functions to implement)
+
+Part 1 Scheduler & Locking (`Project2-A_Simple_Kernel_Part1/kernel/sched/sched.c`, `kernel/locking/lock.c`): The cooperative round-robin scheduler, task blocking/unblocking primitives, and mutex lock acquire/release. (~2 files, 5 functions to implement)
+
+Part 2 Scheduler & Synchronisation (`Project2-A_Simple_Kernel_Part2/kernel/`): The preemptive priority-based scheduler with ready-queue management, priority-based task selection, timer expiration checking, mutex locking, binary semaphore operations, and futex wait/wakeup with hash-based node management. (~5 files, 9 functions to implement)
+
+Process Management & IPC (`Project3-Interactive_OS_and_Process_Management/kernel/`): Multi-core scheduler with process lifecycle management (spawn, exit, kill, waitpid), priority-based scheduling with CPU affinity masks, binary semaphore tracking, and a mailbox-based inter-process communication system for sending and receiving messages with blocking semantics. (~4 files, 12 functions to implement)
+
+Virtual Memory Management (`Project4-Virtual_Memory_Management/kernel/mm/mm.c`, `kernel/sched/sched.c`): SV39 three-level page table initialisation and teardown, user page allocation with NRU page replacement, swap-to-disk eviction, demand-paging page fault handling, shared memory mapping/unmapping, process creation/execution with ELF loading, and process termination with resource cleanup. (~2 files, 13 functions to implement)
+
+Device Driver Layer (`Project5-Device_Driver/drivers/net.c`, `kernel/mm/mm.c`, `kernel/sched/sched.c`): Network packet send/receive with poll and interrupt modes, IRQ mode switching, plus the full virtual memory and scheduler subsystems carried forward from Project 4 with additional page-helper functionality. (~3 files, 18 functions to implement)
+
+File System (`Project6-File_System/kernel/fs/`): A complete on-disk file system with superblock/bitmap-based allocation, inode and block management (alloc, free), directory operations (mkdir, rmdir, ls, cd), hard/soft linking, file operations (touch, cat, fopen, fread, fwrite), plus the full scheduler and virtual memory subsystems from Project 5. (~6 files, 24 functions to implement)
+
+The tests also depend on these signatures and entry points:
+
+The following functions are called or inspected directly by the test suite. You must implement them with these exact signatures:
+
+`static void write_segment(Elf64_Phdr phdr, FILE *fp, FILE *img, int *nbytes)` — writes an ELF segment to a disk image with 512-byte alignment
+`static void write_os_size(int nbytes, FILE *img)` — writes the OS sector count at offset 508 in the image
+`void do_scheduler(void)` (P2A) — cooperative round-robin scheduler
+`void do_block(list_node_t *pcb_node, list_head *queue)` (P2A) — moves a PCB to a block queue
+`void do_unblock(list_node_t *pcb_node)` (P2A) — moves a PCB back to the ready queue
+`void do_mutex_lock_acquire(mutex_lock_t *lock)` (P2A, P2B) — acquires a mutex with blocking
+`void do_mutex_lock_release(mutex_lock_t *lock)` (P2A, P2B) — releases a mutex and wakes waiters
+`void scheduler(void)` (P2B, P3, P4, P5, P6) — preemptive priority-based scheduler
+`list_node_t* max_priority_node(void)` (P2B, P3, P4, P5, P6) — selects the highest-priority ready task
+`pid_t do_spawn(task_info_t *task, void *arg, spawn_mode_t mode)` (P3) — creates a new process
+`void do_exit()` (P3, P4, P5, P6) — handles process exit and resource cleanup
+`int do_kill(pid_t pid)` (P3, P4, P5, P6) — terminates a process by PID
+`int do_waitpid(pid_t pid, ...)` (P3, P4, P5, P6) — waits for a child process to exit
+`ptr_t alloc_user_page(uint8_t pin, PTE *pgtable)` (P4, P5, P6) — allocates a physical page for user space
+`ptr_t selete_page(void)` (P4, P5, P6) — NRU page replacement to select a victim page
+`void write_to_sd(ptr_t pa)` (P4, P5, P6) — evicts a page to disk swap space
+`PTE* init_page_table(void)` (P4, P5, P6) — creates a three-level SV39 page table for a new process
+`void free_process_user_page(PTE *pgdir)` (P4, P5, P6) — recursively frees all pages owned by a process
+`uintptr_t shm_page_get(int key)` (P4, P5, P6) — maps a shared memory page into the current process
+`void shm_page_dt(uintptr_t addr)` (P4, P5, P6) — unmaps a shared memory page
+`void handle_page_fault(regs_context_t *regs, uint64_t stval, uint64_t cause)` (P4, P5, P6) — demand-paging page fault handler
+`long do_net_recv(uintptr_t addr, size_t length, int num_packet, size_t *frLength)` (P5) — receives network packets
+`void do_net_send(uintptr_t addr, size_t length)` (P5) — sends a network packet
+`void do_net_irq_mode(int mode)` (P5) — switches between poll and interrupt modes
+`uint16_t alloc_inode()` (P6) — allocates a free inode from the bitmap
+`uint32_t alloc_block()` (P6) — allocates a free block from the bitmap
+`void free_inode(uint16_t inode_id)` (P6) — frees an inode in the bitmap
+`void free_block(uint32_t block_id)` (P6) — frees a block in the bitmap
+`int mkfs(int print)` (P6) — initialises the file system superblock and root directory
+`int do_mkdir(char *dirname)` (P6) — creates a new directory
+`int do_rmdir(char *dirname)` (P6) — removes a directory
+`int do_ls(char *dirname, int mode, int *print_location_y)` (P6) — lists directory contents
+`int do_cd(char *dirname)` (P6) — changes the current working directory
+`int do_link(char *filename, char *newfile, int mode)` (P6) — creates hard or soft links
+`int do_touch(char *filename)` (P6) — creates a new empty file
+`int do_cat(char *filename, char *buffer)` (P6) — reads file contents into a buffer
+`int do_fopen(char *filename, int access)` (P6) — opens a file and returns a file descriptor
+`int do_fread(int fd, char *buffer, int size)` (P6) — reads data from an open file
+`int do_fwrite(int fd, char *buffer, int size)` (P6) — writes data to an open file
+`int do_mbox_open(char *name)` (P3) — opens or creates a named mailbox
+`int do_mbox_send(int mailbox_id, void *msg, int msg_length)` (P3) — sends a message to a mailbox
+`int do_mbox_recv(int mailbox_id, void *msg, int msg_length)` (P3) — receives a message from a mailbox
+`void binsem_op(int binsem_id, int op)` (P2B, P3) — performs lock/unlock on a binary semaphore
+`futex_node_t* get_node(volatile uint64_t *val_addr, int create)` (P2B) — looks up or creates a futex node
+`void futex_wait(volatile uint64_t *val_addr, uint64_t val)` (P2B) — blocks on a futex if value matches
+`void futex_wakeup(volatile uint64_t *val_addr, int num_wakeup)` (P2B) — wakes tasks blocked on a futex
+`void timer_check(void)` (P2B) — checks expired timers and invokes callbacks
+`pid_t do_exec(const char *file_name, int argc, char *argv[], spawn_mode_t mode)` (P4, P5, P6) — loads and executes an ELF binary as a new process
+`uintptr_t alloc_page_helper(uintptr_t va, uintptr_t pgdir)` (P5, P6) — allocates a page and maps it at a virtual address
+
+
+
+You are running as a long-horizon autonomous engineering agent at
+`/workspace`. This task spans many files and requirements, and is expected
+to take many iterations.
+
+Read every requirement under `/workspace/requirements/` (and any other
+explicit requirement list referenced by the task) and only finish once
+every single one is addressed. Cherry-picking or partial fixes will lead
+to failure.
+
+
+
+## Optional planning artifact
+
+If you believe the task is complex enough to benefit from a plan, you may
+write `/workspace/agent_plans/plan.json` before making changes. This is
+optional. If you create it, it must be a JSON object with `nodes` and
+`edges`. Each node must have string `id` equal to a requirement slug from
+`/workspace/requirements/`, may include `label` and `layer`, and each edge
+must use string `from` and `to` that reference those ids.
+
+
+
+## Git workflow (required)
+
+`/workspace` is initialized as a git repo. After finishing the
+implementation for ONE requirement:
+
+  1. `cd /workspace`
+  2. `git add -A`
+  3. `git diff --cached > requirement_patches/<slug>.diff`
+  4. `git commit -m "impl: <slug>"`
+
+Where `<slug>` is the requirement filename without the `.yaml` extension.
+The patch file MUST be non-empty for the requirement to count as complete.
+Never write or `touch` an empty `.diff` file.
+
+You may run `git log`, `git diff`, `git show` at any time to inspect what
+prior work has done — only your own commits will be there; no reference
+solution is accessible.
+
+## Recommended workflow
+
+1. Read the task carefully and survey `/workspace` so you understand the
+   code you are changing.
+2. As a development agent, when implementing a requirement you may write
+   tests under `/workspace/agent_tests/` to safeguard correctness and
+   future stability — write them if you think they help, otherwise skip.
+3. Keep iterating until every requirement is implemented. Do not stop at a
+   partial fix, a first passing check, or one successful edit.
+4. Do not narrow the scope on your own. Missing a requirement is a task
+   failure even if the changed tests pass.
+5. You may revise the same files and rerun focused checks as many times as
+   needed before finishing.
+6. Your final summary must report requirement coverage counts, including at
+   least the total number of requirements reviewed and how many were
+   implemented and blocked.
+
+Harness progress update:
+- Requirement coverage: 0/7 (0.0%)
+- Completed requirement slugs: none
+- Remaining requirement slugs: p1_bootloader, p2a_cooperative_kernel, p2b_preemptive_kernel, p3_process_management, p4_virtual_memory, p5_device_driver, p6_file_system
+- Your previous run ended naturally. Continue from the current workspace state.
+- You may estimate progress yourself by comparing `/workspace/requirement_patches/*.diff` against `/workspace/requirements/*.yaml`.
+- You are only allowed to end when the whole task is complete, not when one part is complete.
+- The full task prompt is repeated above; keep working until every remaining requirement is implemented or you are truly blocked.
+
+## Git workflow (required)
+
+`/workspace` is initialized as a git repo at the start of round 1. After
+finishing the implementation for ONE requirement:
+
+  1. `cd /workspace`
+  2. `git add -A`
+  3. `git diff --cached > requirement_patches/<slug>.diff`
+  4. `git commit -m "impl: <slug>"`
+
+Where `<slug>` is the requirement filename without the `.yaml` extension.
+The patch file MUST be non-empty for the requirement to count as complete.
+Never write or `touch` an empty `.diff` file.
+
+You may run `git log`, `git diff`, `git show` at any time to inspect what
+prior rounds have done — only your own commits will be there; no reference
+solution is accessible.

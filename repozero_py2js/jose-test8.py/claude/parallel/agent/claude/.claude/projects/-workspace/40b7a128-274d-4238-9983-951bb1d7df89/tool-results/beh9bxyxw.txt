@@ -1,0 +1,909 @@
+===== lib/python/argparse.mjs =====
+     1	/**
+     2	 * A faithful, deliberately narrow port of CPython's `argparse`.
+     3	 *
+     4	 * Only the surface the source program uses is modelled -- optional arguments
+     5	 * with `nargs=None`, the automatic `-h/--help`, and `required=True` -- but
+     6	 * within that surface the goal is byte-identical usage text, error text, and
+     7	 * exit codes.
+     8	 *
+     9	 * The subtle behaviours that are reproduced here, each confirmed against the
+    10	 * reference build:
+    11	 *   - prefix abbreviation (`--pay` resolves to `--payload`)
+    12	 *   - `--opt=value` syntax, including an empty value
+    13	 *   - a bare `-` and negative numbers count as values, other `-`-leading
+    14	 *     tokens do not
+    15	 *   - `--` ends option parsing and is itself never consumed as a value
+    16	 *   - missing-required is reported before unrecognized-arguments
+    17	 */
+    18	
+    19	/** CPython's `_negative_number_matcher`. */
+    20	const NEGATIVE_NUMBER = /^-\d+$|^-\d*\.\d+$/;
+    21	
+    22	/** `argparse.HelpFormatter` defaults. */
+    23	const INDENT = 2;
+    24	const MAX_HELP_POSITION = 24;
+    25	
+    26	class ArgumentError extends Error {}
+    27	
+    28	/**
+    29	 * A single optional argument.
+    30	 */
+    31	class Action {
+    32	  /**
+    33	   * @param {string[]} optionStrings
+    34	   * @param {{dest: string, nargs: number, required?: boolean, metavar?: string|null, help?: string|null, kind?: string}} config
+    35	   */
+    36	  constructor(optionStrings, config) {
+    37	    this.optionStrings = optionStrings;
+    38	    this.dest = config.dest;
+    39	    this.nargs = config.nargs;
+    40	    this.required = config.required ?? false;
+    41	    this.metavar = config.metavar ?? null;
+    42	    this.help = config.help ?? null;
+    43	    this.kind = config.kind ?? 'store';
+    44	  }
+    45	
+    46	  /** `_get_action_name`: how the action is referred to in diagnostics. */
+    47	  get name() {
+    48	    return this.optionStrings.join('/');
+    49	  }
+    50	
+    51	  /** The `PAYLOAD` in `--payload PAYLOAD`. */
+    52	  get displayMetavar() {
+    53	    return this.metavar ?? this.dest.toUpperCase();
+    54	  }
+    55	
+    56	  /** `_format_args` for a single optional. */
+    57	  formatArgs() {
+    58	    return this.nargs === 0 ? '' : this.displayMetavar;
+    59	  }
+    60	
+    61	  /** `_format_action_invocation`, e.g. `-h, --help` or `--payload PAYLOAD`. */
+    62	  formatInvocation() {
+    63	    const args = this.formatArgs();
+    64	    if (args === '') return this.optionStrings.join(', ');
+    65	    return this.optionStrings.map((option) => `${option} ${args}`).join(', ');
+    66	  }
+    67	}
+    68	
+    69	/**
+    70	 * Result of classifying one command-line token.
+    71	 * @typedef {{action: Action|null, optionString: string, explicitArg: string|null}} OptionTuple
+    72	 */
+    73	
+    74	export class ArgumentParser {
+    75	  /**
+    76	   * @param {{prog?: string, addHelp?: boolean, stdout?: {write: (s: string) => void},
+    77	   *          stderr?: {write: (s: string) => void}, exit?: (code: number) => never,
+    78	   *          columns?: number}} [options]
+    79	   */
+    80	  constructor(options = {}) {
+    81	    this.prog = options.prog ?? 'prog';
+    82	    this.stdout = options.stdout ?? process.stdout;
+    83	    this.stderr = options.stderr ?? process.stderr;
+    84	    this.exit = options.exit ?? ((code) => process.exit(code));
+    85	
+    86	    // `shutil.get_terminal_size()` minus 2, matching HelpFormatter._width.
+    87	    this.width = (options.columns ?? terminalColumns()) - 2;
+    88	
+    89	    /** @type {Action[]} */
+    90	    this.actions = [];
+    91	    /** @type {Map<string, Action>} */
+    92	    this.optionStringActions = new Map();
+    93	
+    94	    if (options.addHelp !== false) {
+    95	      this.addArgument(['-h', '--help'], {
+    96	        nargs: 0,
+    97	        kind: 'help',
+    98	        dest: 'help',
+    99	        help: 'show this help message and exit',
+   100	      });
+   101	    }
+   102	  }
+   103	
+   104	  /**
+   105	   * @param {string[]} optionStrings
+   106	   * @param {{dest?: string, nargs?: number, required?: boolean, metavar?: string|null,
+   107	   *          help?: string|null, kind?: string}} [config]
+   108	   * @returns {Action}
+   109	   */
+   110	  addArgument(optionStrings, config = {}) {
+   111	    // `dest` defaults to the first long option with dashes turned into underscores.
+   112	    const dest =
+   113	      config.dest ??
+   114	      (optionStrings.find((s) => s.startsWith('--')) ?? optionStrings[0])
+   115	        .replace(/^-+/, '')
+   116	        .replace(/-/g, '_');
+   117	
+   118	    const action = new Action(optionStrings, { ...config, dest, nargs: config.nargs ?? 1 });
+   119	    this.actions.push(action);
+   120	    for (const optionString of optionStrings) this.optionStringActions.set(optionString, action);
+   121	    return action;
+   122	  }
+   123	
+   124	  // ---------------------------------------------------------------- formatting
+   125	
+   126	  /** `usage: prog [-h] --payload PAYLOAD --secret SECRET` (without the trailing newline). */
+   127	  formatUsage() {
+   128	    const parts = this.actions.map((action) => {
+   129	      const option = action.optionStrings[0];
+   130	      const args = action.formatArgs();
+   131	      const body = args === '' ? option : `${option} ${args}`;
+   132	      return action.required ? body : `[${body}]`;
+   133	    });
+   134	    return `usage: ${[this.prog, ...parts].join(' ')}\n`;
+   135	  }
+   136	
+   137	  /**
+   138	   * `_action_max_length`: the widest invocation, plus the section indent.
+   139	   * Drives the column that help text starts in.
+   140	   */
+   141	  actionMaxLength() {
+   142	    let max = 0;
+   143	    for (const action of this.actions) {
+   144	      max = Math.max(max, action.formatInvocation().length + INDENT);
+   145	    }
+   146	    return max;
+   147	  }
+   148	
+   149	  /** The complete `--help` output. */
+   150	  formatHelp() {
+   151	    const helpPosition = Math.min(this.actionMaxLength() + 2, MAX_HELP_POSITION);
+   152	    const helpWidth = Math.max(this.width - helpPosition, 11);
+   153	    const actionWidth = helpPosition - INDENT - 2;
+   154	
+   155	    let out = this.formatUsage();
+   156	    out += '\n';
+   157	    out += 'options:\n';
+   158	
+   159	    for (const action of this.actions) {
+   160	      const invocation = action.formatInvocation();
+   161	
+   162	      if (!action.help) {
+   163	        out += ' '.repeat(INDENT) + invocation + '\n';
+   164	        continue;
+   165	      }
+   166	
+   167	      const lines = wrap(action.help, helpWidth);
+   168	
+   169	      if (invocation.length <= actionWidth) {
+   170	        out += ' '.repeat(INDENT) + invocation.padEnd(actionWidth) + '  ' + lines[0] + '\n';
+   171	      } else {
+   172	        out += ' '.repeat(INDENT) + invocation + '\n';
+   173	        out += ' '.repeat(helpPosition) + lines[0] + '\n';
+   174	      }
+   175	      for (const line of lines.slice(1)) out += ' '.repeat(helpPosition) + line + '\n';
+   176	    }
+   177	
+   178	    // `HelpFormatter.format_help`: collapse runs of blank lines, then strip the
+   179	    // outer newlines and re-add exactly one.
+   180	    return out.replace(/\n\n\n+/g, '\n\n').replace(/^\n+|\n+$/g, '') + '\n';
+   181	  }
+   182	
+   183	  printUsage() {
+   184	    this.stdout.write(this.formatUsage());
+   185	  }
+   186	
+   187	  printHelp() {
+   188	    this.stdout.write(this.formatHelp());
+   189	  }
+   190	
+   191	  /**
+   192	   * Write usage plus a diagnostic to stderr and exit with status 2.
+   193	   *
+   194	   * @param {string} message
+   195	   * @returns {never}
+   196	   */
+   197	  error(message) {
+   198	    this.stderr.write(this.formatUsage());
+   199	    this.stderr.write(`${this.prog}: error: ${message}\n`);
+   200	    return this.exit(2);
+   201	  }
+   202	
+   203	  // ------------------------------------------------------------------ parsing
+   204	
+   205	  /**
+   206	   * @param {string[]} argv
+   207	   * @returns {Record<string, string|undefined>}
+   208	   */
+   209	  parseArgs(argv) {
+   210	    const { namespace, extras } = this.parseKnownArgs(argv);
+   211	    if (extras.length > 0) {
+   212	      this.error(`unrecognized arguments: ${extras.join(' ')}`);
+   213	    }
+   214	    return namespace;
+   215	  }
+   216	
+   217	  /**
+   218	   * @param {string[]} argv
+   219	   * @returns {{namespace: Record<string, string|undefined>, extras: string[]}}
+   220	   */
+   221	  parseKnownArgs(argv) {
+   222	    /** @type {Record<string, string|undefined>} */
+   223	    const namespace = {};
+   224	    for (const action of this.actions) {
+   225	      if (action.kind === 'store') namespace[action.dest] = undefined;
+   226	    }
+   227	
+   228	    // Classify every token up front, exactly as `_parse_known_args` does: 'O'
+   229	    // for something that looks like an option, 'A' for a plain value, '-' for
+   230	    // the `--` separator itself.
+   231	    /** @type {string[]} */
+   232	    const pattern = [];
+   233	    /** @type {Map<number, OptionTuple>} */
+   234	    const optionTuples = new Map();
+   235	    let afterSeparator = false;
+   236	
+   237	    for (let i = 0; i < argv.length; i++) {
+   238	      const arg = argv[i];
+   239	
+   240	      if (!afterSeparator && arg === '--') {
+   241	        pattern.push('-');
+   242	        afterSeparator = true;
+   243	        continue;
+   244	      }
+   245	      if (afterSeparator) {
+   246	        pattern.push('A');
+   247	        continue;
+   248	      }
+   249	
+   250	      const tuple = this.parseOptional(arg);
+   251	      if (tuple === null) {
+   252	        pattern.push('A');
+   253	      } else {
+   254	        pattern.push('O');
+   255	        optionTuples.set(i, tuple);
+   256	      }
+   257	    }
+   258	
+   259	    /** @type {string[]} */
+   260	    const extras = [];
+   261	    const seen = new Set();
+   262	    const optionIndices = [...optionTuples.keys()].sort((a, b) => a - b);
+   263	    const maxOptionIndex = optionIndices.length > 0 ? optionIndices[optionIndices.length - 1] : -1;
+   264	
+   265	    let startIndex = 0;
+   266	    while (startIndex <= maxOptionIndex) {
+   267	      const nextOptionIndex = optionIndices.find((i) => i >= startIndex);
+   268	      if (nextOptionIndex === undefined) break;
+   269	
+   270	      // No positional actions are defined, so anything before the next option
+   271	      // is surplus.
+   272	      if (startIndex !== nextOptionIndex) {
+   273	        extras.push(...argv.slice(startIndex, nextOptionIndex));
+   274	        startIndex = nextOptionIndex;
+   275	      }
+   276	
+   277	      startIndex = this.consumeOptional(
+   278	        startIndex,
+   279	        argv,
+   280	        pattern,
+   281	        optionTuples,
+   282	        namespace,
+   283	        seen,
+   284	        extras,
+   285	      );
+   286	    }
+   287	
+   288	    extras.push(...argv.slice(startIndex));
+   289	
+   290	    const missing = this.actions.filter((a) => a.required && !seen.has(a));
+   291	    if (missing.length > 0) {
+   292	      this.error(`the following arguments are required: ${missing.map((a) => a.name).join(', ')}`);
+   293	    }
+   294	
+   295	    return { namespace, extras };
+   296	  }
+   297	
+   298	  /**
+   299	   * `_parse_optional`: decide whether a token introduces an option.
+   300	   *
+   301	   * @param {string} argString
+   302	   * @returns {OptionTuple|null} null means "this is a value, not an option"
+   303	   */
+   304	  parseOptional(argString) {
+   305	    if (argString === '') return null;
+   306	    if (!argString.startsWith('-')) return null;
+   307	
+   308	    const exact = this.optionStringActions.get(argString);
+   309	    if (exact) return { action: exact, optionString: argString, explicitArg: null };
+   310	
+   311	    // A lone '-' is a value by convention.
+   312	    if (argString.length === 1) return null;
+   313	
+   314	    const equals = argString.indexOf('=');
+   315	    if (equals !== -1) {
+   316	      const optionString = argString.slice(0, equals);
+   317	      const action = this.optionStringActions.get(optionString);
+   318	      if (action) return { action, optionString, explicitArg: argString.slice(equals + 1) };
+   319	    }
+   320	
+   321	    const candidates = this.getOptionTuples(argString);
+   322	    if (candidates.length > 1) {
+   323	      const options = candidates.map((c) => c.optionString).join(', ');
+   324	      this.error(`ambiguous option: ${argString} could match ${options}`);
+   325	    }
+   326	    if (candidates.length === 1) return candidates[0];
+   327	
+   328	    // No option looks like a negative number here, so `-1` and `-1.5` are values.
+   329	    if (NEGATIVE_NUMBER.test(argString)) return null;
+   330	
+   331	    // Something with a space in it was never meant to be an option.
+   332	    if (argString.includes(' ')) return null;
+   333	
+   334	    // An unknown option: still option-shaped, so it cannot serve as a value.
+   335	    return { action: null, optionString: argString, explicitArg: null };
+   336	  }
+   337	
+   338	  /**
+   339	   * `_get_option_tuples`: resolve abbreviations.
+   340	   *
+   341	   * @param {string} argString
+   342	   * @returns {OptionTuple[]}
+   343	   */
+   344	  getOptionTuples(argString) {
+   345	    /** @type {OptionTuple[]} */
+   346	    const result = [];
+   347	
+   348	    if (argString.startsWith('--')) {
+   349	      const equals = argString.indexOf('=');
+   350	      const prefix = equals === -1 ? argString : argString.slice(0, equals);
+   351	      const explicitArg = equals === -1 ? null : argString.slice(equals + 1);
+   352	
+   353	      for (const [optionString, action] of this.optionStringActions) {
+   354	        if (optionString.startsWith(prefix)) result.push({ action, optionString, explicitArg });
+   355	      }
+   356	      return result;
+   357	    }
+   358	
+   359	    // Single-dash: either an exact short option carrying an attached value, or
+   360	    // a prefix of a longer single-dash option.
+   361	    const shortPrefix = argString.slice(0, 2);
+   362	    const shortExplicit = argString.slice(2);
+   363	
+   364	    for (const [optionString, action] of this.optionStringActions) {
+   365	      if (optionString === shortPrefix) {
+   366	        result.push({ action, optionString, explicitArg: shortExplicit });
+   367	      } else if (optionString.startsWith(argString)) {
+   368	        result.push({ action, optionString, explicitArg: null });
+   369	      }
+   370	    }
+   371	    return result;
+   372	  }
+   373	
+   374	  /**
+   375	   * `consume_optional`: apply one option and report where parsing resumes.
+   376	   *
+   377	   * @returns {number} the index of the next unconsumed token
+   378	   */
+   379	  consumeOptional(startIndex, argv, pattern, optionTuples, namespace, seen, extras) {
+   380	    const { action, optionString, explicitArg } = optionTuples.get(startIndex);
+   381	
+   382	    if (action === null) {
+   383	      extras.push(argv[startIndex]);
+   384	      return startIndex + 1;
+   385	    }
+   386	
+   387	    /** @type {string[]} */
+   388	    let values;
+   389	    let stop;
+   390	
+   391	    if (explicitArg !== null) {
+   392	      if (action.nargs === 0) {
+   393	        this.error(`argument ${action.name}: ignored explicit argument '${explicitArg}'`);
+   394	      }
+   395	      values = [explicitArg];
+   396	      stop = startIndex + 1;
+   397	    } else {
+   398	      const valueStart = startIndex + 1;
+   399	
+   400	      // `_get_nargs_pattern` strips every '-*' for optional actions, so the
+   401	      // pattern for nargs=None is exactly '(A)': the very next token must be a
+   402	      // plain value. That is why `--payload -- x` fails rather than taking `x`.
+   403	      if (action.nargs === 0) {
+   404	        values = [];
+   405	        stop = valueStart;
+   406	      } else {
+   407	        const available = pattern.slice(valueStart, valueStart + action.nargs);
+   408	        if (available.length < action.nargs || available.some((p) => p !== 'A')) {
+   409	          this.error(
+   410	            `argument ${action.name}: expected ${action.nargs === 1 ? 'one argument' : `${action.nargs} arguments`}`,
+   411	          );
+   412	        }
+   413	        values = argv.slice(valueStart, valueStart + action.nargs);
+   414	        stop = valueStart + action.nargs;
+   415	      }
+   416	    }
+   417	
+   418	    seen.add(action);
+   419	    this.takeAction(action, values, namespace);
+   420	    return stop;
+   421	  }
+   422	
+   423	  /**
+   424	   * @param {Action} action
+   425	   * @param {string[]} values
+   426	   * @param {Record<string, string|string[]|undefined>} namespace
+   427	   */
+   428	  takeAction(action, values, namespace) {
+   429	    if (action.kind === 'help') {
+   430	      this.printHelp();
+   431	      this.exit(0);
+   432	      return;
+   433	    }
+   434	    // `store` with nargs=None keeps the single value, not a one-element list.
+   435	    namespace[action.dest] = action.nargs === 1 ? values[0] : values;
+   436	  }
+   437	}
+   438	
+   439	/**
+   440	 * `shutil.get_terminal_size()`: honour `COLUMNS`, else ask the terminal, else
+   441	 * fall back to 80. When output is piped -- which is how the reference build is
+   442	 * usually measured -- the fallback applies.
+   443	 *
+   444	 * @returns {number}
+   445	 */
+   446	function terminalColumns() {
+   447	  const fromEnv = Number.parseInt(process.env.COLUMNS ?? '', 10);
+   448	  if (Number.isInteger(fromEnv) && fromEnv > 0) return fromEnv;
+   449	  if (process.stdout.isTTY && process.stdout.columns > 0) return process.stdout.columns;
+   450	  return 80;
+   451	}
+   452	
+   453	/**
+   454	 * Greedy word wrap, matching `textwrap.wrap` for the simple help strings used
+   455	 * here (no hyphen breaking, whitespace collapsed).
+   456	 *
+   457	 * @param {string} text
+   458	 * @param {number} width
+   459	 * @returns {string[]}
+   460	 */
+   461	function wrap(text, width) {
+   462	  const words = text.split(/\s+/).filter(Boolean);
+   463	  if (words.length === 0) return [''];
+   464	
+   465	  const lines = [];
+   466	  let line = words[0];
+   467	  for (const word of words.slice(1)) {
+   468	    if (line.length + 1 + word.length <= width) {
+   469	      line += ' ' + word;
+   470	    } else {
+   471	      lines.push(line);
+   472	      line = word;
+   473	    }
+   474	  }
+   475	  lines.push(line);
+   476	  return lines;
+   477	}
+   478	
+   479	export { Action, ArgumentError };
+===== lib/python/jsonDecoder.mjs =====
+     1	/**
+     2	 * A JSON parser that preserves key order, mirroring `json.loads` returning a
+     3	 * `dict`. Objects become `Map`s so that the subsequent `repr()` rendering lists
+     4	 * keys in the order they appeared in the document.
+     5	 */
+     6	
+     7	class Parser {
+     8	  /** @param {string} text */
+     9	  constructor(text) {
+    10	    this.text = text;
+    11	    this.pos = 0;
+    12	  }
+    13	
+    14	  error(message) {
+    15	    return new SyntaxError(`${message} (char ${this.pos})`);
+    16	  }
+    17	
+    18	  skipWhitespace() {
+    19	    while (this.pos < this.text.length) {
+    20	      const ch = this.text[this.pos];
+    21	      if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') this.pos++;
+    22	      else break;
+    23	    }
+    24	  }
+    25	
+    26	  parse() {
+    27	    this.skipWhitespace();
+    28	    const value = this.parseValue();
+    29	    this.skipWhitespace();
+    30	    if (this.pos !== this.text.length) throw this.error('Extra data');
+    31	    return value;
+    32	  }
+    33	
+    34	  parseValue() {
+    35	    if (this.pos >= this.text.length) throw this.error('Expecting value');
+    36	    const ch = this.text[this.pos];
+    37	
+    38	    if (ch === '{') return this.parseObject();
+    39	    if (ch === '[') return this.parseArray();
+    40	    if (ch === '"') return this.parseString();
+    41	
+    42	    if (this.text.startsWith('true', this.pos)) {
+    43	      this.pos += 4;
+    44	      return true;
+    45	    }
+    46	    if (this.text.startsWith('false', this.pos)) {
+    47	      this.pos += 5;
+    48	      return false;
+    49	    }
+    50	    if (this.text.startsWith('null', this.pos)) {
+    51	      this.pos += 4;
+    52	      return null;
+    53	    }
+    54	
+    55	    return this.parseNumber();
+    56	  }
+    57	
+    58	  parseObject() {
+    59	    const result = new Map();
+    60	    this.pos++; // '{'
+    61	    this.skipWhitespace();
+    62	
+    63	    if (this.text[this.pos] === '}') {
+    64	      this.pos++;
+    65	      return result;
+    66	    }
+    67	
+    68	    for (;;) {
+    69	      this.skipWhitespace();
+    70	      if (this.text[this.pos] !== '"') throw this.error('Expecting property name enclosed in double quotes');
+    71	      const key = this.parseString();
+    72	      this.skipWhitespace();
+    73	      if (this.text[this.pos] !== ':') throw this.error("Expecting ':' delimiter");
+    74	      this.pos++;
+    75	      this.skipWhitespace();
+    76	      result.set(key, this.parseValue());
+    77	      this.skipWhitespace();
+    78	
+    79	      const ch = this.text[this.pos];
+    80	      if (ch === ',') {
+    81	        this.pos++;
+    82	        continue;
+    83	      }
+    84	      if (ch === '}') {
+    85	        this.pos++;
+    86	        return result;
+    87	      }
+    88	      throw this.error("Expecting ',' delimiter");
+    89	    }
+    90	  }
+    91	
+    92	  parseArray() {
+    93	    const result = [];
+    94	    this.pos++; // '['
+    95	    this.skipWhitespace();
+    96	
+    97	    if (this.text[this.pos] === ']') {
+    98	      this.pos++;
+    99	      return result;
+   100	    }
+   101	
+   102	    for (;;) {
+   103	      this.skipWhitespace();
+   104	      result.push(this.parseValue());
+   105	      this.skipWhitespace();
+   106	
+   107	      const ch = this.text[this.pos];
+   108	      if (ch === ',') {
+   109	        this.pos++;
+   110	        continue;
+   111	      }
+   112	      if (ch === ']') {
+   113	        this.pos++;
+   114	        return result;
+   115	      }
+   116	      throw this.error("Expecting ',' delimiter");
+   117	    }
+   118	  }
+   119	
+   120	  parseString() {
+   121	    this.pos++; // opening quote
+   122	    let out = '';
+   123	
+   124	    for (;;) {
+   125	      if (this.pos >= this.text.length) throw this.error('Unterminated string');
+   126	      const ch = this.text[this.pos];
+   127	
+   128	      if (ch === '"') {
+   129	        this.pos++;
+   130	        return out;
+   131	      }
+   132	
+   133	      if (ch !== '\\') {
+   134	        out += ch;
+   135	        this.pos++;
+   136	        continue;
+   137	      }
+   138	
+   139	      this.pos++;
+   140	      const esc = this.text[this.pos];
+   141	      this.pos++;
+   142	      switch (esc) {
+   143	        case '"': out += '"'; break;
+   144	        case '\\': out += '\\'; break;
+   145	        case '/': out += '/'; break;
+   146	        case 'b': out += '\b'; break;
+   147	        case 'f': out += '\f'; break;
+   148	        case 'n': out += '\n'; break;
+   149	        case 'r': out += '\r'; break;
+   150	        case 't': out += '\t'; break;
+   151	        case 'u': {
+   152	          const hex = this.text.slice(this.pos, this.pos + 4);
+   153	          if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw this.error('Invalid \\uXXXX escape');
+   154	          out += String.fromCharCode(parseInt(hex, 16));
+   155	          this.pos += 4;
+   156	          break;
+   157	        }
+   158	        default:
+   159	          throw this.error(`Invalid \\escape: ${JSON.stringify(esc)}`);
+   160	      }
+   161	    }
+   162	  }
+   163	
+   164	  parseNumber() {
+   165	    const match = /^-?(?:0|[1-9]\d*)(\.\d+)?([eE][-+]?\d+)?/.exec(this.text.slice(this.pos));
+   166	    if (!match) throw this.error('Expecting value');
+   167	    this.pos += match[0].length;
+   168	    // An integer literal with no fraction or exponent stays an integer, as in Python.
+   169	    return match[1] || match[2] ? parseFloat(match[0]) : parseInt(match[0], 10);
+   170	  }
+   171	}
+   172	
+   173	/**
+   174	 * @param {string} text
+   175	 * @returns {unknown} `Map` for objects, `Array` for arrays, primitives otherwise
+   176	 */
+   177	export function loads(text) {
+   178	  return new Parser(text).parse();
+   179	}
+===== lib/python/jsonEncoder.mjs =====
+     1	/**
+     2	 * A JSON serializer that reproduces CPython's `json.dumps` byte for byte for
+     3	 * the settings python-jose uses: `ensure_ascii=True` with the compact
+     4	 * `(',', ':')` separators.
+     5	 *
+     6	 * Objects are represented as `Map`s so that key insertion order survives -- a
+     7	 * plain object would reorder integer-like keys.
+     8	 */
+     9	
+    10	const SHORT_ESCAPES = new Map([
+    11	  [0x08, '\\b'],
+    12	  [0x09, '\\t'],
+    13	  [0x0a, '\\n'],
+    14	  [0x0c, '\\f'],
+    15	  [0x0d, '\\r'],
+    16	  [0x22, '\\"'],
+    17	  [0x5c, '\\\\'],
+    18	]);
+    19	
+    20	/**
+    21	 * Quote a string the way `json.encoder.encode_basestring_ascii` does.
+    22	 *
+    23	 * Iterating UTF-16 code units rather than code points is deliberate: CPython
+    24	 * emits astral characters as an escaped surrogate pair, which is exactly the
+    25	 * pair JavaScript already stores.
+    26	 *
+    27	 * @param {string} str
+    28	 * @returns {string} the quoted, fully ASCII JSON string literal
+    29	 */
+    30	export function encodeBasestringAscii(str) {
+    31	  let out = '"';
+    32	  for (let i = 0; i < str.length; i++) {
+    33	    const code = str.charCodeAt(i);
+    34	
+    35	    const short = SHORT_ESCAPES.get(code);
+    36	    if (short !== undefined) {
+    37	      out += short;
+    38	    } else if (code >= 0x20 && code <= 0x7e) {
+    39	      out += str[i];
+    40	    } else {
+    41	      out += '\\u' + code.toString(16).padStart(4, '0');
+    42	    }
+    43	  }
+    44	  return out + '"';
+    45	}
+    46	
+    47	/**
+    48	 * Render a value using CPython's compact JSON form.
+    49	 *
+    50	 * Accepts `Map` (object), `Array` (array), string, number, boolean, and null.
+    51	 *
+    52	 * @param {unknown} value
+    53	 * @returns {string}
+    54	 */
+    55	export function dumps(value) {
+    56	  if (value === null || value === undefined) return 'null';
+    57	
+    58	  if (typeof value === 'string') return encodeBasestringAscii(value);
+    59	
+    60	  if (typeof value === 'boolean') return value ? 'true' : 'false';
+    61	
+    62	  if (typeof value === 'number') {
+    63	    if (!Number.isFinite(value)) {
+    64	      // CPython emits these bare tokens rather than failing.
+    65	      if (Number.isNaN(value)) return 'NaN';
+    66	      return value > 0 ? 'Infinity' : '-Infinity';
+    67	    }
+    68	    return String(value);
+    69	  }
+    70	
+    71	  if (Array.isArray(value)) {
+    72	    return '[' + value.map(dumps).join(',') + ']';
+    73	  }
+    74	
+    75	  if (value instanceof Map) {
+    76	    const parts = [];
+    77	    for (const [key, item] of value) {
+    78	      parts.push(encodeBasestringAscii(String(key)) + ':' + dumps(item));
+    79	    }
+    80	    return '{' + parts.join(',') + '}';
+    81	  }
+    82	
+    83	  if (typeof value === 'object') {
+    84	    const parts = [];
+    85	    for (const key of Object.keys(value)) {
+    86	      parts.push(encodeBasestringAscii(key) + ':' + dumps(value[key]));
+    87	    }
+    88	    return '{' + parts.join(',') + '}';
+    89	  }
+    90	
+    91	  throw new TypeError(`Object of type ${typeof value} is not JSON serializable`);
+    92	}
+===== lib/python/repr.mjs =====
+     1	/**
+     2	 * CPython's `repr()` for the value shapes this program prints.
+     3	 *
+     4	 * `print(some_dict)` goes through `str()`, which for containers is `repr()`,
+     5	 * and container `repr()` recurses with `repr()` on its members -- so the whole
+     6	 * of lines 2 and 3 of the program's output is produced here.
+     7	 */
+     8	
+     9	import { codePoints, isPrintableCodePoint } from './unicodeClass.mjs';
+    10	
+    11	/**
+    12	 * Reproduce `unicode_repr` from CPython's Objects/unicodeobject.c.
+    13	 *
+    14	 * Quote choice: single quotes, unless the string contains a single quote and no
+    15	 * double quote, in which case double quotes avoid the escaping.
+    16	 *
+    17	 * @param {string} str
+    18	 * @returns {string}
+    19	 */
+    20	export function reprString(str) {
+    21	  const quote = str.includes("'") && !str.includes('"') ? '"' : "'";
+    22	
+    23	  let out = quote;
+    24	  for (const cp of codePoints(str)) {
+    25	    const ch = String.fromCodePoint(cp);
+    26	
+    27	    if (ch === quote || cp === 0x5c) {
+    28	      out += '\\' + ch;
+    29	    } else if (cp === 0x09) {
+    30	      out += '\\t';
+    31	    } else if (cp === 0x0a) {
+    32	      out += '\\n';
+    33	    } else if (cp === 0x0d) {
+    34	      out += '\\r';
+    35	    } else if (cp < 0x20 || cp === 0x7f) {
+    36	      out += '\\x' + cp.toString(16).padStart(2, '0');
+    37	    } else if (cp < 0x7f) {
+    38	      out += ch;
+    39	    } else if (isPrintableCodePoint(cp)) {
+    40	      out += ch;
+    41	    } else if (cp < 0x100) {
+    42	      out += '\\x' + cp.toString(16).padStart(2, '0');
+    43	    } else if (cp < 0x10000) {
+    44	      out += '\\u' + cp.toString(16).padStart(4, '0');
+    45	    } else {
+    46	      out += '\\U' + cp.toString(16).padStart(8, '0');
+    47	    }
+    48	  }
+    49	
+    50	  return out + quote;
+    51	}
+    52	
+    53	/**
+    54	 * Render any supported value the way CPython's `repr()` would.
+    55	 *
+    56	 * @param {unknown} value `Map` renders as a dict, `Array` as a list
+    57	 * @returns {string}
+    58	 */
+    59	export function repr(value) {
+    60	  if (value === null || value === undefined) return 'None';
+    61	
+    62	  if (typeof value === 'string') return reprString(value);
+    63	
+    64	  if (typeof value === 'boolean') return value ? 'True' : 'False';
+    65	
+    66	  if (typeof value === 'number') return reprNumber(value);
+    67	
+    68	  if (typeof value === 'bigint') return value.toString();
+    69	
+    70	  if (Array.isArray(value)) return '[' + value.map(repr).join(', ') + ']';
+    71	
+    72	  if (value instanceof Map) {
+    73	    const parts = [];
+    74	    for (const [key, item] of value) parts.push(`${repr(key)}: ${repr(item)}`);
+    75	    return '{' + parts.join(', ') + '}';
+    76	  }
+    77	
+    78	  if (typeof value === 'object') {
+    79	    const parts = [];
+    80	    for (const key of Object.keys(value)) parts.push(`${repr(key)}: ${repr(value[key])}`);
+    81	    return '{' + parts.join(', ') + '}';
+    82	  }
+    83	
+    84	  return String(value);
+    85	}
+    86	
+    87	/**
+    88	 * Python distinguishes `int` from `float`; the closest JavaScript can get is to
+    89	 * treat whole numbers as ints and give everything else a `.0`-preserving form.
+    90	 *
+    91	 * @param {number} value
+    92	 * @returns {string}
+    93	 */
+    94	function reprNumber(value) {
+    95	  if (Number.isNaN(value)) return 'nan';
+    96	  if (value === Infinity) return 'inf';
+    97	  if (value === -Infinity) return '-inf';
+    98	  return String(value);
+    99	}
+===== lib/python/unicodeClass.mjs =====
+     1	/**
+     2	 * Unicode printability, matching CPython's `str.isprintable()`.
+     3	 *
+     4	 * CPython defines non-printable as "characters defined in the Unicode character
+     5	 * database as Other or Separator, excepting the ASCII space (0x20)". The engine
+     6	 * already ships the character database behind regular-expression property
+     7	 * escapes, so the categories can be queried directly instead of shipping a
+     8	 * table.
+     9	 */
+    10	
+    11	const NON_PRINTABLE = /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zs}\p{Zl}\p{Zp}]/u;
+    12	
+    13	/** Memo for the BMP; astral code points are rare enough to test on demand. */
+    14	const bmpCache = new Int8Array(0x10000).fill(-1);
+    15	
+    16	/**
+    17	 * @param {number} codePoint
+    18	 * @returns {boolean} true when CPython's `repr()` would emit the character raw
+    19	 */
+    20	export function isPrintableCodePoint(codePoint) {
+    21	  // The ASCII space is the one Separator CPython still calls printable.
+    22	  if (codePoint === 0x20) return true;
+    23	
+    24	  if (codePoint < 0x10000) {
+    25	    const cached = bmpCache[codePoint];
+    26	    if (cached !== -1) return cached === 1;
+    27	    const printable = !NON_PRINTABLE.test(String.fromCharCode(codePoint));
+    28	    bmpCache[codePoint] = printable ? 1 : 0;
+    29	    return printable;
+    30	  }
+    31	
+    32	  return !NON_PRINTABLE.test(String.fromCodePoint(codePoint));
+    33	}
+    34	
+    35	/**
+    36	 * Iterate a JavaScript string by Unicode code point, the way CPython iterates
+    37	 * a `str`. Unpaired surrogates are yielded as their own code point.
+    38	 *
+    39	 * @param {string} str
+    40	 * @returns {Generator<number>}
+    41	 */
+    42	export function* codePoints(str) {
+    43	  for (let i = 0; i < str.length; i++) {
+    44	    const unit = str.charCodeAt(i);
+    45	    if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < str.length) {
+    46	      const next = str.charCodeAt(i + 1);
+    47	      if (next >= 0xdc00 && next <= 0xdfff) {
+    48	        yield (unit - 0xd800) * 0x400 + (next - 0xdc00) + 0x10000;
+    49	        i++;
+    50	        continue;
+    51	      }
+    52	    }
+    53	    yield unit;
+    54	  }
+    55	}

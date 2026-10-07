@@ -1,0 +1,93 @@
+All green. Here is the migration.
+
+## Reverse-engineered behavior
+
+I ran the executable ~250 times to recover the black-box semantics. Four findings drove the design:
+
+| Probe | Result | Consequence |
+|---|---|---|
+| `--b '99999999999999999999'` | `99999999999931122162` | Python's unbounded ints leak into output → **BigInt**, not `Number` |
+| `--b -3` | `-1039859216` | Negative checksums; needs Python's two's-complement/floor-shift semantics |
+| `--b '٣_٤'` → 34, `--b '½'` → error | Only category **Nd** digits, underscore separators |
+| `--b $'\x1c5'` → error, `--b $'\xa05'` → 5 | `int()` uses **two different** whitespace sets |
+
+## Library files
+
+**`/output/lib/pyunicode.mjs`** — the Unicode predicates `int()` rests on. The subtle part: `int()` folds non-ASCII space to `U+0020` in stage 1, then stage 2 skips only `Py_ISSPACE`. That's why `'\x1c5'` fails but `'\xa05'` works. Digit values come from ICU data already in the runtime:
+
+```js
+const DECIMAL_DIGIT = /^\p{Nd}$/u;
+const ASCII_SPACE = new Set([0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20]);
+const NON_ASCII_SPACE = new Set([0x0085, 0x00a0, 0x1680, /* … */ 0x3000]);
+
+function buildDigitValues() {          // Intl → all 680 Nd code points
+  for (const system of Intl.supportedValuesOf('numberingSystem')) { /* format 0-9 */ }
+}
+export function decimalDigitValue(codePoint) { /* ASCII fast path → map → scan */ }
+```
+
+I avoided a hand-maintained digit table: formatting `0`–`9` in every CLDR numbering system reproduces **all 680** Nd code points exactly. This matters — the five *mathematical* digit blocks (`U+1D7CE`…`U+1D7FF`) are code-point-adjacent, so the naive "scan back to a non-digit" trick silently merges them. I verified all 9 of those blocks against the reference.
+
+**`/output/lib/pyrepr.mjs`** — `repr()`/`print()`. Python switches to double quotes only when the text has `'` and no `"` (`"it's"` vs `'say "hi"'`).
+
+**`/output/lib/pyint.mjs`** — `int(str)` as CPython's two stages, returning BigInt. Underscores may only sit *between* digits, so `1_0`→10 while `_1`, `1_`, `1__0` all raise.
+
+**`/output/lib/bech32.mjs`** — the two primitives, all-BigInt:
+
+```js
+const GENERATOR = [0x3b6a57b2n, 0x26508e6dn, 0x1ea119fan, 0x3d4233ddn, 0x2a1462b3n];
+
+export function bech32HrpExpand(hrp) {
+  for (const character of hrp) {           // by code point, like Python's `for x in hrp`
+    const codePoint = BigInt(character.codePointAt(0));
+    high.push(codePoint >> 5n); low.push(codePoint & 31n);
+  }
+  return [...high, 0n, ...low];
+}
+export function bech32Polymod(values) { /* checksum = ((checksum & 0x1ffffffn) << 5n) ^ value */ }
+```
+
+Code-point iteration is load-bearing: `--a '😀'` yields `[4016, 0, 0]`, proving `ord()` sees `U+1F600` whole, which `for…of` matches but a UTF-16 index loop would split.
+
+**`/output/lib/linecache.mjs`** + **`/output/lib/pyerrors.mjs`** — traceback rendering. I found the frozen binary's traceback is **cwd-dependent**: it has no embedded source, so `linecache` resolves the bare name `test9.py` against the working directory. Planting a decoy `test9.py` made it print the decoy's lines, which let me recover the exact caret arithmetic (`end_offset` clamps against the raw line *including its newline*) rather than hardcoding it.
+
+**`/output/lib/argparse.mjs`** + **`helpformatter.mjs`** — required long options, `-h/--help`, abbreviation (`--h`→`--help`), the negative-number rule (`--b -3` is a value, `--b -3,+4` is not), and required-before-unrecognized error precedence.
+
+## Entry file — `/output/test9.mjs`
+
+```js
+import { ArgumentParser } from './lib/argparse.mjs';
+import { bech32HrpExpand, bech32Polymod } from './lib/bech32.mjs';
+import { pyInt } from './lib/pyint.mjs';
+import { pyPrint, reprInt, reprIntList } from './lib/pyrepr.mjs';
+import { runPythonMain } from './lib/pyerrors.mjs';
+
+const PROG = 'test9_executable';   // argparse takes prog from basename(sys.argv[0])
+
+function main() {
+  const parser = new ArgumentParser({ prog: PROG });
+  parser.addArgument(['--a'], { required: true }); // HRP
+  parser.addArgument(['--b'], { required: true }); // Data as comma-separated integers
+  const args = parser.parseArgs();
+
+  const data = args.b.split(',').map(pyInt);
+  const hrpExpanded = bech32HrpExpand(args.a);
+  const combined = [...hrpExpanded, ...data];
+  const checksum = bech32Polymod(combined);
+  pyPrint(reprIntList(hrpExpanded));
+  pyPrint(reprInt(checksum));
+}
+
+runPythonMain(main, { scriptName: 'test9.py', moduleName: 'test9' });
+```
+
+## Verification
+
+**763 differential comparisons against the executable, 0 mismatches** — stdout, stderr and exit status each compared byte-for-byte: 106 curated cases × 3 working directories, 300 randomized fuzz cases, 128 Unicode-digit cases across all 64 detected Nd blocks, 9 adjacent math-digit blocks, and 8 `--` separator edges. `--help` is byte-identical.
+
+Two notes on decisions I made:
+
+- **`--` handling was a real bug I caught and fixed.** My first version silently swallowed the separator; the reference reports `unrecognized arguments: --`. Cause: argparse strips `--` inside `_get_values()`, which only runs when a *positional* action consumes arguments — this parser declares none, so the token survives into extras.
+- **`PROG` is hardcoded** to `test9_executable` so usage/error text matches the reference byte-for-byte. The faithful-argparse alternative (`basename(process.argv[1])`) would print `test9.mjs` and break that alignment; I chose output fidelity and flagged it in a comment.
+
+One inherent limit: the `[PYI-<pid>:ERROR]` bootloader line carries a live PID, so it differs per run in the *original* too. I emit the same format with `process.pid`, and normalized that field when diffing.

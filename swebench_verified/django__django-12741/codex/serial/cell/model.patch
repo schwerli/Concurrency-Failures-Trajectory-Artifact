@@ -1,0 +1,122 @@
+diff --git a/django/core/management/commands/flush.py b/django/core/management/commands/flush.py
+index e8ed3967f7..bc8021cf4e 100644
+--- a/django/core/management/commands/flush.py
++++ b/django/core/management/commands/flush.py
+@@ -60,7 +60,7 @@ Are you sure you want to do this?
+ 
+         if confirm == 'yes':
+             try:
+-                connection.ops.execute_sql_flush(database, sql_list)
++                connection.ops.execute_sql_flush(sql_list)
+             except Exception as exc:
+                 raise CommandError(
+                     "Database %s couldn't be flushed. Possible reasons:\n"
+diff --git a/django/db/backends/base/operations.py b/django/db/backends/base/operations.py
+index 70ac07ae09..dedde18975 100644
+--- a/django/db/backends/base/operations.py
++++ b/django/db/backends/base/operations.py
+@@ -400,8 +400,9 @@ class BaseDatabaseOperations:
+         """
+         raise NotImplementedError('subclasses of BaseDatabaseOperations must provide a sql_flush() method')
+ 
+-    def execute_sql_flush(self, using, sql_list):
++    def execute_sql_flush(self, sql_list):
+         """Execute a list of SQL statements to flush the database."""
++        using = self.connection.alias
+         with transaction.atomic(using=using, savepoint=self.connection.features.can_rollback_ddl):
+             with self.connection.cursor() as cursor:
+                 for sql in sql_list:
+diff --git a/tests/backends/base/test_operations.py b/tests/backends/base/test_operations.py
+index 0485fe8465..aeecafd932 100644
+--- a/tests/backends/base/test_operations.py
++++ b/tests/backends/base/test_operations.py
+@@ -1,4 +1,5 @@
+ import decimal
++from unittest import mock
+ 
+ from django.core.management.color import no_style
+ from django.db import NotSupportedError, connection, transaction
+@@ -45,6 +46,20 @@ class SimpleDatabaseOperationTests(SimpleTestCase):
+         with self.assertRaisesMessage(NotImplementedError, msg):
+             self.ops.sql_flush(None, None)
+ 
++    @mock.patch('django.db.backends.base.operations.transaction.atomic')
++    def test_execute_sql_flush_uses_connection_alias(self, atomic):
++        mock_connection = mock.MagicMock()
++        mock_connection.alias = 'other'
++        mock_connection.features.can_rollback_ddl = False
++        cursor = mock.MagicMock()
++        mock_connection.cursor.return_value.__enter__.return_value = cursor
++        ops = BaseDatabaseOperations(connection=mock_connection)
++
++        ops.execute_sql_flush(['SQL 1', 'SQL 2'])
++
++        atomic.assert_called_once_with(using='other', savepoint=False)
++        cursor.execute.assert_has_calls([mock.call('SQL 1'), mock.call('SQL 2')])
++
+     def test_pk_default_value(self):
+         self.assertEqual(self.ops.pk_default_value(), 'DEFAULT')
+ 
+@@ -172,7 +187,7 @@ class SqlFlushTests(TransactionTestCase):
+             reset_sequences=True,
+             allow_cascade=True,
+         )
+-        connection.ops.execute_sql_flush(connection.alias, sql_list)
++        connection.ops.execute_sql_flush(sql_list)
+ 
+         with transaction.atomic():
+             self.assertIs(Author.objects.exists(), False)
+diff --git a/tests/backends/tests.py b/tests/backends/tests.py
+index d6c2331378..40fc6de7fc 100644
+--- a/tests/backends/tests.py
++++ b/tests/backends/tests.py
+@@ -162,7 +162,7 @@ class LongNameTest(TransactionTestCase):
+             VLM_m2m._meta.db_table,
+         ]
+         sql_list = connection.ops.sql_flush(no_style(), tables, reset_sequences=True)
+-        connection.ops.execute_sql_flush(connection.alias, sql_list)
++        connection.ops.execute_sql_flush(sql_list)
+ 
+ 
+ class SequenceResetTest(TestCase):
+diff --git a/tests/empty_models/test_commands.py b/tests/empty_models/test_commands.py
+index 5dd4744033..3c66d21a13 100644
+--- a/tests/empty_models/test_commands.py
++++ b/tests/empty_models/test_commands.py
+@@ -1,7 +1,35 @@
+ import io
++from unittest import mock
+ 
+ from django.core.management import call_command
+-from django.test import TestCase
++from django.core.management.commands.flush import Command
++from django.test import SimpleTestCase, TestCase
++
++
++class FlushCommandTests(SimpleTestCase):
++    @mock.patch(
++        'django.core.management.commands.flush.emit_post_migrate_signal',
++    )
++    @mock.patch(
++        'django.core.management.commands.flush.sql_flush',
++        return_value=['DELETE FROM "test"'],
++    )
++    @mock.patch(
++        'django.core.management.commands.flush.apps.get_app_configs',
++        return_value=[],
++    )
++    @mock.patch('django.core.management.commands.flush.connections')
++    def test_execute_sql_flush_called_without_database_alias(
++        self, connections, get_app_configs, sql_flush, emit_post_migrate_signal,
++    ):
++        connection = mock.MagicMock()
++        connection.settings_dict = {'NAME': 'test_db'}
++        connections.__getitem__.return_value = connection
++
++        Command().handle(database='default', verbosity=0, interactive=False)
++
++        connection.ops.execute_sql_flush.assert_called_once_with(['DELETE FROM "test"'])
++        emit_post_migrate_signal.assert_called_once_with(0, False, 'default')
+ 
+ 
+ class CoreCommandsNoOutputTests(TestCase):

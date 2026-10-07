@@ -1,0 +1,229 @@
+diff --git a/pylint/pyreverse/diagrams.py b/pylint/pyreverse/diagrams.py
+index bf9f67af..e010ea30 100644
+--- a/pylint/pyreverse/diagrams.py
++++ b/pylint/pyreverse/diagrams.py
+@@ -119,6 +119,10 @@ class ClassDiagram(Figure, FilterMixIn):
+         """return class names if needed in diagram"""
+         names = []
+         for node in nodes:
++            if isinstance(node, str):
++                if node not in names:
++                    names.append(node)
++                continue
+             if isinstance(node, astroid.Instance):
+                 node = node._proxied
+             if (
+diff --git a/pylint/pyreverse/inspector.py b/pylint/pyreverse/inspector.py
+index 8fa12202..ecca000b 100644
+--- a/pylint/pyreverse/inspector.py
++++ b/pylint/pyreverse/inspector.py
+@@ -189,6 +189,84 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
+     link_class = visit_classdef
+     link_function = visit_functiondef
+ 
++    @staticmethod
++    def _infer_node(node):
++        try:
++            return set(node.infer())
++        except astroid.InferenceError:
++            return set()
++
++    @staticmethod
++    def _annotation_label(annotation):
++        if isinstance(annotation, astroid.Const) and isinstance(annotation.value, str):
++            return annotation.value
++        return annotation.as_string()
++
++    @classmethod
++    def _infer_annotation(cls, annotation):
++        if isinstance(annotation, astroid.Const) and isinstance(annotation.value, str):
++            return {annotation.value}
++        if isinstance(annotation, (astroid.Name, astroid.Attribute)):
++            values = {
++                value
++                for value in cls._infer_node(annotation)
++                if value is not astroid.Uninferable
++                and isinstance(value, (astroid.ClassDef, astroid.Const, astroid.Instance))
++            }
++            if values:
++                return values
++        return {cls._annotation_label(annotation)}
++
++    @staticmethod
++    def _get_argument_annotation(node):
++        parent = node.parent
++        if not isinstance(parent, astroid.Arguments):
++            return None
++        annotations = (
++            (
++                getattr(parent, "posonlyargs", ()) or (),
++                getattr(parent, "posonlyargs_annotations", ()) or (),
++            ),
++            (parent.args or (), parent.annotations or ()),
++            (
++                parent.kwonlyargs or (),
++                getattr(parent, "kwonlyargs_annotations", ()) or (),
++            ),
++        )
++        for arguments, arg_annotations in annotations:
++            for index, argument in enumerate(arguments):
++                if argument is node:
++                    return arg_annotations[index]
++        return None
++
++    @classmethod
++    def _get_annotation_from_definition(cls, node):
++        parent = node.parent
++        if isinstance(parent, astroid.AnnAssign):
++            return parent.annotation
++        if isinstance(parent, astroid.Arguments):
++            return cls._get_argument_annotation(node)
++        return None
++
++    @classmethod
++    def _get_annotation_from_value(cls, value):
++        if not isinstance(value, astroid.Name):
++            return None
++        for assignment in reversed(value.lookup(value.name)[1]):
++            annotation = cls._get_annotation_from_definition(assignment)
++            if annotation is not None:
++                return annotation
++        return None
++
++    @classmethod
++    def _get_assigned_type_values(cls, node):
++        annotation = cls._get_annotation_from_definition(node)
++        if annotation is None and isinstance(node.parent, astroid.Assign):
++            annotation = cls._get_annotation_from_value(node.parent.value)
++        if annotation is not None:
++            return cls._infer_annotation(annotation)
++        return cls._infer_node(node)
++
+     def visit_assignname(self, node):
+         """visit an astroid.AssignName node
+ 
+@@ -218,19 +296,19 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
+                     self.visit_module(frame)
+ 
+             current = frame.locals_type[node.name]
+-            values = set(node.infer())
++            values = self._get_assigned_type_values(node)
+             frame.locals_type[node.name] = list(set(current) | values)
+         except astroid.InferenceError:
+             pass
+ 
+-    @staticmethod
+-    def handle_assignattr_type(node, parent):
++    @classmethod
++    def handle_assignattr_type(cls, node, parent):
+         """handle an astroid.assignattr node
+ 
+         handle instance_attrs_type
+         """
+         try:
+-            values = set(node.infer())
++            values = cls._get_assigned_type_values(node)
+             current = set(parent.instance_attrs_type[node.attrname])
+             parent.instance_attrs_type[node.attrname] = list(current | values)
+         except astroid.InferenceError:
+diff --git a/tests/unittest_pyreverse_inspector.py b/tests/unittest_pyreverse_inspector.py
+index e1ff6378..9da49430 100644
+--- a/tests/unittest_pyreverse_inspector.py
++++ b/tests/unittest_pyreverse_inspector.py
+@@ -30,6 +30,22 @@ def project():
+     return project
+ 
+ 
++def _type_names(nodes):
++    names = []
++    for node in nodes:
++        if node is astroid.Uninferable:
++            names.append("Uninferable")
++        elif isinstance(node, str):
++            names.append(node)
++        elif isinstance(node, astroid.Instance):
++            names.append(node._proxied.name)
++        elif hasattr(node, "name"):
++            names.append(node.name)
++        else:
++            names.append(getattr(node, "value", repr(node)))
++    return sorted(names)
++
++
+ def test_class_implements(project):
+     klass = project.get_module("data.clientmodule_test")["Ancestor"]
+     assert hasattr(klass, "implements")
+@@ -71,6 +87,32 @@ def test_instance_attrs_resolution(project):
+     assert type_dict["_id"][0] is astroid.Uninferable
+ 
+ 
++def test_instance_attrs_resolution_uses_annotations(tmp_path):
++    module = tmp_path / "typed_module.py"
++    module.write_text(
++        "class Related:\n"
++        "    pass\n"
++        "\n"
++        "class C:\n"
++        "    kind: str = None\n"
++        "\n"
++        "    def __init__(self, value: str = None, rel: Related = None):\n"
++        "        self.value = value\n"
++        "        self.rel = rel\n"
++        "        self.count: float = 0.5\n",
++        encoding="utf-8",
++    )
++    typed_project = get_project(str(module), "typed")
++    linker = inspector.Linker(typed_project)
++    linker.visit(typed_project)
++    klass = typed_project.get_module("typed_module")["C"]
++
++    assert _type_names(klass.locals_type["kind"]) == ["str"]
++    assert _type_names(klass.instance_attrs_type["count"]) == ["float"]
++    assert _type_names(klass.instance_attrs_type["rel"]) == ["Related"]
++    assert _type_names(klass.instance_attrs_type["value"]) == ["str"]
++
++
+ def test_concat_interfaces():
+     cls = astroid.extract_node(
+         '''
+diff --git a/tests/unittest_pyreverse_writer.py b/tests/unittest_pyreverse_writer.py
+index 98bb0148..e4e7701b 100644
+--- a/tests/unittest_pyreverse_writer.py
++++ b/tests/unittest_pyreverse_writer.py
+@@ -132,3 +132,36 @@ def test_get_visibility(names, expected):
+     for name in names:
+         got = get_visibility(name)
+         assert got == expected, f"got {got} instead of {expected} for value {name}"
++
++
++def test_typed_attrs_are_rendered(tmp_path):
++    module = tmp_path / "typed_module.py"
++    module.write_text(
++        "class Related:\n"
++        "    pass\n"
++        "\n"
++        "class C:\n"
++        "    kind: str = None\n"
++        "\n"
++        "    def __init__(self, value: str = None, rel: Related = None):\n"
++        "        self.value = value\n"
++        "        self.rel = rel\n"
++        "        self.count: float = 0.5\n",
++        encoding="utf-8",
++    )
++    project = get_project(str(module), "typed")
++    config = Config()
++    config.output_directory = str(tmp_path)
++    diagrams = DefaultDiadefGenerator(Linker(project), DiadefsHandler(config)).visit(
++        project
++    )
++    for diagram in diagrams:
++        diagram.extract_relationships()
++
++    DotWriter(config).write(diagrams)
++
++    generated = "\n".join(_file_lines(tmp_path / "classes_typed.dot"))
++    assert "kind : str\\l" in generated
++    assert "value : str\\l" in generated
++    assert "count : float\\l" in generated
++    assert 'label="rel"' in generated

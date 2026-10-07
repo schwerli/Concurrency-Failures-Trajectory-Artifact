@@ -1,0 +1,110 @@
+diff --git a/django/db/backends/sqlite3/schema.py b/django/db/backends/sqlite3/schema.py
+index 6752a8e3c0..8b0478491c 100644
+--- a/django/db/backends/sqlite3/schema.py
++++ b/django/db/backends/sqlite3/schema.py
+@@ -324,10 +324,14 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
+ 
+     def add_field(self, model, field):
+         """Create a field on a model."""
+-        # Fields with default values cannot by handled by ALTER TABLE ADD
+-        # COLUMN statement because DROP DEFAULT is not supported in
+-        # ALTER TABLE.
+-        if not field.null or self.effective_default(field) is not None:
++        # Fields with default values or inline UNIQUE constraints cannot be
++        # handled by ALTER TABLE ADD COLUMN. DROP DEFAULT is not supported in
++        # ALTER TABLE and SQLite rejects columns with UNIQUE constraints.
++        if (
++            not field.null or
++            self.effective_default(field) is not None or
++            field.unique
++        ):
+             self._remake_table(model, create_field=field)
+         else:
+             super().add_field(model, field)
+diff --git a/tests/schema/tests.py b/tests/schema/tests.py
+index cd6a52f6af..83b4a6cc3a 100644
+--- a/tests/schema/tests.py
++++ b/tests/schema/tests.py
+@@ -14,7 +14,7 @@ from django.db.models import (
+     BooleanField, CharField, CheckConstraint, DateField, DateTimeField,
+     DecimalField, DurationField, F, FloatField, ForeignKey, ForeignObject,
+     Index, IntegerField, JSONField, ManyToManyField, Model, OneToOneField,
+-    OrderBy, PositiveIntegerField, Q, SlugField, SmallAutoField,
++    OrderBy, PositiveIntegerField, Q, SET_NULL, SlugField, SmallAutoField,
+     SmallIntegerField, TextField, TimeField, UniqueConstraint, UUIDField,
+     Value,
+ )
+@@ -531,6 +531,73 @@ class SchemaTests(TransactionTestCase):
+         self.assertEqual(columns['age'][0], connection.features.introspected_field_types['IntegerField'])
+         self.assertTrue(columns['age'][1][6])
+ 
++    @isolate_apps('schema')
++    @skipUnlessDBFeature('supports_foreign_keys')
++    @unittest.skipUnless(connection.vendor == 'sqlite', 'SQLite tests')
++    def test_add_nullable_o2o_field(self):
++        class LocalAuthor(Model):
++            class Meta:
++                app_label = 'schema'
++
++        class LocalBook(Model):
++            title = CharField(max_length=100, db_index=True)
++            pub_date = DateTimeField()
++
++            class Meta:
++                app_label = 'schema'
++                db_table = 'schema_local_book'
++
++        class LocalBookWithO2O(Model):
++            author = OneToOneField(LocalAuthor, on_delete=SET_NULL, null=True)
++            title = CharField(max_length=100, db_index=True)
++            pub_date = DateTimeField()
++
++            class Meta:
++                app_label = 'schema'
++                db_table = 'schema_local_book'
++
++        self.isolated_local_models = [LocalAuthor, LocalBook]
++        with connection.schema_editor() as editor:
++            editor.create_model(LocalAuthor)
++            editor.create_model(LocalBook)
++
++        new_field = OneToOneField(LocalAuthor, on_delete=SET_NULL, null=True)
++        new_field.set_attributes_from_name('author')
++        new_field.model = LocalBook
++        with connection.schema_editor() as editor:
++            editor.add_field(LocalBook, new_field)
++
++        self.assertForeignKeyExists(LocalBookWithO2O, 'author_id', LocalAuthor._meta.db_table)
++        counts = self.get_constraints_count(
++            LocalBookWithO2O._meta.db_table,
++            'author_id',
++            (LocalAuthor._meta.db_table, LocalAuthor._meta.pk.column),
++        )
++        self.assertEqual(counts, {'fks': 1, 'uniques': 1, 'indexes': 0})
++
++        LocalBookWithO2O.objects.create(
++            author=None,
++            title='Django 1',
++            pub_date=timezone.now(),
++        )
++        LocalBookWithO2O.objects.create(
++            author=None,
++            title='Django 2',
++            pub_date=timezone.now(),
++        )
++        author = LocalAuthor.objects.create()
++        LocalBookWithO2O.objects.create(
++            author=author,
++            title='Django 3',
++            pub_date=timezone.now(),
++        )
++        with self.assertRaises(IntegrityError):
++            LocalBookWithO2O.objects.create(
++                author=author,
++                title='Django 4',
++                pub_date=timezone.now(),
++            )
++
+     def test_add_field_remove_field(self):
+         """
+         Adding a field and removing it removes all deferred sql referring to it.

@@ -1,0 +1,118 @@
+Everything is written to `/output` and verified byte-for-byte against the reference executable.
+
+## Module hierarchy
+
+```
+/output
+├── lib/
+│   ├── py/                      # CPython runtime semantics the script depends on
+│   │   ├── io.mjs               # stdout block-buffering vs. unbuffered stderr, explicit flush
+│   │   ├── exceptions.mjs       # PyException base (pyName/pyFrame), SystemExit
+│   │   ├── builtins.mjs         # print(), str(), repr(), len() — incl. tuple `()` / dict `{}` forms
+│   │   ├── functools.mjs        # partial (.args/.keywords), update_wrapper, lambda naming
+│   │   ├── datetime.mjs         # datetime / time / timedelta (replace, arithmetic, comparison)
+│   │   ├── linecache.mjs        # cwd-relative source lookup for traceback frames
+│   │   └── traceback.mjs        # Py3.11 fine-grained carets + PyInstaller epilogue
+│   ├── argparse/
+│   │   ├── errors.mjs           # ArgumentError, _get_action_name
+│   │   ├── actions.mjs          # store / help actions
+│   │   ├── formatter.mjs        # HelpFormatter: usage wrapping, help-column arithmetic
+│   │   ├── parser.mjs           # ArgumentParser: _parse_optional, _match_argument, error()
+│   │   └── index.mjs
+│   └── schedule/
+│       ├── errors.mjs           # ScheduleError/ValueError/IntervalError + raise-site line numbers
+│       ├── job.mjs              # Job: unit getters, at() parsing, do(), _schedule_next_run, __str__
+│       ├── scheduler.mjs        # Scheduler: jobs, run_pending, cancel_job, clear, get_jobs
+│       └── index.mjs            # default_scheduler + module-level every/cancel_job/clear/get_jobs
+└── test10.mjs                   # entry point
+```
+
+Five behaviors I had to pin down from the black box:
+
+1. **`print(job)` uses `__str__`, not `__repr__`** — `Job(interval=1, unit=seconds, do=<lambda>, args=(), kwargs={})`. `args` renders as an empty *tuple*, `kwargs` as an empty *dict*, and the callable's name is `<lambda>` (JS arrow functions have `name === ''`, so `lambda()` tags it).
+2. **`at()` has two distinct failure modes.** The daily regex is `^[0-2]\d:[0-5]\d(:[0-5]\d)?$`, which *admits* hours 24–29; those then fail a range check. Upstream forgets to interpolate that message, so the literal `{}` is part of the output: `Invalid number of hours ({} is not between 0 and 23)`.
+3. **The traceback source line is cwd-dependent.** `linecache` resolves the frame's relative `"test10.py"` against the working directory, so the line and carets appear only when run from the script's own directory. `lib/py/linecache.mjs` reproduces exactly that.
+4. **stdout is block-buffered when piped.** Redirecting both streams into one pipe shows the traceback *before* the earlier `print` output. `lib/py/io.mjs` buffers and flushes at the exit points, matching the interleaving.
+5. **argparse's usage line splits on whitespace, not on option groups** — so `--c C` can straddle two lines at narrow widths, and `prog` moves to its own line only when `len('usage: ') + len(prog) > 0.75 * width`.
+
+## Entry point
+
+```javascript
+// /output/test10.mjs
+import { ArgumentParser } from './lib/argparse/index.mjs';
+import { print, len } from './lib/py/builtins.mjs';
+import { lambda } from './lib/py/functools.mjs';
+import { flushStdout } from './lib/py/io.mjs';
+import { SystemExit, isPyException } from './lib/py/exceptions.mjs';
+import { printException, printBootloaderFailure, terminate } from './lib/py/traceback.mjs';
+import * as schedule from './lib/schedule/index.mjs';
+
+// The reference build is a frozen binary, so argparse reports the executable's
+// name rather than the script's.
+const PROG = 'test10_executable';
+const SCRIPT = 'test10.py';
+
+// Traceback frames for the one statement that can raise, so an invalid --a
+// reproduces the reference error report. The source text itself is not stored
+// here: like linecache, the renderer reads it from test10.py if the cwd has it.
+const AT_STATEMENT = {
+  file: SCRIPT, line: 21, func: '<module>',
+  mark: 'schedule.every().days.at(args.a)',
+};
+
+function main() {
+  const parser = new ArgumentParser({ prog: PROG });
+  parser.add_argument('--a', { type: String, required: true });
+  parser.add_argument('--b', { type: String, required: true });
+  parser.add_argument('--c', { type: String, required: true });
+  parser.add_argument('--d', { type: String, required: true });
+  const args = parser.parse_args(process.argv.slice(2));
+
+  const job1 = schedule.every().seconds.do(lambda(() => null)); // 创建秒级作业
+  print(job1);
+  schedule.cancel_job(job1); // 取消作业1
+  print(len(schedule.get_jobs()));
+  const job2 = schedule.every().minutes.do(lambda(() => null)); // 创建分钟作业
+  print(job2);
+  const job3 = schedule.every().hours.do(lambda(() => null)); // 创建小时作业
+  print(job3);
+  schedule.clear(); // 清除所有作业
+  print(len(schedule.get_jobs()));
+  const job4 = schedule.every().days.at(args.a).do(lambda(() => null)); // 创建每日作业
+  print(job4);
+  const job5 = schedule.every().weeks.do(lambda(() => null)); // 创建每周作业
+  print(job5);
+  print(len(schedule.get_jobs()));
+}
+
+try {
+  main();
+  flushStdout();
+} catch (error) {
+  if (error instanceof SystemExit) {
+    terminate(error.code);            // parser.error()/--help already wrote their output
+  } else if (isPyException(error)) {
+    printException(error, [AT_STATEMENT, error.pyFrame].filter(Boolean));
+    printBootloaderFailure('test10');
+    terminate(1);
+  } else {
+    throw error;
+  }
+}
+```
+
+## Verification
+
+Compared stdout, stderr, and exit status against `/workspace/dataset/test10_executable` (PyInstaller PID normalized, as it can't match by construction):
+
+| Suite | Result |
+|---|---|
+| 40 hand-built cases (happy paths, all argparse error shapes, `--`/abbrev/negative-number handling, 15 `at()` formats) | 40/40 identical |
+| Same 40 re-run from `/workspace/dataset` (linecache active → source line + carets) | 40/40 identical |
+| 648 random argv vectors, 1–7 tokens from a 32-token alphabet | 0 divergences |
+| `COLUMNS` 12→120 × {`--help`, usage-error} = 218 combinations | 0 mismatches |
+| Library smoke test for unreached API (`every(n)`, `IntervalError`, hourly/minutely `at()`, weekday jobs, tags, `run_pending`, `CancelJob`, `__repr__`, `idle_seconds`) | 20/20, exit 0 |
+
+Constraints confirmed by grep: no `require`/`module.exports`/`exports.`, every local import carries its `.mjs` extension, and the only non-local specifiers are `node:fs` and `node:path`.
+
+One judgment call worth flagging: I hardcoded `prog: 'test10_executable'` in the entry so error and usage output matches the reference binary. `ArgumentParser` itself defaults `prog` to `basename(process.argv[1])`, mirroring Python's own rule — so if you'd rather it self-identify as `test10.mjs`, just drop that one option.

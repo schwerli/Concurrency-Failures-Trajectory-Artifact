@@ -1,0 +1,811 @@
+===== /output/test10.mjs =====
+     1	#!/usr/bin/env node
+     2	/**
+     3	 * Node.js port of dataset/networkx/test10.py.
+     4	 *
+     5	 * Builds a weighted undirected graph from five integer arguments and prints the
+     6	 * same nine lines the Python/networkx original does, byte for byte — including
+     7	 * Python's `repr` formatting, its insertion-order-driven traversal output, and
+     8	 * networkx's own node-connectivity search.
+     9	 *
+    10	 * Usage: node test10.mjs --a 1 --b 2 --c 3 --d 4 --e 5
+    11	 */
+    12	
+    13	import { ParserExit } from './lib/cli/argparse.mjs';
+    14	import { parseArgs } from './lib/cli/args.mjs';
+    15	import { pyPrint, tuple } from './lib/python/repr.mjs';
+    16	import {
+    17	  Graph,
+    18	  bfsEdges,
+    19	  dfsEdges,
+    20	  dijkstraPath,
+    21	  dijkstraPathLength,
+    22	  minimumSpanningTree,
+    23	  nodeConnectivity,
+    24	} from './lib/graph/index.mjs';
+    25	
+    26	/** Python ints render from BigInt; counts computed as Numbers cross over here. */
+    27	const asPyInt = (count) => BigInt(count);
+    28	
+    29	const edgeTuples = (edges) => [...edges].map(([u, v]) => tuple(u, v));
+    30	
+    31	export function main(argv) {
+    32	  const args = parseArgs(argv);
+    33	
+    34	  const G = new Graph();
+    35	  G.addWeightedEdgesFrom([
+    36	    [args.a, args.b, 1.0],
+    37	    [args.b, args.c, 2.0],
+    38	    [args.c, args.d, 3.0],
+    39	    [args.d, args.e, 4.0],
+    40	    [args.a, args.e, 5.0],
+    41	  ]);
+    42	
+    43	  pyPrint(asPyInt(G.numberOfEdges())); // 获取边数量
+    44	  pyPrint(G.getEdgeData(args.a, args.b).weight); // 获取边权重
+    45	  const mst = minimumSpanningTree(G); // 最小生成树
+    46	  pyPrint(asPyInt(mst.numberOfEdges())); // MST边数量
+    47	  pyPrint(mst.hasEdge(args.a, args.b)); // 检查MST中的边
+    48	  // Zero length keeps Python's int 0; any real path length is a float.
+    49	  const length = dijkstraPathLength(G, args.a, args.e); // Dijkstra最短路径长度
+    50	  pyPrint(length.isFloat ? length.value : asPyInt(length.value));
+    51	  pyPrint(dijkstraPath(G, args.a, args.e)); // Dijkstra最短路径
+    52	  pyPrint(edgeTuples(bfsEdges(G, args.a))); // BFS边
+    53	  pyPrint(edgeTuples(dfsEdges(G, args.a))); // DFS边
+    54	  pyPrint(asPyInt(nodeConnectivity(G))); // 节点连通性
+    55	}
+    56	
+    57	try {
+    58	  main(process.argv.slice(2));
+    59	} catch (err) {
+    60	  // argparse exits through ParserExit so pending output is flushed first.
+    61	  if (err instanceof ParserExit) process.exitCode = err.status;
+    62	  else throw err;
+    63	}
+===== /output/lib/index.mjs =====
+     1	/**
+     2	 * Public surface of the port: Python runtime shims, the argparse clone, and the
+     3	 * graph algorithms.
+     4	 */
+     5	
+     6	export { PyTuple, tuple, pyRepr, pyPrint, reprFloat, reprStr } from './python/repr.mjs';
+     7	export { pyInt, PyValueError } from './python/int.mjs';
+     8	export { Heap, byPriorityThenSequence } from './python/heapq.mjs';
+     9	
+    10	export { ArgumentParser, ArgumentError, ParserExit } from './cli/argparse.mjs';
+    11	export { PROG, ARGUMENT_NAMES, buildParser, parseArgs } from './cli/args.mjs';
+    12	
+    13	export * from './graph/index.mjs';
+===== /output/lib/graph/connectivity.mjs =====
+     1	/**
+     2	 * Connectivity: `networkx.is_connected` and `networkx.node_connectivity`.
+     3	 */
+     4	
+     5	import { buildAuxiliaryNodeConnectivity, maximumFlowValue, sideA, sideB } from './flow.mjs';
+     6	
+     7	/** `nx.is_connected`: a plain BFS from the first node reaches every node. */
+     8	export function isConnected(G) {
+     9	  const total = G.numberOfNodes();
+    10	  if (total === 0) {
+    11	    throw new Error('Connectivity is undefined for the null graph.');
+    12	  }
+    13	  const start = G.nodes().next().value;
+    14	  const seen = new Set([start]);
+    15	  const queue = [start];
+    16	  for (let head = 0; head < queue.length; head += 1) {
+    17	    for (const nbr of G.neighbors(queue[head])) {
+    18	      if (!seen.has(nbr)) {
+    19	        seen.add(nbr);
+    20	        queue.push(nbr);
+    21	      }
+    22	    }
+    23	  }
+    24	  return seen.size === total;
+    25	}
+    26	
+    27	/**
+    28	 * `nx.local_node_connectivity(G, s, t)`: the number of internally node-disjoint
+    29	 * s-t paths, as a max flow from sB to tA on the split-node digraph.
+    30	 */
+    31	export function localNodeConnectivity(G, s, t, auxiliary = buildAuxiliaryNodeConnectivity(G)) {
+    32	  const source = sideB(auxiliary.mapping.get(s));
+    33	  const sink = sideA(auxiliary.mapping.get(t));
+    34	  return maximumFlowValue(auxiliary, source, sink);
+    35	}
+    36	
+    37	/**
+    38	 * `nx.node_connectivity(G)` for an undirected graph, following networkx's search
+    39	 * exactly rather than computing textbook vertex connectivity:
+    40	 *
+    41	 *   - a disconnected graph is 0;
+    42	 *   - otherwise start from K = the minimum degree, taking the *first* minimum in
+    43	 *     node insertion order (and remember a self-loop adds 2 to a degree, so it can
+    44	 *     leave K above the graph's true connectivity);
+    45	 *   - lower K with the local connectivity of that node against each non-neighbour,
+    46	 *     then against each non-adjacent pair of its neighbours.
+    47	 */
+    48	export function nodeConnectivity(G) {
+    49	  if (!isConnected(G)) return 0;
+    50	
+    51	  let v = null;
+    52	  let K = null;
+    53	  for (const [node, degree] of G.degrees()) {
+    54	    if (K === null || degree < K) {
+    55	      v = node;
+    56	      K = degree;
+    57	    }
+    58	  }
+    59	
+    60	  const auxiliary = buildAuxiliaryNodeConnectivity(G);
+    61	  const neighbors = [...G.neighbors(v)];
+    62	  const neighborSet = new Set(neighbors);
+    63	
+    64	  for (const w of G.nodes()) {
+    65	    if (w === v || neighborSet.has(w)) continue;
+    66	    K = Math.min(K, localNodeConnectivity(G, v, w, auxiliary));
+    67	  }
+    68	
+    69	  for (let i = 0; i < neighbors.length; i += 1) {
+    70	    for (let j = i + 1; j < neighbors.length; j += 1) {
+    71	      const [x, y] = [neighbors[i], neighbors[j]];
+    72	      if (G.hasEdge(x, y)) continue;
+    73	      K = Math.min(K, localNodeConnectivity(G, x, y, auxiliary));
+    74	    }
+    75	  }
+    76	
+    77	  return K;
+    78	}
+===== /output/lib/graph/flow.mjs =====
+     1	/**
+     2	 * Maximum flow on the auxiliary digraph used for node connectivity.
+     3	 *
+     4	 * `networkx.connectivity.build_auxiliary_node_connectivity` splits every node v
+     5	 * into vA -> vB with capacity 1 and turns each undirected edge {u, v} into the arcs
+     6	 * uB -> vA and vB -> uA (also capacity 1). A maximum flow from sB to tA then counts
+     7	 * internally node-disjoint s-t paths, because every interior node is throttled to
+     8	 * one unit by its own split arc.
+     9	 *
+    10	 * All capacities are 1, so Edmonds-Karp (BFS augmenting paths) is exact and the
+    11	 * value is independent of the search order.
+    12	 */
+    13	
+    14	/** Split-node index scheme: node i occupies 2i (the "A" side) and 2i+1 (the "B" side). */
+    15	const sideA = (i) => 2 * i;
+    16	const sideB = (i) => 2 * i + 1;
+    17	
+    18	export function buildAuxiliaryNodeConnectivity(G) {
+    19	  const mapping = new Map();
+    20	  for (const node of G.nodes()) mapping.set(node, mapping.size);
+    21	
+    22	  // Assignment semantics, not accumulation: a repeated arc keeps capacity 1, which
+    23	  // matters for self-loops (they emit the same arc twice).
+    24	  const arcs = new Map();
+    25	  const addArc = (from, to) => arcs.set(`${from}>${to}`, [from, to]);
+    26	
+    27	  for (const i of mapping.values()) addArc(sideA(i), sideB(i));
+    28	  for (const [u, v] of G.edges()) {
+    29	    addArc(sideB(mapping.get(u)), sideA(mapping.get(v)));
+    30	    addArc(sideB(mapping.get(v)), sideA(mapping.get(u)));
+    31	  }
+    32	
+    33	  return { mapping, order: 2 * mapping.size, arcs: [...arcs.values()] };
+    34	}
+    35	
+    36	/** Residual network held as paired arcs: arc `i` and its reverse `i ^ 1`. */
+    37	class FlowNetwork {
+    38	  constructor(order) {
+    39	    this._first = new Array(order).fill(-1);
+    40	    this._next = [];
+    41	    this._target = [];
+    42	    this._capacity = [];
+    43	  }
+    44	
+    45	  addArc(from, to, capacity) {
+    46	    this._push(from, to, capacity);
+    47	    this._push(to, from, 0);
+    48	  }
+    49	
+    50	  _push(from, to, capacity) {
+    51	    this._target.push(to);
+    52	    this._capacity.push(capacity);
+    53	    this._next.push(this._first[from]);
+    54	    this._first[from] = this._target.length - 1;
+    55	  }
+    56	
+    57	  /** Max flow value from `source` to `sink`, one BFS augmentation at a time. */
+    58	  maximumFlowValue(source, sink) {
+    59	    if (source === sink) return Infinity;
+    60	    let value = 0;
+    61	    for (;;) {
+    62	      const cameFrom = new Array(this._first.length).fill(-1);
+    63	      cameFrom[source] = -2;
+    64	      const queue = [source];
+    65	      let head = 0;
+    66	      while (head < queue.length && cameFrom[sink] === -1) {
+    67	        const node = queue[head++];
+    68	        for (let arc = this._first[node]; arc !== -1; arc = this._next[arc]) {
+    69	          const to = this._target[arc];
+    70	          if (this._capacity[arc] > 0 && cameFrom[to] === -1) {
+    71	            cameFrom[to] = arc;
+    72	            queue.push(to);
+    73	          }
+    74	        }
+    75	      }
+    76	      if (cameFrom[sink] === -1) return value;
+    77	
+    78	      let bottleneck = Infinity;
+    79	      for (let arc = cameFrom[sink]; arc !== -2; arc = cameFrom[this._target[arc ^ 1]]) {
+    80	        bottleneck = Math.min(bottleneck, this._capacity[arc]);
+    81	      }
+    82	      for (let arc = cameFrom[sink]; arc !== -2; arc = cameFrom[this._target[arc ^ 1]]) {
+    83	        this._capacity[arc] -= bottleneck;
+    84	        this._capacity[arc ^ 1] += bottleneck;
+    85	      }
+    86	      value += bottleneck;
+    87	    }
+    88	  }
+    89	}
+    90	
+    91	export function maximumFlowValue(auxiliary, source, sink) {
+    92	  const network = new FlowNetwork(auxiliary.order);
+    93	  for (const [from, to] of auxiliary.arcs) network.addArc(from, to, 1);
+    94	  return network.maximumFlowValue(source, sink);
+    95	}
+    96	
+    97	export { sideA, sideB };
+===== /output/lib/graph/graph.mjs =====
+     1	/**
+     2	 * An undirected graph with the same storage model as `networkx.Graph`:
+     3	 * an insertion-ordered node table, and per node an insertion-ordered adjacency
+     4	 * table mapping neighbour -> shared edge-attribute object.
+     5	 *
+     6	 * The ordering is not incidental — BFS/DFS/Dijkstra all iterate adjacency in
+     7	 * insertion order, so it decides the exact output. Re-assigning an existing key
+     8	 * keeps its original position in both Python dicts and JS Maps, which is why a
+     9	 * duplicate edge updates the weight without moving the neighbour.
+    10	 *
+    11	 * Node ids are BigInt (Python ints); Map compares BigInt keys by value.
+    12	 */
+    13	
+    14	export class Graph {
+    15	  constructor() {
+    16	    this._adj = new Map();
+    17	  }
+    18	
+    19	  addNode(node) {
+    20	    if (!this._adj.has(node)) this._adj.set(node, new Map());
+    21	  }
+    22	
+    23	  /** `G.add_edge(u, v, **attr)`: both directions share one attribute object. */
+    24	  addEdge(u, v, attr) {
+    25	    this.addNode(u);
+    26	    this.addNode(v);
+    27	    const data = this._adj.get(u).get(v) ?? {};
+    28	    Object.assign(data, attr);
+    29	    this._adj.get(u).set(v, data);
+    30	    this._adj.get(v).set(u, data);
+    31	  }
+    32	
+    33	  /** `G.add_weighted_edges_from(ebunch)` for `[u, v, weight]` triples. */
+    34	  addWeightedEdgesFrom(ebunch, weightKey = 'weight') {
+    35	    for (const [u, v, weight] of ebunch) {
+    36	      this.addEdge(u, v, { [weightKey]: weight });
+    37	    }
+    38	  }
+    39	
+    40	  numberOfNodes() {
+    41	    return this._adj.size;
+    42	  }
+    43	
+    44	  nodes() {
+    45	    return this._adj.keys();
+    46	  }
+    47	
+    48	  hasNode(node) {
+    49	    return this._adj.has(node);
+    50	  }
+    51	
+    52	  /** Adjacency table of `node` (`G[node]`). */
+    53	  adj(node) {
+    54	    return this._adj.get(node);
+    55	  }
+    56	
+    57	  neighbors(node) {
+    58	    return this._adj.get(node).keys();
+    59	  }
+    60	
+    61	  hasEdge(u, v) {
+    62	    const nbrs = this._adj.get(u);
+    63	    return nbrs !== undefined && nbrs.has(v);
+    64	  }
+    65	
+    66	  /** `G[u][v]`, the shared attribute object. */
+    67	  getEdgeData(u, v) {
+    68	    return this._adj.get(u)?.get(v);
+    69	  }
+    70	
+    71	  /** Degree as networkx counts it: a self-loop contributes 2. */
+    72	  degree(node) {
+    73	    const nbrs = this._adj.get(node);
+    74	    return nbrs.size + (nbrs.has(node) ? 1 : 0);
+    75	  }
+    76	
+    77	  /** `G.degree()`: `[node, degree]` pairs in node insertion order. */
+    78	  *degrees() {
+    79	    for (const node of this._adj.keys()) yield [node, this.degree(node)];
+    80	  }
+    81	
+    82	  /**
+    83	   * `G.edges(data=True)`: every edge once, in networkx's order — outer loop over
+    84	   * nodes, inner loop over adjacency, skipping neighbours already emitted. A
+    85	   * self-loop is yielded once.
+    86	   */
+    87	  *edges() {
+    88	    const seen = new Set();
+    89	    for (const [node, nbrs] of this._adj) {
+    90	      for (const [nbr, data] of nbrs) {
+    91	        if (!seen.has(nbr)) yield [node, nbr, data];
+    92	      }
+    93	      seen.add(node);
+    94	    }
+    95	  }
+    96	
+    97	  numberOfEdges() {
+    98	    let count = 0;
+    99	    for (const _edge of this.edges()) count += 1;
+   100	    return count;
+   101	  }
+   102	}
+===== /output/lib/graph/index.mjs =====
+     1	/** Graph data structure and the networkx algorithms this port needs. */
+     2	
+     3	export { Graph } from './graph.mjs';
+     4	export { bfsEdges, dfsEdges } from './traversal.mjs';
+     5	export { kruskalEdges, minimumSpanningTree } from './mst.mjs';
+     6	export { dijkstra, dijkstraPath, dijkstraPathLength } from './shortest_path.mjs';
+     7	export { buildAuxiliaryNodeConnectivity, maximumFlowValue } from './flow.mjs';
+     8	export { isConnected, localNodeConnectivity, nodeConnectivity } from './connectivity.mjs';
+===== /output/lib/graph/mst.mjs =====
+     1	/**
+     2	 * `networkx.minimum_spanning_tree`, Kruskal's algorithm (the networkx default).
+     3	 */
+     4	
+     5	import { Graph } from './graph.mjs';
+     6	
+     7	/** Union-Find with path compression and union by rank. */
+     8	class UnionFind {
+     9	  constructor() {
+    10	    this._parent = new Map();
+    11	    this._rank = new Map();
+    12	  }
+    13	
+    14	  find(x) {
+    15	    if (!this._parent.has(x)) {
+    16	      this._parent.set(x, x);
+    17	      this._rank.set(x, 0);
+    18	      return x;
+    19	    }
+    20	    let root = x;
+    21	    while (this._parent.get(root) !== root) root = this._parent.get(root);
+    22	    let walk = x;
+    23	    while (this._parent.get(walk) !== root) {
+    24	      const next = this._parent.get(walk);
+    25	      this._parent.set(walk, root);
+    26	      walk = next;
+    27	    }
+    28	    return root;
+    29	  }
+    30	
+    31	  union(a, b) {
+    32	    const rootA = this.find(a);
+    33	    const rootB = this.find(b);
+    34	    if (rootA === rootB) return;
+    35	    const rankA = this._rank.get(rootA);
+    36	    const rankB = this._rank.get(rootB);
+    37	    if (rankA < rankB) {
+    38	      this._parent.set(rootA, rootB);
+    39	    } else if (rankA > rankB) {
+    40	      this._parent.set(rootB, rootA);
+    41	    } else {
+    42	      this._parent.set(rootB, rootA);
+    43	      this._rank.set(rootA, rankA + 1);
+    44	    }
+    45	  }
+    46	}
+    47	
+    48	/**
+    49	 * Kruskal edges. `sorted()` in Python is stable and keys on the weight alone, so
+    50	 * equal-weight edges stay in `G.edges()` order — which is what decides the tree
+    51	 * when weights tie. Self-loops are always rejected, since both endpoints already
+    52	 * share a component.
+    53	 */
+    54	export function* kruskalEdges(G, weightKey = 'weight') {
+    55	  const edges = [...G.edges()].map(([u, v, data], index) => ({
+    56	    u,
+    57	    v,
+    58	    weight: data[weightKey] ?? 1,
+    59	    index,
+    60	  }));
+    61	  edges.sort((a, b) => (a.weight === b.weight ? a.index - b.index : a.weight - b.weight));
+    62	
+    63	  const subtrees = new UnionFind();
+    64	  for (const { u, v, weight } of edges) {
+    65	    if (subtrees.find(u) !== subtrees.find(v)) {
+    66	      subtrees.union(u, v);
+    67	      yield [u, v, weight];
+    68	    }
+    69	  }
+    70	}
+    71	
+    72	/** `nx.minimum_spanning_tree(G)`: every node of G, plus the Kruskal edges. */
+    73	export function minimumSpanningTree(G, weightKey = 'weight') {
+    74	  const tree = new Graph();
+    75	  for (const node of G.nodes()) tree.addNode(node);
+    76	  for (const [u, v, weight] of kruskalEdges(G, weightKey)) {
+    77	    tree.addEdge(u, v, { [weightKey]: weight });
+    78	  }
+    79	  return tree;
+    80	}
+===== /output/lib/graph/shortest_path.mjs =====
+     1	/**
+     2	 * Dijkstra shortest paths, following `networkx._dijkstra_multisource`.
+     3	 *
+     4	 * Two details drive exact output alignment:
+     5	 *  - The source starts at Python *int* `0`, while every edge weight is a float. So
+     6	 *    a zero-length result (source == target) prints as `0`, not `0.0`. Distances
+     7	 *    carry an `isFloat` tag to preserve that.
+     8	 *  - Relaxation is strict `<`, and the heap orders by (distance, insertion
+     9	 *    counter). Equal-cost paths therefore resolve to the one discovered first.
+    10	 */
+    11	
+    12	import { Heap, byPriorityThenSequence } from '../python/heapq.mjs';
+    13	
+    14	class NetworkXNoPath extends Error {}
+    15	
+    16	/** A distance that remembers whether Python would hold an int or a float. */
+    17	function intZero() {
+    18	  return { value: 0, isFloat: false };
+    19	}
+    20	
+    21	function add(distance, cost) {
+    22	  return { value: distance.value + cost, isFloat: true };
+    23	}
+    24	
+    25	/**
+    26	 * Single-source Dijkstra to `target`. Returns the distance and the path built the
+    27	 * same way networkx does (`paths[u] = paths[v] + [u]`, overwritten only on strict
+    28	 * improvement).
+    29	 */
+    30	export function dijkstra(G, source, target, weightKey = 'weight') {
+    31	  if (!G.hasNode(source)) throw new NetworkXNoPath(`node ${source} not in graph`);
+    32	
+    33	  const dist = new Map();
+    34	  const seen = new Map([[source, intZero()]]);
+    35	  const paths = new Map([[source, [source]]]);
+    36	  const fringe = new Heap(byPriorityThenSequence);
+    37	  let counter = 0;
+    38	
+    39	  fringe.push({ priority: 0, sequence: counter++, node: source, distance: intZero() });
+    40	
+    41	  while (fringe.size > 0) {
+    42	    const { node: v, distance: d } = fringe.pop();
+    43	    if (dist.has(v)) continue;
+    44	    dist.set(v, d);
+    45	    if (v === target) break;
+    46	
+    47	    for (const [u, data] of G.adj(v)) {
+    48	      const cost = data[weightKey];
+    49	      if (cost === undefined) continue;
+    50	      const candidate = add(d, cost);
+    51	      const known = seen.get(u);
+    52	      if (dist.has(u)) continue;
+    53	      if (known === undefined || candidate.value < known.value) {
+    54	        seen.set(u, candidate);
+    55	        fringe.push({ priority: candidate.value, sequence: counter++, node: u, distance: candidate });
+    56	        paths.set(u, [...paths.get(v), u]);
+    57	      }
+    58	    }
+    59	  }
+    60	
+    61	  if (!dist.has(target)) {
+    62	    throw new NetworkXNoPath(`No path between ${source} and ${target}.`);
+    63	  }
+    64	  return { length: dist.get(target), path: paths.get(target) };
+    65	}
+    66	
+    67	/** `nx.dijkstra_path_length`: the tagged distance, so the caller can print it faithfully. */
+    68	export function dijkstraPathLength(G, source, target, weightKey = 'weight') {
+    69	  return dijkstra(G, source, target, weightKey).length;
+    70	}
+    71	
+    72	/** `nx.dijkstra_path`. */
+    73	export function dijkstraPath(G, source, target, weightKey = 'weight') {
+    74	  return dijkstra(G, source, target, weightKey).path;
+    75	}
+===== /output/lib/graph/traversal.mjs =====
+     1	/**
+     2	 * Breadth- and depth-first edge generators, mirroring `networkx.bfs_edges` and
+     3	 * `networkx.dfs_edges`. Both visit neighbours in adjacency insertion order and
+     4	 * both skip already-visited nodes, so a self-loop never yields an edge.
+     5	 */
+     6	
+     7	/**
+     8	 * `nx.bfs_edges(G, source)`: tree edges in level order. Children of a level are
+     9	 * emitted parent by parent, in the adjacency order of each parent.
+    10	 */
+    11	export function* bfsEdges(G, source) {
+    12	  const total = G.numberOfNodes();
+    13	  const visited = new Set([source]);
+    14	  let level = [source];
+    15	
+    16	  while (level.length > 0) {
+    17	    const nextLevel = [];
+    18	    for (const parent of level) {
+    19	      for (const child of G.neighbors(parent)) {
+    20	        if (visited.has(child)) continue;
+    21	        yield [parent, child];
+    22	        visited.add(child);
+    23	        nextLevel.push(child);
+    24	      }
+    25	      if (visited.size === total) return;
+    26	    }
+    27	    level = nextLevel;
+    28	  }
+    29	}
+    30	
+    31	/**
+    32	 * `nx.dfs_edges(G, source)`: an explicit stack of *stateful* neighbour iterators.
+    33	 * Resuming a parent continues where its iterator left off rather than rescanning
+    34	 * from the start, which is observable whenever a parent has several unvisited
+    35	 * neighbours.
+    36	 */
+    37	export function* dfsEdges(G, source) {
+    38	  const depthLimit = G.numberOfNodes();
+    39	  const visited = new Set([source]);
+    40	  const stack = [{ node: source, children: G.neighbors(source) }];
+    41	  let depth = 1;
+    42	
+    43	  while (stack.length > 0) {
+    44	    const frame = stack[stack.length - 1];
+    45	    let descended = false;
+    46	
+    47	    for (;;) {
+    48	      const step = frame.children.next();
+    49	      if (step.done) break;
+    50	      const child = step.value;
+    51	      if (visited.has(child)) continue;
+    52	      yield [frame.node, child];
+    53	      visited.add(child);
+    54	      if (depth < depthLimit) {
+    55	        stack.push({ node: child, children: G.neighbors(child) });
+    56	        depth += 1;
+    57	        descended = true;
+    58	        break;
+    59	      }
+    60	    }
+    61	
+    62	    if (!descended) {
+    63	      stack.pop();
+    64	      depth -= 1;
+    65	    }
+    66	  }
+    67	}
+===== /output/lib/python/heapq.mjs =====
+     1	/**
+     2	 * A binary min-heap standing in for Python's `heapq`.
+     3	 *
+     4	 * Dijkstra pushes `(distance, counter, node)` tuples, so the ordering is total and
+     5	 * the pop sequence is fully determined by the comparator (the counter breaks every
+     6	 * distance tie in insertion order, exactly like networkx).
+     7	 */
+     8	
+     9	export class Heap {
+    10	  constructor(compare) {
+    11	    this._compare = compare;
+    12	    this._items = [];
+    13	  }
+    14	
+    15	  get size() {
+    16	    return this._items.length;
+    17	  }
+    18	
+    19	  push(item) {
+    20	    const items = this._items;
+    21	    items.push(item);
+    22	    let child = items.length - 1;
+    23	    while (child > 0) {
+    24	      const parent = (child - 1) >> 1;
+    25	      if (this._compare(items[child], items[parent]) >= 0) break;
+    26	      [items[child], items[parent]] = [items[parent], items[child]];
+    27	      child = parent;
+    28	    }
+    29	  }
+    30	
+    31	  pop() {
+    32	    const items = this._items;
+    33	    const top = items[0];
+    34	    const last = items.pop();
+    35	    if (items.length > 0) {
+    36	      items[0] = last;
+    37	      let parent = 0;
+    38	      for (;;) {
+    39	        const left = 2 * parent + 1;
+    40	        const right = left + 1;
+    41	        let smallest = parent;
+    42	        if (left < items.length && this._compare(items[left], items[smallest]) < 0) smallest = left;
+    43	        if (right < items.length && this._compare(items[right], items[smallest]) < 0) smallest = right;
+    44	        if (smallest === parent) break;
+    45	        [items[parent], items[smallest]] = [items[smallest], items[parent]];
+    46	        parent = smallest;
+    47	      }
+    48	    }
+    49	    return top;
+    50	  }
+    51	}
+    52	
+    53	/** Comparator for `(priority, sequence)` entries: priority first, insertion order second. */
+    54	export function byPriorityThenSequence(a, b) {
+    55	  if (a.priority !== b.priority) return a.priority < b.priority ? -1 : 1;
+    56	  return a.sequence - b.sequence;
+    57	}
+===== /output/lib/python/int.mjs =====
+     1	/**
+     2	 * CPython's `int(str)` coercion.
+     3	 *
+     4	 * Accepts surrounding Unicode whitespace, an optional sign, Unicode decimal digits
+     5	 * (not just ASCII) and PEP 515 underscore separators between digits. Values are
+     6	 * arbitrary precision, so the result is a BigInt.
+     7	 */
+     8	
+     9	/** Code points for which Python's Py_UNICODE_ISSPACE is true. */
+    10	const WHITESPACE = new Set(
+    11	  [
+    12	    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x85, 0xa0, 0x1680,
+    13	    0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009,
+    14	    0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000,
+    15	  ],
+    16	);
+    17	
+    18	/** Raised for input `int()` would reject; the caller turns it into an argparse error. */
+    19	export class PyValueError extends Error {}
+    20	
+    21	const DECIMAL_DIGIT = /\p{Nd}/u;
+    22	const INT_LITERAL = /^([+-]?)(\p{Nd}+(?:_\p{Nd}+)*)$/u;
+    23	
+    24	function isSpace(ch) {
+    25	  return WHITESPACE.has(ch.codePointAt(0));
+    26	}
+    27	
+    28	function strip(text) {
+    29	  const chars = Array.from(text);
+    30	  let start = 0;
+    31	  let end = chars.length;
+    32	  while (start < end && isSpace(chars[start])) start += 1;
+    33	  while (end > start && isSpace(chars[end - 1])) end -= 1;
+    34	  return chars.slice(start, end).join('');
+    35	}
+    36	
+    37	/**
+    38	 * Numeric value of a Unicode decimal digit. Unicode guarantees decimal digits come
+    39	 * in contiguous runs of ten starting at the script's zero, so walking backwards to
+    40	 * the first non-digit code point recovers the offset within the run.
+    41	 */
+    42	function decimalValue(ch) {
+    43	  const cp = ch.codePointAt(0);
+    44	  if (cp >= 0x30 && cp <= 0x39) return cp - 0x30;
+    45	  for (let back = 1; back <= 10 && cp - back >= 0; back += 1) {
+    46	    if (!DECIMAL_DIGIT.test(String.fromCodePoint(cp - back))) return back - 1;
+    47	  }
+    48	  return 0;
+    49	}
+    50	
+    51	export function pyInt(text) {
+    52	  const match = INT_LITERAL.exec(strip(text));
+    53	  if (match === null) throw new PyValueError(`invalid literal for int() with base 10: ${text}`);
+    54	
+    55	  const [, sign, body] = match;
+    56	  let ascii = '';
+    57	  for (const ch of body) {
+    58	    if (ch !== '_') ascii += String(decimalValue(ch));
+    59	  }
+    60	  return BigInt(sign === '-' ? `-${ascii}` : ascii);
+    61	}
+    62	
+    63	/** `int.__name__`, used verbatim in argparse's "invalid int value" message. */
+    64	pyInt.pyName = 'int';
+===== /output/lib/python/repr.mjs =====
+     1	/**
+     2	 * CPython `repr()` / `print()` rendering for the value shapes this port produces.
+     3	 *
+     4	 * The mapping between JS and Python values is deliberate and load-bearing:
+     5	 *   BigInt  -> Python int    (node ids are arbitrary precision, so they must not be Numbers)
+     6	 *   Number  -> Python float  (edge weights and path lengths)
+     7	 *   Boolean -> Python bool
+     8	 *   Array   -> Python list
+     9	 *   PyTuple -> Python tuple
+    10	 */
+    11	
+    12	/** Marker wrapper so `(1, 2)` can be told apart from the list `[1, 2]`. */
+    13	export class PyTuple {
+    14	  constructor(items) {
+    15	    this.items = items;
+    16	  }
+    17	}
+    18	
+    19	export function tuple(...items) {
+    20	  return new PyTuple(items);
+    21	}
+    22	
+    23	/** repr() of a str: single quotes, switching to double quotes when the text contains `'`. */
+    24	export function reprStr(s) {
+    25	  const quote = s.includes("'") && !s.includes('"') ? '"' : "'";
+    26	  let out = quote;
+    27	  for (const ch of s) {
+    28	    if (ch === '\\') out += '\\\\';
+    29	    else if (ch === '\n') out += '\\n';
+    30	    else if (ch === '\r') out += '\\r';
+    31	    else if (ch === '\t') out += '\\t';
+    32	    else if (ch === quote) out += '\\' + ch;
+    33	    else {
+    34	      const cp = ch.codePointAt(0);
+    35	      if (cp < 0x20 || cp === 0x7f) out += '\\x' + cp.toString(16).padStart(2, '0');
+    36	      else out += ch;
+    37	    }
+    38	  }
+    39	  return out + quote;
+    40	}
+    41	
+    42	/** Shortest decimal digits that round-trip, plus the exponent of the leading digit. */
+    43	function shortestDigits(x) {
+    44	  if (x === 0) return ['0', 0];
+    45	  const [mantissa, exponent] = x.toExponential().split('e');
+    46	  return [mantissa.replace('.', ''), Number(exponent)];
+    47	}
+    48	
+    49	/**
+    50	 * repr() of a float. CPython prints the shortest round-tripping decimal and only
+    51	 * switches to scientific notation when the decimal point lands at position <= -4
+    52	 * or > 16 (so 1e15 prints in full but 1e16 does not). Exponents carry a sign and
+    53	 * at least two digits.
+    54	 */
+    55	export function reprFloat(x) {
+    56	  if (Number.isNaN(x)) return 'nan';
+    57	  if (x === Infinity) return 'inf';
+    58	  if (x === -Infinity) return '-inf';
+    59	
+    60	  const negative = x < 0 || Object.is(x, -0);
+    61	  const [digits, exponent] = shortestDigits(Math.abs(x));
+    62	  const decpt = exponent + 1;
+    63	
+    64	  let body;
+    65	  if (decpt <= -4 || decpt > 16) {
+    66	    const mantissa = digits.length > 1 ? `${digits[0]}.${digits.slice(1)}` : digits;
+    67	    const exp = decpt - 1;
+    68	    body = `${mantissa}e${exp < 0 ? '-' : '+'}${String(Math.abs(exp)).padStart(2, '0')}`;
+    69	  } else if (decpt <= 0) {
+    70	    body = `0.${'0'.repeat(-decpt)}${digits}`;
+    71	  } else if (decpt >= digits.length) {
+    72	    body = `${digits}${'0'.repeat(decpt - digits.length)}.0`;
+    73	  } else {
+    74	    body = `${digits.slice(0, decpt)}.${digits.slice(decpt)}`;
+    75	  }
+    76	  return negative ? `-${body}` : body;
+    77	}
+    78	
+    79	export function pyRepr(value) {
+    80	  if (typeof value === 'bigint') return value.toString();
+    81	  if (typeof value === 'boolean') return value ? 'True' : 'False';
+    82	  if (typeof value === 'number') return reprFloat(value);
+    83	  if (typeof value === 'string') return reprStr(value);
+    84	  if (value instanceof PyTuple) {
+    85	    const items = value.items.map(pyRepr);
+    86	    return items.length === 1 ? `(${items[0]},)` : `(${items.join(', ')})`;
+    87	  }
+    88	  if (Array.isArray(value)) return `[${value.map(pyRepr).join(', ')}]`;
+    89	  throw new TypeError(`no Python repr for ${typeof value}`);
+    90	}
+    91	
+    92	/** `print(value)`: str() semantics, which differ from repr() only for strings. */
+    93	export function pyPrint(value) {
+    94	  console.log(typeof value === 'string' ? value : pyRepr(value));
+    95	}

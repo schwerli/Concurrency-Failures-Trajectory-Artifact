@@ -1,0 +1,147 @@
+diff --git a/dbg/check_fix.py b/dbg/check_fix.py
+new file mode 100644
+index 0000000000..0aaa9e7b80
+--- /dev/null
++++ b/dbg/check_fix.py
+@@ -0,0 +1,20 @@
++import sys; sys.path.insert(0, "/workspace/dbg")
++from sympy import *
++import patched_body
++from sympy.simplify.sqrtdenest import _sqrt_match
++
++print("_sqrt_match(4 + I) =", _sqrt_match(4 + I))
++print("_sqrt_match(4 + 3*I) =", _sqrt_match(4 + 3*I))
++e1 = (3 - sqrt(2)*sqrt(4 + 3*I) + 3*I)/2
++print("issue expr (3-sqrt(2)*sqrt(4+3I)+3I)/2 auto-evals to:", e1, "; sqrtdenest ->", sqrtdenest(e1))
++e2 = 3 - sqrt(2)*sqrt(4 + 3*I) + 3*I
++print("3-sqrt(2)*sqrt(4+3I)+3I:", e2, "; sqrtdenest ->", sqrtdenest(e2))
++e3 = 3 - sqrt(2)*sqrt(4 + I) + 3*I
++print("3-sqrt(2)*sqrt(4+I)+3I ->", sqrtdenest(e3), "| unchanged?", sqrtdenest(e3) == e3)
++e4 = (3 - sqrt(2)*sqrt(4 + I) + 3*I)/2
++print("(3-sqrt(2)*sqrt(4+I)+3I)/2 ->", sqrtdenest(e4), "| unchanged?", sqrtdenest(e4) == e4)
++print("sqrtdenest(sqrt(4+I)) ->", sqrtdenest(sqrt(4+I)))
++print("sqrtdenest(sqrt(4+3*I)) ->", sqrtdenest(sqrt(4+3*I)))
++# sanity: previously-working behaviour preserved
++print("_sqrt_match(1+sqrt(2)+sqrt(2)*sqrt(3)+2*sqrt(1+sqrt(5))) =",
++      _sqrt_match(1 + sqrt(2) + sqrt(2)*sqrt(3) + 2*sqrt(1+sqrt(5))))
+diff --git a/dbg/patched_body.py b/dbg/patched_body.py
+new file mode 100644
+index 0000000000..4b6b129fdf
+--- /dev/null
++++ b/dbg/patched_body.py
+@@ -0,0 +1,68 @@
++import sympy.simplify.sqrtdenest as sd
++from sympy.core import S, Mul, Add
++from sympy.core.function import _mexpand
++from sympy.utilities import default_sort_key
++from sympy.simplify.sqrtdenest import sqrt_depth, is_sqrt
++
++def _sqrt_match(p):
++    from sympy.simplify.radsimp import split_surds
++    p = _mexpand(p)
++    if p.is_Number:
++        res = (p, S.Zero, S.Zero)
++    elif p.is_Add:
++        pargs = sorted(p.args, key=default_sort_key)
++        sqargs = [x**2 for x in pargs]
++        if all(sq.is_Rational and sq.is_positive for sq in sqargs):
++            r, b, a = split_surds(p)
++            res = a, b, r
++            return list(res)
++        v = [(sqrt_depth(x), x, i) for i, x in enumerate(pargs)]
++        nmax = max(v, key=default_sort_key)
++        if nmax[0] == 0:
++            res = []
++        else:
++            depth, _, i = nmax
++            r = pargs.pop(i)
++            v.pop(i)
++            b = S.One
++            if r.is_Mul:
++                bv = []
++                rv = []
++                for x in r.args:
++                    if sqrt_depth(x) < depth:
++                        bv.append(x)
++                    else:
++                        rv.append(x)
++                b = Mul._from_args(bv)
++                r = Mul._from_args(rv)
++            a1 = []
++            b1 = [b]
++            for x in v:
++                if x[0] < depth:
++                    a1.append(x[1])
++                else:
++                    x1 = x[1]
++                    if x1 == r:
++                        b1.append(1)
++                    else:
++                        if x1.is_Mul:
++                            x1args = list(x1.args)
++                            if r in x1args:
++                                x1args.remove(r)
++                                b1.append(Mul(*x1args))
++                            else:
++                                a1.append(x[1])
++                        else:
++                            a1.append(x[1])
++            a = Add(*a1)
++            b = Add(*b1)
++            res = (a, b, r**2)
++    else:
++        b, r = p.as_coeff_Mul()
++        if is_sqrt(r):
++            res = (S.Zero, b, r**2)
++        else:
++            res = []
++    return list(res)
++
++sd._sqrt_match = _sqrt_match
+diff --git a/sympy/simplify/sqrtdenest.py b/sympy/simplify/sqrtdenest.py
+index f0b7653ea8..23fff903ef 100644
+--- a/sympy/simplify/sqrtdenest.py
++++ b/sympy/simplify/sqrtdenest.py
+@@ -156,7 +156,8 @@ def _sqrt_match(p):
+         res = (p, S.Zero, S.Zero)
+     elif p.is_Add:
+         pargs = sorted(p.args, key=default_sort_key)
+-        if all((x**2).is_Rational for x in pargs):
++        sqargs = [x**2 for x in pargs]
++        if all(sq.is_Rational and sq.is_positive for sq in sqargs):
+             r, b, a = split_surds(p)
+             res = a, b, r
+             return list(res)
+@@ -227,7 +228,9 @@ def _sqrtdenest0(expr):
+         if d is S.One:  # n is a square root
+             if n.base.is_Add:
+                 args = sorted(n.base.args, key=default_sort_key)
+-                if len(args) > 2 and all((x**2).is_Integer for x in args):
++                sqargs = [x**2 for x in args]
++                if len(args) > 2 and all(
++                        sq.is_Integer and sq.is_positive for sq in sqargs):
+                     try:
+                         return _sqrtdenest_rec(n)
+                     except SqrtdenestStopIteration:
+@@ -442,6 +445,10 @@ def _sqrt_numeric_denest(a, b, r, d2):
+     or returns None if not denested.
+     """
+     from sympy.simplify.simplify import radsimp
++    if b.is_real is False:
++        # the formula below rewrites b*sqrt(r) as sign(b)*sqrt(b**2*r)
++        # which is only valid for real b
++        return None
+     depthr = sqrt_depth(r)
+     d = sqrt(d2)
+     vad = a + d
+diff --git a/sympy/simplify/tests/test_sqrtdenest.py b/sympy/simplify/tests/test_sqrtdenest.py
+index c30f7a3235..b99aac6027 100644
+--- a/sympy/simplify/tests/test_sqrtdenest.py
++++ b/sympy/simplify/tests/test_sqrtdenest.py
+@@ -1,5 +1,5 @@
+ from sympy import sqrt, root, S, Symbol, sqrtdenest, Integral, cos
+-from sympy.simplify.sqrtdenest import _subsets as subsets
++from sympy.simplify.sqrtdenest import _subsets as subsets, _sqrt_match
+ from sympy.utilities.pytest import slow
+ 
+ r2, r3, r5, r6, r7, r10, r15, r29 = [sqrt(x) for x in [2, 3, 5, 6, 7, 10,

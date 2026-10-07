@@ -1,0 +1,41 @@
+diff --git a/sklearn/metrics/cluster/supervised.py b/sklearn/metrics/cluster/supervised.py
+index a987778ae..9bcca75a2 100644
+--- a/sklearn/metrics/cluster/supervised.py
++++ b/sklearn/metrics/cluster/supervised.py
+@@ -856,7 +856,7 @@ def fowlkes_mallows_score(labels_true, labels_pred, sparse=False):
+     tk = np.dot(c.data, c.data) - n_samples
+     pk = np.sum(np.asarray(c.sum(axis=0)).ravel() ** 2) - n_samples
+     qk = np.sum(np.asarray(c.sum(axis=1)).ravel() ** 2) - n_samples
+-    return tk / np.sqrt(pk * qk) if tk != 0. else 0.
++    return np.sqrt(tk / pk) * np.sqrt(tk / qk) if tk != 0. else 0.
+ 
+ 
+ def entropy(labels):
+diff --git a/sklearn/metrics/cluster/tests/test_supervised.py b/sklearn/metrics/cluster/tests/test_supervised.py
+index 8da03d1e1..4737ddc95 100644
+--- a/sklearn/metrics/cluster/tests/test_supervised.py
++++ b/sklearn/metrics/cluster/tests/test_supervised.py
+@@ -16,6 +16,7 @@ from sklearn.metrics.cluster import v_measure_score
+ from sklearn.utils import assert_all_finite
+ from sklearn.utils.testing import (
+         assert_equal, assert_almost_equal, assert_raise_message,
++        assert_no_warnings,
+ )
+ from numpy.testing import assert_array_almost_equal
+ 
+@@ -274,3 +275,15 @@ def test_fowlkes_mallows_score_properties():
+     # symmetric and permutation(both together)
+     score_both = fowlkes_mallows_score(labels_b, (labels_a + 2) % 3)
+     assert_almost_equal(score_both, expected)
++
++
++def test_fowlkes_mallows_score_big_values():
++    # non-regression test for #10945: the intermediate product of the
++    # pair counts used to overflow the integer dtype, returning nan
++    n_samples = 100000
++    labels_true = np.zeros(n_samples, dtype=np.int32)
++    labels_true[n_samples // 2:] = 1
++    labels_pred = labels_true.copy()
++
++    score = assert_no_warnings(fowlkes_mallows_score, labels_true, labels_pred)
++    assert_almost_equal(score, 1.)

@@ -1,0 +1,100 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index ee45bb941e..90ac6aa064 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -56,6 +56,15 @@ def _load_field(app_label, model_name, field_name):
+     return apps.get_model(app_label, model_name)._meta.get_field(field_name)
+ 
+ 
++def _has_user_defined_display_method(cls, method_name):
++    for base in cls.mro():
++        if method_name not in base.__dict__:
++            continue
++        method = base.__dict__[method_name]
++        return not getattr(method, '_django_generated_field_display', False)
++    return False
++
++
+ # A guide to Field parameters:
+ #
+ #   * name:      The name of the field specified in the model.
+@@ -763,8 +772,11 @@ class Field(RegisterLookupMixin):
+             if not getattr(cls, self.attname, None):
+                 setattr(cls, self.attname, self.descriptor_class(self))
+         if self.choices is not None:
+-            setattr(cls, 'get_%s_display' % self.name,
+-                    partialmethod(cls._get_FIELD_display, field=self))
++            method_name = 'get_%s_display' % self.name
++            if not _has_user_defined_display_method(cls, method_name):
++                method = partialmethod(cls._get_FIELD_display, field=self)
++                method._django_generated_field_display = True
++                setattr(cls, method_name, method)
+ 
+     def get_filter_kwargs_for_object(self, obj):
+         """
+diff --git a/tests/model_fields/tests.py b/tests/model_fields/tests.py
+index 0d6e930b06..b1ef3e4bc0 100644
+--- a/tests/model_fields/tests.py
++++ b/tests/model_fields/tests.py
+@@ -4,6 +4,7 @@ from django import forms
+ from django.core.exceptions import ValidationError
+ from django.db import models
+ from django.test import SimpleTestCase, TestCase
++from django.test.utils import isolate_apps
+ from django.utils.functional import lazy
+ 
+ from .models import (
+@@ -168,6 +169,53 @@ class GetFieldDisplayTests(SimpleTestCase):
+         self.assertIsInstance(val, str)
+         self.assertEqual(val, 'translated')
+ 
++    @isolate_apps('model_fields')
++    def test_overriding_get_FIELD_display(self):
++        class FooBar(models.Model):
++            foo_bar = models.IntegerField(choices=[(1, 'foo'), (2, 'bar')])
++
++            def get_foo_bar_display(self):
++                return 'something'
++
++            class Meta:
++                app_label = 'model_fields'
++
++        self.assertEqual(FooBar(foo_bar=1).get_foo_bar_display(), 'something')
++
++    @isolate_apps('model_fields')
++    def test_inherited_overriding_get_FIELD_display(self):
++        class Base(models.Model):
++            foo_bar = models.IntegerField(choices=[(1, 'foo'), (2, 'bar')])
++
++            def get_foo_bar_display(self):
++                return 'something'
++
++            class Meta:
++                abstract = True
++                app_label = 'model_fields'
++
++        class FooBar(Base):
++            class Meta:
++                app_label = 'model_fields'
++
++        self.assertEqual(FooBar(foo_bar=1).get_foo_bar_display(), 'something')
++
++    @isolate_apps('model_fields')
++    def test_inherited_get_FIELD_display_uses_child_field(self):
++        class Base(models.Model):
++            foo_bar = models.IntegerField(choices=[(1, 'foo')])
++
++            class Meta:
++                abstract = True
++                app_label = 'model_fields'
++
++        class FooBar(Base):
++            class Meta:
++                app_label = 'model_fields'
++
++        FooBar._meta.get_field('foo_bar').choices = [(1, 'bar')]
++        self.assertEqual(FooBar(foo_bar=1).get_foo_bar_display(), 'bar')
++
+     def test_iterator_choices(self):
+         """
+         get_choices() works with Iterators.

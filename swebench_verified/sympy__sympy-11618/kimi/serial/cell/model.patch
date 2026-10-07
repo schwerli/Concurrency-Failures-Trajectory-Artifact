@@ -1,0 +1,65 @@
+diff --git a/sympy/geometry/point.py b/sympy/geometry/point.py
+index 593048464..4c6219e6f 100644
+--- a/sympy/geometry/point.py
++++ b/sympy/geometry/point.py
+@@ -77,6 +77,7 @@ class Point(GeometryEntity):
+     """
+     def __new__(cls, *args, **kwargs):
+         evaluate = kwargs.get('evaluate', global_evaluate[0])
++        dim = kwargs.get('dim', None)
+ 
+         if iterable(args[0]):
+             if isinstance(args[0], Point) and not evaluate:
+@@ -87,6 +88,10 @@ def __new__(cls, *args, **kwargs):
+         # if we were already a Point, we're doing an excess
+         # iteration, but we'll worry about efficiency later
+         coords = Tuple(*args)
++        if dim is not None:
++            # pad with zeros or truncate to match the given dimension
++            coords = coords[:dim]
++            coords += (S.Zero,)*(dim - len(coords))
+         if any(a.is_number and im(a) for a in coords):
+             raise ValueError('Imaginary coordinates not permitted.')
+ 
+@@ -265,9 +270,22 @@ def distance(self, p):
+         >>> p3.distance(Point(0, 0))
+         sqrt(x**2 + y**2)
+ 
++        If the two points do not have the same dimension, the
++        lower-dimensional point is padded with zeros so the distance
++        is computed in the higher-dimensional space:
++
++        >>> Point(1, 2).distance(Point(1, 2, 3))
++        3
++        >>> Point(2, 0).distance(Point(1, 0, 2))
++        sqrt(5)
++
+         """
+-        return sqrt(sum([(a - b)**2 for a, b in zip(
+-            self.args, p.args if isinstance(p, Point) else p)]))
++        p = Point(p)
++        if len(p.args) != len(self.args):
++            dim = max(len(p.args), len(self.args))
++            p = Point(p, dim=dim)
++            self = Point(self, dim=dim)
++        return sqrt(sum([(a - b)**2 for a, b in zip(self.args, p.args)]))
+ 
+     def taxicab_distance(self, p):
+         """The Taxicab Distance from self to point p.
+diff --git a/sympy/geometry/tests/test_point.py b/sympy/geometry/tests/test_point.py
+index c7b2d30f1..6b7ae03f2 100644
+--- a/sympy/geometry/tests/test_point.py
++++ b/sympy/geometry/tests/test_point.py
+@@ -42,6 +42,12 @@ def test_point():
+     assert Point.distance(p1, p1) == 0
+     assert Point.distance(p3, p2) == sqrt(p2.x**2 + p2.y**2)
+ 
++    # distance between points of different dimensions: the
++    # lower-dimensional point is padded with zeros
++    assert Point(2, 0).distance(Point(1, 0, 2)) == sqrt(5)
++    assert Point(1, 0, 2).distance(Point(2, 0)) == sqrt(5)
++    assert Point(1, 2).distance(Point(1, 2, 3)) == 3
++
+     assert Point.taxicab_distance(p4, p3) == 2
+ 
+     p1_1 = Point(x1, x1)

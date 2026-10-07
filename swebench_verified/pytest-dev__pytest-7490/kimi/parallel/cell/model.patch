@@ -1,0 +1,94 @@
+diff --git a/changelog/7513.bugfix.rst b/changelog/7513.bugfix.rst
+new file mode 100644
+index 000000000..f8664b9c5
+--- /dev/null
++++ b/changelog/7513.bugfix.rst
+@@ -0,0 +1 @@
++Support for dynamically added ``xfail`` markers (added during test execution with e.g. ``request.node.add_marker``) is restored.
+diff --git a/src/_pytest/skipping.py b/src/_pytest/skipping.py
+index 335e10996..e208cc108 100644
+--- a/src/_pytest/skipping.py
++++ b/src/_pytest/skipping.py
+@@ -276,21 +276,27 @@ def pytest_runtest_makereport(item: Item, call: CallInfo[None]):
+         assert call.excinfo.value.msg is not None
+         rep.wasxfail = "reason: " + call.excinfo.value.msg
+         rep.outcome = "skipped"
+-    elif not rep.skipped and xfailed:
+-        if call.excinfo:
+-            raises = xfailed.raises
+-            if raises is not None and not isinstance(call.excinfo.value, raises):
+-                rep.outcome = "failed"
+-            else:
+-                rep.outcome = "skipped"
+-                rep.wasxfail = xfailed.reason
+-        elif call.when == "call":
+-            if xfailed.strict:
+-                rep.outcome = "failed"
+-                rep.longrepr = "[XPASS(strict)] " + xfailed.reason
+-            else:
+-                rep.outcome = "passed"
+-                rep.wasxfail = xfailed.reason
++    elif not rep.skipped:
++        if xfailed is None and call.when == "call":
++            # Check if the test added an xfail marker dynamically during the
++            # call phase, which is not visible during setup or before the
++            # test function body runs.
++            xfailed = evaluate_xfail_marks(item)
++        if xfailed:
++            if call.excinfo:
++                raises = xfailed.raises
++                if raises is not None and not isinstance(call.excinfo.value, raises):
++                    rep.outcome = "failed"
++                else:
++                    rep.outcome = "skipped"
++                    rep.wasxfail = xfailed.reason
++            elif call.when == "call":
++                if xfailed.strict:
++                    rep.outcome = "failed"
++                    rep.longrepr = "[XPASS(strict)] " + xfailed.reason
++                else:
++                    rep.outcome = "passed"
++                    rep.wasxfail = xfailed.reason
+ 
+     if (
+         item._store.get(skipped_by_mark_key, True)
+diff --git a/testing/test_skipping.py b/testing/test_skipping.py
+index 8fceb37aa..af14ce23b 100644
+--- a/testing/test_skipping.py
++++ b/testing/test_skipping.py
+@@ -425,6 +425,35 @@ class TestXFail:
+         result = testdir.runpytest(p)
+         result.stdout.fnmatch_lines(["*1 xfailed*"])
+ 
++    def test_dynamic_xfail_set_during_call(self, testdir):
++        p = testdir.makepyfile(
++            """
++            import pytest
++
++            def test_this(request):
++                request.node.add_marker(pytest.mark.xfail(reason="this is an xfail"))
++                assert 0
++        """
++        )
++        result = testdir.runpytest(p, "-rsx")
++        result.stdout.fnmatch_lines(
++            ["*XFAIL*test_this*", "*this is an xfail*", "*1 xfailed*"]
++        )
++        assert result.ret == 0
++
++    def test_dynamic_xfail_set_during_call_xpass_strict(self, testdir):
++        p = testdir.makepyfile(
++            """
++            import pytest
++
++            def test_this(request):
++                request.node.add_marker(pytest.mark.xfail(reason="nope", strict=True))
++        """
++        )
++        result = testdir.runpytest(p)
++        result.stdout.fnmatch_lines(["*[[]XPASS(strict)[]] nope*", "*1 failed*"])
++        assert result.ret == 1
++
+     @pytest.mark.parametrize(
+         "expected, actual, matchline",
+         [

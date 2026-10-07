@@ -1,0 +1,13 @@
+Fixed.
+
+**Root cause:** `ModuleDocumenter.get_object_members()` used `if not self.__all__:` to detect "module has no `__all__`". Since `self.__all__` is initialized to `None` and `inspect.getall()` returns `None` when the attribute is absent, an empty list `[]` was conflated with `None` — both taking the "document all implicit members" branch.
+
+**Fix** (`sphinx/ext/autodoc/__init__.py:1077`): distinguish absent from empty with `if self.__all__ is None:`. An empty `__all__` now falls through to the filtering branch, where every member fails the `member.__name__ not in self.__all__` check and gets `skipped = True`.
+
+**Verification:**
+- Added `tests/roots/test-ext-autodoc/target/empty_all.py` (the reproduction from the report) and `test_autodoc_empty_all`. It fails on the unpatched tree — output contains 18 extra lines documenting `foo`/`bar`/`baz` — and passes with the fix, emitting only the module directive and its docstring.
+- Ran the autodoc, autosummary, and `util.inspect` suites: 5 failures, all pre-existing (confirmed identical on a stashed clean tree) — `test_ext_autodoc.py::test_autodoc` plus 4 in `test_ext_autosummary.py`, unrelated to `__all__` handling.
+
+Two notes on scope:
+- `sort_members()` at line 1102 still uses truthiness (`and self.__all__`), which I left alone: with an empty `__all__` there are no members to sort, so both branches are equivalent there.
+- Mocked modules (`_MockModule.__all__ = []` in `mock.py:86`) now document nothing rather than everything `dir()` returns. That's the correct reading of an empty `__all__`, and `test_ext_autodoc_mock.py` passes, but it is a behavior change for anyone autodoc'ing a module listed in `autodoc_mock_imports`.

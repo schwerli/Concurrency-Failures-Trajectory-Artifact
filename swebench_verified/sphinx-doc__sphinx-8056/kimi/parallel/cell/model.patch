@@ -1,0 +1,53 @@
+diff --git a/sphinx/util/docfields.py b/sphinx/util/docfields.py
+index c07bc7f66..c7078a86a 100644
+--- a/sphinx/util/docfields.py
++++ b/sphinx/util/docfields.py
+@@ -325,9 +325,12 @@ class DocFieldTransformer:
+                 except ValueError:
+                     pass
+                 else:
+-                    types.setdefault(typename, {})[argname] = \
+-                        [nodes.Text(argtype)]
+-                    fieldarg = argname
++                    # the argument name must not contain a comma, otherwise it
++                    # is a combined parameter name like ``x1, x2`` (numpydoc)
++                    if ',' not in argtype:
++                        types.setdefault(typename, {})[argname] = \
++                            [nodes.Text(argtype)]
++                        fieldarg = argname
+ 
+             translatable_content = nodes.inline(field_body.rawsource,
+                                                 translatable=True)
+diff --git a/tests/test_domain_py.py b/tests/test_domain_py.py
+index b98f37912..37ce78c79 100644
+--- a/tests/test_domain_py.py
++++ b/tests/test_domain_py.py
+@@ -521,6 +521,28 @@ def test_pyfunction(app):
+     assert domain.objects['example.func2'] == ('index', 'example.func2', 'function')
+ 
+ 
++def test_pyfunction_combined_params(app):
++    text = (".. py:function:: f(x1, x2)\n"
++            "\n"
++            "   :param x1, x2: desc\n"
++            "   :type x1, x2: str, optional\n")
++    doctree = restructuredtext.parse(app, text)
++    field = doctree[1][1][0][0]
++    assert_node(field[0], [nodes.field_name, "Parameters"])
++    assert_node(field[1][0],
++                (nodes.paragraph,
++                 [addnodes.literal_strong, "x1"],
++                 [addnodes.literal_strong, ", "],
++                 [addnodes.literal_strong, "x2"],
++                 " (",
++                 [pending_xref, [addnodes.literal_emphasis, "str"]],
++                 [addnodes.literal_emphasis, ", "],
++                 [pending_xref, [addnodes.literal_emphasis, "optional"]],
++                 ")",
++                 " -- ",
++                 "desc"))
++
++
+ def test_pyclass_options(app):
+     text = (".. py:class:: Class1\n"
+             ".. py:class:: Class2\n"

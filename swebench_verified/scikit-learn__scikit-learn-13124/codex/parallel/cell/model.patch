@@ -1,0 +1,47 @@
+diff --git a/sklearn/model_selection/_split.py b/sklearn/model_selection/_split.py
+index 24394f869..86c4138de 100644
+--- a/sklearn/model_selection/_split.py
++++ b/sklearn/model_selection/_split.py
+@@ -620,7 +620,12 @@ class StratifiedKFold(_BaseKFold):
+         super().__init__(n_splits, shuffle, random_state)
+ 
+     def _make_test_folds(self, X, y=None):
+-        rng = self.random_state
++        if self.shuffle:
++            # Share one RNG across the per-class KFold instances so that
++            # each class gets a different permutation in a reproducible way.
++            rng = check_random_state(self.random_state)
++        else:
++            rng = self.random_state
+         y = np.asarray(y)
+         type_of_target_y = type_of_target(y)
+         allowed_target_types = ('binary', 'multiclass')
+diff --git a/sklearn/model_selection/tests/test_split.py b/sklearn/model_selection/tests/test_split.py
+index 5981df285..dbf97207a 100644
+--- a/sklearn/model_selection/tests/test_split.py
++++ b/sklearn/model_selection/tests/test_split.py
+@@ -494,6 +494,24 @@ def test_shuffle_stratifiedkfold():
+     check_cv_coverage(kf0, X_40, y, groups=None, expected_n_splits=5)
+ 
+ 
++def test_shuffle_stratifiedkfold_single_test_sample_per_class():
++    # Changing the seed should change the actual fold composition, not only
++    # the fold order, when each class contributes one sample per split.
++    X = np.ones(20)
++    y = [0] * 10 + [1] * 10
++
++    test_pairs_by_seed = []
++    for seed in (0, 1):
++        cv = StratifiedKFold(10, shuffle=True, random_state=seed)
++        test_pairs = [tuple(test) for _, test in cv.split(X, y)]
++
++        # Identical per-class shuffles would always pair indices offset by 10.
++        assert_not_equal({pair[1] - pair[0] for pair in test_pairs}, {10})
++        test_pairs_by_seed.append(set(test_pairs))
++
++    assert_not_equal(test_pairs_by_seed[0], test_pairs_by_seed[1])
++
++
+ def test_kfold_can_detect_dependent_samples_on_digits():  # see #2372
+     # The digits samples are dependent: they are apparently grouped by authors
+     # although we don't have any information on the groups segment locations

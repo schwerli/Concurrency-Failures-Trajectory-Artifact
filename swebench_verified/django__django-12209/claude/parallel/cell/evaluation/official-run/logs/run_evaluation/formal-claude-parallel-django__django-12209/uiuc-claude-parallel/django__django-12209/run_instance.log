@@ -1,0 +1,246 @@
+2026-08-15 06:16:56,264 - INFO - Creating container for django__django-12209...
+2026-08-15 06:16:56,637 - INFO - Container for django__django-12209 created: 8990c046fe79c2cd0083d2b08869c572cfd9cdc72f3c75b7c944369d217ce937
+2026-08-15 06:16:57,076 - INFO - Container for django__django-12209 started: 8990c046fe79c2cd0083d2b08869c572cfd9cdc72f3c75b7c944369d217ce937
+2026-08-15 06:16:57,076 - INFO - Intermediate patch for django__django-12209 written to logs/run_evaluation/formal-claude-parallel-django__django-12209/uiuc-claude-parallel/django__django-12209/patch.diff, now applying to container...
+2026-08-15 06:16:57,257 - INFO - >>>>> Applied Patch:
+Checking patch django/db/models/base.py...
+Checking patch docs/ref/models/instances.txt...
+Checking patch docs/releases/3.0.txt...
+Checking patch tests/basic/tests.py...
+Checking patch tests/serializers/test_natural.py...
+Applied patch django/db/models/base.py cleanly.
+Applied patch docs/ref/models/instances.txt cleanly.
+Applied patch docs/releases/3.0.txt cleanly.
+Applied patch tests/basic/tests.py cleanly.
+Applied patch tests/serializers/test_natural.py cleanly.
+
+2026-08-15 06:16:58,208 - INFO - Git diff before:
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index e3b14a41a0..844c01e95e 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -849,6 +849,7 @@ class Model(metaclass=ModelBase):
+         updated = False
+         # Skip an UPDATE when adding an instance and primary key has a default.
+         if (
++            not raw and
+             not force_insert and
+             self._state.adding and
+             self._meta.pk.default and
+diff --git a/docs/ref/models/instances.txt b/docs/ref/models/instances.txt
+index 9345bc0fe0..1d07d50f5b 100644
+--- a/docs/ref/models/instances.txt
++++ b/docs/ref/models/instances.txt
+@@ -475,6 +475,15 @@ follows this algorithm:
+   didn't update anything (e.g. if primary key is set to a value that doesn't
+   exist in the database), Django executes an ``INSERT``.
+ 
++.. versionchanged:: 3.0
++
++    When adding a new object whose primary key field has a
++    :attr:`~django.db.models.Field.default`, Django skips the ``UPDATE`` and
++    always executes a single ``INSERT``, even if the primary key was set
++    explicitly. Fetch the object from the database first, or use
++    :meth:`~django.db.models.query.QuerySet.update`, if you want to change an
++    existing row.
++
+ The one gotcha here is that you should be careful not to specify a primary-key
+ value explicitly when saving new objects, if you cannot guarantee the
+ primary-key value is unused. For more on this nuance, see `Explicitly specifying
+diff --git a/docs/releases/3.0.txt b/docs/releases/3.0.txt
+index 435755f732..3840fc9614 100644
+--- a/docs/releases/3.0.txt
++++ b/docs/releases/3.0.txt
+@@ -504,6 +504,22 @@ more secure default values:
+ See the *What's New* :ref:`Security section <whats-new-security-3.0>` above for
+ more details on these changes.
+ 
++``Model.save()`` when providing a default for the primary key
++-------------------------------------------------------------
++
++:meth:`Model.save() <django.db.models.Model.save>` no longer attempts to find a
++row when saving a new ``Model`` instance and a default value for the primary key
++is provided, and always performs a single ``INSERT`` query. In older versions of
++Django, an ``UPDATE`` and then possibly an ``INSERT`` query were performed.
++
++This makes creating such objects faster, but it means that assigning an existing
++primary key to a new instance no longer overwrites the existing row. If you need
++to update an existing row, either fetch the instance from the database first, or
++use :meth:`~django.db.models.query.QuerySet.update`.
++
++Loading fixtures with :djadmin:`loaddata` is unaffected: raw saves still update
++an existing row.
++
+ Miscellaneous
+ -------------
+ 
+diff --git a/tests/basic/tests.py b/tests/basic/tests.py
+index 5eada343e1..ed8157cf6b 100644
+--- a/tests/basic/tests.py
++++ b/tests/basic/tests.py
+@@ -139,6 +139,16 @@ class ModelInstanceCreationTests(TestCase):
+         with self.assertNumQueries(1):
+             PrimaryKeyWithDefault().save()
+ 
++    def test_save_raw_primary_with_default(self):
++        # A raw save (e.g. loaddata) isn't affected by the primary key default,
++        # so an existing row is updated instead of a duplicate INSERT being
++        # attempted.
++        obj = PrimaryKeyWithDefault.objects.create()
++        PrimaryKeyWithDefault(uuid=obj.uuid).save_base(raw=True)
++        self.assertQuerysetEqual(
++            PrimaryKeyWithDefault.objects.all(), [obj.uuid], lambda o: o.uuid,
++        )
++
+ 
+ class ModelTest(TestCase):
+     def test_objects_attribute_is_only_available_on_the_class_itself(self):
+diff --git a/tests/serializers/test_natural.py b/tests/serializers/test_natural.py
+index 3b4218bcc9..547cfa48f4 100644
+--- a/tests/serializers/test_natural.py
++++ b/tests/serializers/test_natural.py
+@@ -200,6 +200,19 @@ def pk_with_default(self, format):
+     self.assertEqual(objs[0].object.pk, obj.pk)
+ 
+ 
++def deserialize_pk_with_default(self, format):
++    """
++    Deserialized objects are saved with an UPDATE when the primary key has a
++    default and the row already exists, rather than a duplicate INSERT.
++    """
++    obj = NaturalPKWithDefault.objects.create(name='name')
++    string_data = serializers.serialize(format, [obj])
++    for deserialized_object in serializers.deserialize(format, string_data):
++        deserialized_object.save()
++    self.assertEqual(NaturalPKWithDefault.objects.count(), 1)
++    self.assertEqual(NaturalPKWithDefault.objects.get().pk, obj.pk)
++
++
+ # Dynamically register tests for each serializer
+ register_tests(NaturalKeySerializerTests, 'test_%s_natural_key_serializer', natural_key_serializer_test)
+ register_tests(NaturalKeySerializerTests, 'test_%s_serializer_natural_keys', natural_key_test)
+@@ -209,3 +222,4 @@ register_tests(NaturalKeySerializerTests, 'test_%s_forward_references_fk_errors'
+ register_tests(NaturalKeySerializerTests, 'test_%s_forward_references_m2ms', forward_ref_m2m_test)
+ register_tests(NaturalKeySerializerTests, 'test_%s_forward_references_m2m_errors', forward_ref_m2m_with_error_test)
+ register_tests(NaturalKeySerializerTests, 'test_%s_pk_with_default', pk_with_default)
++register_tests(NaturalKeySerializerTests, 'test_%s_deserialize_pk_with_default', deserialize_pk_with_default)
+2026-08-15 06:16:58,226 - INFO - Eval script for django__django-12209 written to logs/run_evaluation/formal-claude-parallel-django__django-12209/uiuc-claude-parallel/django__django-12209/eval.sh; copying to container...
+2026-08-15 06:17:10,648 - INFO - Test runtime: 12.33 seconds
+2026-08-15 06:17:10,648 - INFO - Test output for django__django-12209 written to logs/run_evaluation/formal-claude-parallel-django__django-12209/uiuc-claude-parallel/django__django-12209/test_output.txt
+2026-08-15 06:17:10,728 - INFO - Git diff after:
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index e3b14a41a0..844c01e95e 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -849,6 +849,7 @@ class Model(metaclass=ModelBase):
+         updated = False
+         # Skip an UPDATE when adding an instance and primary key has a default.
+         if (
++            not raw and
+             not force_insert and
+             self._state.adding and
+             self._meta.pk.default and
+diff --git a/docs/ref/models/instances.txt b/docs/ref/models/instances.txt
+index 9345bc0fe0..1d07d50f5b 100644
+--- a/docs/ref/models/instances.txt
++++ b/docs/ref/models/instances.txt
+@@ -475,6 +475,15 @@ follows this algorithm:
+   didn't update anything (e.g. if primary key is set to a value that doesn't
+   exist in the database), Django executes an ``INSERT``.
+ 
++.. versionchanged:: 3.0
++
++    When adding a new object whose primary key field has a
++    :attr:`~django.db.models.Field.default`, Django skips the ``UPDATE`` and
++    always executes a single ``INSERT``, even if the primary key was set
++    explicitly. Fetch the object from the database first, or use
++    :meth:`~django.db.models.query.QuerySet.update`, if you want to change an
++    existing row.
++
+ The one gotcha here is that you should be careful not to specify a primary-key
+ value explicitly when saving new objects, if you cannot guarantee the
+ primary-key value is unused. For more on this nuance, see `Explicitly specifying
+diff --git a/docs/releases/3.0.txt b/docs/releases/3.0.txt
+index 435755f732..3840fc9614 100644
+--- a/docs/releases/3.0.txt
++++ b/docs/releases/3.0.txt
+@@ -504,6 +504,22 @@ more secure default values:
+ See the *What's New* :ref:`Security section <whats-new-security-3.0>` above for
+ more details on these changes.
+ 
++``Model.save()`` when providing a default for the primary key
++-------------------------------------------------------------
++
++:meth:`Model.save() <django.db.models.Model.save>` no longer attempts to find a
++row when saving a new ``Model`` instance and a default value for the primary key
++is provided, and always performs a single ``INSERT`` query. In older versions of
++Django, an ``UPDATE`` and then possibly an ``INSERT`` query were performed.
++
++This makes creating such objects faster, but it means that assigning an existing
++primary key to a new instance no longer overwrites the existing row. If you need
++to update an existing row, either fetch the instance from the database first, or
++use :meth:`~django.db.models.query.QuerySet.update`.
++
++Loading fixtures with :djadmin:`loaddata` is unaffected: raw saves still update
++an existing row.
++
+ Miscellaneous
+ -------------
+ 
+diff --git a/tests/basic/tests.py b/tests/basic/tests.py
+index 5eada343e1..ed8157cf6b 100644
+--- a/tests/basic/tests.py
++++ b/tests/basic/tests.py
+@@ -139,6 +139,16 @@ class ModelInstanceCreationTests(TestCase):
+         with self.assertNumQueries(1):
+             PrimaryKeyWithDefault().save()
+ 
++    def test_save_raw_primary_with_default(self):
++        # A raw save (e.g. loaddata) isn't affected by the primary key default,
++        # so an existing row is updated instead of a duplicate INSERT being
++        # attempted.
++        obj = PrimaryKeyWithDefault.objects.create()
++        PrimaryKeyWithDefault(uuid=obj.uuid).save_base(raw=True)
++        self.assertQuerysetEqual(
++            PrimaryKeyWithDefault.objects.all(), [obj.uuid], lambda o: o.uuid,
++        )
++
+ 
+ class ModelTest(TestCase):
+     def test_objects_attribute_is_only_available_on_the_class_itself(self):
+diff --git a/tests/serializers/test_natural.py b/tests/serializers/test_natural.py
+index 3b4218bcc9..547cfa48f4 100644
+--- a/tests/serializers/test_natural.py
++++ b/tests/serializers/test_natural.py
+@@ -200,6 +200,19 @@ def pk_with_default(self, format):
+     self.assertEqual(objs[0].object.pk, obj.pk)
+ 
+ 
++def deserialize_pk_with_default(self, format):
++    """
++    Deserialized objects are saved with an UPDATE when the primary key has a
++    default and the row already exists, rather than a duplicate INSERT.
++    """
++    obj = NaturalPKWithDefault.objects.create(name='name')
++    string_data = serializers.serialize(format, [obj])
++    for deserialized_object in serializers.deserialize(format, string_data):
++        deserialized_object.save()
++    self.assertEqual(NaturalPKWithDefault.objects.count(), 1)
++    self.assertEqual(NaturalPKWithDefault.objects.get().pk, obj.pk)
++
++
+ # Dynamically register tests for each serializer
+ register_tests(NaturalKeySerializerTests, 'test_%s_natural_key_serializer', natural_key_serializer_test)
+ register_tests(NaturalKeySerializerTests, 'test_%s_serializer_natural_keys', natural_key_test)
+@@ -209,3 +222,4 @@ register_tests(NaturalKeySerializerTests, 'test_%s_forward_references_fk_errors'
+ register_tests(NaturalKeySerializerTests, 'test_%s_forward_references_m2ms', forward_ref_m2m_test)
+ register_tests(NaturalKeySerializerTests, 'test_%s_forward_references_m2m_errors', forward_ref_m2m_with_error_test)
+ register_tests(NaturalKeySerializerTests, 'test_%s_pk_with_default', pk_with_default)
++register_tests(NaturalKeySerializerTests, 'test_%s_deserialize_pk_with_default', deserialize_pk_with_default)
+2026-08-15 06:17:10,728 - INFO - Grading answer for django__django-12209...
+2026-08-15 06:17:10,729 - INFO - report: {'django__django-12209': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': True, 'tests_status': {'FAIL_TO_PASS': {'success': ['partial(func, *args, **keywords) - new function with partial application'], 'failure': []}, 'PASS_TO_PASS': {'success': [], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for django__django-12209: resolved: True
+2026-08-15 06:17:10,730 - INFO - Attempting to stop container sweb.eval.django__django-12209.formal-claude-parallel-django__django-12209...
+2026-08-15 06:17:26,369 - INFO - Container sweb.eval.django__django-12209.formal-claude-parallel-django__django-12209 stopped successfully.
+2026-08-15 06:17:26,369 - INFO - Attempting to remove container sweb.eval.django__django-12209.formal-claude-parallel-django__django-12209...
+2026-08-15 06:17:30,488 - INFO - Container sweb.eval.django__django-12209.formal-claude-parallel-django__django-12209 removed successfully.

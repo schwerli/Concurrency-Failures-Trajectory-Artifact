@@ -1,0 +1,62 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fafc1beee8..d8d3036edb 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -423,6 +423,24 @@ class KeyTransformExact(JSONExact):
+         return super().as_sql(compiler, connection)
+ 
+ 
++class KeyTransformIn(lookups.In):
++    def resolve_expression_parameter(self, compiler, connection, sql, param):
++        sql, params = super().resolve_expression_parameter(compiler, connection, sql, param)
++        if sql == '%s' and len(params) == 1:
++            if connection.vendor == 'oracle':
++                value = json.loads(params[0]) if isinstance(params[0], str) else params[0]
++                sql = "%s('%s', '$.value')" % (
++                    'JSON_QUERY' if isinstance(value, (list, dict)) else 'JSON_VALUE',
++                    json.dumps({'value': value}),
++                )
++                return sql, []
++            elif connection.vendor == 'mysql':
++                sql = "JSON_EXTRACT(%s, '$')" % sql
++            elif connection.vendor == 'sqlite' and params[0] != 'null':
++                sql = "JSON_EXTRACT(%s, '$')" % sql
++        return sql, params
++
++
+ class KeyTransformIExact(CaseInsensitiveMixin, KeyTransformTextLookupMixin, lookups.IExact):
+     pass
+ 
+@@ -480,6 +498,7 @@ class KeyTransformGte(KeyTransformNumericLookupMixin, lookups.GreaterThanOrEqual
+ 
+ 
+ KeyTransform.register_lookup(KeyTransformExact)
++KeyTransform.register_lookup(KeyTransformIn)
+ KeyTransform.register_lookup(KeyTransformIExact)
+ KeyTransform.register_lookup(KeyTransformIsNull)
+ KeyTransform.register_lookup(KeyTransformIContains)
+diff --git a/tests/model_fields/test_jsonfield.py b/tests/model_fields/test_jsonfield.py
+index a7648711ac..71804880a2 100644
+--- a/tests/model_fields/test_jsonfield.py
++++ b/tests/model_fields/test_jsonfield.py
+@@ -596,6 +596,20 @@ class TestQuerying(TestCase):
+         )
+         self.assertIs(NullableJSONModel.objects.filter(value__c__lt=5).exists(), False)
+ 
++    def test_key_in(self):
++        tests = [
++            ('value__c__in', [14], self.objs[3:5]),
++            ('value__foo__in', ['bar', 'baz'], [self.objs[7]]),
++            ('value__baz__in', [{'a': 'b', 'c': 'd'}], [self.objs[7]]),
++            ('value__d__in', [['e', {'f': 'g'}]], [self.objs[4]]),
++        ]
++        for lookup, value, expected in tests:
++            with self.subTest(lookup=lookup, value=value):
++                self.assertSequenceEqual(
++                    NullableJSONModel.objects.filter(**{lookup: value}),
++                    expected,
++                )
++
+     @skipIf(
+         connection.vendor == 'oracle',
+         'Raises ORA-00600: internal error code on Oracle 18.',

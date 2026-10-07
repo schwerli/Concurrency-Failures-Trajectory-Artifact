@@ -1,0 +1,193 @@
+diff --git a/doc/whats-new.rst b/doc/whats-new.rst
+index afb8a9b2..6bb8b2af 100644
+--- a/doc/whats-new.rst
++++ b/doc/whats-new.rst
+@@ -57,6 +57,9 @@ Bug fixes
+ - Fixed bug in ``combine_by_coords()`` causing a `ValueError` if the input had
+   an unused dimension with coordinates which were not monotonic (:issue`3150`).
+   By `Tom Nicholas <http://github.com/TomNicholas>`_.
++- Fixed regression introduced in v0.12.2 where ``Dataset.copy(deep=True)``,
++  ``DataArray.copy()``, ``copy.copy()`` and ``copy.deepcopy()`` would cast
++  indices with dtype ``'<U*'`` to dtype ``object``.
+ 
+ .. _whats-new.0.12.3:
+ 
+diff --git a/xarray/core/indexing.py b/xarray/core/indexing.py
+index e262d9ee..6efdb495 100644
+--- a/xarray/core/indexing.py
++++ b/xarray/core/indexing.py
+@@ -1241,6 +1241,8 @@ class PandasIndexAdapter(ExplicitlyIndexedNDArrayMixin):
+                 dtype = np.dtype('O')
+             else:
+                 dtype = array.dtype
++        else:
++            dtype = np.dtype(dtype)
+         self._dtype = dtype
+ 
+     @property
+@@ -1305,3 +1307,14 @@ class PandasIndexAdapter(ExplicitlyIndexedNDArrayMixin):
+     def __repr__(self):
+         return ('%s(array=%r, dtype=%r)'
+                 % (type(self).__name__, self.array, self.dtype))
++
++    def copy(self, deep=True):
++        # Not the same as just writing `self.array.copy(deep=deep)`, as
++        # shallow copies of the underlying numpy.ndarrays become deep ones
++        # upon pickling
++        # >>> len(pickle.dumps((self.array, self.array)))
++        # 4000281
++        # >>> len(pickle.dumps((self.array, self.array.copy(deep=False))))
++        # 8000341
++        array = self.array.copy(deep=True) if deep else self.array
++        return PandasIndexAdapter(array, self._dtype)
+diff --git a/xarray/core/variable.py b/xarray/core/variable.py
+index 379be8f5..5c6a3ad0 100644
+--- a/xarray/core/variable.py
++++ b/xarray/core/variable.py
+@@ -1942,14 +1942,7 @@ class IndexVariable(Variable):
+             data copied from original.
+         """
+         if data is None:
+-            if deep:
+-                # self._data should be a `PandasIndexAdapter` instance at this
+-                # point, which doesn't have a copy method, so make a deep copy
+-                # of the underlying `pandas.MultiIndex` and create a new
+-                # `PandasIndexAdapter` instance with it.
+-                data = PandasIndexAdapter(self._data.array.copy(deep=True))
+-            else:
+-                data = self._data
++            data = self._data.copy(deep=deep)
+         else:
+             data = as_compatible_data(data)
+             if self.shape != data.shape:
+diff --git a/xarray/tests/data/example.grib.47d85.idx b/xarray/tests/data/example.grib.47d85.idx
+new file mode 100755
+index 0000000000000000000000000000000000000000..a3a8fa286a18af0ca61d11ffae7eaccf506f791f
+GIT binary patch
+literal 3244
+zcmbW4O>7%Q6oBpE#y_#0pCWqUP$48z0d|`-R>UcyRio4-t(t&xfz^0-HZx*>%<Qa*
+zD^+b;h!7efqzts>1Xtj|0f`G&ICJLMGZHt>%*?KLJxX^sY7X(lGw*xvd$YD)9#p>h
+zp;=NtY~HjF2p)7?7zE$|2AtJzU<Yn_7Chu9{L&G>$Cp{n#?Y|>NI5F8hCHxK2?TC>
+zqA~;&arQ=+!hjB-)jb4+fU){B=vsh+E<6P8(19J9kF!}wh)+bm%BO&MJRGnFmPw6|
+z;W*$Qilnn9^h6fU7Nf;=7?=bPDfT_iY7%)JP_eC+d)Q5u<Dpp2TbMvo9^MJv0VJGN
+zp@pO1D)g*f3Wws9P2eXX^vv<(R85p;?J2~Z14qz#$98-`IcvMt+NRjsji|!Fi^1(^
+zam&8#V~+}@>JSj%Zdsz40rCmm0kXJCpi<W4OO&84m+yO6#?*swa4i<DP-QbmMH#p3
+z_hc2EErg>x&;b;W;GQoF;gGd$>`+LI!8mH$J!vGb%D`4&sD8>;F0;Dndja%<P-eQ8
+ztZ#;Ytd{#FHUn(V&V{1?Ht)}DM$bm6ggUH2;6dmBVmJ=p-1zeA=&88~P0;K0u9|D6
+z32kUzUR%EkuJl$-@q1-uy=U=$so(4$vGQG>&{!3F0R<lAeUbC#gBxg{wQ%4M0Kw*#
+zhi(HAMMb^+5;*3|=uPyNs&D(33VIuLw7O6?DF$7Ra-l0pCbXh5Z2XJ%(Q3^6J7JEL
+z^NS%%PjG_V{<WMiqdq>Dd4EIoEW1qEh)J2-U(IODEcZg_wEH%CDS_t57cw>ZcPj}q
+zM?QXFgnU^(52x=)lYjM`#>|p0glh8trO+JtLZ&AF*Q{1(zf^GZXOaK0sxh<V(_6}b
+zYVx1e5@?QmAybq8sGcy-bo26?;2|s1^qV05d}?>U-q5I7`sqC>EZWce&~GozCD0uG
+zLZ+twPs+^EPg|N%rzZbrGpSQDv*Zh*+TDNON}xINg-lKUZaZP-$fpgJ&*;O`m!!$>
+z&1=jo`9i2B-&shYIr4=}O}@66FmvS7hMq<Kna<3TFNA9Hzb_?)=ExT^HTiGP3npYO
+z(|3m<h1O)?SVph2g?NZG?Rbpj?7U5U*N~&0Atp6wsEOu;qx)=;`lsJN=IEl>Yo}3a
+zSW*GaNkIITIC}vdqc6nkYa-@lJ;n&tJf$L+rX!P$W6l~Q;9x5%iq-AVGpX-8@#ID^
+zaKvDXjy~si#29jPNln1YLd>R|HB~UC<9Pg(YO)(sJ8BvYcPJmA6Z9zJJdzyr7(GEx
+z(RXT36w)3+g6%Q(4x(a&j~GcOopXIp4An}dHBqrb*By)ZL~u(Dcxmj3Rx*0bnv(;n
+zQuH)^Bd@@pM1em~3Y?2N6;&c+rkf%%Tu>X%_yehdO);JNUYsnJJl%lbrWz2kSE8wZ
+WNPOy>zGH}n1Zu)BuZVvNI{yRi48nK-
+
+literal 0
+HcmV?d00001
+
+diff --git a/xarray/tests/data/example.grib.5b7b6.idx b/xarray/tests/data/example.grib.5b7b6.idx
+new file mode 100755
+index 0000000000000000000000000000000000000000..b010eea8572bd5b0b761cf1948e98412441f1c1c
+GIT binary patch
+literal 3180
+zcmbW3O>7%Q6o8%J#y_#0pCWoe0>pt7TDwgfE8-N<s!?jvR!u;?z-qiZn;Ee`W_H%Z
+zh?W#+4rqiTbs9Kw1Wp`!<O*lb9649w#+jMf^{j{5yNDd(@y@*Oz3<IhdPn6apixqP
+zY{_;H2=2Fi7)9U!Mx51dU=QvD4m{+K`T2+ZK3`*17emj9AmymU>hi!IB@p=8iShtY
+z#Mv7i3M1NwPUjF10!Hd<)Nud>9e4=*fd|_%A7=}YkdTOc<xc<!c-&`oER$Lv!BNCN
+z5J?wo7>F#Ktt5-<FtQ0AP#gxFRVDH|pkiAs_pz^+qk&j1Iha6O9=;X(eMmT~KnEwm
+z6&N^s6b{5Gm%xu>7}%rnsj4W?*;j}~4-TRCw(Es}a@O*ljcu{Fmr#X4kb+yu;<kGy
+z!~qpbl>s2Y-*JRoq|#L7M*^+M<$D2^=W0>hzm`gtsWMokBK2+eU74A)<#>1(dVt~~
+z+z(}P4q3~^9)-l}kCIm1mlpDREbK&<>Y;4k8mrl15WygdWu|L-eKY>`%3QC+=7G!E
+znOOAP<-Pgs<b5cW&_z}!@F4a8u{@7&Z+(4|yeY3j8+5zftM-O%Ll@eYHa4$<%iSxs
+z_`kls*>!lY)NAw}Y7(p9Afh0kyeIPAJi3AIu_lhfJ|NiM3D6xNBB-dfR|3a;4ZVrp
+zQnl^=Tt*krMWZIv)`g(Xzw)3<iof+2x`!^O#6L7~sBHfau=E|)z}=^Fnwa!&D)I9z
+z)vH-0$`*`E-2G<WAkMNbKu%ikq8BtWN4tP%Xung|#2oGP6%pEV#v72{jG_JV8G|@W
+zy8vlu|D7Rov<rxa_U{Wuk-bvEZ5M0*R56INw6nXJiZryps%m78b^+1Q{;;Nr|LL~n
+z@BIt?d!KgOn{|UYOFO%psYpY6bx|X8v<rxa_Opzbqn$N!YK_KA{#!%WD2cPQ3y_BP
+z_f3t=(Jmkw+Ml*GF-JRVq<kauZ+m~qAkNY*KpNWZWsS_yE+87()fG+5(asuKto^4+
+zoTXiWG_-$N)kWrL7Z45Y)3bsIS<?>vK}?}D9v;@v>ufn40&O=P135eElF+y0sAh>t
+z3tDPAdCbvgY=wr;KR@Q^6|vXKqSWA{0vh9h^pQAw4t<FpiO<(W%!_7>6|31uMXpXp
+z>WyR0>O<gRCn<{6+&Hjl7<%dCMKSQiV2U0*;&;VZ@!-6gV3mcKEjeqbU`$8p_$bw6
+zHzsz}G#THbypK-MQNlTr9K_KRbc()Jd!mrm5EAT;aBz?mBYeb2IqsYv24W~yD$TKq
+z6Z`&1JQKl9HLPW^Cq~I)nr@5_s7ldk_8_moA4Gvajtg8&I+au+WG0&;GMrNz-spX)
+qfo(BqhC!Mvm3+PdPbV4>vzL;oeLzAQ+M#EOhD2&YpIaA0efuBXuBq7o
+
+literal 0
+HcmV?d00001
+
+diff --git a/xarray/tests/test_dataarray.py b/xarray/tests/test_dataarray.py
+index 5697704b..30fc06d1 100644
+--- a/xarray/tests/test_dataarray.py
++++ b/xarray/tests/test_dataarray.py
+@@ -2,7 +2,7 @@ import pickle
+ import sys
+ import warnings
+ from collections import OrderedDict
+-from copy import deepcopy
++from copy import copy, deepcopy
+ from textwrap import dedent
+ 
+ import numpy as np
+@@ -3480,6 +3480,18 @@ class TestDataArray:
+ 
+         assert_identical(da['a'], expected_orig)
+ 
++    @pytest.mark.parametrize('deep', [True, False])
++    def test_copy_index_dtypes(self, deep):
++        # regression test: copy used to cast '<U*' indexes to object
++        da = DataArray(['baz'], dims='x',
++                       coords={'x': ['foo'], 'y': ('x', ['bar'])})
++        for copied in [da.copy(deep=deep),
++                       deepcopy(da) if deep else copy(da)]:
++            assert_identical(da, copied)
++            assert da.dtype == copied.dtype
++            for k, v in da.coords.variables.items():
++                assert v.dtype == copied.coords.variables[k].dtype
++
+     def test_real_and_imag(self):
+         array = DataArray(1 + 2j)
+         assert_identical(array.real, DataArray(1))
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index fc6f7f36..4ac70579 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -2107,6 +2107,17 @@ class TestDataset:
+ 
+         assert_identical(ds.coords['a'], expected_orig)
+ 
++    @pytest.mark.parametrize('deep', [True, False])
++    def test_copy_index_dtypes(self, deep):
++        # regression test: copy used to cast '<U*' indexes to object
++        ds = Dataset(coords={'x': ['foo'], 'y': ('x', ['bar'])},
++                     data_vars={'z': ('x', ['baz'])})
++        for copied in [ds.copy(deep=deep),
++                       deepcopy(ds) if deep else copy(ds)]:
++            assert_identical(ds, copied)
++            for k, v in ds.variables.items():
++                assert v.dtype == copied.variables[k].dtype
++
+     def test_copy_with_data_errors(self):
+         orig = create_test_data()
+         new_var1 = np.arange(orig['var1'].size).reshape(orig['var1'].shape)
+diff --git a/xarray/tests/test_variable.py b/xarray/tests/test_variable.py
+index 73d2a40b..3978d1c4 100644
+--- a/xarray/tests/test_variable.py
++++ b/xarray/tests/test_variable.py
+@@ -477,8 +477,9 @@ class VariableSubclassobjects:
+         assert actual.dtype == object
+ 
+     @pytest.mark.parametrize('deep', [True, False])
+-    def test_copy(self, deep):
+-        v = self.cls('x', 0.5 * np.arange(10), {'foo': 'bar'})
++    @pytest.mark.parametrize('astype', [float, int, str])
++    def test_copy(self, deep, astype):
++        v = self.cls('x', (0.5 * np.arange(10)).astype(astype), {'foo': 'bar'})
+         w = v.copy(deep=deep)
+         assert type(v) is type(w)
+         assert_identical(v, w)

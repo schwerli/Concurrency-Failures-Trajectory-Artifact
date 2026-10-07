@@ -1,0 +1,78 @@
+diff --git a/sympy/polys/densetools.py b/sympy/polys/densetools.py
+index f057824642..afd1097911 100644
+--- a/sympy/polys/densetools.py
++++ b/sympy/polys/densetools.py
+@@ -17,6 +17,7 @@
+ )
+ from sympy.polys.densebasic import (
+     dup_strip, dmp_strip,
++    dup_normal, dmp_normal,
+     dup_convert, dmp_convert,
+     dup_degree, dmp_degree,
+     dmp_to_dict,
+@@ -1197,6 +1198,7 @@ def dup_clear_denoms(f, K0, K1=None, convert=False):
+ 
+     if not K1.is_one(common):
+         f = dup_mul_ground(f, common, K0)
++        f = dup_normal(f, K0)
+ 
+     if not convert:
+         return common, f
+@@ -1251,6 +1253,7 @@ def dmp_clear_denoms(f, u, K0, K1=None, convert=False):
+ 
+     if not K1.is_one(common):
+         f = dmp_mul_ground(f, common, u, K0)
++        f = dmp_normal(f, u, K0)
+ 
+     if not convert:
+         return common, f
+diff --git a/sympy/polys/tests/test_densetools.py b/sympy/polys/tests/test_densetools.py
+index ca78e1b0e1..4e2c71b1f1 100644
+--- a/sympy/polys/tests/test_densetools.py
++++ b/sympy/polys/tests/test_densetools.py
+@@ -43,7 +43,7 @@
+ from sympy.polys.domains import FF, ZZ, QQ, EX
+ from sympy.polys.rings import ring
+ 
+-from sympy import S, I, sin
++from sympy import S, I, sin, sqrt
+ 
+ from sympy.abc import x
+ 
+@@ -635,6 +635,9 @@ def test_dup_clear_denoms():
+     assert dup_clear_denoms([EX(7)], EX) == (EX(1), [EX(7)])
+     assert dup_clear_denoms([EX(sin(x)/x), EX(0)], EX) == (EX(x), [EX(sin(x)), EX(0)])
+ 
++    zeroish = EX(S.One/(1 + sqrt(2)) - sqrt(2) + 1)
++    assert dup_clear_denoms([zeroish], EX) == (EX(1 + sqrt(2)), [])
++
+ 
+ def test_dmp_clear_denoms():
+     assert dmp_clear_denoms([[]], 1, QQ, ZZ) == (ZZ(1), [[]])
+@@ -664,3 +667,6 @@ def test_dmp_clear_denoms():
+         [[EX(S(3)/2)], [EX(S(9)/4)]], 1, EX) == (EX(4), [[EX(6)], [EX(9)]])
+     assert dmp_clear_denoms([[EX(7)]], 1, EX) == (EX(1), [[EX(7)]])
+     assert dmp_clear_denoms([[EX(sin(x)/x), EX(0)]], 1, EX) == (EX(x), [[EX(sin(x)), EX(0)]])
++
++    zeroish = EX(S.One/(1 + sqrt(2)) - sqrt(2) + 1)
++    assert dmp_clear_denoms([[zeroish]], 1, EX) == (EX(1 + sqrt(2)), [[]])
+diff --git a/sympy/polys/tests/test_polytools.py b/sympy/polys/tests/test_polytools.py
+index c774fc41e2..e4f85728a5 100644
+--- a/sympy/polys/tests/test_polytools.py
++++ b/sympy/polys/tests/test_polytools.py
+@@ -1444,6 +1444,15 @@ def test_Poly_clear_denoms():
+     assert coeff == 3 and poly == Poly(
+         x + 3*sqrt(2), x, domain='EX') and poly.get_domain() == EX
+ 
++    zero_poly = Poly(0, x, domain='EX')
++    coeff, poly = Poly(
++        S.One/(1 + sqrt(2)) - sqrt(2) + 1, x, domain='EX').clear_denoms()
++    assert coeff == 1 + sqrt(2)
++    assert poly.rep == zero_poly.rep
++    assert poly.is_zero is True
++    assert poly.terms_gcd() == zero_poly.terms_gcd()
++    assert poly.primitive() == zero_poly.primitive()
++
+ 
+ def test_Poly_rat_clear_denoms():
+     f = Poly(x**2/y + 1, x)

@@ -1,0 +1,1683 @@
+     1	"""
+     2	soot_analysis.py -- Jimple-like intermediate representation and core
+     3	whole-program analysis utilities (a Soot work-alike).
+     4	
+     5	This is layer 1 of the analysis stack.  It converts the neutral
+     6	:mod:`program_model` representation into a Jimple-like three-address IR,
+     7	registers everything in a global ``Scene``, builds a Class Hierarchy
+     8	Analysis (CHA) call graph, and provides classic intra-procedural
+     9	optimisations (copy propagation, dead-assignment elimination,
+    10	unreachable-code elimination).
+    11	
+    12	Layer 2 (``flowdroid_analysis``) and layer 3 (``stubdroid_analysis``)
+    13	build on the IR, the ``Scene`` and the ``CallGraph`` exposed here.
+    14	
+    15	Vocabulary follows Soot as closely as is reasonable in Python:
+    16	
+    17	    Value        -- Local, Constant, FieldRef, InvokeExpr, NewExpr, ...
+    18	    Unit / Stmt  -- AssignStmt, IdentityStmt, InvokeStmt, ReturnStmt, ...
+    19	    JimpleBody   -- locals + units of one method
+    20	    SootField / SootMethod / SootClass
+    21	    Scene        -- the global registry (``Scene.v()``)
+    22	    Hierarchy    -- sub/super class queries and virtual dispatch
+    23	    CallGraph    -- Edge set produced by ``CHATransformer``
+    24	    UnitGraph    -- intra-procedural CFG
+    25	    CopyPropagator / DeadAssignmentEliminator / UnreachableCodeEliminator
+    26	
+    27	Run standalone::
+    28	
+    29	    python3 soot_analysis.py
+    30	"""
+    31	
+    32	from __future__ import annotations
+    33	
+    34	import os
+    35	import sys
+    36	from dataclasses import dataclass, field as _dc_field
+    37	from typing import Any, Iterable, Iterator, Optional
+    38	
+    39	from program_model import (
+    40	    ClassDef,
+    41	    FieldRef,
+    42	    Method,
+    43	    MethodBody,
+    44	    MethodSignature,
+    45	    Program,
+    46	    Statement,
+    47	    Type,
+    48	    Variable,
+    49	    load_all_benchmarks,
+    50	    load_program,
+    51	)
+    52	from utils import (
+    53	    Timer,
+    54	    build_class_index,
+    55	    build_hierarchy,
+    56	    build_method_index,
+    57	    get_all_subclasses,
+    58	)
+    59	
+    60	BENCHMARK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmarks")
+    61	
+    62	PRIMITIVE_TYPE_NAMES = frozenset(
+    63	    {"int", "long", "short", "byte", "char", "float", "double", "boolean", "void"}
+    64	)
+    65	
+    66	OBJECT_CLASS = "java.lang.Object"
+    67	
+    68	
+    69	# ---------------------------------------------------------------------------
+    70	# Types
+    71	# ---------------------------------------------------------------------------
+    72	
+    73	
+    74	def make_type(name: str) -> Type:
+    75	    """Build a :class:`program_model.Type` from a type name string."""
+    76	    if name is None:
+    77	        name = OBJECT_CLASS
+    78	    is_array = name.endswith("[]")
+    79	    base = name
+    80	    while base.endswith("[]"):
+    81	        base = base[:-2]
+    82	    return Type(
+    83	        name=name,
+    84	        is_primitive=base in PRIMITIVE_TYPE_NAMES and not is_array,
+    85	        is_array=is_array,
+    86	        element_type=base if is_array else None,
+    87	    )
+    88	
+    89	
+    90	VOID_TYPE = make_type("void")
+    91	INT_TYPE = make_type("int")
+    92	BOOLEAN_TYPE = make_type("boolean")
+    93	OBJECT_TYPE = make_type(OBJECT_CLASS)
+    94	STRING_TYPE = make_type("java.lang.String")
+    95	NULL_TYPE = make_type("null_type")
+    96	UNKNOWN_TYPE = make_type("unknown")
+    97	
+    98	
+    99	def is_reference_type(t: Type | None) -> bool:
+   100	    """True for object/array types (i.e. things that can carry taint)."""
+   101	    if t is None:
+   102	        return True
+   103	    return not t.is_primitive or t.is_array
+   104	
+   105	
+   106	# ---------------------------------------------------------------------------
+   107	# Jimple values
+   108	# ---------------------------------------------------------------------------
+   109	
+   110	
+   111	class Value:
+   112	    """Base class of the Jimple value hierarchy."""
+   113	
+   114	    __slots__ = ()
+   115	
+   116	    def get_type(self) -> Type:  # pragma: no cover - overridden
+   117	        return UNKNOWN_TYPE
+   118	
+   119	    def get_use_boxes(self) -> list["Value"]:
+   120	        """Values used by this value (transitively, excluding ``self``)."""
+   121	        return []
+   122	
+   123	    def used_locals(self) -> list["Local"]:
+   124	        out: list[Local] = []
+   125	        for v in self.get_use_boxes():
+   126	            if isinstance(v, Local):
+   127	                out.append(v)
+   128	        if isinstance(self, Local):
+   129	            out.append(self)
+   130	        return out
+   131	
+   132	    # -- value identity is structural, which keeps analyses deterministic --
+   133	    def _key(self) -> tuple:
+   134	        return (type(self).__name__, str(self))
+   135	
+   136	    def __eq__(self, other: object) -> bool:
+   137	        if not isinstance(other, Value):
+   138	            return NotImplemented
+   139	        return self._key() == other._key()
+   140	
+   141	    def __hash__(self) -> int:
+   142	        return hash(self._key())
+   143	
+   144	    def __repr__(self) -> str:
+   145	        return str(self)
+   146	
+   147	
+   148	class Local(Value):
+   149	    """A Jimple local variable (``r0``, ``i1``, ...)."""
+   150	
+   151	    __slots__ = ("name", "type", "is_parameter", "param_index")
+   152	
+   153	    def __init__(
+   154	        self,
+   155	        name: str,
+   156	        var_type: Type | None = None,
+   157	        is_parameter: bool = False,
+   158	        param_index: int = -1,
+   159	    ) -> None:
+   160	        self.name = name
+   161	        self.type = var_type if var_type is not None else UNKNOWN_TYPE
+   162	        self.is_parameter = is_parameter
+   163	        self.param_index = param_index
+   164	
+   165	    # Soot spells it ``getName`` / ``getType``.
+   166	    def get_name(self) -> str:
+   167	        return self.name
+   168	
+   169	    def get_type(self) -> Type:
+   170	        return self.type
+   171	
+   172	    def _key(self) -> tuple:
+   173	        return ("Local", self.name)
+   174	
+   175	    def __str__(self) -> str:
+   176	        return self.name
+   177	
+   178	
+   179	class Constant(Value):
+   180	    """A compile-time constant."""
+   181	
+   182	    __slots__ = ("value", "type", "text")
+   183	
+   184	    def __init__(self, value: Any, const_type: Type | None = None, text: str | None = None) -> None:
+   185	        self.value = value
+   186	        self.type = const_type if const_type is not None else UNKNOWN_TYPE
+   187	        self.text = text if text is not None else str(value)
+   188	
+   189	    def get_type(self) -> Type:
+   190	        return self.type
+   191	
+   192	    def _key(self) -> tuple:
+   193	        return ("Constant", self.text)
+   194	
+   195	    def __str__(self) -> str:
+   196	        return self.text
+   197	
+   198	
+   199	class IntConstant(Constant):
+   200	    __slots__ = ()
+   201	
+   202	    def __init__(self, value: int, text: str | None = None) -> None:
+   203	        super().__init__(int(value), INT_TYPE, text if text is not None else str(value))
+   204	
+   205	
+   206	class LongConstant(Constant):
+   207	    __slots__ = ()
+   208	
+   209	    def __init__(self, value: int, text: str | None = None) -> None:
+   210	        super().__init__(int(value), make_type("long"), text if text is not None else str(value))
+   211	
+   212	
+   213	class DoubleConstant(Constant):
+   214	    __slots__ = ()
+   215	
+   216	    def __init__(self, value: float, text: str | None = None) -> None:
+   217	        super().__init__(float(value), make_type("double"), text if text is not None else str(value))
+   218	
+   219	
+   220	class StringConstant(Constant):
+   221	    __slots__ = ()
+   222	
+   223	    def __init__(self, value: str, text: str | None = None) -> None:
+   224	        super().__init__(value, STRING_TYPE, text if text is not None else '"%s"' % value)
+   225	
+   226	
+   227	class BooleanConstant(Constant):
+   228	    __slots__ = ()
+   229	
+   230	    def __init__(self, value: bool, text: str | None = None) -> None:
+   231	        super().__init__(
+   232	            bool(value), BOOLEAN_TYPE, text if text is not None else ("true" if value else "false")
+   233	        )
+   234	
+   235	
+   236	class NullConstant(Constant):
+   237	    __slots__ = ()
+   238	
+   239	    def __init__(self) -> None:
+   240	        super().__init__(None, NULL_TYPE, "null")
+   241	
+   242	
+   243	class ClassConstant(Constant):
+   244	    __slots__ = ()
+   245	
+   246	    def __init__(self, class_name: str) -> None:
+   247	        super().__init__(class_name, make_type("java.lang.Class"), "class %s" % class_name)
+   248	
+   249	
+   250	class ThisRef(Value):
+   251	    """``@this`` -- only valid on the right of an :class:`IdentityStmt`."""
+   252	
+   253	    __slots__ = ("type",)
+   254	
+   255	    def __init__(self, this_type: Type | None = None) -> None:
+   256	        self.type = this_type if this_type is not None else OBJECT_TYPE
+   257	
+   258	    def get_type(self) -> Type:
+   259	        return self.type
+   260	
+   261	    def _key(self) -> tuple:
+   262	        return ("ThisRef", self.type.name)
+   263	
+   264	    def __str__(self) -> str:
+   265	        return "@this: %s" % self.type.name
+   266	
+   267	
+   268	class ParameterRef(Value):
+   269	    """``@parameterN`` -- only valid on the right of an :class:`IdentityStmt`."""
+   270	
+   271	    __slots__ = ("index", "type")
+   272	
+   273	    def __init__(self, index: int, param_type: Type | None = None) -> None:
+   274	        self.index = index
+   275	        self.type = param_type if param_type is not None else OBJECT_TYPE
+   276	
+   277	    def get_index(self) -> int:
+   278	        return self.index
+   279	
+   280	    def get_type(self) -> Type:
+   281	        return self.type
+   282	
+   283	    def _key(self) -> tuple:
+   284	        return ("ParameterRef", self.index)
+   285	
+   286	    def __str__(self) -> str:
+   287	        return "@parameter%d: %s" % (self.index, self.type.name)
+   288	
+   289	
+   290	class CaughtExceptionRef(Value):
+   291	    __slots__ = ("type",)
+   292	
+   293	    def __init__(self, exc_type: Type | None = None) -> None:
+   294	        self.type = exc_type if exc_type is not None else make_type("java.lang.Throwable")
+   295	
+   296	    def get_type(self) -> Type:
+   297	        return self.type
+   298	
+   299	    def _key(self) -> tuple:
+   300	        return ("CaughtExceptionRef", self.type.name)
+   301	
+   302	    def __str__(self) -> str:
+   303	        return "@caughtexception"
+   304	
+   305	
+   306	class FieldSignature:
+   307	    """``<declaring.Class: type name>``."""
+   308	
+   309	    __slots__ = ("declaring_class", "name", "type")
+   310	
+   311	    def __init__(self, declaring_class: str, name: str, field_type: Type | None = None) -> None:
+   312	        self.declaring_class = declaring_class
+   313	        self.name = name
+   314	        self.type = field_type if field_type is not None else OBJECT_TYPE
+   315	
+   316	    def full_signature(self) -> str:
+   317	        return "<%s: %s %s>" % (self.declaring_class, self.type.name, self.name)
+   318	
+   319	    def get_sub_signature(self) -> str:
+   320	        return "%s %s" % (self.type.name, self.name)
+   321	
+   322	    def __str__(self) -> str:
+   323	        return self.full_signature()
+   324	
+   325	    def __repr__(self) -> str:
+   326	        return self.full_signature()
+   327	
+   328	    def __eq__(self, other: object) -> bool:
+   329	        if not isinstance(other, FieldSignature):
+   330	            return NotImplemented
+   331	        return self.full_signature() == other.full_signature()
+   332	
+   333	    def __hash__(self) -> int:
+   334	        return hash(self.full_signature())
+   335	
+   336	
+   337	class SootField:
+   338	    """A field declared by a :class:`SootClass`."""
+   339	
+   340	    __slots__ = ("name", "type", "declaring_class", "is_static", "is_final", "access")
+   341	
+   342	    def __init__(
+   343	        self,
+   344	        name: str,
+   345	        field_type: Type,
+   346	        declaring_class: str,
+   347	        is_static: bool = False,
+   348	        is_final: bool = False,
+   349	        access: str = "public",
+   350	    ) -> None:
+   351	        self.name = name
+   352	        self.type = field_type
+   353	        self.declaring_class = declaring_class
+   354	        self.is_static = is_static
+   355	        self.is_final = is_final
+   356	        self.access = access
+   357	
+   358	    def get_name(self) -> str:
+   359	        return self.name
+   360	
+   361	    def get_type(self) -> Type:
+   362	        return self.type
+   363	
+   364	    def get_signature(self) -> FieldSignature:
+   365	        return FieldSignature(self.declaring_class, self.name, self.type)
+   366	
+   367	    def get_sub_signature(self) -> str:
+   368	        return "%s %s" % (self.type.name, self.name)
+   369	
+   370	    def __str__(self) -> str:
+   371	        return self.get_signature().full_signature()
+   372	
+   373	    def __repr__(self) -> str:
+   374	        return str(self)
+   375	
+   376	
+   377	class FieldRefValue(Value):
+   378	    """Common base of instance and static field references."""
+   379	
+   380	    __slots__ = ("field",)
+   381	
+   382	    def __init__(self, field_sig: FieldSignature) -> None:
+   383	        self.field = field_sig
+   384	
+   385	    def get_field(self) -> FieldSignature:
+   386	        return self.field
+   387	
+   388	    def get_field_name(self) -> str:
+   389	        return self.field.name
+   390	
+   391	    def get_type(self) -> Type:
+   392	        return self.field.type
+   393	
+   394	
+   395	class InstanceFieldRef(FieldRefValue):
+   396	    """``base.field``."""
+   397	
+   398	    __slots__ = ("base",)
+   399	
+   400	    def __init__(self, base: Value, field_sig: FieldSignature) -> None:
+   401	        super().__init__(field_sig)
+   402	        self.base = base
+   403	
+   404	    def get_base(self) -> Value:
+   405	        return self.base
+   406	
+   407	    def get_use_boxes(self) -> list[Value]:
+   408	        return [self.base]
+   409	
+   410	    def _key(self) -> tuple:
+   411	        return ("InstanceFieldRef", str(self.base), self.field.full_signature())
+   412	
+   413	    def __str__(self) -> str:
+   414	        return "%s.%s" % (self.base, self.field.name)
+   415	
+   416	
+   417	class StaticFieldRef(FieldRefValue):
+   418	    """``Class.field``."""
+   419	
+   420	    __slots__ = ()
+   421	
+   422	    def _key(self) -> tuple:
+   423	        return ("StaticFieldRef", self.field.full_signature())
+   424	
+   425	    def __str__(self) -> str:
+   426	        return "%s.%s" % (self.field.declaring_class, self.field.name)
+   427	
+   428	
+   429	class ArrayRef(Value):
+   430	    """``base[index]``."""
+   431	
+   432	    __slots__ = ("base", "index", "type")
+   433	
+   434	    def __init__(self, base: Value, index: Value, elem_type: Type | None = None) -> None:
+   435	        self.base = base
+   436	        self.index = index
+   437	        self.type = elem_type if elem_type is not None else OBJECT_TYPE
+   438	
+   439	    def get_base(self) -> Value:
+   440	        return self.base
+   441	
+   442	    def get_index(self) -> Value:
+   443	        return self.index
+   444	
+   445	    def get_type(self) -> Type:
+   446	        return self.type
+   447	
+   448	    def get_use_boxes(self) -> list[Value]:
+   449	        return [self.base, self.index]
+   450	
+   451	    def _key(self) -> tuple:
+   452	        return ("ArrayRef", str(self.base), str(self.index))
+   453	
+   454	    def __str__(self) -> str:
+   455	        return "%s[%s]" % (self.base, self.index)
+   456	
+   457	
+   458	class Expr(Value):
+   459	    """Base class of Jimple expressions."""
+   460	
+   461	    __slots__ = ()
+   462	
+   463	
+   464	class NewExpr(Expr):
+   465	    """``new Type``."""
+   466	
+   467	    __slots__ = ("base_type",)
+   468	
+   469	    def __init__(self, base_type: Type) -> None:
+   470	        self.base_type = base_type
+   471	
+   472	    def get_base_type(self) -> Type:
+   473	        return self.base_type
+   474	
+   475	    def get_type(self) -> Type:
+   476	        return self.base_type
+   477	
+   478	    def _key(self) -> tuple:
+   479	        return ("NewExpr", self.base_type.name)
+   480	
+   481	    def __str__(self) -> str:
+   482	        return "new %s" % self.base_type.name
+   483	
+   484	
+   485	class NewArrayExpr(Expr):
+   486	    """``new Type[size]``."""
+   487	
+   488	    __slots__ = ("base_type", "size")
+   489	
+   490	    def __init__(self, base_type: Type, size: Value | None = None) -> None:
+   491	        self.base_type = base_type
+   492	        self.size = size if size is not None else IntConstant(0)
+   493	
+   494	    def get_base_type(self) -> Type:
+   495	        return self.base_type
+   496	
+   497	    def get_type(self) -> Type:
+   498	        return self.base_type
+   499	
+   500	    def get_use_boxes(self) -> list[Value]:
+   501	        return [self.size]
+   502	
+   503	    def _key(self) -> tuple:
+   504	        return ("NewArrayExpr", self.base_type.name, str(self.size))
+   505	
+   506	    def __str__(self) -> str:
+   507	        return "newarray (%s)[%s]" % (self.base_type.name, self.size)
+   508	
+   509	
+   510	class CastExpr(Expr):
+   511	    """``(Type) op``."""
+   512	
+   513	    __slots__ = ("op", "cast_type")
+   514	
+   515	    def __init__(self, op: Value, cast_type: Type) -> None:
+   516	        self.op = op
+   517	        self.cast_type = cast_type
+   518	
+   519	    def get_op(self) -> Value:
+   520	        return self.op
+   521	
+   522	    def get_cast_type(self) -> Type:
+   523	        return self.cast_type
+   524	
+   525	    def get_type(self) -> Type:
+   526	        return self.cast_type
+   527	
+   528	    def get_use_boxes(self) -> list[Value]:
+   529	        return [self.op]
+   530	
+   531	    def _key(self) -> tuple:
+   532	        return ("CastExpr", self.cast_type.name, str(self.op))
+   533	
+   534	    def __str__(self) -> str:
+   535	        return "(%s) %s" % (self.cast_type.name, self.op)
+   536	
+   537	
+   538	class InstanceOfExpr(Expr):
+   539	    __slots__ = ("op", "check_type")
+   540	
+   541	    def __init__(self, op: Value, check_type: Type) -> None:
+   542	        self.op = op
+   543	        self.check_type = check_type
+   544	
+   545	    def get_type(self) -> Type:
+   546	        return BOOLEAN_TYPE
+   547	
+   548	    def get_use_boxes(self) -> list[Value]:
+   549	        return [self.op]
+   550	
+   551	    def _key(self) -> tuple:
+   552	        return ("InstanceOfExpr", self.check_type.name, str(self.op))
+   553	
+   554	    def __str__(self) -> str:
+   555	        return "%s instanceof %s" % (self.op, self.check_type.name)
+   556	
+   557	
+   558	class BinopExpr(Expr):
+   559	    """``op1 <symbol> op2`` -- also used for the generic multi-operand case."""
+   560	
+   561	    __slots__ = ("op1", "op2", "symbol", "type")
+   562	
+   563	    def __init__(
+   564	        self, op1: Value, op2: Value, symbol: str = "+", result_type: Type | None = None
+   565	    ) -> None:
+   566	        self.op1 = op1
+   567	        self.op2 = op2
+   568	        self.symbol = symbol
+   569	        self.type = result_type if result_type is not None else UNKNOWN_TYPE
+   570	
+   571	    def get_op1(self) -> Value:
+   572	        return self.op1
+   573	
+   574	    def get_op2(self) -> Value:
+   575	        return self.op2
+   576	
+   577	    def get_symbol(self) -> str:
+   578	        return self.symbol
+   579	
+   580	    def get_type(self) -> Type:
+   581	        return self.type
+   582	
+   583	    def get_use_boxes(self) -> list[Value]:
+   584	        return [self.op1, self.op2]
+   585	
+   586	    def _key(self) -> tuple:
+   587	        return ("BinopExpr", str(self.op1), self.symbol, str(self.op2))
+   588	
+   589	    def __str__(self) -> str:
+   590	        return "%s %s %s" % (self.op1, self.symbol, self.op2)
+   591	
+   592	
+   593	class ConditionExpr(BinopExpr):
+   594	    """A comparison used by :class:`IfStmt`."""
+   595	
+   596	    __slots__ = ("text",)
+   597	
+   598	    def __init__(
+   599	        self,
+   600	        op1: Value,
+   601	        op2: Value,
+   602	        symbol: str = "==",
+   603	        text: str | None = None,
+   604	    ) -> None:
+   605	        super().__init__(op1, op2, symbol, BOOLEAN_TYPE)
+   606	        self.text = text
+   607	
+   608	    def _key(self) -> tuple:
+   609	        return ("ConditionExpr", self.text or str(super().__str__()))
+   610	
+   611	    def __str__(self) -> str:
+   612	        if self.text:
+   613	            return self.text
+   614	        return "%s %s %s" % (self.op1, self.symbol, self.op2)
+   615	
+   616	
+   617	class PhiExpr(Expr):
+   618	    """An n-ary value merge -- used when a statement mentions several locals."""
+   619	
+   620	    __slots__ = ("operands", "text", "type")
+   621	
+   622	    def __init__(self, operands: list[Value], text: str = "", result_type: Type | None = None):
+   623	        self.operands = list(operands)
+   624	        self.text = text
+   625	        self.type = result_type if result_type is not None else UNKNOWN_TYPE
+   626	
+   627	    def get_type(self) -> Type:
+   628	        return self.type
+   629	
+   630	    def get_use_boxes(self) -> list[Value]:
+   631	        return list(self.operands)
+   632	
+   633	    def _key(self) -> tuple:
+   634	        return ("PhiExpr", self.text, tuple(str(o) for o in self.operands))
+   635	
+   636	    def __str__(self) -> str:
+   637	        return self.text or ("Phi(%s)" % ", ".join(str(o) for o in self.operands))
+   638	
+   639	
+   640	class SootMethodRef:
+   641	    """An unresolved reference to a method (Soot's ``SootMethodRef``)."""
+   642	
+   643	    __slots__ = ("signature",)
+   644	
+   645	    def __init__(self, signature: MethodSignature) -> None:
+   646	        self.signature = signature
+   647	
+   648	    @property
+   649	    def declaring_class(self) -> str:
+   650	        return self.signature.class_name
+   651	
+   652	    @property
+   653	    def name(self) -> str:
+   654	        return self.signature.method_name
+   655	
+   656	    @property
+   657	    def parameter_types(self) -> list[str]:
+   658	        return list(self.signature.param_types)
+   659	
+   660	    @property
+   661	    def return_type(self) -> str:
+   662	        return self.signature.return_type
+   663	
+   664	    def get_signature(self) -> str:
+   665	        return self.signature.full_signature()
+   666	
+   667	    def get_sub_signature(self) -> str:
+   668	        return sub_signature_of(self.signature)
+   669	
+   670	    def resolve(self, scene: "Scene | None" = None) -> "SootMethod | None":
+   671	        scene = scene or Scene.v()
+   672	        return scene.get_method_unsafe(self.signature.full_signature())
+   673	
+   674	    def __str__(self) -> str:
+   675	        return self.signature.full_signature()
+   676	
+   677	    def __repr__(self) -> str:
+   678	        return str(self)
+   679	
+   680	    def __eq__(self, other: object) -> bool:
+   681	        if not isinstance(other, SootMethodRef):
+   682	            return NotImplemented
+   683	        return self.get_signature() == other.get_signature()
+   684	
+   685	    def __hash__(self) -> int:
+   686	        return hash(self.get_signature())
+   687	
+   688	
+   689	def sub_signature_of(signature: MethodSignature) -> str:
+   690	    """``void foo(java.lang.String)`` -- the class-independent part."""
+   691	    return "%s %s(%s)" % (
+   692	        signature.return_type,
+   693	        signature.method_name,
+   694	        ", ".join(signature.param_types),
+   695	    )
+   696	
+   697	
+   698	class InvokeExpr(Expr):
+   699	    """Base class of the four Jimple invoke expressions."""
+   700	
+   701	    __slots__ = ("method_ref", "args")
+   702	
+   703	    def __init__(self, method_ref: SootMethodRef, args: list[Value] | None = None) -> None:
+   704	        self.method_ref = method_ref
+   705	        self.args = list(args or [])
+   706	
+   707	    # -- Soot-style accessors ------------------------------------------------
+   708	    def get_method_ref(self) -> SootMethodRef:
+   709	        return self.method_ref
+   710	
+   711	    def get_method(self) -> SootMethodRef:  # convenience alias
+   712	        return self.method_ref
+   713	
+   714	    def get_signature(self) -> str:
+   715	        return self.method_ref.get_signature()
+   716	
+   717	    def get_args(self) -> list[Value]:
+   718	        return list(self.args)
+   719	
+   720	    def get_arg(self, index: int) -> Value | None:
+   721	        if 0 <= index < len(self.args):
+   722	            return self.args[index]
+   723	        return None
+   724	
+   725	    def get_arg_count(self) -> int:
+   726	        return len(self.args)
+   727	
+   728	    def get_type(self) -> Type:
+   729	        return make_type(self.method_ref.return_type)
+   730	
+   731	    def get_base(self) -> Value | None:
+   732	        return None
+   733	
+   734	    def get_use_boxes(self) -> list[Value]:
+   735	        return list(self.args)
+   736	
+   737	    @property
+   738	    def kind(self) -> str:  # pragma: no cover - overridden
+   739	        return "invoke"
+   740	
+   741	    def _key(self) -> tuple:
+   742	        return (
+   743	            type(self).__name__,
+   744	            str(self.get_base()),
+   745	            self.method_ref.get_signature(),
+   746	            tuple(str(a) for a in self.args),
+   747	        )
+   748	
+   749	    def __str__(self) -> str:
+   750	        arglist = ", ".join(str(a) for a in self.args)
+   751	        return "%s %s(%s)" % (self.kind + "invoke", self.method_ref.get_signature(), arglist)
+   752	
+   753	
+   754	class InstanceInvokeExpr(InvokeExpr):
+   755	    """An invoke with a receiver."""
+   756	
+   757	    __slots__ = ("base",)
+   758	
+   759	    def __init__(
+   760	        self, base: Value, method_ref: SootMethodRef, args: list[Value] | None = None
+   761	    ) -> None:
+   762	        super().__init__(method_ref, args)
+   763	        self.base = base
+   764	
+   765	    def get_base(self) -> Value:
+   766	        return self.base
+   767	
+   768	    def get_use_boxes(self) -> list[Value]:
+   769	        return [self.base] + list(self.args)
+   770	
+   771	    def __str__(self) -> str:
+   772	        arglist = ", ".join(str(a) for a in self.args)
+   773	        return "%sinvoke %s.%s(%s)" % (
+   774	            self.kind,
+   775	            self.base,
+   776	            self.method_ref.get_signature(),
+   777	            arglist,
+   778	        )
+   779	
+   780	
+   781	class VirtualInvokeExpr(InstanceInvokeExpr):
+   782	    __slots__ = ()
+   783	
+   784	    @property
+   785	    def kind(self) -> str:
+   786	        return "virtual"
+   787	
+   788	
+   789	class SpecialInvokeExpr(InstanceInvokeExpr):
+   790	    __slots__ = ()
+   791	
+   792	    @property
+   793	    def kind(self) -> str:
+   794	        return "special"
+   795	
+   796	
+   797	class InterfaceInvokeExpr(InstanceInvokeExpr):
+   798	    __slots__ = ()
+   799	
+   800	    @property
+   801	    def kind(self) -> str:
+   802	        return "interface"
+   803	
+   804	
+   805	class StaticInvokeExpr(InvokeExpr):
+   806	    __slots__ = ()
+   807	
+   808	    @property
+   809	    def kind(self) -> str:
+   810	        return "static"
+   811	
+   812	    def __str__(self) -> str:
+   813	        arglist = ", ".join(str(a) for a in self.args)
+   814	        return "staticinvoke %s(%s)" % (self.method_ref.get_signature(), arglist)
+   815	
+   816	
+   817	__all_values__ = [
+   818	    "Value",
+   819	    "Local",
+   820	    "Constant",
+   821	    "IntConstant",
+   822	    "LongConstant",
+   823	    "DoubleConstant",
+   824	    "StringConstant",
+   825	    "BooleanConstant",
+   826	    "NullConstant",
+   827	    "ClassConstant",
+   828	    "ThisRef",
+   829	    "ParameterRef",
+   830	    "CaughtExceptionRef",
+   831	    "FieldSignature",
+   832	    "SootField",
+   833	    "FieldRefValue",
+   834	    "InstanceFieldRef",
+   835	    "StaticFieldRef",
+   836	    "ArrayRef",
+   837	    "Expr",
+   838	    "NewExpr",
+   839	    "NewArrayExpr",
+   840	    "CastExpr",
+   841	    "InstanceOfExpr",
+   842	    "BinopExpr",
+   843	    "ConditionExpr",
+   844	    "PhiExpr",
+   845	    "SootMethodRef",
+   846	    "InvokeExpr",
+   847	    "InstanceInvokeExpr",
+   848	    "VirtualInvokeExpr",
+   849	    "SpecialInvokeExpr",
+   850	    "InterfaceInvokeExpr",
+   851	    "StaticInvokeExpr",
+   852	]
+   853	
+   854	
+   855	# ---------------------------------------------------------------------------
+   856	# Jimple units (statements)
+   857	# ---------------------------------------------------------------------------
+   858	
+   859	
+   860	class Unit:
+   861	    """Base class of the Jimple unit (statement) hierarchy.
+   862	
+   863	    Units carry a deterministic, globally unique ``uid`` so that they can be
+   864	    used as dictionary/set keys without relying on object identity hashing.
+   865	    """
+   866	
+   867	    _next_uid = 0
+   868	
+   869	    __slots__ = (
+   870	        "uid",
+   871	        "stmt_id",
+   872	        "line_number",
+   873	        "source_stmt",
+   874	        "owner",
+   875	        "_succ_ids",
+   876	        "metadata",
+   877	    )
+   878	
+   879	    def __init__(
+   880	        self,
+   881	        stmt_id: int = -1,
+   882	        line_number: int = 0,
+   883	        source_stmt: Statement | None = None,
+   884	    ) -> None:
+   885	        Unit._next_uid += 1
+   886	        self.uid = Unit._next_uid
+   887	        self.stmt_id = stmt_id
+   888	        self.line_number = line_number
+   889	        self.source_stmt = source_stmt
+   890	        self.owner: "SootMethod | None" = None
+   891	        self._succ_ids: list[int] = []
+   892	        self.metadata: dict[str, Any] = dict(source_stmt.metadata) if source_stmt else {}
+   893	
+   894	    # -- classification ------------------------------------------------------
+   895	    def branches(self) -> bool:
+   896	        """True if control may transfer somewhere other than the next unit."""
+   897	        return False
+   898	
+   899	    def falls_through(self) -> bool:
+   900	        """True if control may continue with the textually next unit."""
+   901	        return True
+   902	
+   903	    def is_return(self) -> bool:
+   904	        return False
+   905	
+   906	    # -- def/use -------------------------------------------------------------
+   907	    def get_def_boxes(self) -> list[Value]:
+   908	        return []
+   909	
+   910	    def get_use_boxes(self) -> list[Value]:
+   911	        return []
+   912	
+   913	    def get_defined_local(self) -> Local | None:
+   914	        for v in self.get_def_boxes():
+   915	            if isinstance(v, Local):
+   916	                return v
+   917	        return None
+   918	
+   919	    def get_used_locals(self) -> list[Local]:
+   920	        out: list[Local] = []
+   921	        seen: set[str] = set()
+   922	        for v in self.get_use_boxes():
+   923	            for loc in v.used_locals():
+   924	                if loc.name not in seen:
+   925	                    seen.add(loc.name)
+   926	                    out.append(loc)
+   927	        return out
+   928	
+   929	    # -- invoke helpers ------------------------------------------------------
+   930	    def contains_invoke_expr(self) -> bool:
+   931	        return self.get_invoke_expr() is not None
+   932	
+   933	    def get_invoke_expr(self) -> InvokeExpr | None:
+   934	        return None
+   935	
+   936	    def contains_field_ref(self) -> bool:
+   937	        return self.get_field_ref() is not None
+   938	
+   939	    def get_field_ref(self) -> FieldRefValue | None:
+   940	        return None
+   941	
+   942	    def contains_array_ref(self) -> bool:
+   943	        return self.get_array_ref() is not None
+   944	
+   945	    def get_array_ref(self) -> ArrayRef | None:
+   946	        return None
+   947	
+   948	    # -- taint metadata forwarded from the neutral program model -------------
+   949	    @property
+   950	    def is_source(self) -> bool:
+   951	        return bool(self.source_stmt.is_source) if self.source_stmt else False
+   952	
+   953	    @property
+   954	    def is_sink(self) -> bool:
+   955	        return bool(self.source_stmt.is_sink) if self.source_stmt else False
+   956	
+   957	    @property
+   958	    def source_category(self) -> str | None:
+   959	        return self.source_stmt.source_category if self.source_stmt else None
+   960	
+   961	    @property
+   962	    def sink_category(self) -> str | None:
+   963	        return self.source_stmt.sink_category if self.source_stmt else None
+   964	
+   965	    @property
+   966	    def kind(self) -> str:
+   967	        return self.source_stmt.kind if self.source_stmt else "nop"
+   968	
+   969	    def get_java_source_start_line_number(self) -> int:
+   970	        return self.line_number
+   971	
+   972	    def replace_use(self, old: Value, new: Value) -> int:  # pragma: no cover - overridden
+   973	        return 0
+   974	
+   975	    # -- identity ------------------------------------------------------------
+   976	    def __eq__(self, other: object) -> bool:
+   977	        if not isinstance(other, Unit):
+   978	            return NotImplemented
+   979	        return self.uid == other.uid
+   980	
+   981	    def __hash__(self) -> int:
+   982	        return hash(self.uid)
+   983	
+   984	    def __repr__(self) -> str:
+   985	        return str(self)
+   986	
+   987	    def __str__(self) -> str:  # pragma: no cover - overridden
+   988	        return "nop"
+   989	
+   990	
+   991	class Stmt(Unit):
+   992	    """Alias for :class:`Unit` -- Soot distinguishes ``Unit`` from ``Stmt``."""
+   993	
+   994	    __slots__ = ()
+   995	
+   996	
+   997	class NopStmt(Stmt):
+   998	    __slots__ = ()
+   999	
+  1000	    def __str__(self) -> str:
+  1001	        return "nop"
+  1002	
+  1003	
+  1004	class DefinitionStmt(Stmt):
+  1005	    """Base class of statements that define something (``left = right``)."""
+  1006	
+  1007	    __slots__ = ("left_op", "right_op")
+  1008	
+  1009	    def __init__(
+  1010	        self,
+  1011	        left_op: Value,
+  1012	        right_op: Value,
+  1013	        stmt_id: int = -1,
+  1014	        line_number: int = 0,
+  1015	        source_stmt: Statement | None = None,
+  1016	    ) -> None:
+  1017	        super().__init__(stmt_id, line_number, source_stmt)
+  1018	        self.left_op = left_op
+  1019	        self.right_op = right_op
+  1020	
+  1021	    def get_left_op(self) -> Value:
+  1022	        return self.left_op
+  1023	
+  1024	    def get_right_op(self) -> Value:
+  1025	        return self.right_op
+  1026	
+  1027	    def get_def_boxes(self) -> list[Value]:
+  1028	        return [self.left_op]
+  1029	
+  1030	    def get_use_boxes(self) -> list[Value]:
+  1031	        uses: list[Value] = [self.right_op]
+  1032	        uses.extend(self.right_op.get_use_boxes())
+  1033	        # ``a.f = x`` and ``a[i] = x`` *use* the base (and index) too.
+  1034	        if isinstance(self.left_op, (InstanceFieldRef, ArrayRef)):
+  1035	            uses.extend(self.left_op.get_use_boxes())
+  1036	        return uses
+  1037	
+  1038	    def get_def_locals(self) -> list[Local]:
+  1039	        return [self.left_op] if isinstance(self.left_op, Local) else []
+  1040	
+  1041	    def get_invoke_expr(self) -> InvokeExpr | None:
+  1042	        return self.right_op if isinstance(self.right_op, InvokeExpr) else None
+  1043	
+  1044	    def get_field_ref(self) -> FieldRefValue | None:
+  1045	        if isinstance(self.left_op, FieldRefValue):
+  1046	            return self.left_op
+  1047	        if isinstance(self.right_op, FieldRefValue):
+  1048	            return self.right_op
+  1049	        return None
+  1050	
+  1051	    def get_array_ref(self) -> ArrayRef | None:
+  1052	        if isinstance(self.left_op, ArrayRef):
+  1053	            return self.left_op
+  1054	        if isinstance(self.right_op, ArrayRef):
+  1055	            return self.right_op
+  1056	        return None
+  1057	
+  1058	    def replace_use(self, old: Value, new: Value) -> int:
+  1059	        replaced = 0
+  1060	        if self.right_op == old:
+  1061	            self.right_op = new
+  1062	            replaced += 1
+  1063	        else:
+  1064	            replaced += _replace_in_value(self.right_op, old, new)
+  1065	        if isinstance(self.left_op, (InstanceFieldRef, ArrayRef)):
+  1066	            replaced += _replace_in_value(self.left_op, old, new)
+  1067	        return replaced
+  1068	
+  1069	    def __str__(self) -> str:
+  1070	        return "%s = %s" % (self.left_op, self.right_op)
+  1071	
+  1072	
+  1073	class AssignStmt(DefinitionStmt):
+  1074	    """``left = right``."""
+  1075	
+  1076	    __slots__ = ()
+  1077	
+  1078	
+  1079	class IdentityStmt(DefinitionStmt):
+  1080	    """``r0 := @this`` / ``r1 := @parameter0``."""
+  1081	
+  1082	    __slots__ = ()
+  1083	
+  1084	    def get_use_boxes(self) -> list[Value]:
+  1085	        # Identity statements do not *use* any local.
+  1086	        return []
+  1087	
+  1088	    def replace_use(self, old: Value, new: Value) -> int:
+  1089	        return 0
+  1090	
+  1091	    def __str__(self) -> str:
+  1092	        return "%s := %s" % (self.left_op, self.right_op)
+  1093	
+  1094	
+  1095	class InvokeStmt(Stmt):
+  1096	    """A call whose result is discarded."""
+  1097	
+  1098	    __slots__ = ("invoke_expr",)
+  1099	
+  1100	    def __init__(
+  1101	        self,
+  1102	        invoke_expr: InvokeExpr,
+  1103	        stmt_id: int = -1,
+  1104	        line_number: int = 0,
+  1105	        source_stmt: Statement | None = None,
+  1106	    ) -> None:
+  1107	        super().__init__(stmt_id, line_number, source_stmt)
+  1108	        self.invoke_expr = invoke_expr
+  1109	
+  1110	    def get_invoke_expr(self) -> InvokeExpr:
+  1111	        return self.invoke_expr
+  1112	
+  1113	    def get_use_boxes(self) -> list[Value]:
+  1114	        return [self.invoke_expr] + self.invoke_expr.get_use_boxes()
+  1115	
+  1116	    def replace_use(self, old: Value, new: Value) -> int:
+  1117	        return _replace_in_value(self.invoke_expr, old, new)
+  1118	
+  1119	    def __str__(self) -> str:
+  1120	        return str(self.invoke_expr)
+  1121	
+  1122	
+  1123	class ReturnStmt(Stmt):
+  1124	    """``return op``."""
+  1125	
+  1126	    __slots__ = ("op",)
+  1127	
+  1128	    def __init__(
+  1129	        self,
+  1130	        op: Value,
+  1131	        stmt_id: int = -1,
+  1132	        line_number: int = 0,
+  1133	        source_stmt: Statement | None = None,
+  1134	    ) -> None:
+  1135	        super().__init__(stmt_id, line_number, source_stmt)
+  1136	        self.op = op
+  1137	
+  1138	    def get_op(self) -> Value:
+  1139	        return self.op
+  1140	
+  1141	    def falls_through(self) -> bool:
+  1142	        return False
+  1143	
+  1144	    def is_return(self) -> bool:
+  1145	        return True
+  1146	
+  1147	    def get_use_boxes(self) -> list[Value]:
+  1148	        return [self.op]
+  1149	
+  1150	    def replace_use(self, old: Value, new: Value) -> int:
+  1151	        if self.op == old:
+  1152	            self.op = new
+  1153	            return 1
+  1154	        return 0
+  1155	
+  1156	    def __str__(self) -> str:
+  1157	        return "return %s" % self.op
+  1158	
+  1159	
+  1160	class ReturnVoidStmt(Stmt):
+  1161	    """``return``."""
+  1162	
+  1163	    __slots__ = ()
+  1164	
+  1165	    def falls_through(self) -> bool:
+  1166	        return False
+  1167	
+  1168	    def is_return(self) -> bool:
+  1169	        return True
+  1170	
+  1171	    def __str__(self) -> str:
+  1172	        return "return"
+  1173	
+  1174	
+  1175	class ThrowStmt(Stmt):
+  1176	    """``throw op``."""
+  1177	
+  1178	    __slots__ = ("op",)
+  1179	
+  1180	    def __init__(
+  1181	        self,
+  1182	        op: Value,
+  1183	        stmt_id: int = -1,
+  1184	        line_number: int = 0,
+  1185	        source_stmt: Statement | None = None,
+  1186	    ) -> None:
+  1187	        super().__init__(stmt_id, line_number, source_stmt)
+  1188	        self.op = op
+  1189	
+  1190	    def falls_through(self) -> bool:
+  1191	        return False
+  1192	
+  1193	    def get_use_boxes(self) -> list[Value]:
+  1194	        return [self.op]
+  1195	
+  1196	    def replace_use(self, old: Value, new: Value) -> int:
+  1197	        if self.op == old:
+  1198	            self.op = new
+  1199	            return 1
+  1200	        return 0
+  1201	
+  1202	    def __str__(self) -> str:
+  1203	        return "throw %s" % self.op
+  1204	
+  1205	
+  1206	class BranchingStmt(Stmt):
+  1207	    """Base class of ``goto``/``if``."""
+  1208	
+  1209	    __slots__ = ("targets",)
+  1210	
+  1211	    def __init__(
+  1212	        self,
+  1213	        stmt_id: int = -1,
+  1214	        line_number: int = 0,
+  1215	        source_stmt: Statement | None = None,
+  1216	    ) -> None:
+  1217	        super().__init__(stmt_id, line_number, source_stmt)
+  1218	        self.targets: list[Unit] = []
+  1219	
+  1220	    def branches(self) -> bool:
+  1221	        return True
+  1222	
+  1223	    def get_targets(self) -> list[Unit]:
+  1224	        return list(self.targets)
+  1225	
+  1226	    def set_target(self, index: int, unit: Unit) -> None:
+  1227	        while len(self.targets) <= index:
+  1228	            self.targets.append(unit)
+  1229	        self.targets[index] = unit
+  1230	
+  1231	
+  1232	class GotoStmt(BranchingStmt):
+  1233	    """``goto target``."""
+  1234	
+  1235	    __slots__ = ()
+  1236	
+  1237	    def falls_through(self) -> bool:
+  1238	        return False
+  1239	
+  1240	    @property
+  1241	    def target(self) -> Unit | None:
+  1242	        return self.targets[0] if self.targets else None
+  1243	
+  1244	    def get_target(self) -> Unit | None:
+  1245	        return self.target
+  1246	
+  1247	    def __str__(self) -> str:
+  1248	        t = self.target
+  1249	        return "goto %s" % ("stmt%d" % t.stmt_id if t is not None else "?")
+  1250	
+  1251	
+  1252	class IfStmt(BranchingStmt):
+  1253	    """``if condition goto target``.
+  1254	
+  1255	    ``false_target`` is modelled explicitly because the neutral program model
+  1256	    carries both branch destinations.
+  1257	    """
+  1258	
+  1259	    __slots__ = ("condition", "false_target")
+  1260	
+  1261	    def __init__(
+  1262	        self,
+  1263	        condition: Value,
+  1264	        stmt_id: int = -1,
+  1265	        line_number: int = 0,
+  1266	        source_stmt: Statement | None = None,
+  1267	    ) -> None:
+  1268	        super().__init__(stmt_id, line_number, source_stmt)
+  1269	        self.condition = condition
+  1270	        self.false_target: Unit | None = None
+  1271	
+  1272	    def get_condition(self) -> Value:
+  1273	        return self.condition
+  1274	
+  1275	    @property
+  1276	    def target(self) -> Unit | None:
+  1277	        return self.targets[0] if self.targets else None
+  1278	
+  1279	    def get_target(self) -> Unit | None:
+  1280	        return self.target
+  1281	
+  1282	    def falls_through(self) -> bool:
+  1283	        return self.false_target is None
+  1284	
+  1285	    def get_use_boxes(self) -> list[Value]:
+  1286	        return [self.condition] + self.condition.get_use_boxes()
+  1287	
+  1288	    def replace_use(self, old: Value, new: Value) -> int:
+  1289	        if self.condition == old:
+  1290	            self.condition = new
+  1291	            return 1
+  1292	        return _replace_in_value(self.condition, old, new)
+  1293	
+  1294	    def __str__(self) -> str:
+  1295	        t = self.target
+  1296	        return "if %s goto %s" % (
+  1297	            self.condition,
+  1298	            "stmt%d" % t.stmt_id if t is not None else "?",
+  1299	        )
+  1300	
+  1301	
+  1302	def _replace_in_value(value: Value, old: Value, new: Value) -> int:
+  1303	    """Structurally replace ``old`` with ``new`` inside ``value``."""
+  1304	    replaced = 0
+  1305	    if isinstance(value, InstanceInvokeExpr):
+  1306	        if value.base == old:
+  1307	            value.base = new
+  1308	            replaced += 1
+  1309	    if isinstance(value, InvokeExpr):
+  1310	        for i, a in enumerate(value.args):
+  1311	            if a == old:
+  1312	                value.args[i] = new
+  1313	                replaced += 1
+  1314	    elif isinstance(value, InstanceFieldRef):
+  1315	        if value.base == old:
+  1316	            value.base = new
+  1317	            replaced += 1
+  1318	    elif isinstance(value, ArrayRef):
+  1319	        if value.base == old:
+  1320	            value.base = new
+  1321	            replaced += 1
+  1322	        if value.index == old:
+  1323	            value.index = new
+  1324	            replaced += 1
+  1325	    elif isinstance(value, CastExpr):
+  1326	        if value.op == old:
+  1327	            value.op = new
+  1328	            replaced += 1
+  1329	    elif isinstance(value, InstanceOfExpr):
+  1330	        if value.op == old:
+  1331	            value.op = new
+  1332	            replaced += 1
+  1333	    elif isinstance(value, PhiExpr):
+  1334	        for i, o in enumerate(value.operands):
+  1335	            if o == old:
+  1336	                value.operands[i] = new
+  1337	                replaced += 1
+  1338	    elif isinstance(value, BinopExpr):
+  1339	        if value.op1 == old:
+  1340	            value.op1 = new
+  1341	            replaced += 1
+  1342	        if value.op2 == old:
+  1343	            value.op2 = new
+  1344	            replaced += 1
+  1345	    elif isinstance(value, NewArrayExpr):
+  1346	        if value.size == old:
+  1347	            value.size = new
+  1348	            replaced += 1
+  1349	    return replaced
+  1350	
+  1351	
+  1352	__all_units__ = [
+  1353	    "Unit",
+  1354	    "Stmt",
+  1355	    "NopStmt",
+  1356	    "DefinitionStmt",
+  1357	    "AssignStmt",
+  1358	    "IdentityStmt",
+  1359	    "InvokeStmt",
+  1360	    "ReturnStmt",
+  1361	    "ReturnVoidStmt",
+  1362	    "ThrowStmt",
+  1363	    "BranchingStmt",
+  1364	    "GotoStmt",
+  1365	    "IfStmt",
+  1366	]
+  1367	
+  1368	
+  1369	# ---------------------------------------------------------------------------
+  1370	# Bodies, methods, classes
+  1371	# ---------------------------------------------------------------------------
+  1372	
+  1373	
+  1374	class JimpleBody:
+  1375	    """The Jimple body of one method: locals plus an ordered unit chain."""
+  1376	
+  1377	    def __init__(
+  1378	        self,
+  1379	        method: "SootMethod | None" = None,
+  1380	        locals_: list[Local] | None = None,
+  1381	        units: list[Unit] | None = None,
+  1382	        this_local: Local | None = None,
+  1383	        param_locals: list[Local] | None = None,
+  1384	    ) -> None:
+  1385	        self.method = method
+  1386	        self.locals: list[Local] = list(locals_ or [])
+  1387	        self.units: list[Unit] = list(units or [])
+  1388	        self.this_local = this_local
+  1389	        self.param_locals: list[Local] = list(param_locals or [])
+  1390	        self.traps: list[dict] = []
+  1391	
+  1392	    # -- Soot-style accessors ------------------------------------------------
+  1393	    def get_method(self) -> "SootMethod | None":
+  1394	        return self.method
+  1395	
+  1396	    def get_units(self) -> list[Unit]:
+  1397	        return self.units
+  1398	
+  1399	    def get_locals(self) -> list[Local]:
+  1400	        return self.locals
+  1401	
+  1402	    def get_this_local(self) -> Local | None:
+  1403	        return self.this_local
+  1404	
+  1405	    def get_parameter_local(self, index: int) -> Local | None:
+  1406	        if 0 <= index < len(self.param_locals):
+  1407	            return self.param_locals[index]
+  1408	        return None
+  1409	
+  1410	    def get_parameter_locals(self) -> list[Local]:
+  1411	        return list(self.param_locals)
+  1412	
+  1413	    def get_local_by_name(self, name: str) -> Local | None:
+  1414	        for loc in self.locals:
+  1415	            if loc.name == name:
+  1416	                return loc
+  1417	        return None
+  1418	
+  1419	    def get_unit_by_stmt_id(self, stmt_id: int) -> Unit | None:
+  1420	        for u in self.units:
+  1421	            if u.stmt_id == stmt_id:
+  1422	                return u
+  1423	        return None
+  1424	
+  1425	    def get_head(self) -> Unit | None:
+  1426	        return self.units[0] if self.units else None
+  1427	
+  1428	    def get_tails(self) -> list[Unit]:
+  1429	        return [u for u in self.units if not u.falls_through() and not u.branches()]
+  1430	
+  1431	    def get_return_units(self) -> list[Unit]:
+  1432	        return [u for u in self.units if u.is_return()]
+  1433	
+  1434	    def index_of(self, unit: Unit) -> int:
+  1435	        for i, u in enumerate(self.units):
+  1436	            if u is unit or u == unit:
+  1437	                return i
+  1438	        return -1
+  1439	
+  1440	    def get_successor_of(self, unit: Unit) -> Unit | None:
+  1441	        i = self.index_of(unit)
+  1442	        if i >= 0 and i + 1 < len(self.units):
+  1443	            return self.units[i + 1]
+  1444	        return None
+  1445	
+  1446	    def __len__(self) -> int:
+  1447	        return len(self.units)
+  1448	
+  1449	    def __iter__(self) -> Iterator[Unit]:
+  1450	        return iter(self.units)
+  1451	
+  1452	    def to_string(self) -> str:
+  1453	        lines = []
+  1454	        sig = self.method.get_signature() if self.method else "<unknown>"
+  1455	        lines.append("%s {" % sig)
+  1456	        for loc in self.locals:
+  1457	            lines.append("    %s %s;" % (loc.type.name, loc.name))
+  1458	        if self.locals:
+  1459	            lines.append("")
+  1460	        for u in self.units:
+  1461	            lines.append("    stmt%-3d %s;" % (u.stmt_id, u))
+  1462	        lines.append("}")
+  1463	        return "\n".join(lines)
+  1464	
+  1465	    def __str__(self) -> str:
+  1466	        return self.to_string()
+  1467	
+  1468	    def clone(self) -> "JimpleBody":
+  1469	        """Deep-ish clone: fresh units, shared method reference."""
+  1470	        if self.method is None:
+  1471	            return JimpleBody()
+  1472	        builder = IRBuilder(Scene.v())
+  1473	        return builder.rebuild_body(self)
+  1474	
+  1475	
+  1476	class SootMethod:
+  1477	    """A method owned by a :class:`SootClass`."""
+  1478	
+  1479	    def __init__(
+  1480	        self,
+  1481	        signature: MethodSignature,
+  1482	        declaring_class: str,
+  1483	        is_static: bool = False,
+  1484	        is_abstract: bool = False,
+  1485	        is_constructor: bool = False,
+  1486	        is_entry_point: bool = False,
+  1487	        access: str = "public",
+  1488	        is_phantom: bool = False,
+  1489	        is_library: bool = False,
+  1490	    ) -> None:
+  1491	        self.signature = signature
+  1492	        self.declaring_class = declaring_class
+  1493	        self.is_static = is_static
+  1494	        self.is_abstract = is_abstract
+  1495	        self.is_constructor = is_constructor
+  1496	        self.is_entry_point = is_entry_point
+  1497	        self.access = access
+  1498	        self.is_phantom = is_phantom
+  1499	        self.is_library = is_library
+  1500	        self.active_body: JimpleBody | None = None
+  1501	        self.source_method: Method | None = None
+  1502	
+  1503	    # -- naming --------------------------------------------------------------
+  1504	    @property
+  1505	    def name(self) -> str:
+  1506	        return self.signature.method_name
+  1507	
+  1508	    def get_name(self) -> str:
+  1509	        return self.signature.method_name
+  1510	
+  1511	    def get_signature(self) -> str:
+  1512	        return self.signature.full_signature()
+  1513	
+  1514	    def get_sub_signature(self) -> str:
+  1515	        return sub_signature_of(self.signature)
+  1516	
+  1517	    def get_declaring_class(self) -> str:
+  1518	        return self.declaring_class
+  1519	
+  1520	    def get_declaring_soot_class(self) -> "SootClass | None":
+  1521	        return Scene.v().get_soot_class_unsafe(self.declaring_class)
+  1522	
+  1523	    def get_parameter_types(self) -> list[str]:
+  1524	        return list(self.signature.param_types)
+  1525	
+  1526	    def get_parameter_count(self) -> int:
+  1527	        return len(self.signature.param_types)
+  1528	
+  1529	    def get_return_type(self) -> Type:
+  1530	        return make_type(self.signature.return_type)
+  1531	
+  1532	    def make_ref(self) -> SootMethodRef:
+  1533	        return SootMethodRef(self.signature)
+  1534	
+  1535	    # -- body ----------------------------------------------------------------
+  1536	    def has_active_body(self) -> bool:
+  1537	        return self.active_body is not None
+  1538	
+  1539	    def get_active_body(self) -> JimpleBody | None:
+  1540	        return self.active_body
+  1541	
+  1542	    def set_active_body(self, body: JimpleBody | None) -> None:
+  1543	        self.active_body = body
+  1544	        if body is not None:
+  1545	            body.method = self
+  1546	            for u in body.units:
+  1547	                u.owner = self
+  1548	
+  1549	    def retrieve_active_body(self) -> JimpleBody | None:
+  1550	        return self.active_body
+  1551	
+  1552	    def is_concrete(self) -> bool:
+  1553	        return (not self.is_abstract) and self.active_body is not None
+  1554	
+  1555	    def get_units(self) -> list[Unit]:
+  1556	        return self.active_body.units if self.active_body else []
+  1557	
+  1558	    def is_java_library_method(self) -> bool:
+  1559	        return self.is_library
+  1560	
+  1561	    def __str__(self) -> str:
+  1562	        return self.get_signature()
+  1563	
+  1564	    def __repr__(self) -> str:
+  1565	        return self.get_signature()
+  1566	
+  1567	    def __eq__(self, other: object) -> bool:
+  1568	        if not isinstance(other, SootMethod):
+  1569	            return NotImplemented
+  1570	        return self.get_signature() == other.get_signature()
+  1571	
+  1572	    def __hash__(self) -> int:
+  1573	        return hash(self.get_signature())
+  1574	
+  1575	
+  1576	class SootClass:
+  1577	    """A class or interface registered in the :class:`Scene`."""
+  1578	
+  1579	    def __init__(
+  1580	        self,
+  1581	        name: str,
+  1582	        super_class_name: str | None = OBJECT_CLASS,
+  1583	        interfaces: list[str] | None = None,
+  1584	        is_interface: bool = False,
+  1585	        is_abstract: bool = False,
+  1586	        is_library: bool = False,
+  1587	        is_phantom: bool = False,
+  1588	        is_android_component: bool = False,
+  1589	        component_type: str | None = None,
+  1590	    ) -> None:
+  1591	        self.name = name
+  1592	        if name == OBJECT_CLASS:
+  1593	            super_class_name = None
+  1594	        self.super_class_name = super_class_name
+  1595	        self.interfaces: list[str] = list(interfaces or [])
+  1596	        self.is_interface = is_interface
+  1597	        self.is_abstract = is_abstract
+  1598	        self.is_library = is_library
+  1599	        self.is_phantom = is_phantom
+  1600	        self.is_android_component = is_android_component
+  1601	        self.component_type = component_type
+  1602	        self.fields: dict[str, SootField] = {}
+  1603	        self.methods: dict[str, SootMethod] = {}
+  1604	        self.source_class: ClassDef | None = None
+  1605	
+  1606	    # -- naming --------------------------------------------------------------
+  1607	    def get_name(self) -> str:
+  1608	        return self.name
+  1609	
+  1610	    def get_short_name(self) -> str:
+  1611	        return self.name.rsplit(".", 1)[-1]
+  1612	
+  1613	    def get_package_name(self) -> str:
+  1614	        return self.name.rsplit(".", 1)[0] if "." in self.name else ""
+  1615	
+  1616	    def get_type(self) -> Type:
+  1617	        return make_type(self.name)
+  1618	
+  1619	    # -- hierarchy -----------------------------------------------------------
+  1620	    def has_super_class(self) -> bool:
+  1621	        return self.super_class_name is not None
+  1622	
+  1623	    def get_super_class(self) -> "SootClass | None":
+  1624	        if self.super_class_name is None:
+  1625	            return None
+  1626	        return Scene.v().get_soot_class_unsafe(self.super_class_name)
+  1627	
+  1628	    def get_interfaces(self) -> list[str]:
+  1629	        return list(self.interfaces)
+  1630	
+  1631	    def is_application_class(self) -> bool:
+  1632	        return not self.is_library and not self.is_phantom
+  1633	
+  1634	    # -- members -------------------------------------------------------------
+  1635	    def add_field(self, f: SootField) -> None:
+  1636	        self.fields[f.name] = f
+  1637	
+  1638	    def get_fields(self) -> list[SootField]:
+  1639	        return list(self.fields.values())
+  1640	
+  1641	    def get_field_by_name(self, name: str) -> SootField | None:
+  1642	        return self.fields.get(name)
+  1643	
+  1644	    def declares_field(self, name: str) -> bool:
+  1645	        return name in self.fields
+  1646	
+  1647	    def add_method(self, m: SootMethod) -> None:
+  1648	        self.methods[m.get_sub_signature()] = m
+  1649	
+  1650	    def get_methods(self) -> list[SootMethod]:
+  1651	        return list(self.methods.values())
+  1652	
+  1653	    def get_method_by_sub_signature(self, sub_sig: str) -> SootMethod | None:
+  1654	        return self.methods.get(sub_sig)
+  1655	
+  1656	    def get_method_by_name(self, name: str) -> SootMethod | None:
+  1657	        for m in self.methods.values():
+  1658	            if m.name == name:
+  1659	                return m
+  1660	        return None
+  1661	
+  1662	    def get_methods_by_name(self, name: str) -> list[SootMethod]:
+  1663	        return [m for m in self.methods.values() if m.name == name]
+  1664	
+  1665	    def declares_method(self, sub_sig: str) -> bool:
+  1666	        return sub_sig in self.methods
+  1667	
+  1668	    def get_method_count(self) -> int:
+  1669	        return len(self.methods)
+  1670	
+  1671	    def __str__(self) -> str:
+  1672	        return self.name
+  1673	
+  1674	    def __repr__(self) -> str:
+  1675	        return "SootClass(%s)" % self.name
+  1676	
+  1677	    def __eq__(self, other: object) -> bool:
+  1678	        if not isinstance(other, SootClass):
+  1679	            return NotImplemented
+  1680	        return self.name == other.name
+  1681	
+  1682	    def __hash__(self) -> int:
+  1683	        return hash(self.name)

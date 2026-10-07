@@ -1,0 +1,31 @@
+Migration complete and verified.
+
+## What I built
+
+**`immer::vector` re-implemented from scratch** (`src/immer/`) as a genuine persistent data structure, not a `Vec` wrapper — inferred from the interface only:
+
+- `node.rs` — bit-partitioned trie, 5 bits/level (branching factor 32), nodes shared across versions via `Rc`. `push_back` copies only the nodes on one root-to-leaf path.
+- `vector.rs` — `Vector<T>` with a 32-element tail buffer, so the common `push_back` copies just that small buffer. Plus `Index`, `IntoIterator`, `FromIterator`, `PartialEq`, `Debug`, and O(1) `Clone`.
+- `iter.rs` — chunked iterator that descends the trie once per 32-element leaf, making full traversal O(n) rather than O(n log n).
+
+**C++ semantics shims** (`src/cpp/`) — the two behaviors that would silently diverge otherwise:
+
+- `std::stoi`: leading whitespace (including `\v`, which Rust's `is_ascii_whitespace` misses), optional sign, prefix-only parse — `"12abc"` → `12`, `"3.9"` → `3`, `"0x10"` → `0`.
+- Failure path: an uncaught C++ exception. `stoi("abc")` reproduces libstdc++'s exact stderr text and aborts with SIGABRT (exit 134) rather than Rust's clean panic/exit 101.
+- `int` overflow: all arithmetic uses `wrapping_*`, so `n=65535` prints `2147450880 / -65536` exactly like the original.
+
+## Verification
+
+| Check | Result |
+|---|---|
+| `rustc -O test11.rs` + `cargo build --release` | both clean, zero warnings |
+| `cargo test` (8 unit tests) | all pass |
+| Exhaustive n = −5…200 vs C++ binary | 207/207 |
+| Trie boundaries (32, 1024, 32768, 1048576 ±1) + overflow + 19 parser cases | 44/44 |
+| 400 randomized inputs, byte-exact stdout **and** stderr **and** exit code | 400/400 |
+
+One unit test specifically pins the property the C++ type guarantees but the test program never exercises: 1100 intermediate versions kept alive simultaneously, each still reading back its own prefix correctly.
+
+Zero external dependencies (`Cargo.lock` contains only the package itself). 1M elements runs in 0.17s.
+
+Two notes on how I read the spec: requirement 7 asks for "an executable at `/output/test11.rs`", which conflicts with that path being the Rust source — I kept `test11.rs` as the source and put the executable at `/output/test11` (also at `target/release/test11`). And `test11.rs` uses `#[path]` module declarations rather than a separate lib target, so the identical file builds both via bare `rustc test11.rs` and via Cargo.

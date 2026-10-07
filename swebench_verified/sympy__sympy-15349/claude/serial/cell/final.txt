@@ -1,0 +1,32 @@
+You were right, and it's a one-character typo.
+
+**The bug** — `sympy/algebras/quaternion.py:532`:
+
+```python
+m12 = 2*s*(q.c*q.d + q.b*q.a)   # was
+m12 = 2*s*(q.c*q.d - q.b*q.a)   # fixed
+```
+
+`m12` was written identically to `m21` on the next line — the `-` got copy-pasted as `+`. That makes the matrix symmetric in the (1,2)/(2,1) pair, which is why your x-rotation came out with two positive `sin(x)` terms.
+
+**Answer to your question about the reference equations:** the standard quaternion→matrix formula for `q = a + bi + cj + dk` is
+
+```
+[1-2(c²+d²)   2(bc-ad)    2(bd+ac) ]
+[ 2(bc+ad)   1-2(b²+d²)   2(cd-ab) ]   ← this entry had the wrong sign
+[ 2(bd-ac)    2(cd+ab)   1-2(b²+c²)]
+```
+
+Note the antisymmetric pairing: each off-diagonal pair differs only in the sign of the `a`-term. That structure was broken, so the result wasn't a rotation at all. Rather than trust the formula, I verified against the *definition* of quaternion rotation:
+
+- `M·Mᵀ = I` and `det(M) = 1` for a fully symbolic `Quaternion(a,b,c,d)` — it's now a proper rotation (before the fix it was neither orthogonal nor det 1)
+- `M·v` matches `q·v·q⁻¹` exactly for a symbolic vector — this is the property the method is *supposed* to implement, computed independently via sympy's own quaternion multiplication
+- All three axis rotations now give the textbook right-handed matrices, including your case
+
+**Tests** — `sympy/algebras/tests/test_quaternion.py` had baked the wrong values in:
+
+The existing `Quaternion(1,2,3,4)` expectation contained `14/15` at *both* `m12` and `m21`, the duplication fingerprint of the bug; that matrix had `det ≠ 1`. Corrected to `2/3` (det now 1). The 4x4 translation column shifted as a consequence (`-4/15 → 0`), since it's derived from the rotation block.
+
+Worth flagging: the only symbolic test present used `Quaternion(cos(θ/2), 0, 0, sin(θ/2))` — a **z**-rotation, where `b = c = 0` makes `m12` vanish and the sign error invisible. Same for both doctests. That's precisely why this survived; I added an x-rotation case covering the entry that was wrong.
+
+`sympy/algebras/` unit tests (4) and doctests (12) all pass. No other code in the repo calls `to_rotation_matrix`, so the blast radius is contained.

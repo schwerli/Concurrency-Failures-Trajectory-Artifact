@@ -1,0 +1,220 @@
+2026-08-13 02:15:13,254 - INFO - Creating container for sympy__sympy-16792...
+2026-08-13 02:15:13,399 - INFO - Container for sympy__sympy-16792 created: 5d7f9a0a171274bb5b2dd5198a53a41e28c39fb4d8c8a3ab086398c5dfeef908
+2026-08-13 02:15:13,764 - INFO - Container for sympy__sympy-16792 started: 5d7f9a0a171274bb5b2dd5198a53a41e28c39fb4d8c8a3ab086398c5dfeef908
+2026-08-13 02:15:13,764 - INFO - Intermediate patch for sympy__sympy-16792 written to logs/run_evaluation/formal-codex-serial-sympy__sympy-16792/uiuc-codex-serial/sympy__sympy-16792/patch.diff, now applying to container...
+2026-08-13 02:15:13,907 - INFO - >>>>> Applied Patch:
+Checking patch sympy/utilities/codegen.py...
+Checking patch sympy/utilities/tests/test_autowrap.py...
+Checking patch sympy/utilities/tests/test_codegen.py...
+Applied patch sympy/utilities/codegen.py cleanly.
+Applied patch sympy/utilities/tests/test_autowrap.py cleanly.
+Applied patch sympy/utilities/tests/test_codegen.py cleanly.
+
+2026-08-13 02:15:14,265 - INFO - Git diff before:
+diff --git a/sympy/utilities/codegen.py b/sympy/utilities/codegen.py
+index f0befb2bd..551f7b763 100644
+--- a/sympy/utilities/codegen.py
++++ b/sympy/utilities/codegen.py
+@@ -652,6 +652,12 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+                 new_symbols.remove(symbol)
+         symbols = new_symbols
+ 
++        def argument_metadata(arg):
++            if isinstance(arg, (Indexed, IndexedBase, MatrixSymbol)):
++                if arg.shape is not None and all(dim is not None for dim in arg.shape):
++                    return {'dimensions': [(S.Zero, dim - 1) for dim in arg.shape]}
++            return {}
++
+         # Decide whether to use output argument or return value
+         return_val = []
+         output_args = []
+@@ -703,11 +709,7 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+ 
+         for symbol in sorted(symbols, key=str):
+             if symbol in array_symbols:
+-                dims = []
+-                array = array_symbols[symbol]
+-                for dim in array.shape:
+-                    dims.append((S.Zero, dim - 1))
+-                metadata = {'dimensions': dims}
++                metadata = argument_metadata(array_symbols[symbol])
+             else:
+                 metadata = {}
+ 
+@@ -719,10 +721,13 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+         if argument_sequence is not None:
+             # if the user has supplied IndexedBase instances, we'll accept that
+             new_sequence = []
++            sequence_metadata = {}
+             for arg in argument_sequence:
+                 if isinstance(arg, IndexedBase):
++                    sequence_metadata[arg.label] = argument_metadata(arg)
+                     new_sequence.append(arg.label)
+                 else:
++                    sequence_metadata[arg] = argument_metadata(arg)
+                     new_sequence.append(arg)
+             argument_sequence = new_sequence
+ 
+@@ -739,7 +744,8 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+                 try:
+                     new_args.append(name_arg_dict[symbol])
+                 except KeyError:
+-                    new_args.append(InputArgument(symbol))
++                    new_args.append(InputArgument(
++                        symbol, **sequence_metadata.get(symbol, {})))
+             arg_list = new_args
+ 
+         return Routine(name, arg_list, return_val, local_vars, global_vars)
+diff --git a/sympy/utilities/tests/test_autowrap.py b/sympy/utilities/tests/test_autowrap.py
+index 47fe933dc..ed133780d 100644
+--- a/sympy/utilities/tests/test_autowrap.py
++++ b/sympy/utilities/tests/test_autowrap.py
+@@ -84,6 +84,26 @@ def test_cython_wrapper_inoutarg():
+     assert source == expected
+ 
+ 
++def test_cython_wrapper_unused_matrix_input():
++    from sympy import MatrixSymbol
++    x = MatrixSymbol('x', 2, 1)
++    routine = make_routine("test", 1.0, argument_sequence=[x], language='C')
++    code_gen = CythonCodeWrapper(CCodeGen())
++    source = get_string(code_gen.dump_pyx, [routine])
++
++    expected = (
++        "import numpy as np\n"
++        "cimport numpy as np\n"
++        "\n"
++        "cdef extern from 'file.h':\n"
++        "    double test(double *x)\n"
++        "\n"
++        "def test_c(np.ndarray[np.double_t, ndim=2] x):\n"
++        "\n"
++        "    return test(<double*> x.data)")
++    assert source == expected
++
++
+ def test_cython_wrapper_compile_flags():
+     from sympy import Equality
+     x, y, z = symbols('x,y,z')
+diff --git a/sympy/utilities/tests/test_codegen.py b/sympy/utilities/tests/test_codegen.py
+index 1cd56e12d..d81836184 100644
+--- a/sympy/utilities/tests/test_codegen.py
++++ b/sympy/utilities/tests/test_codegen.py
+@@ -56,6 +56,20 @@ def test_Routine_argument_order():
+     assert [ arg.name for arg in r.arguments ] == [z, x, a, y]
+ 
+ 
++def test_Routine_argument_sequence_preserves_unused_array_args():
++    x = MatrixSymbol('x', 2, 1)
++    r = make_routine('test', 1.0, argument_sequence=[x], language='C')
++    assert [arg.name for arg in r.arguments] == [x]
++    assert r.arguments[0].dimensions == [(0, 1), (0, 0)]
++
++    from sympy.tensor import IndexedBase
++    n = symbols('n', integer=True)
++    A = IndexedBase('A', shape=(n, 3))
++    r = make_routine('test', 1.0, argument_sequence=[A], language='C')
++    assert [arg.name for arg in r.arguments] == [A.label]
++    assert r.arguments[0].dimensions == [(0, n - 1), (0, 2)]
++
++
+ def test_empty_c_code():
+     code_gen = C89CodeGen()
+     source = get_string(code_gen.dump_c, [])
+2026-08-13 02:15:14,266 - INFO - Eval script for sympy__sympy-16792 written to logs/run_evaluation/formal-codex-serial-sympy__sympy-16792/uiuc-codex-serial/sympy__sympy-16792/eval.sh; copying to container...
+2026-08-13 02:15:18,163 - INFO - Test runtime: 3.81 seconds
+2026-08-13 02:15:18,163 - INFO - Test output for sympy__sympy-16792 written to logs/run_evaluation/formal-codex-serial-sympy__sympy-16792/uiuc-codex-serial/sympy__sympy-16792/test_output.txt
+2026-08-13 02:15:18,216 - INFO - Git diff after:
+diff --git a/sympy/utilities/codegen.py b/sympy/utilities/codegen.py
+index f0befb2bd..551f7b763 100644
+--- a/sympy/utilities/codegen.py
++++ b/sympy/utilities/codegen.py
+@@ -652,6 +652,12 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+                 new_symbols.remove(symbol)
+         symbols = new_symbols
+ 
++        def argument_metadata(arg):
++            if isinstance(arg, (Indexed, IndexedBase, MatrixSymbol)):
++                if arg.shape is not None and all(dim is not None for dim in arg.shape):
++                    return {'dimensions': [(S.Zero, dim - 1) for dim in arg.shape]}
++            return {}
++
+         # Decide whether to use output argument or return value
+         return_val = []
+         output_args = []
+@@ -703,11 +709,7 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+ 
+         for symbol in sorted(symbols, key=str):
+             if symbol in array_symbols:
+-                dims = []
+-                array = array_symbols[symbol]
+-                for dim in array.shape:
+-                    dims.append((S.Zero, dim - 1))
+-                metadata = {'dimensions': dims}
++                metadata = argument_metadata(array_symbols[symbol])
+             else:
+                 metadata = {}
+ 
+@@ -719,10 +721,13 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+         if argument_sequence is not None:
+             # if the user has supplied IndexedBase instances, we'll accept that
+             new_sequence = []
++            sequence_metadata = {}
+             for arg in argument_sequence:
+                 if isinstance(arg, IndexedBase):
++                    sequence_metadata[arg.label] = argument_metadata(arg)
+                     new_sequence.append(arg.label)
+                 else:
++                    sequence_metadata[arg] = argument_metadata(arg)
+                     new_sequence.append(arg)
+             argument_sequence = new_sequence
+ 
+@@ -739,7 +744,8 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+                 try:
+                     new_args.append(name_arg_dict[symbol])
+                 except KeyError:
+-                    new_args.append(InputArgument(symbol))
++                    new_args.append(InputArgument(
++                        symbol, **sequence_metadata.get(symbol, {})))
+             arg_list = new_args
+ 
+         return Routine(name, arg_list, return_val, local_vars, global_vars)
+diff --git a/sympy/utilities/tests/test_autowrap.py b/sympy/utilities/tests/test_autowrap.py
+index 47fe933dc..ed133780d 100644
+--- a/sympy/utilities/tests/test_autowrap.py
++++ b/sympy/utilities/tests/test_autowrap.py
+@@ -84,6 +84,26 @@ def test_cython_wrapper_inoutarg():
+     assert source == expected
+ 
+ 
++def test_cython_wrapper_unused_matrix_input():
++    from sympy import MatrixSymbol
++    x = MatrixSymbol('x', 2, 1)
++    routine = make_routine("test", 1.0, argument_sequence=[x], language='C')
++    code_gen = CythonCodeWrapper(CCodeGen())
++    source = get_string(code_gen.dump_pyx, [routine])
++
++    expected = (
++        "import numpy as np\n"
++        "cimport numpy as np\n"
++        "\n"
++        "cdef extern from 'file.h':\n"
++        "    double test(double *x)\n"
++        "\n"
++        "def test_c(np.ndarray[np.double_t, ndim=2] x):\n"
++        "\n"
++        "    return test(<double*> x.data)")
++    assert source == expected
++
++
+ def test_cython_wrapper_compile_flags():
+     from sympy import Equality
+     x, y, z = symbols('x,y,z')
+2026-08-13 02:15:18,216 - INFO - Git diff changed after running eval script
+2026-08-13 02:15:18,216 - INFO - Grading answer for sympy__sympy-16792...
+2026-08-13 02:15:18,216 - INFO - report: {'sympy__sympy-16792': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': True, 'tests_status': {'FAIL_TO_PASS': {'success': ['test_ccode_unused_array_arg'], 'failure': []}, 'PASS_TO_PASS': {'success': ['test_Routine_argument_order', 'test_empty_c_code', 'test_empty_c_code_with_comment', 'test_empty_c_header', 'test_simple_c_code', 'test_c_code_reserved_words', 'test_numbersymbol_c_code', 'test_c_code_argument_order', 'test_simple_c_header', 'test_simple_c_codegen', 'test_multiple_results_c', 'test_no_results_c', 'test_ansi_math1_codegen', 'test_ansi_math2_codegen', 'test_complicated_codegen', 'test_loops_c', 'test_dummy_loops_c', 'test_partial_loops_c', 'test_output_arg_c', 'test_output_arg_c_reserved_words', 'test_ccode_results_named_ordered', 'test_ccode_matrixsymbol_slice', 'test_ccode_cse', 'test_empty_f_code', 'test_empty_f_code_with_header', 'test_empty_f_header', 'test_simple_f_code', 'test_numbersymbol_f_code', 'test_erf_f_code', 'test_f_code_argument_order', 'test_simple_f_header', 'test_simple_f_codegen', 'test_multiple_results_f', 'test_no_results_f', 'test_intrinsic_math_codegen', 'test_intrinsic_math2_codegen', 'test_complicated_codegen_f95', 'test_loops', 'test_dummy_loops_f95', 'test_loops_InOut', 'test_partial_loops_f', 'test_output_arg_f', 'test_inline_function', 'test_f_code_call_signature_wrap', 'test_check_case', 'test_check_case_false_positive', 'test_c_fortran_omit_routine_name', 'test_fcode_matrix_output', 'test_fcode_results_named_ordered', 'test_fcode_matrixsymbol_slice', 'test_fcode_matrixsymbol_slice_autoname', 'test_global_vars', 'test_custom_codegen', 'test_c_with_printer'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for sympy__sympy-16792: resolved: True
+2026-08-13 02:15:18,217 - INFO - Attempting to stop container sweb.eval.sympy__sympy-16792.formal-codex-serial-sympy__sympy-16792...
+2026-08-13 02:15:36,879 - INFO - Container sweb.eval.sympy__sympy-16792.formal-codex-serial-sympy__sympy-16792 stopped successfully.
+2026-08-13 02:15:36,879 - INFO - Attempting to remove container sweb.eval.sympy__sympy-16792.formal-codex-serial-sympy__sympy-16792...
+2026-08-13 02:15:39,665 - INFO - Container sweb.eval.sympy__sympy-16792.formal-codex-serial-sympy__sympy-16792 removed successfully.

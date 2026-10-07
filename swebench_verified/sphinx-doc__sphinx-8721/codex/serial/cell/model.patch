@@ -1,0 +1,117 @@
+diff --git a/sphinx/ext/viewcode.py b/sphinx/ext/viewcode.py
+index a7d52a91c..2e9721240 100644
+--- a/sphinx/ext/viewcode.py
++++ b/sphinx/ext/viewcode.py
+@@ -30,6 +30,32 @@ logger = logging.getLogger(__name__)
+ 
+ 
+ OUTPUT_DIRNAME = '_modules'
++VIEWCODE_ENABLED_TAG = 'viewcode_enabled'
++
++
++def _should_output_viewcode(app: Sphinx) -> bool:
++    if app.builder.format != 'html':
++        return False
++    if app.builder.name == "singlehtml":
++        return False
++    if app.builder.name.startswith("epub") and not app.config.viewcode_enable_epub:
++        return False
++
++    return True
++
++
++def _should_collect_viewcode_data(app: Sphinx) -> bool:
++    if app.builder.name == "singlehtml":
++        return False
++    if app.builder.name.startswith("epub") and not app.config.viewcode_enable_epub:
++        return False
++
++    return True
++
++
++def builder_inited(app: Sphinx) -> None:
++    if _should_output_viewcode(app):
++        app.tags.add(VIEWCODE_ENABLED_TAG)
+ 
+ 
+ def _get_full_modname(app: Sphinx, modname: str, attribute: str) -> Optional[str]:
+@@ -54,9 +80,7 @@ def doctree_read(app: Sphinx, doctree: Node) -> None:
+     env = app.builder.env
+     if not hasattr(env, '_viewcode_modules'):
+         env._viewcode_modules = {}  # type: ignore
+-    if app.builder.name == "singlehtml":
+-        return
+-    if app.builder.name.startswith("epub") and not env.config.viewcode_enable_epub:
++    if not _should_collect_viewcode_data(app):
+         return
+ 
+     def has_tag(modname: str, fullname: str, docname: str, refname: str) -> bool:
+@@ -116,7 +140,7 @@ def doctree_read(app: Sphinx, doctree: Node) -> None:
+             names.add(fullname)
+             pagename = posixpath.join(OUTPUT_DIRNAME, modname.replace('.', '/'))
+             inline = nodes.inline('', _('[source]'), classes=['viewcode-link'])
+-            onlynode = addnodes.only(expr='html')
++            onlynode = addnodes.only(expr=VIEWCODE_ENABLED_TAG)
+             onlynode += addnodes.pending_xref('', inline, reftype='viewcode', refdomain='std',
+                                               refexplicit=False, reftarget=pagename,
+                                               refid=fullname, refdoc=env.docname)
+@@ -179,6 +203,9 @@ def should_generate_module_page(app: Sphinx, modname: str) -> bool:
+ 
+ 
+ def collect_pages(app: Sphinx) -> Generator[Tuple[str, Dict[str, Any], str], None, None]:
++    if not _should_output_viewcode(app):
++        return
++
+     env = app.builder.env
+     if not hasattr(env, '_viewcode_modules'):
+         return
+@@ -278,8 +305,9 @@ def collect_pages(app: Sphinx) -> Generator[Tuple[str, Dict[str, Any], str], Non
+ 
+ def setup(app: Sphinx) -> Dict[str, Any]:
+     app.add_config_value('viewcode_import', None, False)
+-    app.add_config_value('viewcode_enable_epub', False, False)
++    app.add_config_value('viewcode_enable_epub', False, 'env')
+     app.add_config_value('viewcode_follow_imported_members', True, False)
++    app.connect('builder-inited', builder_inited)
+     app.connect('doctree-read', doctree_read)
+     app.connect('env-merge-info', env_merge_info)
+     app.connect('html-collect-pages', collect_pages)
+@@ -290,6 +318,6 @@ def setup(app: Sphinx) -> Dict[str, Any]:
+     app.add_event('viewcode-follow-imported')
+     return {
+         'version': sphinx.__display_version__,
+-        'env_version': 1,
++        'env_version': 2,
+         'parallel_read_safe': True
+     }
+diff --git a/tests/test_ext_viewcode.py b/tests/test_ext_viewcode.py
+index 79864095b..bc14461a5 100644
+--- a/tests/test_ext_viewcode.py
++++ b/tests/test_ext_viewcode.py
+@@ -102,3 +102,26 @@ def test_local_source_files(app, status, warning):
+ 
+     assert result.count('href="_modules/not_a_package/submodule.html#not_a_package.submodule.Class3.class_attr"') == 1
+     assert result.count('This is the class attribute class_attr') == 1
++
++
++@pytest.mark.sphinx(testroot='ext-viewcode')
++def test_viewcode_epub_disabled_by_default(app_params, make_app):
++    srcdir = app_params.kwargs['srcdir']
++    html_app = make_app('html', srcdir=srcdir)
++    html_app.build()
++
++    epub_app = make_app('epub', srcdir=srcdir)
++    epub_app.build()
++
++    assert not (epub_app.outdir / '_modules').exists()
++    assert '_modules/' not in (epub_app.outdir / 'index.xhtml').read_text()
++
++
++@pytest.mark.sphinx('epub', testroot='ext-viewcode',
++                    confoverrides={'viewcode_enable_epub': True})
++def test_viewcode_epub_enabled(app):
++    app.build()
++
++    result = (app.outdir / 'index.xhtml').read_text()
++    assert 'href="_modules/spam/mod1.xhtml#func1"' in result
++    assert (app.outdir / '_modules' / 'spam' / 'mod1.xhtml').exists()

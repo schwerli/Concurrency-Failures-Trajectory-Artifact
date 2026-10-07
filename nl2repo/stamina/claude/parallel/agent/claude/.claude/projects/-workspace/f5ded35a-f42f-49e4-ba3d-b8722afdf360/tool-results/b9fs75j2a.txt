@@ -1,0 +1,1414 @@
+########## ./__init__.py
+     1	# SPDX-FileCopyrightText: 2022 Hynek Schlawack <hs@ox.cx>
+     2	#
+     3	# SPDX-License-Identifier: MIT
+     4	
+     5	from . import instrumentation
+     6	from ._config import is_active, is_testing, set_active, set_testing
+     7	from ._core import (
+     8	    AsyncRetryingCaller,
+     9	    Attempt,
+    10	    BoundAsyncRetryingCaller,
+    11	    BoundRetryingCaller,
+    12	    RetryingCaller,
+    13	    retry,
+    14	    retry_context,
+    15	)
+    16	
+    17	
+    18	__all__ = [
+    19	    "AsyncRetryingCaller",
+    20	    "Attempt",
+    21	    "BoundAsyncRetryingCaller",
+    22	    "BoundRetryingCaller",
+    23	    "RetryingCaller",
+    24	    "instrumentation",
+    25	    "is_active",
+    26	    "is_testing",
+    27	    "retry",
+    28	    "retry_context",
+    29	    "set_active",
+    30	    "set_testing",
+    31	]
+    32	
+    33	
+    34	def __getattr__(name: str) -> object:
+    35	    # The global configuration object is private API, but it's handy enough to
+    36	    # be reachable as `stamina.CONFIG` without importing `stamina._config`.
+    37	    if name == "CONFIG":
+    38	        from ._config import CONFIG
+    39	
+    40	        return CONFIG
+    41	
+    42	    if name != "__version__":
+    43	        msg = f"module {__name__} has no attribute {name}"
+    44	        raise AttributeError(msg)
+    45	
+    46	    from importlib.metadata import version
+    47	
+    48	    return version("stamina")
+########## ./_config.py
+     1	# SPDX-FileCopyrightText: 2022 Hynek Schlawack <hs@ox.cx>
+     2	#
+     3	# SPDX-License-Identifier: MIT
+     4	
+     5	from __future__ import annotations
+     6	
+     7	from threading import Lock
+     8	from types import TracebackType
+     9	from typing import Callable
+    10	
+    11	from .instrumentation import RetryHookFactory
+    12	from .instrumentation._hooks import get_default_hooks, init_hooks
+    13	from .typing import RetryHook
+    14	
+    15	
+    16	class _Testing:
+    17	    """
+    18	    Test mode specification.
+    19	
+    20	    Strictly private.
+    21	    """
+    22	
+    23	    __slots__ = ("attempts", "cap")
+    24	
+    25	    attempts: int
+    26	    cap: bool
+    27	
+    28	    def __init__(self, attempts: int, cap: bool) -> None:
+    29	        self.attempts = attempts
+    30	        self.cap = cap
+    31	
+    32	    def get_attempts(self, non_testing_attempts: int | None) -> int:
+    33	        """
+    34	        Get the number of attempts to use.
+    35	
+    36	        Args:
+    37	            non_testing_attempts: The number of attempts specified by the user.
+    38	
+    39	        Returns:
+    40	            The number of attempts to use.
+    41	        """
+    42	        if self.cap:
+    43	            return min(self.attempts, non_testing_attempts or self.attempts)
+    44	
+    45	        return self.attempts
+    46	
+    47	
+    48	class _Config:
+    49	    """
+    50	    Global stamina configuration.
+    51	
+    52	    Strictly private.
+    53	    """
+    54	
+    55	    __slots__ = (
+    56	        "_get_on_retry",
+    57	        "_is_active",
+    58	        "_on_retry",
+    59	        "_testing",
+    60	        "lock",
+    61	    )
+    62	
+    63	    lock: Lock
+    64	    _is_active: bool
+    65	    _testing: _Testing | None
+    66	    _on_retry: (
+    67	        tuple[RetryHook, ...] | tuple[RetryHook | RetryHookFactory, ...] | None
+    68	    )
+    69	    _get_on_retry: Callable[[], tuple[RetryHook, ...]]
+    70	
+    71	    def __init__(self, lock: Lock) -> None:
+    72	        self.lock = lock
+    73	        self._is_active = True
+    74	        self._testing = None
+    75	
+    76	        # Prepare delayed initialization.
+    77	        self._on_retry = None
+    78	        self._get_on_retry = self._init_on_first_retry
+    79	
+    80	    @property
+    81	    def is_active(self) -> bool:
+    82	        return self._is_active
+    83	
+    84	    @is_active.setter
+    85	    def is_active(self, value: bool) -> None:
+    86	        with self.lock:
+    87	            self._is_active = value
+    88	
+    89	    @property
+    90	    def testing(self) -> _Testing | None:
+    91	        return self._testing
+    92	
+    93	    @testing.setter
+    94	    def testing(self, value: _Testing | None) -> None:
+    95	        with self.lock:
+    96	            self._testing = value
+    97	
+    98	    @property
+    99	    def on_retry(self) -> tuple[RetryHook, ...]:
+   100	        return self._get_on_retry()
+   101	
+   102	    @on_retry.setter
+   103	    def on_retry(
+   104	        self, value: tuple[RetryHook | RetryHookFactory, ...] | None
+   105	    ) -> None:
+   106	        with self.lock:
+   107	            self._get_on_retry = self._init_on_first_retry
+   108	            self._on_retry = value
+   109	
+   110	    def _init_on_first_retry(self) -> tuple[RetryHook, ...]:
+   111	        """
+   112	        Perform delayed initialization of on_retry hooks.
+   113	        """
+   114	        with self.lock:
+   115	            # Ensure hooks didn't init while waiting for the lock.
+   116	            if self._get_on_retry == self._init_on_first_retry:
+   117	                if self._on_retry is None:
+   118	                    self._on_retry = get_default_hooks()
+   119	
+   120	                self._on_retry = init_hooks(self._on_retry)
+   121	
+   122	                self._get_on_retry = lambda: self._on_retry  # type: ignore[assignment, return-value]
+   123	
+   124	        return self._on_retry  # type: ignore[return-value]
+   125	
+   126	
+   127	CONFIG = _Config(Lock())
+   128	
+   129	
+   130	def is_active() -> bool:
+   131	    """
+   132	    Check whether retrying is active.
+   133	
+   134	    Returns:
+   135	        Whether retrying is active.
+   136	    """
+   137	    return CONFIG.is_active
+   138	
+   139	
+   140	def set_active(active: bool) -> None:
+   141	    """
+   142	    Activate or deactivate retrying.
+   143	
+   144	    Is idempotent and can be called repeatedly with the same value.
+   145	    """
+   146	    CONFIG.is_active = bool(active)
+   147	
+   148	
+   149	def is_testing() -> bool:
+   150	    """
+   151	    Check whether test mode is enabled.
+   152	
+   153	    .. versionadded:: 24.3.0
+   154	    """
+   155	    return CONFIG.testing is not None
+   156	
+   157	
+   158	class _RestoreTestingCM:
+   159	    def __init__(self, old: _Testing | None) -> None:
+   160	        self.old = old
+   161	
+   162	    def __enter__(self) -> None:
+   163	        pass
+   164	
+   165	    def __exit__(
+   166	        self,
+   167	        exc_type: type[BaseException] | None,
+   168	        exc_val: BaseException | None,
+   169	        exc_tb: TracebackType | None,
+   170	    ) -> None:
+   171	        CONFIG.testing = self.old
+   172	
+   173	
+   174	def set_testing(
+   175	    testing: bool, *, attempts: int = 1, cap: bool = False
+   176	) -> _RestoreTestingCM:
+   177	    """
+   178	    Activate or deactivate test mode.
+   179	
+   180	    In testing mode, backoffs are disabled, and attempts are set to *attempts*.
+   181	
+   182	    If *cap* is True, the number of attempts is not set but capped at
+   183	    *attempts*. This means that if *attempts* is greater than the number of
+   184	    attempts specified by the user, the user's value is used.
+   185	
+   186	    Is idempotent and can be called repeatedly with the same values.
+   187	
+   188	    .. versionadded:: 24.3.0
+   189	    .. versionadded:: 25.1.0 *cap*
+   190	    .. versionadded:: 25.1.0 Can be used as a context manager.
+   191	    """
+   192	    old = CONFIG.testing
+   193	    CONFIG.testing = _Testing(attempts, cap) if testing else None
+   194	
+   195	    return _RestoreTestingCM(old)
+########## ./_core.py
+     1	# SPDX-FileCopyrightText: 2022 Hynek Schlawack <hs@ox.cx>
+     2	#
+     3	# SPDX-License-Identifier: MIT
+     4	
+     5	from __future__ import annotations
+     6	
+     7	import contextlib
+     8	import datetime as dt
+     9	import random
+    10	import sys
+    11	
+    12	from contextlib import AbstractContextManager
+    13	from dataclasses import dataclass, replace
+    14	from functools import wraps
+    15	from inspect import iscoroutinefunction
+    16	from types import TracebackType
+    17	from typing import (
+    18	    AsyncIterator,
+    19	    Awaitable,
+    20	    Callable,
+    21	    Iterator,
+    22	    Tuple,
+    23	    Type,
+    24	    TypedDict,
+    25	    TypeVar,
+    26	    Union,
+    27	)
+    28	
+    29	import tenacity as _t
+    30	
+    31	from ._config import CONFIG, _Config, _Testing
+    32	from .instrumentation._data import RetryDetails, guess_name
+    33	
+    34	
+    35	if sys.version_info >= (3, 10):
+    36	    from typing import ParamSpec
+    37	else:
+    38	    from typing_extensions import ParamSpec
+    39	
+    40	try:
+    41	    from sniffio import current_async_library
+    42	except ImportError:  # pragma: no cover -- we always have sniffio in tests
+    43	
+    44	    def current_async_library() -> str:
+    45	        return "asyncio"
+    46	
+    47	
+    48	async def _smart_sleep(delay: float) -> None:
+    49	    io = current_async_library()
+    50	
+    51	    if io == "asyncio":
+    52	        import asyncio
+    53	
+    54	        await asyncio.sleep(delay)
+    55	    elif io == "trio":
+    56	        import trio
+    57	
+    58	        await trio.sleep(delay)
+    59	    else:  # pragma: no cover
+    60	        msg = f"Unknown async library: {io!r}"
+    61	        raise RuntimeError(msg)
+    62	
+    63	
+    64	T = TypeVar("T")
+    65	P = ParamSpec("P")
+    66	# for backwards compatibility with Python<3.10
+    67	ExcOrPredicate = Union[
+    68	    Type[Exception], Tuple[Type[Exception], ...], Callable[[Exception], bool]
+    69	]
+    70	
+    71	
+    72	def retry_context(
+    73	    on: ExcOrPredicate,
+    74	    attempts: int | None = 10,
+    75	    timeout: float | dt.timedelta | None = 45.0,
+    76	    wait_initial: float | dt.timedelta = 0.1,
+    77	    wait_max: float | dt.timedelta = 5.0,
+    78	    wait_jitter: float | dt.timedelta = 1.0,
+    79	    wait_exp_base: float = 2.0,
+    80	) -> _RetryContextIterator:
+    81	    """
+    82	    Iterator that yields context managers that can be used to retry code
+    83	    blocks.
+    84	
+    85	    Arguments have the same meaning as for :func:`stamina.retry`.
+    86	
+    87	    .. versionadded:: 23.1.0
+    88	    .. versionadded:: 23.3.0 `Trio <https://trio.readthedocs.io/>`_ support.
+    89	    """
+    90	
+    91	    return _RetryContextIterator.from_params(
+    92	        on=on,
+    93	        attempts=attempts,
+    94	        timeout=timeout,
+    95	        wait_initial=wait_initial,
+    96	        wait_max=wait_max,
+    97	        wait_jitter=wait_jitter,
+    98	        wait_exp_base=wait_exp_base,
+    99	        name="<context block>",
+   100	        args=(),
+   101	        kw={},
+   102	    )
+   103	
+   104	
+   105	class Attempt:
+   106	    """
+   107	    A context manager that can be used to retry code blocks.
+   108	
+   109	    Instances are yielded by the :func:`stamina.retry_context` iterator.
+   110	
+   111	    .. versionadded:: 23.2.0
+   112	    """
+   113	
+   114	    __slots__ = ("_next_wait_fn", "_t_attempt")
+   115	
+   116	    _t_attempt: _t.AttemptManager
+   117	
+   118	    def __init__(
+   119	        self,
+   120	        attempt: _t.AttemptManager,
+   121	        next_wait_fn: Callable[[int], float] | None,
+   122	    ):
+   123	        self._t_attempt = attempt
+   124	        self._next_wait_fn = next_wait_fn
+   125	
+   126	    def __repr__(self) -> str:
+   127	        return f"<Attempt num={self.num}, next_wait={float(self.next_wait)}>"
+   128	
+   129	    @property
+   130	    def num(self) -> int:
+   131	        """
+   132	        The number of the current attempt.
+   133	        """
+   134	        return self._t_attempt.retry_state.attempt_number  # type: ignore[no-any-return]
+   135	
+   136	    @property
+   137	    def next_wait(self) -> float:
+   138	        """
+   139	        The number of seconds of backoff before the *next* attempt if *this*
+   140	        attempt fails.
+   141	
+   142	
+   143	        .. warning::
+   144	            This value does **not** include a possible random jitter and is
+   145	            therefore just a *lower bound* of the actual value.
+   146	
+   147	        .. versionadded:: 24.3.0
+   148	        """
+   149	        return (
+   150	            self._next_wait_fn(self._t_attempt.retry_state.attempt_number + 1)
+   151	            if self._next_wait_fn
+   152	            else 0.0
+   153	        )
+   154	
+   155	    def __enter__(self) -> None:
+   156	        return self._t_attempt.__enter__()  # type: ignore[no-any-return]
+   157	
+   158	    def __exit__(
+   159	        self,
+   160	        exc_type: type[BaseException] | None,
+   161	        exc_value: BaseException | None,
+   162	        traceback: TracebackType | None,
+   163	    ) -> bool | None:
+   164	        return self._t_attempt.__exit__(  # type: ignore[no-any-return]
+   165	            exc_type, exc_value, traceback
+   166	        )
+   167	
+   168	
+   169	class RetryKWs(TypedDict):
+   170	    attempts: int | None
+   171	    timeout: float | dt.timedelta | None
+   172	    wait_initial: float | dt.timedelta
+   173	    wait_max: float | dt.timedelta
+   174	    wait_jitter: float | dt.timedelta
+   175	    wait_exp_base: float
+   176	
+   177	
+   178	class BaseRetryingCaller:
+   179	    """
+   180	    Simple base class that transforms retry parameters into a dictionary that
+   181	    can be `**`-passed into `retry_context`.
+   182	    """
+   183	
+   184	    __slots__ = ("_context_kws",)
+   185	
+   186	    _context_kws: RetryKWs
+   187	
+   188	    def __init__(
+   189	        self,
+   190	        attempts: int | None = 10,
+   191	        timeout: float | dt.timedelta | None = 45.0,
+   192	        wait_initial: float | dt.timedelta = 0.1,
+   193	        wait_max: float | dt.timedelta = 5.0,
+   194	        wait_jitter: float | dt.timedelta = 1.0,
+   195	        wait_exp_base: float = 2.0,
+   196	    ):
+   197	        self._context_kws = {
+   198	            "attempts": attempts,
+   199	            "timeout": timeout,
+   200	            "wait_initial": wait_initial,
+   201	            "wait_max": wait_max,
+   202	            "wait_jitter": wait_jitter,
+   203	            "wait_exp_base": wait_exp_base,
+   204	        }
+   205	
+   206	    def __repr__(self) -> str:
+   207	        kws = ", ".join(
+   208	            f"{k}={self._context_kws[k]!r}"  # type: ignore[literal-required]
+   209	            for k in sorted(self._context_kws)
+   210	            if k != "on"
+   211	        )
+   212	        return f"<{self.__class__.__name__}({kws})>"
+   213	
+   214	
+   215	class RetryingCaller(BaseRetryingCaller):
+   216	    """
+   217	    Call your callables with retries.
+   218	
+   219	    Arguments have the same meaning as for :func:`stamina.retry`.
+   220	
+   221	    Tip:
+   222	        Instances of ``RetryingCaller`` may be reused because they internally
+   223	        create a new :func:`retry_context` iterator on each call.
+   224	
+   225	    .. versionadded:: 24.2.0
+   226	    """
+   227	
+   228	    def __call__(
+   229	        self,
+   230	        on: ExcOrPredicate,
+   231	        callable_: Callable[P, T],
+   232	        /,
+   233	        *args: P.args,
+   234	        **kwargs: P.kwargs,
+   235	    ) -> T:
+   236	        r"""
+   237	        Call ``callable_(*args, **kw)`` with retries if *on* is raised.
+   238	
+   239	        Args:
+   240	            on: Exception(s) to retry on.
+   241	
+   242	            callable\_: Callable to call.
+   243	
+   244	            args: Positional arguments to pass to *callable_*.
+   245	
+   246	            kw: Keyword arguments to pass to *callable_*.
+   247	        """
+   248	        for attempt in retry_context(on, **self._context_kws):
+   249	            with attempt:
+   250	                return callable_(*args, **kwargs)
+   251	
+   252	        raise SystemError("unreachable")  # noqa: EM101
+   253	
+   254	    def on(self, on: ExcOrPredicate, /) -> BoundRetryingCaller:
+   255	        """
+   256	        Create a new instance of :class:`BoundRetryingCaller` with the same
+   257	        parameters, but bound to a specific exception type.
+   258	
+   259	        .. versionadded:: 24.2.0
+   260	        """
+   261	        # This should be a `functools.partial`, but unfortunately it's
+   262	        # impossible to provide a nicely typed API with it, so we use a
+   263	        # separate class.
+   264	        return BoundRetryingCaller(self, on)
+   265	
+   266	
+   267	class BoundRetryingCaller:
+   268	    """
+   269	    Same as :class:`RetryingCaller`, but pre-bound to a specific exception
+   270	    type.
+   271	
+   272	    Caution:
+   273	        Returned by :meth:`RetryingCaller.on` -- do not instantiate directly.
+   274	
+   275	    .. versionadded:: 24.2.0
+   276	    """
+   277	
+   278	    __slots__ = ("_caller", "_on")
+   279	
+   280	    _caller: RetryingCaller
+   281	    _on: ExcOrPredicate
+   282	
+   283	    def __init__(
+   284	        self,
+   285	        caller: RetryingCaller,
+   286	        on: ExcOrPredicate,
+   287	    ):
+   288	        self._caller = caller
+   289	        self._on = on
+   290	
+   291	    def __repr__(self) -> str:
+   292	        return (
+   293	            f"<BoundRetryingCaller({guess_name(self._on)}, {self._caller!r})>"
+   294	        )
+   295	
+   296	    def __call__(
+   297	        self, callable_: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
+   298	    ) -> T:
+   299	        """
+   300	        Same as :func:`RetryingCaller.__call__`, except retry on the exception
+   301	        that is bound to this instance.
+   302	        """
+   303	        return self._caller(self._on, callable_, *args, **kwargs)
+   304	
+   305	
+   306	class AsyncRetryingCaller(BaseRetryingCaller):
+   307	    """
+   308	    Same as :class:`RetryingCaller`, but for async callables.
+   309	
+   310	    .. versionadded:: 24.2.0
+   311	    """
+   312	
+   313	    async def __call__(
+   314	        self,
+   315	        on: ExcOrPredicate,
+   316	        callable_: Callable[P, Awaitable[T]],
+   317	        /,
+   318	        *args: P.args,
+   319	        **kwargs: P.kwargs,
+   320	    ) -> T:
+   321	        """
+   322	        Same as :meth:`RetryingCaller.__call__`, but *callable_* is awaited.
+   323	        """
+   324	        async for attempt in retry_context(on, **self._context_kws):
+   325	            with attempt:
+   326	                return await callable_(*args, **kwargs)
+   327	
+   328	        raise SystemError("unreachable")  # noqa: EM101
+   329	
+   330	    def on(self, on: ExcOrPredicate, /) -> BoundAsyncRetryingCaller:
+   331	        """
+   332	        Create a new instance of :class:`BoundAsyncRetryingCaller` with the
+   333	        same parameters, but bound to a specific exception type.
+   334	
+   335	        .. versionadded:: 24.2.0
+   336	        """
+   337	        return BoundAsyncRetryingCaller(self, on)
+   338	
+   339	
+   340	class BoundAsyncRetryingCaller:
+   341	    """
+   342	    Same as :class:`BoundRetryingCaller`, but for async callables.
+   343	
+   344	    Caution:
+   345	        Returned by :meth:`AsyncRetryingCaller.on` -- do not instantiate
+   346	        directly.
+   347	
+   348	    .. versionadded:: 24.2.0
+   349	    """
+   350	
+   351	    __slots__ = ("_caller", "_on")
+   352	
+   353	    _caller: AsyncRetryingCaller
+   354	    _on: ExcOrPredicate
+   355	
+   356	    def __init__(
+   357	        self,
+   358	        caller: AsyncRetryingCaller,
+   359	        on: ExcOrPredicate,
+   360	    ):
+   361	        self._caller = caller
+   362	        self._on = on
+   363	
+   364	    def __repr__(self) -> str:
+   365	        return f"<BoundAsyncRetryingCaller({guess_name(self._on)}, {self._caller!r})>"
+   366	
+   367	    async def __call__(
+   368	        self,
+   369	        callable_: Callable[P, Awaitable[T]],
+   370	        /,
+   371	        *args: P.args,
+   372	        **kwargs: P.kwargs,
+   373	    ) -> T:
+   374	        """
+   375	        Same as :func:`AsyncRetryingCaller.__call__`, except retry on the
+   376	        exception that is bound to this instance.
+   377	        """
+   378	        return await self._caller(self._on, callable_, *args, **kwargs)
+   379	
+   380	
+   381	_STOP_NO_RETRY = _t.stop_after_attempt(1)
+   382	
+   383	
+   384	class _LazyNoAsyncRetry:
+   385	    """
+   386	    Allows us a free null object pattern using non-retries and avoid None.
+   387	    """
+   388	
+   389	    __slots__ = ()
+   390	
+   391	    def __aiter__(self) -> _t.AsyncRetrying:
+   392	        return _t.AsyncRetrying(
+   393	            reraise=True, stop=_STOP_NO_RETRY, sleep=_smart_sleep
+   394	        ).__aiter__()
+   395	
+   396	
+   397	_LAZY_NO_ASYNC_RETRY = _LazyNoAsyncRetry()
+   398	
+   399	
+   400	@dataclass
+   401	class _RetryContextIterator:
+   402	    __slots__ = (
+   403	        "_args",
+   404	        "_attempts",
+   405	        "_cms_to_exit",
+   406	        "_kw",
+   407	        "_name",
+   408	        "_t_a_retrying",
+   409	        "_t_kw",
+   410	        "_wait_exp_base",
+   411	        "_wait_initial",
+   412	        "_wait_jitter",
+   413	        "_wait_max",
+   414	    )
+   415	    _t_kw: dict[str, object]
+   416	    _t_a_retrying: _t.AsyncRetrying
+   417	    _name: str
+   418	    _args: tuple[object, ...]
+   419	    _kw: dict[str, object]
+   420	
+   421	    _attempts: int | None
+   422	    _wait_jitter: float
+   423	    _wait_initial: float
+   424	    _wait_max: float
+   425	    _wait_exp_base: float
+   426	
+   427	    _cms_to_exit: list[AbstractContextManager[None]]
+   428	
+   429	    @classmethod
+   430	    def from_params(
+   431	        cls,
+   432	        on: ExcOrPredicate,
+   433	        attempts: int | None,
+   434	        timeout: float | dt.timedelta | None,
+   435	        wait_initial: float | dt.timedelta,
+   436	        wait_max: float | dt.timedelta,
+   437	        wait_jitter: float | dt.timedelta,
+   438	        wait_exp_base: float,
+   439	        name: str,
+   440	        args: tuple[object, ...],
+   441	        kw: dict[str, object],
+   442	    ) -> _RetryContextIterator:
+   443	        if (
+   444	            isinstance(on, type) and issubclass(on, BaseException)
+   445	        ) or isinstance(on, tuple):
+   446	            _retry = _t.retry_if_exception_type(on)
+   447	        else:
+   448	            _retry = _t.retry_if_exception(on)
+   449	
+   450	        if isinstance(wait_initial, dt.timedelta):
+   451	            wait_initial = wait_initial.total_seconds()
+   452	
+   453	        if isinstance(wait_max, dt.timedelta):
+   454	            wait_max = wait_max.total_seconds()
+   455	
+   456	        if isinstance(wait_jitter, dt.timedelta):
+   457	            wait_jitter = wait_jitter.total_seconds()
+   458	
+   459	        inst = cls(
+   460	            _name=name,
+   461	            _args=args,
+   462	            _kw=kw,
+   463	            _attempts=attempts,
+   464	            _wait_jitter=wait_jitter,
+   465	            _wait_initial=wait_initial,
+   466	            _wait_max=wait_max,
+   467	            _wait_exp_base=wait_exp_base,
+   468	            _t_kw={
+   469	                "retry": _retry,
+   470	                "stop": _make_stop(
+   471	                    attempts=attempts,
+   472	                    timeout=(
+   473	                        timeout.total_seconds()
+   474	                        if isinstance(timeout, dt.timedelta)
+   475	                        else timeout
+   476	                    ),
+   477	                ),
+   478	                "reraise": True,
+   479	            },
+   480	            _t_a_retrying=_LAZY_NO_ASYNC_RETRY,
+   481	            _cms_to_exit=[],
+   482	        )
+   483	
+   484	        inst._t_kw["wait"] = inst._jittered_backoff_for_rcs
+   485	
+   486	        return inst
+   487	
+   488	    def with_name(
+   489	        self, name: str, args: tuple[object, ...], kw: dict[str, object]
+   490	    ) -> _RetryContextIterator:
+   491	        """
+   492	        Recreate ourselves with a new name and arguments.
+   493	        """
+   494	        return replace(self, _name=name, _args=args, _kw=kw)
+   495	
+   496	    def _apply_maybe_test_mode_to_tenacity_kw(
+   497	        self, testing: _Testing | None
+   498	    ) -> dict[str, object]:
+   499	        if testing is None:
+   500	            return self._t_kw
+   501	
+   502	        t_kw = self._t_kw.copy()
+   503	
+   504	        t_kw["stop"] = _t.stop_after_attempt(
+   505	            testing.get_attempts(self._attempts)
+   506	        )
+   507	
+   508	        return t_kw
+   509	
+   510	    def _exit_cms(self, _: _t.RetryCallState | None) -> None:
+   511	        for cm in reversed(self._cms_to_exit):
+   512	            cm.__exit__(None, None, None)
+   513	
+   514	    def __iter__(self) -> Iterator[Attempt]:
+   515	        if not CONFIG.is_active:
+   516	            for r in _t.Retrying(reraise=True, stop=_STOP_NO_RETRY):
+   517	                yield Attempt(r, None)
+   518	
+   519	            return
+   520	
+   521	        before_sleep = _make_before_sleep(
+   522	            self._name, CONFIG, self._args, self._kw, self._cms_to_exit
+   523	        )
+   524	
+   525	        for r in _t.Retrying(
+   526	            before=self._exit_cms,
+   527	            before_sleep=before_sleep,
+   528	            **self._apply_maybe_test_mode_to_tenacity_kw(CONFIG.testing),
+   529	        ):
+   530	            yield Attempt(r, self._backoff_for_attempt_number)
+   531	
+   532	    def __aiter__(self) -> AsyncIterator[Attempt]:
+   533	        if CONFIG.is_active:
+   534	            self._t_a_retrying = _t.AsyncRetrying(
+   535	                sleep=_smart_sleep,
+   536	                before=self._exit_cms,
+   537	                before_sleep=_make_before_sleep(
+   538	                    self._name, CONFIG, self._args, self._kw, self._cms_to_exit
+   539	                ),
+   540	                **self._apply_maybe_test_mode_to_tenacity_kw(CONFIG.testing),
+   541	            )
+   542	
+   543	        self._t_a_retrying = self._t_a_retrying.__aiter__()
+   544	
+   545	        return self
+   546	
+   547	    async def __anext__(self) -> Attempt:
+   548	        return Attempt(
+   549	            await self._t_a_retrying.__anext__(),
+   550	            self._backoff_for_attempt_number,
+   551	        )
+   552	
+   553	    def _backoff_for_attempt_number(self, num: int) -> float:
+   554	        """
+   555	        Compute a jitter-less lower bound for backoff number *num*.
+   556	
+   557	        *num* is 1-based.
+   558	        """
+   559	        return _compute_backoff(
+   560	            num, self._wait_max, self._wait_initial, self._wait_exp_base, 0
+   561	        )
+   562	
+   563	    def _jittered_backoff_for_rcs(self, rcs: _t.RetryCallState) -> float:
+   564	        """
+   565	        Compute the backoff for *rcs*.
+   566	        """
+   567	        return _compute_backoff(
+   568	            rcs.attempt_number,
+   569	            self._wait_max,
+   570	            self._wait_initial,
+   571	            self._wait_exp_base,
+   572	            self._wait_jitter,
+   573	        )
+   574	
+   575	
+   576	def _compute_backoff(
+   577	    num: int,
+   578	    max_backoff: float,
+   579	    initial: float,
+   580	    exp_base: float,
+   581	    max_jitter: float,
+   582	) -> float:
+   583	    """
+   584	    If not in testing mode, compute the backoff for attempt *num* with the
+   585	    given parameters and clamp it to *max_backoff*.
+   586	    """
+   587	    if CONFIG.testing is not None:
+   588	        return 0.0
+   589	
+   590	    jitter = random.uniform(0, max_jitter) if max_jitter else 0  # noqa: S311
+   591	
+   592	    return min(max_backoff, initial * (exp_base ** (num - 1)) + jitter)
+   593	
+   594	
+   595	def _make_before_sleep(
+   596	    name: str,
+   597	    config: _Config,
+   598	    args: tuple[object, ...],
+   599	    kw: dict[str, object],
+   600	    hook_cms: list[contextlib.AbstractContextManager[None]],
+   601	) -> Callable[[_t.RetryCallState], None]:
+   602	    """
+   603	    Create a `before_sleep` callback function that runs our `RetryHook`s with
+   604	    the necessary arguments.
+   605	
+   606	    If a hook returns a context manager, it's entered before retries start and
+   607	    exited after they finish by keeping track of the context managers in
+   608	    *hook_cms*.
+   609	    """
+   610	
+   611	    last_idle_for = 0.0
+   612	
+   613	    def before_sleep(rcs: _t.RetryCallState) -> None:
+   614	        nonlocal last_idle_for
+   615	
+   616	        wait_for = rcs.idle_for - last_idle_for
+   617	
+   618	        details = RetryDetails(
+   619	            name=name,
+   620	            retry_num=rcs.attempt_number,
+   621	            wait_for=wait_for,
+   622	            waited_so_far=rcs.idle_for - wait_for,
+   623	            caused_by=rcs.outcome.exception(),
+   624	            args=args,
+   625	            kwargs=kw,
+   626	        )
+   627	
+   628	        for hook in config.on_retry:
+   629	            maybe_cm = hook(details)
+   630	
+   631	            if isinstance(maybe_cm, AbstractContextManager):
+   632	                maybe_cm.__enter__()
+   633	                hook_cms.append(maybe_cm)
+   634	
+   635	        last_idle_for = rcs.idle_for
+   636	
+   637	    return before_sleep
+   638	
+   639	
+   640	def _make_stop(*, attempts: int | None, timeout: float | None) -> _t.stop_base:
+   641	    """
+   642	    Combine *attempts* and *timeout* into one stop condition.
+   643	    """
+   644	    stops = []
+   645	
+   646	    if attempts:
+   647	        stops.append(_t.stop_after_attempt(attempts))
+   648	
+   649	    if timeout:
+   650	        stops.append(_t.stop_after_delay(timeout))
+   651	
+   652	    if len(stops) > 1:
+   653	        return _t.stop_any(*stops)
+   654	
+   655	    if not stops:
+   656	        return _t.stop_never
+   657	
+   658	    return stops[0]
+   659	
+   660	
+   661	def retry(
+   662	    *,
+   663	    on: ExcOrPredicate,
+   664	    attempts: int | None = 10,
+   665	    timeout: float | dt.timedelta | None = 45.0,
+   666	    wait_initial: float | dt.timedelta = 0.1,
+   667	    wait_max: float | dt.timedelta = 5.0,
+   668	    wait_jitter: float | dt.timedelta = 1.0,
+   669	    wait_exp_base: float = 2.0,
+   670	) -> Callable[[Callable[P, T]], Callable[P, T]]:
+   671	    r"""
+   672	    Retry if one of configured exceptions are raised.
+   673	
+   674	    The backoff delays between retries grow exponentially plus a random jitter.
+   675	
+   676	    The backoff for retry attempt number *attempt* is computed as:
+   677	
+   678	    .. keep in-sync with docs/motivation.md
+   679	    .. math::
+   680	
+   681	       min(wait\_max, wait\_initial * wait\_exp\_base^{attempt - 1} + random(0, wait\_jitter))
+   682	
+   683	    Since :math:`x^0` is always 1, the first backoff is within the interval
+   684	    :math:`[wait\_initial,wait\_initial+wait\_jitter]`. Thus, with default
+   685	    values between 0.1 and 1.1 seconds.
+   686	
+   687	    If all retries fail, the *last* exception is let through.
+   688	
+   689	    All float-based time parameters are in seconds.
+   690	
+   691	    .. warning::
+   692	       It is possible to get unbounded retries by passing `None` for *attempts*
+   693	       (= infinite attempts) and *timeout* (= no timeout).
+   694	
+   695	    Args:
+   696	        on:
+   697	            An Exception or a tuple of Exceptions on which the decorated
+   698	            callable will be retried.
+   699	
+   700	            You can also pass a *predicate* in the form of a callable that
+   701	            takes an exception and returns a bool which decides whether the
+   702	            exception should be retried -- True meaning yes.
+   703	
+   704	            This allows more fine-grained control over when to retry. For
+   705	            example, to only retry on HTTP errors in the 500s range that
+   706	            indicate server errors, but not those in the 400s which indicate a
+   707	            client error.
+   708	
+   709	            There is no default -- you *must* pass this explicitly.
+   710	
+   711	        attempts:
+   712	            Maximum total number of attempts. Can be combined with *timeout*.
+   713	            `None` means *no* limit to attempts.
+   714	
+   715	        timeout:
+   716	            Maximum total time for all retries. Can be combined with
+   717	            *attempts*. `None` means *no* timeout.
+   718	
+   719	        wait_initial: Minimum backoff before the *first* retry.
+   720	
+   721	        wait_max: Maximum backoff time between retries at any time.
+   722	
+   723	        wait_jitter:
+   724	            Maximum *jitter* that is added to retry back-off delays (the actual
+   725	            jitter added is a random number between 0 and *wait_jitter*)
+   726	
+   727	        wait_exp_base: The exponential base used to compute the retry backoff.
+   728	
+   729	    .. versionchanged:: 23.1.0
+   730	       All time-related parameters can now be specified as a
+   731	       :class:`datetime.timedelta`.
+   732	
+   733	    .. versionadded:: 23.3.0 `Trio <https://trio.readthedocs.io/>`_ support.
+   734	
+   735	    .. versionadded:: 24.3.0 *on* can be a callable now.
+   736	    """
+   737	    retry_ctx = _RetryContextIterator.from_params(
+   738	        on=on,
+   739	        attempts=attempts,
+   740	        timeout=timeout,
+   741	        wait_initial=wait_initial,
+   742	        wait_max=wait_max,
+   743	        wait_jitter=wait_jitter,
+   744	        wait_exp_base=wait_exp_base,
+   745	        name="<unknown>",
+   746	        args=(),
+   747	        kw={},
+   748	    )
+   749	
+   750	    def retry_decorator(wrapped: Callable[P, T]) -> Callable[P, T]:
+   751	        name = guess_name(wrapped)
+   752	
+   753	        if not iscoroutinefunction(wrapped):
+   754	
+   755	            @wraps(wrapped)
+   756	            def sync_inner(*args: P.args, **kw: P.kwargs) -> T:  # type: ignore[return]
+   757	                for attempt in retry_ctx.with_name(  # noqa: RET503
+   758	                    name, args, kw
+   759	                ):
+   760	                    with attempt:
+   761	                        return wrapped(*args, **kw)
+   762	
+   763	            return sync_inner
+   764	
+   765	        @wraps(wrapped)
+   766	        async def async_inner(*args: P.args, **kw: P.kwargs) -> T:  # type: ignore[return]
+   767	            async for attempt in retry_ctx.with_name(  # noqa: RET503
+   768	                name, args, kw
+   769	            ):
+   770	                with attempt:
+   771	                    return await wrapped(*args, **kw)  # type: ignore[no-any-return]
+   772	
+   773	        return async_inner  # type: ignore[return-value]
+   774	
+   775	    return retry_decorator
+########## ./instrumentation/__init__.py
+     1	# SPDX-FileCopyrightText: 2022 Hynek Schlawack <hs@ox.cx>
+     2	#
+     3	# SPDX-License-Identifier: MIT
+     4	
+     5	from __future__ import annotations
+     6	
+     7	from ._data import RetryDetails, RetryHook, RetryHookFactory
+     8	from ._hooks import get_on_retry_hooks, set_on_retry_hooks
+     9	from ._logging import LoggingOnRetryHook
+    10	from ._prometheus import PrometheusOnRetryHook, get_prometheus_counter
+    11	from ._structlog import StructlogOnRetryHook
+    12	
+    13	
+    14	__all__ = [
+    15	    "LoggingOnRetryHook",
+    16	    "PrometheusOnRetryHook",
+    17	    "RetryDetails",
+    18	    "RetryHook",
+    19	    "RetryHookFactory",
+    20	    "StructlogOnRetryHook",
+    21	    "get_on_retry_hooks",
+    22	    "get_prometheus_counter",
+    23	    "set_on_retry_hooks",
+    24	]
+    25	
+    26	# Convenience aliases for the initializers & helpers that live in private
+    27	# modules.  They are *not* part of `__all__` (and therefore not part of the
+    28	# public API), but importing them from here saves users from having to reach
+    29	# into private modules.
+    30	_EXTRA_NAMES = {
+    31	    "get_default_hooks": ("._hooks", "get_default_hooks"),
+    32	    "init_hooks": ("._hooks", "init_hooks"),
+    33	    "init_logging": ("._logging", "init_logging"),
+    34	    "init_prometheus": ("._prometheus", "init_prometheus"),
+    35	    "init_structlog": ("._structlog", "init_structlog"),
+    36	}
+    37	
+    38	
+    39	def __getattr__(name: str) -> object:
+    40	    try:
+    41	        mod_name, attr = _EXTRA_NAMES[name]
+    42	    except KeyError:
+    43	        msg = f"module {__name__} has no attribute {name}"
+    44	        raise AttributeError(msg) from None
+    45	
+    46	    from importlib import import_module
+    47	
+    48	    return getattr(import_module(mod_name, __name__), attr)
+########## ./instrumentation/_data.py
+     1	# SPDX-FileCopyrightText: 2022 Hynek Schlawack <hs@ox.cx>
+     2	#
+     3	# SPDX-License-Identifier: MIT
+     4	
+     5	from __future__ import annotations
+     6	
+     7	from contextlib import AbstractContextManager
+     8	from dataclasses import dataclass
+     9	from typing import Callable, Protocol
+    10	
+    11	
+    12	def guess_name(obj: object) -> str:
+    13	    name = getattr(obj, "__qualname__", None) or "<unnamed object>"
+    14	    mod = getattr(obj, "__module__", None) or "<unknown module>"
+    15	
+    16	    if mod == "builtins":
+    17	        return name
+    18	
+    19	    return f"{mod}.{name}"
+    20	
+    21	
+    22	@dataclass(frozen=True)
+    23	class RetryDetails:
+    24	    r"""
+    25	    Details about a retry attempt that are passed into :class:`RetryHook`\ s.
+    26	
+    27	    Attributes:
+    28	        name: Name of the callable that is being retried.
+    29	
+    30	        args: Positional arguments that were passed to the callable.
+    31	
+    32	        kwargs: Keyword arguments that were passed to the callable.
+    33	
+    34	        retry_num:
+    35	            Number of the retry attempt. Starts at 1 after the first failure.
+    36	
+    37	        wait_for:
+    38	            Time in seconds that *stamina* will wait before the next attempt.
+    39	
+    40	        waited_so_far:
+    41	            Time in seconds that *stamina* has waited so far for the current
+    42	            callable.
+    43	
+    44	        caused_by: Exception that caused the retry attempt.
+    45	
+    46	    .. versionadded:: 23.2.0
+    47	    """
+    48	
+    49	    __slots__ = (
+    50	        "args",
+    51	        "caused_by",
+    52	        "kwargs",
+    53	        "name",
+    54	        "retry_num",
+    55	        "wait_for",
+    56	        "waited_so_far",
+    57	    )
+    58	
+    59	    name: str
+    60	    args: tuple[object, ...]
+    61	    kwargs: dict[str, object]
+    62	    retry_num: int
+    63	    wait_for: float
+    64	    waited_so_far: float
+    65	    caused_by: Exception
+    66	
+    67	
+    68	class RetryHook(Protocol):
+    69	    """
+    70	    A callable that gets called after an attempt has failed and a retry has
+    71	    been scheduled.
+    72	
+    73	    This is a :class:`typing.Protocol` that can be implemented by any callable
+    74	    that takes one argument of type :class:`RetryDetails` and returns None.
+    75	
+    76	    If the hook returns a context manager, it will be entered when the retry is
+    77	    scheduled and exited right before the retry is attempted.
+    78	
+    79	    .. versionadded:: 23.2.0
+    80	
+    81	    .. versionadded:: 25.1.0
+    82	       Added support for context managers.
+    83	    """
+    84	
+    85	    def __call__(
+    86	        self, details: RetryDetails
+    87	    ) -> None | AbstractContextManager[None]: ...
+    88	
+    89	
+    90	@dataclass(frozen=True)
+    91	class RetryHookFactory:
+    92	    """
+    93	    Wraps a callable that returns a :class:`RetryHook`.
+    94	
+    95	    They are called on the first scheduled retry and can be used to delay
+    96	    initialization. If you need to pass arguments, you can do that using
+    97	    :func:`functools.partial`.
+    98	
+    99	    .. versionadded:: 23.2.0
+   100	    """
+   101	
+   102	    hook_factory: Callable[[], RetryHook]
+########## ./instrumentation/_hooks.py
+     1	# SPDX-FileCopyrightText: 2022 Hynek Schlawack <hs@ox.cx>
+     2	#
+     3	# SPDX-License-Identifier: MIT
+     4	
+     5	from __future__ import annotations
+     6	
+     7	from typing import Iterable
+     8	
+     9	from ._data import RetryHook, RetryHookFactory
+    10	from ._logging import LoggingOnRetryHook
+    11	from ._prometheus import PrometheusOnRetryHook
+    12	from ._structlog import StructlogOnRetryHook
+    13	
+    14	
+    15	def init_hooks(
+    16	    maybe_delayed: tuple[RetryHook | RetryHookFactory, ...],
+    17	) -> tuple[RetryHook, ...]:
+    18	    """
+    19	    Execute delayed hook factories and return a tuple of finalized hooks.
+    20	    """
+    21	    hooks = []
+    22	    for hook_or_factory in maybe_delayed:
+    23	        if isinstance(hook_or_factory, RetryHookFactory):
+    24	            hooks.append(hook_or_factory.hook_factory())
+    25	        else:
+    26	            hooks.append(hook_or_factory)
+    27	
+    28	    return tuple(hooks)
+    29	
+    30	
+    31	def get_default_hooks() -> tuple[RetryHookFactory, ...]:
+    32	    """
+    33	    Return the default hooks according to availability.
+    34	    """
+    35	    hooks = []
+    36	
+    37	    try:
+    38	        import prometheus_client  # noqa: F401
+    39	
+    40	        hooks.append(PrometheusOnRetryHook)
+    41	    except ImportError:
+    42	        pass
+    43	
+    44	    try:
+    45	        import structlog  # noqa: F401
+    46	
+    47	        hooks.append(StructlogOnRetryHook)
+    48	    except ImportError:
+    49	        hooks.append(LoggingOnRetryHook)
+    50	
+    51	    return tuple(hooks)
+    52	
+    53	
+    54	def set_on_retry_hooks(
+    55	    hooks: Iterable[RetryHook | RetryHookFactory] | None,
+    56	) -> None:
+    57	    """
+    58	    Set hooks that are called after a retry has been scheduled.
+    59	
+    60	    Args:
+    61	        hooks:
+    62	            Hooks to call after a retry has been scheduled. Passing None resets
+    63	            to default. To deactivate instrumentation, pass an empty iterable.
+    64	
+    65	    .. versionadded:: 23.2.0
+    66	    """
+    67	    from .._config import CONFIG
+    68	
+    69	    CONFIG.on_retry = tuple(hooks) if hooks is not None else hooks
+    70	
+    71	
+    72	def get_on_retry_hooks() -> tuple[RetryHook, ...]:
+    73	    """
+    74	    Get hooks that are called after a retry has been scheduled.
+    75	
+    76	    Returns:
+    77	        Hooks that will run if a retry is scheduled. Factories are called if
+    78	        they haven't already.
+    79	
+    80	    .. versionadded:: 23.2.0
+    81	    """
+    82	    from .._config import CONFIG
+    83	
+    84	    return CONFIG.on_retry
+########## ./instrumentation/_logging.py
+     1	# SPDX-FileCopyrightText: 2022 Hynek Schlawack <hs@ox.cx>
+     2	#
+     3	# SPDX-License-Identifier: MIT
+     4	
+     5	from __future__ import annotations
+     6	
+     7	from ._data import RetryDetails, RetryHook, RetryHookFactory
+     8	
+     9	
+    10	def init_logging(log_level: int = 30) -> RetryHook:
+    11	    """
+    12	    Initialize logging using the standard library.
+    13	
+    14	    Returned hook logs scheduled retries at *log_level*.
+    15	
+    16	    .. versionadded:: 23.2.0
+    17	    """
+    18	    import logging
+    19	
+    20	    logger = logging.getLogger("stamina")
+    21	
+    22	    def log_retries(details: RetryDetails) -> None:
+    23	        logger.log(
+    24	            log_level,
+    25	            "stamina.retry_scheduled",
+    26	            extra={
+    27	                "stamina.callable": details.name,
+    28	                "stamina.args": tuple(repr(a) for a in details.args),
+    29	                "stamina.kwargs": dict(details.kwargs.items()),
+    30	                "stamina.retry_num": details.retry_num,
+    31	                "stamina.caused_by": repr(details.caused_by),
+    32	                "stamina.wait_for": round(details.wait_for, 2),
+    33	                "stamina.waited_so_far": round(details.waited_so_far, 2),
+    34	            },
+    35	        )
+    36	
+    37	    return log_retries
+    38	
+    39	
+    40	LoggingOnRetryHook = RetryHookFactory(init_logging)
+########## ./instrumentation/_prometheus.py
+     1	# SPDX-FileCopyrightText: 2022 Hynek Schlawack <hs@ox.cx>
+     2	#
+     3	# SPDX-License-Identifier: MIT
+     4	
+     5	from __future__ import annotations
+     6	
+     7	from typing import TYPE_CHECKING
+     8	
+     9	from ._data import RetryDetails, RetryHook, RetryHookFactory, guess_name
+    10	
+    11	
+    12	if TYPE_CHECKING:
+    13	    from prometheus_client import Counter
+    14	
+    15	
+    16	RETRIES_TOTAL = None
+    17	
+    18	
+    19	def init_prometheus() -> RetryHook:
+    20	    """
+    21	    Initialize Prometheus instrumentation.
+    22	    """
+    23	    from prometheus_client import Counter
+    24	
+    25	    global RETRIES_TOTAL  # noqa: PLW0603
+    26	
+    27	    # Mostly for testing so we can call init_prometheus more than once.
+    28	    if RETRIES_TOTAL is None:
+    29	        RETRIES_TOTAL = Counter(
+    30	            "stamina_retries_total",
+    31	            "Total number of retries.",
+    32	            ("callable", "retry_num", "error_type"),
+    33	        )
+    34	
+    35	    def count_retries(details: RetryDetails) -> None:
+    36	        """
+    37	        Count and log retries for callable *name*.
+    38	        """
+    39	        RETRIES_TOTAL.labels(
+    40	            callable=details.name,
+    41	            retry_num=details.retry_num,
+    42	            error_type=guess_name(details.caused_by.__class__),
+    43	        ).inc()
+    44	
+    45	    return count_retries
+    46	
+    47	
+    48	def get_prometheus_counter() -> Counter | None:
+    49	    """
+    50	    Return the Prometheus counter for the number of retries.
+    51	
+    52	    Returns:
+    53	        If active, the Prometheus `counter
+    54	        <https://github.com/prometheus/client_python>`_ for the number of
+    55	        retries. None otherwise.
+    56	
+    57	    .. versionadded:: 23.2.0
+    58	    """
+    59	    from . import get_on_retry_hooks
+    60	
+    61	    # Finalize the hooks if not done yet.
+    62	    get_on_retry_hooks()
+    63	
+    64	    return RETRIES_TOTAL
+    65	
+    66	
+    67	PrometheusOnRetryHook = RetryHookFactory(init_prometheus)
+########## ./instrumentation/_structlog.py
+     1	# SPDX-FileCopyrightText: 2022 Hynek Schlawack <hs@ox.cx>
+     2	#
+     3	# SPDX-License-Identifier: MIT
+     4	
+     5	from __future__ import annotations
+     6	
+     7	from ._data import RetryDetails, RetryHook, RetryHookFactory
+     8	
+     9	
+    10	def init_structlog() -> RetryHook:
+    11	    """
+    12	    Initialize structlog instrumentation.
+    13	
+    14	    .. versionadded:: 23.2.0
+    15	    """
+    16	    import structlog
+    17	
+    18	    logger = structlog.get_logger("stamina")
+    19	
+    20	    def log_retries(details: RetryDetails) -> None:
+    21	        logger.warning(
+    22	            "stamina.retry_scheduled",
+    23	            callable=details.name,
+    24	            args=tuple(repr(a) for a in details.args),
+    25	            kwargs=dict(details.kwargs.items()),
+    26	            retry_num=details.retry_num,
+    27	            caused_by=repr(details.caused_by),
+    28	            wait_for=round(details.wait_for, 2),
+    29	            waited_so_far=round(details.waited_so_far, 2),
+    30	        )
+    31	
+    32	    return log_retries
+    33	
+    34	
+    35	StructlogOnRetryHook = RetryHookFactory(init_structlog)
+########## ./typing.py
+     1	# SPDX-FileCopyrightText: 2022 Hynek Schlawack <hs@ox.cx>
+     2	#
+     3	# SPDX-License-Identifier: MIT
+     4	
+     5	from __future__ import annotations
+     6	
+     7	from .instrumentation import RetryDetails, RetryHook
+     8	
+     9	
+    10	__all__ = ["RetryDetails", "RetryHook"]

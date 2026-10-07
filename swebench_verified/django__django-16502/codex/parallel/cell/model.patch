@@ -1,0 +1,75 @@
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..1c08a69049 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -143,6 +143,27 @@ class ServerHandler(simple_server.ServerHandler):
+         if self.headers.get("Connection") == "close":
+             self.request_handler.close_connection = True
+ 
++    def write(self, data):
++        """'write()' callable as specified by PEP 3333."""
++        assert type(data) is bytes, "write() argument must be a bytes instance"
++
++        if not self.status:
++            raise AssertionError("write() before start_response()")
++        elif not self.headers_sent:
++            # Send headers before suppressing the response body for HEAD
++            # requests so Content-Length can still be determined correctly.
++            self.bytes_sent = len(data)
++            self.send_headers()
++        else:
++            self.bytes_sent += len(data)
++
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            self._flush()
++            return
++
++        self._write(data)
++        self._flush()
++
+     def close(self):
+         self.get_stdin().read()
+         super().close()
+diff --git a/tests/servers/test_basehttp.py b/tests/servers/test_basehttp.py
+index a837505feb..5f417aa46f 100644
+--- a/tests/servers/test_basehttp.py
++++ b/tests/servers/test_basehttp.py
+@@ -1,7 +1,7 @@
+ from io import BytesIO
+ 
+ from django.core.handlers.wsgi import WSGIRequest
+-from django.core.servers.basehttp import WSGIRequestHandler, WSGIServer
++from django.core.servers.basehttp import ServerHandler, WSGIRequestHandler, WSGIServer
+ from django.test import SimpleTestCase
+ from django.test.client import RequestFactory
+ from django.test.utils import captured_stderr
+@@ -134,3 +134,29 @@ class WSGIServerTestCase(SimpleTestCase):
+                         self.assertEqual(cm.records[0].getMessage(), msg)
+                 finally:
+                     server.server_close()
++
++
++class ServerHandlerTestCase(SimpleTestCase):
++    def test_head_request_body_not_sent(self):
++        def test_app(environ, start_response):
++            start_response("200 OK", [("Content-Type", "text/plain")])
++            return [b"Hello World!"]
++
++        handler = ServerHandler(
++            BytesIO(),
++            BytesIO(),
++            BytesIO(),
++            {"REQUEST_METHOD": "HEAD", "SERVER_PROTOCOL": "HTTP/1.1"},
++        )
++        handler.request_handler = Stub(
++            close_connection=False,
++            log_request=lambda *args, **kwargs: None,
++            server=Stub(),
++        )
++
++        handler.run(test_app)
++
++        response = handler.stdout.getvalue()
++        headers, body = response.split(b"\r\n\r\n", 1)
++        self.assertIn(b"Content-Length: 12\r\n", headers + b"\r\n")
++        self.assertEqual(body, b"")

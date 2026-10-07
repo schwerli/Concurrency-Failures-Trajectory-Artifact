@@ -1,0 +1,51 @@
+diff --git a/django/core/management/base.py b/django/core/management/base.py
+index abc6f79a15..11862998f8 100644
+--- a/django/core/management/base.py
++++ b/django/core/management/base.py
+@@ -6,6 +6,7 @@ import argparse
+ import os
+ import sys
+ from argparse import ArgumentParser, HelpFormatter
++from functools import partial
+ from io import TextIOBase
+ 
+ import django
+@@ -65,6 +66,15 @@ class CommandParser(ArgumentParser):
+             self.error(self.missing_args_message)
+         return super().parse_args(args, namespace)
+ 
++    def add_subparsers(self, **kwargs):
++        parser_class = kwargs.get("parser_class", type(self))
++        if isinstance(parser_class, type) and issubclass(parser_class, CommandParser):
++            kwargs["parser_class"] = partial(
++                parser_class,
++                called_from_command_line=self.called_from_command_line,
++            )
++        return super().add_subparsers(**kwargs)
++
+     def error(self, message):
+         if self.called_from_command_line:
+             super().error(message)
+diff --git a/tests/user_commands/tests.py b/tests/user_commands/tests.py
+index e40632385c..7489cf7f3e 100644
+--- a/tests/user_commands/tests.py
++++ b/tests/user_commands/tests.py
+@@ -454,6 +454,18 @@ class CommandRunTests(AdminScriptTestCase):
+         self.assertNoOutput(err)
+         self.assertEqual(out.strip(), "Set foo")
+ 
++    def test_subparser_missing_required_args(self):
++        self.write_settings("settings.py", apps=["user_commands"])
++        out, err = self.run_manage(["subparser", "foo"])
++        self.assertNoOutput(out)
++        self.assertNotInOutput(err, "Traceback")
++        self.assertNotInOutput(err, "CommandError")
++        self.assertOutput(err, "usage: manage.py subparser foo [-h] bar")
++        self.assertOutput(
++            err,
++            "manage.py subparser foo: error: the following arguments are required: bar",
++        )
++
+     def test_skip_checks(self):
+         self.write_settings(
+             "settings.py",

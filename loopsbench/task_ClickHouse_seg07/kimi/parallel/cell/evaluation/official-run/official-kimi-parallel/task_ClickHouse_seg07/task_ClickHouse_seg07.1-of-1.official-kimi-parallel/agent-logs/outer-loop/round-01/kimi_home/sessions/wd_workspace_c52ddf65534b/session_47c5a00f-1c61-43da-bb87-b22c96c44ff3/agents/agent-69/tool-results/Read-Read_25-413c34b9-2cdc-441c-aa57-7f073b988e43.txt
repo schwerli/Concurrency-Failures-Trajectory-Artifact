@@ -1,0 +1,1000 @@
+1	diff --git a/src/AggregateFunctions/AggregateFunctionQuantile.cpp b/src/AggregateFunctions/AggregateFunctionQuantile.cpp
+2	index 6783a55418ae..38b3c91be69b 100644
+3	--- a/src/AggregateFunctions/AggregateFunctionQuantile.cpp
+4	+++ b/src/AggregateFunctions/AggregateFunctionQuantile.cpp
+5	@@ -1,8 +1,9 @@
+6	 #include <AggregateFunctions/AggregateFunctionQuantile.h>
+7	-
+8	+#include <AggregateFunctions/QuantileReservoirSampler.h>
+9	 #include <AggregateFunctions/AggregateFunctionFactory.h>
+10	 #include <AggregateFunctions/Helpers.h>
+11	-
+12	+#include <DataTypes/DataTypeDate.h>
+13	+#include <DataTypes/DataTypeDateTime.h>
+14	 #include <Core/Field.h>
+15	 
+16	 
+17	@@ -21,70 +22,6 @@ namespace
+18	 template <typename Value, bool float_return> using FuncQuantile = AggregateFunctionQuantile<Value, QuantileReservoirSampler<Value>, NameQuantile, false, std::conditional_t<float_return, Float64, void>, false>;
+19	 template <typename Value, bool float_return> using FuncQuantiles = AggregateFunctionQuantile<Value, QuantileReservoirSampler<Value>, NameQuantiles, false, std::conditional_t<float_return, Float64, void>, true>;
+20	 
+21	-template <typename Value, bool float_return> using FuncQuantileDeterministic = AggregateFunctionQuantile<Value, QuantileReservoirSamplerDeterministic<Value>, NameQuantileDeterministic, true, std::conditional_t<float_return, Float64, void>, false>;
+22	-template <typename Value, bool float_return> using FuncQuantilesDeterministic = AggregateFunctionQuantile<Value, QuantileReservoirSamplerDeterministic<Value>, NameQuantilesDeterministic, true, std::conditional_t<float_return, Float64, void>, true>;
+23	-
+24	-template <typename Value, bool _> using FuncQuantileExact = AggregateFunctionQuantile<Value, QuantileExact<Value>, NameQuantileExact, false, void, false>;
+25	-template <typename Value, bool _> using FuncQuantilesExact = AggregateFunctionQuantile<Value, QuantileExact<Value>, NameQuantilesExact, false, void, true>;
+26	-
+27	-template <typename Value, bool _> using FuncQuantileExactLow = AggregateFunctionQuantile<Value, QuantileExactLow<Value>, NameQuantileExactLow, false, void, false>;
+28	-template <typename Value, bool _> using FuncQuantilesExactLow = AggregateFunctionQuantile<Value, QuantileExactLow<Value>, NameQuantilesExactLow, false, void, true>;
+29	-template <typename Value, bool _> using FuncQuantileExactHigh = AggregateFunctionQuantile<Value, QuantileExactHigh<Value>, NameQuantileExactHigh, false, void, false>;
+30	-template <typename Value, bool _> using FuncQuantilesExactHigh = AggregateFunctionQuantile<Value, QuantileExactHigh<Value>, NameQuantilesExactHigh, false, void, true>;
+31	-
+32	-template <typename Value, bool _> using FuncQuantileExactExclusive = AggregateFunctionQuantile<Value, QuantileExactExclusive<Value>, NameQuantileExactExclusive, false, Float64, false>;
+33	-template <typename Value, bool _> using FuncQuantilesExactExclusive = AggregateFunctionQuantile<Value, QuantileExactExclusive<Value>, NameQuantilesExactExclusive, false, Float64, true>;
+34	-
+35	-template <typename Value, bool _> using FuncQuantileExactInclusive = AggregateFunctionQuantile<Value, QuantileExactInclusive<Value>, NameQuantileExactInclusive, false, Float64, false>;
+36	-template <typename Value, bool _> using FuncQuantilesExactInclusive = AggregateFunctionQuantile<Value, QuantileExactInclusive<Value>, NameQuantilesExactInclusive, false, Float64, true>;
+37	-
+38	-template <typename Value, bool _> using FuncQuantileExactWeighted = AggregateFunctionQuantile<Value, QuantileExactWeighted<Value>, NameQuantileExactWeighted, true, void, false>;
+39	-template <typename Value, bool _> using FuncQuantilesExactWeighted = AggregateFunctionQuantile<Value, QuantileExactWeighted<Value>, NameQuantilesExactWeighted, true, void, true>;
+40	-
+41	-template <typename Value, bool _> using FuncQuantileTiming = AggregateFunctionQuantile<Value, QuantileTiming<Value>, NameQuantileTiming, false, Float32, false>;
+42	-template <typename Value, bool _> using FuncQuantilesTiming = AggregateFunctionQuantile<Value, QuantileTiming<Value>, NameQuantilesTiming, false, Float32, true>;
+43	-
+44	-template <typename Value, bool _> using FuncQuantileTimingWeighted = AggregateFunctionQuantile<Value, QuantileTiming<Value>, NameQuantileTimingWeighted, true, Float32, false>;
+45	-template <typename Value, bool _> using FuncQuantilesTimingWeighted = AggregateFunctionQuantile<Value, QuantileTiming<Value>, NameQuantilesTimingWeighted, true, Float32, true>;
+46	-
+47	-template <typename Value, bool float_return> using FuncQuantileTDigest = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantileTDigest, false, std::conditional_t<float_return, Float32, void>, false>;
+48	-template <typename Value, bool float_return> using FuncQuantilesTDigest = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantilesTDigest, false, std::conditional_t<float_return, Float32, void>, true>;
+49	-
+50	-template <typename Value, bool float_return> using FuncQuantileTDigestWeighted = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantileTDigestWeighted, true, std::conditional_t<float_return, Float32, void>, false>;
+51	-template <typename Value, bool float_return> using FuncQuantilesTDigestWeighted = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantilesTDigestWeighted, true, std::conditional_t<float_return, Float32, void>, true>;
+52	-
+53	-template <typename Value, bool float_return> using FuncQuantileBFloat16 = AggregateFunctionQuantile<Value, QuantileBFloat16Histogram<Value>, NameQuantileBFloat16, false, std::conditional_t<float_return, Float64, void>, false>;
+54	-template <typename Value, bool float_return> using FuncQuantilesBFloat16 = AggregateFunctionQuantile<Value, QuantileBFloat16Histogram<Value>, NameQuantilesBFloat16, false, std::conditional_t<float_return, Float64, void>, true>;
+55	-
+56	-template <typename Value, bool float_return> using FuncQuantileBFloat16Weighted = AggregateFunctionQuantile<Value, QuantileBFloat16Histogram<Value>, NameQuantileBFloat16Weighted, true, std::conditional_t<float_return, Float64, void>, false>;
+57	-template <typename Value, bool float_return> using FuncQuantilesBFloat16Weighted = AggregateFunctionQuantile<Value, QuantileBFloat16Histogram<Value>, NameQuantilesBFloat16Weighted, true, std::conditional_t<float_return, Float64, void>, true>;
+58	-
+59	-template <template <typename, bool> class Function>
+60	-constexpr bool supportDecimal()
+61	-{
+62	-    return std::is_same_v<Function<Float32, false>, FuncQuantile<Float32, false>> ||
+63	-        std::is_same_v<Function<Float32, false>, FuncQuantiles<Float32, false>> ||
+64	-        std::is_same_v<Function<Float32, false>, FuncQuantileExact<Float32, false>> ||
+65	-        std::is_same_v<Function<Float32, false>, FuncQuantileExactLow<Float32, false>> ||
+66	-        std::is_same_v<Function<Float32, false>, FuncQuantileExactHigh<Float32, false>> ||
+67	-        std::is_same_v<Function<Float32, false>, FuncQuantilesExact<Float32, false>> ||
+68	-        std::is_same_v<Function<Float32, false>, FuncQuantilesExactLow<Float32, false>> ||
+69	-        std::is_same_v<Function<Float32, false>, FuncQuantilesExactHigh<Float32, false>> ||
+70	-        std::is_same_v<Function<Float32, false>, FuncQuantileExactWeighted<Float32, false>> ||
+71	-        std::is_same_v<Function<Float32, false>, FuncQuantilesExactWeighted<Float32, false>>;
+72	-}
+73	-
+74	-template <template <typename, bool> class Function>
+75	-constexpr bool supportBigInt()
+76	-{
+77	-    return std::is_same_v<Function<Float32, false>, FuncQuantile<Float32, false>> ||
+78	-        std::is_same_v<Function<Float32, false>, FuncQuantiles<Float32, false>> ||
+79	-        std::is_same_v<Function<Float32, false>, FuncQuantileExact<Float32, false>> ||
+80	-        std::is_same_v<Function<Float32, false>, FuncQuantilesExact<Float32, false>> ||
+81	-        std::is_same_v<Function<Float32, false>, FuncQuantileExactWeighted<Float32, false>> ||
+82	-        std::is_same_v<Function<Float32, false>, FuncQuantilesExactWeighted<Float32, false>>;
+83	-}
+84	-
+85	 template <template <typename, bool> class Function>
+86	 AggregateFunctionPtr createAggregateFunctionQuantile(
+87	     const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+88	@@ -102,22 +39,16 @@ AggregateFunctionPtr createAggregateFunctionQuantile(
+89	     if (which.idx == TypeIndex::Date) return std::make_shared<Function<DataTypeDate::FieldType, false>>(argument_types, params);
+90	     if (which.idx == TypeIndex::DateTime) return std::make_shared<Function<DataTypeDateTime::FieldType, false>>(argument_types, params);
+91	 
+92	-    if constexpr (supportDecimal<Function>())
+93	-    {
+94	-        if (which.idx == TypeIndex::Decimal32) return std::make_shared<Function<Decimal32, false>>(argument_types, params);
+95	-        if (which.idx == TypeIndex::Decimal64) return std::make_shared<Function<Decimal64, false>>(argument_types, params);
+96	-        if (which.idx == TypeIndex::Decimal128) return std::make_shared<Function<Decimal128, false>>(argument_types, params);
+97	-        if (which.idx == TypeIndex::Decimal256) return std::make_shared<Function<Decimal256, false>>(argument_types, params);
+98	-        if (which.idx == TypeIndex::DateTime64) return std::make_shared<Function<DateTime64, false>>(argument_types, params);
+99	-    }
+100	-
+101	-    if constexpr (supportBigInt<Function>())
+102	-    {
+103	-        if (which.idx == TypeIndex::Int128) return std::make_shared<Function<Int128, true>>(argument_types, params);
+104	-        if (which.idx == TypeIndex::UInt128) return std::make_shared<Function<Int128, true>>(argument_types, params);
+105	-        if (which.idx == TypeIndex::Int256) return std::make_shared<Function<Int256, true>>(argument_types, params);
+106	-        if (which.idx == TypeIndex::UInt256) return std::make_shared<Function<UInt256, true>>(argument_types, params);
+107	-    }
+108	+    if (which.idx == TypeIndex::Decimal32) return std::make_shared<Function<Decimal32, false>>(argument_types, params);
+109	+    if (which.idx == TypeIndex::Decimal64) return std::make_shared<Function<Decimal64, false>>(argument_types, params);
+110	+    if (which.idx == TypeIndex::Decimal128) return std::make_shared<Function<Decimal128, false>>(argument_types, params);
+111	+    if (which.idx == TypeIndex::Decimal256) return std::make_shared<Function<Decimal256, false>>(argument_types, params);
+112	+    if (which.idx == TypeIndex::DateTime64) return std::make_shared<Function<DateTime64, false>>(argument_types, params);
+113	+
+114	+    if (which.idx == TypeIndex::Int128) return std::make_shared<Function<Int128, true>>(argument_types, params);
+115	+    if (which.idx == TypeIndex::UInt128) return std::make_shared<Function<Int128, true>>(argument_types, params);
+116	+    if (which.idx == TypeIndex::Int256) return std::make_shared<Function<Int256, true>>(argument_types, params);
+117	+    if (which.idx == TypeIndex::UInt256) return std::make_shared<Function<UInt256, true>>(argument_types, params);
+118	 
+119	     throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name,
+120	                     ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+121	@@ -133,58 +64,8 @@ void registerAggregateFunctionsQuantile(AggregateFunctionFactory & factory)
+122	     factory.registerFunction(NameQuantile::name, createAggregateFunctionQuantile<FuncQuantile>);
+123	     factory.registerFunction(NameQuantiles::name, { createAggregateFunctionQuantile<FuncQuantiles>, properties });
+124	 
+125	-    factory.registerFunction(NameQuantileDeterministic::name, createAggregateFunctionQuantile<FuncQuantileDeterministic>);
+126	-    factory.registerFunction(NameQuantilesDeterministic::name, { createAggregateFunctionQuantile<FuncQuantilesDeterministic>, properties });
+127	-
+128	-    factory.registerFunction(NameQuantileExact::name, createAggregateFunctionQuantile<FuncQuantileExact>);
+129	-    factory.registerFunction(NameQuantilesExact::name, { createAggregateFunctionQuantile<FuncQuantilesExact>, properties });
+130	-
+131	-    factory.registerFunction(NameQuantileExactLow::name, createAggregateFunctionQuantile<FuncQuantileExactLow>);
+132	-    factory.registerFunction(NameQuantilesExactLow::name, { createAggregateFunctionQuantile<FuncQuantilesExactLow>, properties });
+133	-
+134	-    factory.registerFunction(NameQuantileExactHigh::name, createAggregateFunctionQuantile<FuncQuantileExactHigh>);
+135	-    factory.registerFunction(NameQuantilesExactHigh::name, { createAggregateFunctionQuantile<FuncQuantilesExactHigh>, properties });
+136	-
+137	-    factory.registerFunction(NameQuantileExactExclusive::name, createAggregateFunctionQuantile<FuncQuantileExactExclusive>);
+138	-    factory.registerFunction(NameQuantilesExactExclusive::name, { createAggregateFunctionQuantile<FuncQuantilesExactExclusive>, properties });
+139	-
+140	-    factory.registerFunction(NameQuantileExactInclusive::name, createAggregateFunctionQuantile<FuncQuantileExactInclusive>);
+141	-    factory.registerFunction(NameQuantilesExactInclusive::name, { createAggregateFunctionQuantile<FuncQuantilesExactInclusive>, properties });
+142	-
+143	-    factory.registerFunction(NameQuantileExactWeighted::name, createAggregateFunctionQuantile<FuncQuantileExactWeighted>);
+144	-    factory.registerFunction(NameQuantilesExactWeighted::name, { createAggregateFunctionQuantile<FuncQuantilesExactWeighted>, properties });
+145	-
+146	-    factory.registerFunction(NameQuantileTiming::name, createAggregateFunctionQuantile<FuncQuantileTiming>);
+147	-    factory.registerFunction(NameQuantilesTiming::name, { createAggregateFunctionQuantile<FuncQuantilesTiming>, properties });
+148	-
+149	-    factory.registerFunction(NameQuantileTimingWeighted::name, createAggregateFunctionQuantile<FuncQuantileTimingWeighted>);
+150	-    factory.registerFunction(NameQuantilesTimingWeighted::name, { createAggregateFunctionQuantile<FuncQuantilesTimingWeighted>, properties });
+151	-
+152	-    factory.registerFunction(NameQuantileTDigest::name, createAggregateFunctionQuantile<FuncQuantileTDigest>);
+153	-    factory.registerFunction(NameQuantilesTDigest::name, { createAggregateFunctionQuantile<FuncQuantilesTDigest>, properties });
+154	-
+155	-    factory.registerFunction(NameQuantileTDigestWeighted::name, createAggregateFunctionQuantile<FuncQuantileTDigestWeighted>);
+156	-    factory.registerFunction(NameQuantilesTDigestWeighted::name, { createAggregateFunctionQuantile<FuncQuantilesTDigestWeighted>, properties });
+157	-
+158	-    factory.registerFunction(NameQuantileBFloat16::name, createAggregateFunctionQuantile<FuncQuantileBFloat16>);
+159	-    factory.registerFunction(NameQuantilesBFloat16::name, { createAggregateFunctionQuantile<FuncQuantilesBFloat16>, properties });
+160	-
+161	-    factory.registerFunction(NameQuantileBFloat16Weighted::name, createAggregateFunctionQuantile<FuncQuantileBFloat16Weighted>);
+162	-    factory.registerFunction(NameQuantilesBFloat16Weighted::name, createAggregateFunctionQuantile<FuncQuantilesBFloat16Weighted>);
+163	-
+164	     /// 'median' is an alias for 'quantile'
+165	     factory.registerAlias("median", NameQuantile::name);
+166	-    factory.registerAlias("medianDeterministic", NameQuantileDeterministic::name);
+167	-    factory.registerAlias("medianExact", NameQuantileExact::name);
+168	-    factory.registerAlias("medianExactLow", NameQuantileExactLow::name);
+169	-    factory.registerAlias("medianExactHigh", NameQuantileExactHigh::name);
+170	-    factory.registerAlias("medianExactWeighted", NameQuantileExactWeighted::name);
+171	-    factory.registerAlias("medianTiming", NameQuantileTiming::name);
+172	-    factory.registerAlias("medianTimingWeighted", NameQuantileTimingWeighted::name);
+173	-    factory.registerAlias("medianTDigest", NameQuantileTDigest::name);
+174	-    factory.registerAlias("medianTDigestWeighted", NameQuantileTDigestWeighted::name);
+175	-    factory.registerAlias("medianBFloat16", NameQuantileBFloat16::name);
+176	-    factory.registerAlias("medianBFloat16Weighted", NameQuantileBFloat16Weighted::name);
+177	 }
+178	 
+179	 }
+180	diff --git a/src/AggregateFunctions/AggregateFunctionQuantile.h b/src/AggregateFunctions/AggregateFunctionQuantile.h
+181	index 65edcaea13a4..6e7f88d3f8c1 100644
+182	--- a/src/AggregateFunctions/AggregateFunctionQuantile.h
+183	+++ b/src/AggregateFunctions/AggregateFunctionQuantile.h
+184	@@ -2,24 +2,12 @@
+185	 
+186	 #include <AggregateFunctions/FactoryHelpers.h>
+187	 #include <AggregateFunctions/AggregateFunctionFactory.h>
+188	-
+189	-/// These must be exposed in header for the purpose of dynamic compilation.
+190	-#include <AggregateFunctions/QuantileReservoirSampler.h>
+191	-#include <AggregateFunctions/QuantileReservoirSamplerDeterministic.h>
+192	-#include <AggregateFunctions/QuantileExact.h>
+193	-#include <AggregateFunctions/QuantileExactWeighted.h>
+194	-#include <AggregateFunctions/QuantileTiming.h>
+195	-#include <AggregateFunctions/QuantileTDigest.h>
+196	-#include <AggregateFunctions/QuantileBFloat16Histogram.h>
+197	-
+198	 #include <AggregateFunctions/IAggregateFunction.h>
+199	 #include <AggregateFunctions/QuantilesCommon.h>
+200	 #include <Columns/ColumnArray.h>
+201	 #include <Columns/ColumnDecimal.h>
+202	 #include <Columns/ColumnsNumber.h>
+203	 #include <DataTypes/DataTypeArray.h>
+204	-#include <DataTypes/DataTypeDate.h>
+205	-#include <DataTypes/DataTypeDateTime.h>
+206	 #include <DataTypes/DataTypesNumber.h>
+207	 #include <DataTypes/DataTypeAggregateFunction.h>
+208	 #include <IO/ReadHelpers.h>
+209	diff --git a/src/AggregateFunctions/AggregateFunctionQuantileBFloat16.cpp b/src/AggregateFunctions/AggregateFunctionQuantileBFloat16.cpp
+210	new file mode 100644
+211	index 000000000000..7538e79c3da2
+212	--- /dev/null
+213	+++ b/src/AggregateFunctions/AggregateFunctionQuantileBFloat16.cpp
+214	@@ -0,0 +1,60 @@
+215	+#include <AggregateFunctions/AggregateFunctionQuantile.h>
+216	+#include <AggregateFunctions/QuantileBFloat16Histogram.h>
+217	+#include <AggregateFunctions/AggregateFunctionFactory.h>
+218	+#include <AggregateFunctions/Helpers.h>
+219	+#include <DataTypes/DataTypeDate.h>
+220	+#include <DataTypes/DataTypeDateTime.h>
+221	+#include <Core/Field.h>
+222	+
+223	+
+224	+namespace DB
+225	+{
+226	+struct Settings;
+227	+
+228	+namespace ErrorCodes
+229	+{
+230	+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+231	+}
+232	+
+233	+namespace
+234	+{
+235	+
+236	+template <typename Value, bool float_return> using FuncQuantileBFloat16 = AggregateFunctionQuantile<Value, QuantileBFloat16Histogram<Value>, NameQuantileBFloat16, false, std::conditional_t<float_return, Float64, void>, false>;
+237	+template <typename Value, bool float_return> using FuncQuantilesBFloat16 = AggregateFunctionQuantile<Value, QuantileBFloat16Histogram<Value>, NameQuantilesBFloat16, false, std::conditional_t<float_return, Float64, void>, true>;
+238	+
+239	+template <template <typename, bool> class Function>
+240	+AggregateFunctionPtr createAggregateFunctionQuantile(
+241	+    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+242	+{
+243	+    /// Second argument type check doesn't depend on the type of the first one.
+244	+    Function<void, true>::assertSecondArg(argument_types);
+245	+
+246	+    const DataTypePtr & argument_type = argument_types[0];
+247	+    WhichDataType which(argument_type);
+248	+
+249	+#define DISPATCH(TYPE) \
+250	+    if (which.idx == TypeIndex::TYPE) return std::make_shared<Function<TYPE, true>>(argument_types, params);
+251	+    FOR_BASIC_NUMERIC_TYPES(DISPATCH)
+252	+#undef DISPATCH
+253	+    if (which.idx == TypeIndex::Date) return std::make_shared<Function<DataTypeDate::FieldType, false>>(argument_types, params);
+254	+    if (which.idx == TypeIndex::DateTime) return std::make_shared<Function<DataTypeDateTime::FieldType, false>>(argument_types, params);
+255	+
+256	+    throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name,
+257	+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+258	+}
+259	+
+260	+}
+261	+
+262	+void registerAggregateFunctionsQuantileBFloat16(AggregateFunctionFactory & factory)
+263	+{
+264	+    /// For aggregate functions returning array we cannot return NULL on empty set.
+265	+    AggregateFunctionProperties properties = { .returns_default_when_only_null = true };
+266	+
+267	+    factory.registerFunction(NameQuantileBFloat16::name, createAggregateFunctionQuantile<FuncQuantileBFloat16>);
+268	+    factory.registerFunction(NameQuantilesBFloat16::name, { createAggregateFunctionQuantile<FuncQuantilesBFloat16>, properties });
+269	+
+270	+    /// 'median' is an alias for 'quantile'
+271	+    factory.registerAlias("medianBFloat16", NameQuantileBFloat16::name);
+272	+}
+273	+
+274	+}
+275	diff --git a/src/AggregateFunctions/AggregateFunctionQuantileBFloat16Weighted.cpp b/src/AggregateFunctions/AggregateFunctionQuantileBFloat16Weighted.cpp
+276	new file mode 100644
+277	index 000000000000..15699a16689f
+278	--- /dev/null
+279	+++ b/src/AggregateFunctions/AggregateFunctionQuantileBFloat16Weighted.cpp
+280	@@ -0,0 +1,57 @@
+281	+#include <AggregateFunctions/AggregateFunctionQuantile.h>
+282	+#include <AggregateFunctions/QuantileBFloat16Histogram.h>
+283	+#include <AggregateFunctions/AggregateFunctionFactory.h>
+284	+#include <AggregateFunctions/Helpers.h>
+285	+#include <DataTypes/DataTypeDate.h>
+286	+#include <DataTypes/DataTypeDateTime.h>
+287	+#include <Core/Field.h>
+288	+
+289	+
+290	+namespace DB
+291	+{
+292	+struct Settings;
+293	+
+294	+namespace ErrorCodes
+295	+{
+296	+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+297	+}
+298	+
+299	+namespace
+300	+{
+301	+
+302	+template <typename Value, bool float_return> using FuncQuantileBFloat16Weighted = AggregateFunctionQuantile<Value, QuantileBFloat16Histogram<Value>, NameQuantileBFloat16Weighted, true, std::conditional_t<float_return, Float64, void>, false>;
+303	+template <typename Value, bool float_return> using FuncQuantilesBFloat16Weighted = AggregateFunctionQuantile<Value, QuantileBFloat16Histogram<Value>, NameQuantilesBFloat16Weighted, true, std::conditional_t<float_return, Float64, void>, true>;
+304	+
+305	+template <template <typename, bool> class Function>
+306	+AggregateFunctionPtr createAggregateFunctionQuantile(
+307	+    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+308	+{
+309	+    /// Second argument type check doesn't depend on the type of the first one.
+310	+    Function<void, true>::assertSecondArg(argument_types);
+311	+
+312	+    const DataTypePtr & argument_type = argument_types[0];
+313	+    WhichDataType which(argument_type);
+314	+
+315	+#define DISPATCH(TYPE) \
+316	+    if (which.idx == TypeIndex::TYPE) return std::make_shared<Function<TYPE, true>>(argument_types, params);
+317	+    FOR_BASIC_NUMERIC_TYPES(DISPATCH)
+318	+#undef DISPATCH
+319	+    if (which.idx == TypeIndex::Date) return std::make_shared<Function<DataTypeDate::FieldType, false>>(argument_types, params);
+320	+    if (which.idx == TypeIndex::DateTime) return std::make_shared<Function<DataTypeDateTime::FieldType, false>>(argument_types, params);
+321	+
+322	+    throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name,
+323	+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+324	+}
+325	+
+326	+}
+327	+
+328	+void registerAggregateFunctionsQuantileBFloat16Weighted(AggregateFunctionFactory & factory)
+329	+{
+330	+    factory.registerFunction(NameQuantileBFloat16Weighted::name, createAggregateFunctionQuantile<FuncQuantileBFloat16Weighted>);
+331	+    factory.registerFunction(NameQuantilesBFloat16Weighted::name, createAggregateFunctionQuantile<FuncQuantilesBFloat16Weighted>);
+332	+
+333	+    /// 'median' is an alias for 'quantile'
+334	+    factory.registerAlias("medianBFloat16Weighted", NameQuantileBFloat16Weighted::name);
+335	+}
+336	+
+337	+}
+338	diff --git a/src/AggregateFunctions/AggregateFunctionQuantileDeterministic.cpp b/src/AggregateFunctions/AggregateFunctionQuantileDeterministic.cpp
+339	new file mode 100644
+340	index 000000000000..a9486da25fa2
+341	--- /dev/null
+342	+++ b/src/AggregateFunctions/AggregateFunctionQuantileDeterministic.cpp
+343	@@ -0,0 +1,65 @@
+344	+#include <AggregateFunctions/AggregateFunctionQuantile.h>
+345	+#include <AggregateFunctions/QuantileReservoirSamplerDeterministic.h>
+346	+#include <AggregateFunctions/AggregateFunctionFactory.h>
+347	+#include <AggregateFunctions/Helpers.h>
+348	+#include <DataTypes/DataTypeDate.h>
+349	+#include <DataTypes/DataTypeDateTime.h>
+350	+#include <Core/Field.h>
+351	+
+352	+
+353	+namespace DB
+354	+{
+355	+struct Settings;
+356	+
+357	+namespace ErrorCodes
+358	+{
+359	+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+360	+}
+361	+
+362	+namespace
+363	+{
+364	+
+365	+template <typename Value, bool float_return> using FuncQuantileDeterministic = AggregateFunctionQuantile<Value, QuantileReservoirSamplerDeterministic<Value>, NameQuantileDeterministic, true, std::conditional_t<float_return, Float64, void>, false>;
+366	+template <typename Value, bool float_return> using FuncQuantilesDeterministic = AggregateFunctionQuantile<Value, QuantileReservoirSamplerDeterministic<Value>, NameQuantilesDeterministic, true, std::conditional_t<float_return, Float64, void>, true>;
+367	+
+368	+template <template <typename, bool> class Function>
+369	+AggregateFunctionPtr createAggregateFunctionQuantile(
+370	+    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+371	+{
+372	+    /// Second argument type check doesn't depend on the type of the first one.
+373	+    Function<void, true>::assertSecondArg(argument_types);
+374	+
+375	+    const DataTypePtr & argument_type = argument_types[0];
+376	+    WhichDataType which(argument_type);
+377	+
+378	+#define DISPATCH(TYPE) \
+379	+    if (which.idx == TypeIndex::TYPE) return std::make_shared<Function<TYPE, true>>(argument_types, params);
+380	+    FOR_BASIC_NUMERIC_TYPES(DISPATCH)
+381	+#undef DISPATCH
+382	+    if (which.idx == TypeIndex::Date) return std::make_shared<Function<DataTypeDate::FieldType, false>>(argument_types, params);
+383	+    if (which.idx == TypeIndex::DateTime) return std::make_shared<Function<DataTypeDateTime::FieldType, false>>(argument_types, params);
+384	+
+385	+    if (which.idx == TypeIndex::Int128) return std::make_shared<Function<Int128, true>>(argument_types, params);
+386	+    if (which.idx == TypeIndex::UInt128) return std::make_shared<Function<Int128, true>>(argument_types, params);
+387	+    if (which.idx == TypeIndex::Int256) return std::make_shared<Function<Int256, true>>(argument_types, params);
+388	+    if (which.idx == TypeIndex::UInt256) return std::make_shared<Function<UInt256, true>>(argument_types, params);
+389	+
+390	+    throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name,
+391	+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+392	+}
+393	+
+394	+}
+395	+
+396	+void registerAggregateFunctionsQuantileDeterministic(AggregateFunctionFactory & factory)
+397	+{
+398	+    /// For aggregate functions returning array we cannot return NULL on empty set.
+399	+    AggregateFunctionProperties properties = { .returns_default_when_only_null = true };
+400	+
+401	+    factory.registerFunction(NameQuantileDeterministic::name, createAggregateFunctionQuantile<FuncQuantileDeterministic>);
+402	+    factory.registerFunction(NameQuantilesDeterministic::name, { createAggregateFunctionQuantile<FuncQuantilesDeterministic>, properties });
+403	+
+404	+    /// 'median' is an alias for 'quantile'
+405	+    factory.registerAlias("medianDeterministic", NameQuantileDeterministic::name);
+406	+}
+407	+
+408	+}
+409	diff --git a/src/AggregateFunctions/AggregateFunctionQuantileExact.cpp b/src/AggregateFunctions/AggregateFunctionQuantileExact.cpp
+410	new file mode 100644
+411	index 000000000000..39de9d0eeaf0
+412	--- /dev/null
+413	+++ b/src/AggregateFunctions/AggregateFunctionQuantileExact.cpp
+414	@@ -0,0 +1,72 @@
+415	+#include <AggregateFunctions/AggregateFunctionQuantile.h>
+416	+#include <AggregateFunctions/QuantileExact.h>
+417	+#include <AggregateFunctions/AggregateFunctionFactory.h>
+418	+#include <AggregateFunctions/Helpers.h>
+419	+#include <DataTypes/DataTypeDate.h>
+420	+#include <DataTypes/DataTypeDateTime.h>
+421	+#include <Core/Field.h>
+422	+
+423	+
+424	+namespace DB
+425	+{
+426	+struct Settings;
+427	+
+428	+namespace ErrorCodes
+429	+{
+430	+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+431	+}
+432	+
+433	+namespace
+434	+{
+435	+
+436	+template <typename Value, bool _> using FuncQuantileExact = AggregateFunctionQuantile<Value, QuantileExact<Value>, NameQuantileExact, false, void, false>;
+437	+template <typename Value, bool _> using FuncQuantilesExact = AggregateFunctionQuantile<Value, QuantileExact<Value>, NameQuantilesExact, false, void, true>;
+438	+
+439	+
+440	+template <template <typename, bool> class Function>
+441	+AggregateFunctionPtr createAggregateFunctionQuantile(
+442	+    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+443	+{
+444	+    /// Second argument type check doesn't depend on the type of the first one.
+445	+    Function<void, true>::assertSecondArg(argument_types);
+446	+
+447	+    const DataTypePtr & argument_type = argument_types[0];
+448	+    WhichDataType which(argument_type);
+449	+
+450	+#define DISPATCH(TYPE) \
+451	+    if (which.idx == TypeIndex::TYPE) return std::make_shared<Function<TYPE, true>>(argument_types, params);
+452	+    FOR_BASIC_NUMERIC_TYPES(DISPATCH)
+453	+#undef DISPATCH
+454	+    if (which.idx == TypeIndex::Date) return std::make_shared<Function<DataTypeDate::FieldType, false>>(argument_types, params);
+455	+    if (which.idx == TypeIndex::DateTime) return std::make_shared<Function<DataTypeDateTime::FieldType, false>>(argument_types, params);
+456	+
+457	+    if (which.idx == TypeIndex::Decimal32) return std::make_shared<Function<Decimal32, false>>(argument_types, params);
+458	+    if (which.idx == TypeIndex::Decimal64) return std::make_shared<Function<Decimal64, false>>(argument_types, params);
+459	+    if (which.idx == TypeIndex::Decimal128) return std::make_shared<Function<Decimal128, false>>(argument_types, params);
+460	+    if (which.idx == TypeIndex::Decimal256) return std::make_shared<Function<Decimal256, false>>(argument_types, params);
+461	+    if (which.idx == TypeIndex::DateTime64) return std::make_shared<Function<DateTime64, false>>(argument_types, params);
+462	+
+463	+    if (which.idx == TypeIndex::Int128) return std::make_shared<Function<Int128, true>>(argument_types, params);
+464	+    if (which.idx == TypeIndex::UInt128) return std::make_shared<Function<Int128, true>>(argument_types, params);
+465	+    if (which.idx == TypeIndex::Int256) return std::make_shared<Function<Int256, true>>(argument_types, params);
+466	+    if (which.idx == TypeIndex::UInt256) return std::make_shared<Function<UInt256, true>>(argument_types, params);
+467	+
+468	+    throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name,
+469	+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+470	+}
+471	+
+472	+}
+473	+
+474	+void registerAggregateFunctionsQuantileExact(AggregateFunctionFactory & factory)
+475	+{
+476	+    /// For aggregate functions returning array we cannot return NULL on empty set.
+477	+    AggregateFunctionProperties properties = { .returns_default_when_only_null = true };
+478	+
+479	+    factory.registerFunction(NameQuantileExact::name, createAggregateFunctionQuantile<FuncQuantileExact>);
+480	+    factory.registerFunction(NameQuantilesExact::name, { createAggregateFunctionQuantile<FuncQuantilesExact>, properties });
+481	+
+482	+    /// 'median' is an alias for 'quantile'
+483	+    factory.registerAlias("medianExact", NameQuantileExact::name);
+484	+}
+485	+
+486	+}
+487	diff --git a/src/AggregateFunctions/AggregateFunctionQuantileExactExclusive.cpp b/src/AggregateFunctions/AggregateFunctionQuantileExactExclusive.cpp
+488	new file mode 100644
+489	index 000000000000..81f81ad00cb0
+490	--- /dev/null
+491	+++ b/src/AggregateFunctions/AggregateFunctionQuantileExactExclusive.cpp
+492	@@ -0,0 +1,57 @@
+493	+#include <AggregateFunctions/AggregateFunctionQuantile.h>
+494	+#include <AggregateFunctions/QuantileExact.h>
+495	+#include <AggregateFunctions/AggregateFunctionFactory.h>
+496	+#include <AggregateFunctions/Helpers.h>
+497	+#include <DataTypes/DataTypeDate.h>
+498	+#include <DataTypes/DataTypeDateTime.h>
+499	+#include <Core/Field.h>
+500	+
+501	+
+502	+namespace DB
+503	+{
+504	+struct Settings;
+505	+
+506	+namespace ErrorCodes
+507	+{
+508	+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+509	+}
+510	+
+511	+namespace
+512	+{
+513	+
+514	+template <typename Value, bool _> using FuncQuantileExactExclusive = AggregateFunctionQuantile<Value, QuantileExactExclusive<Value>, NameQuantileExactExclusive, false, Float64, false>;
+515	+template <typename Value, bool _> using FuncQuantilesExactExclusive = AggregateFunctionQuantile<Value, QuantileExactExclusive<Value>, NameQuantilesExactExclusive, false, Float64, true>;
+516	+
+517	+template <template <typename, bool> class Function>
+518	+AggregateFunctionPtr createAggregateFunctionQuantile(
+519	+    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+520	+{
+521	+    /// Second argument type check doesn't depend on the type of the first one.
+522	+    Function<void, true>::assertSecondArg(argument_types);
+523	+
+524	+    const DataTypePtr & argument_type = argument_types[0];
+525	+    WhichDataType which(argument_type);
+526	+
+527	+#define DISPATCH(TYPE) \
+528	+    if (which.idx == TypeIndex::TYPE) return std::make_shared<Function<TYPE, true>>(argument_types, params);
+529	+    FOR_BASIC_NUMERIC_TYPES(DISPATCH)
+530	+#undef DISPATCH
+531	+    if (which.idx == TypeIndex::Date) return std::make_shared<Function<DataTypeDate::FieldType, false>>(argument_types, params);
+532	+    if (which.idx == TypeIndex::DateTime) return std::make_shared<Function<DataTypeDateTime::FieldType, false>>(argument_types, params);
+533	+
+534	+    throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name,
+535	+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+536	+}
+537	+
+538	+}
+539	+
+540	+void registerAggregateFunctionsQuantileExactExclusive(AggregateFunctionFactory & factory)
+541	+{
+542	+    /// For aggregate functions returning array we cannot return NULL on empty set.
+543	+    AggregateFunctionProperties properties = { .returns_default_when_only_null = true };
+544	+
+545	+    factory.registerFunction(NameQuantileExactExclusive::name, createAggregateFunctionQuantile<FuncQuantileExactExclusive>);
+546	+    factory.registerFunction(NameQuantilesExactExclusive::name, { createAggregateFunctionQuantile<FuncQuantilesExactExclusive>, properties });
+547	+}
+548	+
+549	+}
+550	diff --git a/src/AggregateFunctions/AggregateFunctionQuantileExactHigh.cpp b/src/AggregateFunctions/AggregateFunctionQuantileExactHigh.cpp
+551	new file mode 100644
+552	index 000000000000..d2d6d7ce9bae
+553	--- /dev/null
+554	+++ b/src/AggregateFunctions/AggregateFunctionQuantileExactHigh.cpp
+555	@@ -0,0 +1,67 @@
+556	+#include <AggregateFunctions/AggregateFunctionQuantile.h>
+557	+#include <AggregateFunctions/QuantileExact.h>
+558	+#include <AggregateFunctions/AggregateFunctionFactory.h>
+559	+#include <AggregateFunctions/Helpers.h>
+560	+#include <DataTypes/DataTypeDate.h>
+561	+#include <DataTypes/DataTypeDateTime.h>
+562	+#include <Core/Field.h>
+563	+
+564	+
+565	+namespace DB
+566	+{
+567	+struct Settings;
+568	+
+569	+namespace ErrorCodes
+570	+{
+571	+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+572	+}
+573	+
+574	+namespace
+575	+{
+576	+
+577	+template <typename Value, bool _> using FuncQuantileExactHigh = AggregateFunctionQuantile<Value, QuantileExactHigh<Value>, NameQuantileExactHigh, false, void, false>;
+578	+template <typename Value, bool _> using FuncQuantilesExactHigh = AggregateFunctionQuantile<Value, QuantileExactHigh<Value>, NameQuantilesExactHigh, false, void, true>;
+579	+
+580	+
+581	+template <template <typename, bool> class Function>
+582	+AggregateFunctionPtr createAggregateFunctionQuantile(
+583	+    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+584	+{
+585	+    /// Second argument type check doesn't depend on the type of the first one.
+586	+    Function<void, true>::assertSecondArg(argument_types);
+587	+
+588	+    const DataTypePtr & argument_type = argument_types[0];
+589	+    WhichDataType which(argument_type);
+590	+
+591	+#define DISPATCH(TYPE) \
+592	+    if (which.idx == TypeIndex::TYPE) return std::make_shared<Function<TYPE, true>>(argument_types, params);
+593	+    FOR_BASIC_NUMERIC_TYPES(DISPATCH)
+594	+#undef DISPATCH
+595	+    if (which.idx == TypeIndex::Date) return std::make_shared<Function<DataTypeDate::FieldType, false>>(argument_types, params);
+596	+    if (which.idx == TypeIndex::DateTime) return std::make_shared<Function<DataTypeDateTime::FieldType, false>>(argument_types, params);
+597	+
+598	+    if (which.idx == TypeIndex::Decimal32) return std::make_shared<Function<Decimal32, false>>(argument_types, params);
+599	+    if (which.idx == TypeIndex::Decimal64) return std::make_shared<Function<Decimal64, false>>(argument_types, params);
+600	+    if (which.idx == TypeIndex::Decimal128) return std::make_shared<Function<Decimal128, false>>(argument_types, params);
+601	+    if (which.idx == TypeIndex::Decimal256) return std::make_shared<Function<Decimal256, false>>(argument_types, params);
+602	+    if (which.idx == TypeIndex::DateTime64) return std::make_shared<Function<DateTime64, false>>(argument_types, params);
+603	+
+604	+    throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name,
+605	+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+606	+}
+607	+
+608	+}
+609	+
+610	+void registerAggregateFunctionsQuantileExactHigh(AggregateFunctionFactory & factory)
+611	+{
+612	+    /// For aggregate functions returning array we cannot return NULL on empty set.
+613	+    AggregateFunctionProperties properties = { .returns_default_when_only_null = true };
+614	+
+615	+    factory.registerFunction(NameQuantileExactHigh::name, createAggregateFunctionQuantile<FuncQuantileExactHigh>);
+616	+    factory.registerFunction(NameQuantilesExactHigh::name, { createAggregateFunctionQuantile<FuncQuantilesExactHigh>, properties });
+617	+
+618	+    /// 'median' is an alias for 'quantile'
+619	+    factory.registerAlias("medianExactHigh", NameQuantileExactHigh::name);
+620	+}
+621	+
+622	+}
+623	diff --git a/src/AggregateFunctions/AggregateFunctionQuantileExactInclusive.cpp b/src/AggregateFunctions/AggregateFunctionQuantileExactInclusive.cpp
+624	new file mode 100644
+625	index 000000000000..c96f9d4e6d2e
+626	--- /dev/null
+627	+++ b/src/AggregateFunctions/AggregateFunctionQuantileExactInclusive.cpp
+628	@@ -0,0 +1,57 @@
+629	+#include <AggregateFunctions/AggregateFunctionQuantile.h>
+630	+#include <AggregateFunctions/QuantileExact.h>
+631	+#include <AggregateFunctions/AggregateFunctionFactory.h>
+632	+#include <AggregateFunctions/Helpers.h>
+633	+#include <DataTypes/DataTypeDate.h>
+634	+#include <DataTypes/DataTypeDateTime.h>
+635	+#include <Core/Field.h>
+636	+
+637	+
+638	+namespace DB
+639	+{
+640	+struct Settings;
+641	+
+642	+namespace ErrorCodes
+643	+{
+644	+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+645	+}
+646	+
+647	+namespace
+648	+{
+649	+
+650	+template <typename Value, bool _> using FuncQuantileExactInclusive = AggregateFunctionQuantile<Value, QuantileExactInclusive<Value>, NameQuantileExactInclusive, false, Float64, false>;
+651	+template <typename Value, bool _> using FuncQuantilesExactInclusive = AggregateFunctionQuantile<Value, QuantileExactInclusive<Value>, NameQuantilesExactInclusive, false, Float64, true>;
+652	+
+653	+template <template <typename, bool> class Function>
+654	+AggregateFunctionPtr createAggregateFunctionQuantile(
+655	+    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+656	+{
+657	+    /// Second argument type check doesn't depend on the type of the first one.
+658	+    Function<void, true>::assertSecondArg(argument_types);
+659	+
+660	+    const DataTypePtr & argument_type = argument_types[0];
+661	+    WhichDataType which(argument_type);
+662	+
+663	+#define DISPATCH(TYPE) \
+664	+    if (which.idx == TypeIndex::TYPE) return std::make_shared<Function<TYPE, true>>(argument_types, params);
+665	+    FOR_BASIC_NUMERIC_TYPES(DISPATCH)
+666	+#undef DISPATCH
+667	+    if (which.idx == TypeIndex::Date) return std::make_shared<Function<DataTypeDate::FieldType, false>>(argument_types, params);
+668	+    if (which.idx == TypeIndex::DateTime) return std::make_shared<Function<DataTypeDateTime::FieldType, false>>(argument_types, params);
+669	+
+670	+    throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name,
+671	+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+672	+}
+673	+
+674	+}
+675	+
+676	+void registerAggregateFunctionsQuantileExactInclusive(AggregateFunctionFactory & factory)
+677	+{
+678	+    /// For aggregate functions returning array we cannot return NULL on empty set.
+679	+    AggregateFunctionProperties properties = { .returns_default_when_only_null = true };
+680	+
+681	+    factory.registerFunction(NameQuantileExactInclusive::name, createAggregateFunctionQuantile<FuncQuantileExactInclusive>);
+682	+    factory.registerFunction(NameQuantilesExactInclusive::name, { createAggregateFunctionQuantile<FuncQuantilesExactInclusive>, properties });
+683	+}
+684	+
+685	+}
+686	diff --git a/src/AggregateFunctions/AggregateFunctionQuantileExactLow.cpp b/src/AggregateFunctions/AggregateFunctionQuantileExactLow.cpp
+687	new file mode 100644
+688	index 000000000000..8565b3b21b07
+689	--- /dev/null
+690	+++ b/src/AggregateFunctions/AggregateFunctionQuantileExactLow.cpp
+691	@@ -0,0 +1,66 @@
+692	+#include <AggregateFunctions/AggregateFunctionQuantile.h>
+693	+#include <AggregateFunctions/QuantileExact.h>
+694	+#include <AggregateFunctions/AggregateFunctionFactory.h>
+695	+#include <AggregateFunctions/Helpers.h>
+696	+#include <DataTypes/DataTypeDate.h>
+697	+#include <DataTypes/DataTypeDateTime.h>
+698	+#include <Core/Field.h>
+699	+
+700	+
+701	+namespace DB
+702	+{
+703	+struct Settings;
+704	+
+705	+namespace ErrorCodes
+706	+{
+707	+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+708	+}
+709	+
+710	+namespace
+711	+{
+712	+
+713	+template <typename Value, bool _> using FuncQuantileExactLow = AggregateFunctionQuantile<Value, QuantileExactLow<Value>, NameQuantileExactLow, false, void, false>;
+714	+template <typename Value, bool _> using FuncQuantilesExactLow = AggregateFunctionQuantile<Value, QuantileExactLow<Value>, NameQuantilesExactLow, false, void, true>;
+715	+
+716	+template <template <typename, bool> class Function>
+717	+AggregateFunctionPtr createAggregateFunctionQuantile(
+718	+    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+719	+{
+720	+    /// Second argument type check doesn't depend on the type of the first one.
+721	+    Function<void, true>::assertSecondArg(argument_types);
+722	+
+723	+    const DataTypePtr & argument_type = argument_types[0];
+724	+    WhichDataType which(argument_type);
+725	+
+726	+#define DISPATCH(TYPE) \
+727	+    if (which.idx == TypeIndex::TYPE) return std::make_shared<Function<TYPE, true>>(argument_types, params);
+728	+    FOR_BASIC_NUMERIC_TYPES(DISPATCH)
+729	+#undef DISPATCH
+730	+    if (which.idx == TypeIndex::Date) return std::make_shared<Function<DataTypeDate::FieldType, false>>(argument_types, params);
+731	+    if (which.idx == TypeIndex::DateTime) return std::make_shared<Function<DataTypeDateTime::FieldType, false>>(argument_types, params);
+732	+
+733	+    if (which.idx == TypeIndex::Decimal32) return std::make_shared<Function<Decimal32, false>>(argument_types, params);
+734	+    if (which.idx == TypeIndex::Decimal64) return std::make_shared<Function<Decimal64, false>>(argument_types, params);
+735	+    if (which.idx == TypeIndex::Decimal128) return std::make_shared<Function<Decimal128, false>>(argument_types, params);
+736	+    if (which.idx == TypeIndex::Decimal256) return std::make_shared<Function<Decimal256, false>>(argument_types, params);
+737	+    if (which.idx == TypeIndex::DateTime64) return std::make_shared<Function<DateTime64, false>>(argument_types, params);
+738	+
+739	+    throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name,
+740	+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+741	+}
+742	+
+743	+}
+744	+
+745	+void registerAggregateFunctionsQuantileExactLow(AggregateFunctionFactory & factory)
+746	+{
+747	+    /// For aggregate functions returning array we cannot return NULL on empty set.
+748	+    AggregateFunctionProperties properties = { .returns_default_when_only_null = true };
+749	+
+750	+    factory.registerFunction(NameQuantileExactLow::name, createAggregateFunctionQuantile<FuncQuantileExactLow>);
+751	+    factory.registerFunction(NameQuantilesExactLow::name, { createAggregateFunctionQuantile<FuncQuantilesExactLow>, properties });
+752	+
+753	+    /// 'median' is an alias for 'quantile'
+754	+    factory.registerAlias("medianExactLow", NameQuantileExactLow::name);
+755	+}
+756	+
+757	+}
+758	diff --git a/src/AggregateFunctions/AggregateFunctionQuantileExactWeighted.cpp b/src/AggregateFunctions/AggregateFunctionQuantileExactWeighted.cpp
+759	new file mode 100644
+760	index 000000000000..63e4d3df24b4
+761	--- /dev/null
+762	+++ b/src/AggregateFunctions/AggregateFunctionQuantileExactWeighted.cpp
+763	@@ -0,0 +1,71 @@
+764	+#include <AggregateFunctions/AggregateFunctionQuantile.h>
+765	+#include <AggregateFunctions/QuantileExactWeighted.h>
+766	+#include <AggregateFunctions/AggregateFunctionFactory.h>
+767	+#include <AggregateFunctions/Helpers.h>
+768	+#include <DataTypes/DataTypeDate.h>
+769	+#include <DataTypes/DataTypeDateTime.h>
+770	+#include <Core/Field.h>
+771	+
+772	+
+773	+namespace DB
+774	+{
+775	+struct Settings;
+776	+
+777	+namespace ErrorCodes
+778	+{
+779	+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+780	+}
+781	+
+782	+namespace
+783	+{
+784	+
+785	+template <typename Value, bool _> using FuncQuantileExactWeighted = AggregateFunctionQuantile<Value, QuantileExactWeighted<Value>, NameQuantileExactWeighted, true, void, false>;
+786	+template <typename Value, bool _> using FuncQuantilesExactWeighted = AggregateFunctionQuantile<Value, QuantileExactWeighted<Value>, NameQuantilesExactWeighted, true, void, true>;
+787	+
+788	+template <template <typename, bool> class Function>
+789	+AggregateFunctionPtr createAggregateFunctionQuantile(
+790	+    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+791	+{
+792	+    /// Second argument type check doesn't depend on the type of the first one.
+793	+    Function<void, true>::assertSecondArg(argument_types);
+794	+
+795	+    const DataTypePtr & argument_type = argument_types[0];
+796	+    WhichDataType which(argument_type);
+797	+
+798	+#define DISPATCH(TYPE) \
+799	+    if (which.idx == TypeIndex::TYPE) return std::make_shared<Function<TYPE, true>>(argument_types, params);
+800	+    FOR_BASIC_NUMERIC_TYPES(DISPATCH)
+801	+#undef DISPATCH
+802	+    if (which.idx == TypeIndex::Date) return std::make_shared<Function<DataTypeDate::FieldType, false>>(argument_types, params);
+803	+    if (which.idx == TypeIndex::DateTime) return std::make_shared<Function<DataTypeDateTime::FieldType, false>>(argument_types, params);
+804	+
+805	+    if (which.idx == TypeIndex::Decimal32) return std::make_shared<Function<Decimal32, false>>(argument_types, params);
+806	+    if (which.idx == TypeIndex::Decimal64) return std::make_shared<Function<Decimal64, false>>(argument_types, params);
+807	+    if (which.idx == TypeIndex::Decimal128) return std::make_shared<Function<Decimal128, false>>(argument_types, params);
+808	+    if (which.idx == TypeIndex::Decimal256) return std::make_shared<Function<Decimal256, false>>(argument_types, params);
+809	+    if (which.idx == TypeIndex::DateTime64) return std::make_shared<Function<DateTime64, false>>(argument_types, params);
+810	+
+811	+    if (which.idx == TypeIndex::Int128) return std::make_shared<Function<Int128, true>>(argument_types, params);
+812	+    if (which.idx == TypeIndex::UInt128) return std::make_shared<Function<Int128, true>>(argument_types, params);
+813	+    if (which.idx == TypeIndex::Int256) return std::make_shared<Function<Int256, true>>(argument_types, params);
+814	+    if (which.idx == TypeIndex::UInt256) return std::make_shared<Function<UInt256, true>>(argument_types, params);
+815	+
+816	+    throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name,
+817	+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+818	+}
+819	+
+820	+}
+821	+
+822	+void registerAggregateFunctionsQuantileExactWeighted(AggregateFunctionFactory & factory)
+823	+{
+824	+    /// For aggregate functions returning array we cannot return NULL on empty set.
+825	+    AggregateFunctionProperties properties = { .returns_default_when_only_null = true };
+826	+
+827	+    factory.registerFunction(NameQuantileExactWeighted::name, createAggregateFunctionQuantile<FuncQuantileExactWeighted>);
+828	+    factory.registerFunction(NameQuantilesExactWeighted::name, { createAggregateFunctionQuantile<FuncQuantilesExactWeighted>, properties });
+829	+
+830	+    /// 'median' is an alias for 'quantile'
+831	+    factory.registerAlias("medianExactWeighted", NameQuantileExactWeighted::name);
+832	+}
+833	+
+834	+}
+835	diff --git a/src/AggregateFunctions/AggregateFunctionQuantileTDigest.cpp b/src/AggregateFunctions/AggregateFunctionQuantileTDigest.cpp
+836	new file mode 100644
+837	index 000000000000..6943dbe63379
+838	--- /dev/null
+839	+++ b/src/AggregateFunctions/AggregateFunctionQuantileTDigest.cpp
+840	@@ -0,0 +1,60 @@
+841	+#include <AggregateFunctions/AggregateFunctionQuantile.h>
+842	+#include <AggregateFunctions/QuantileTDigest.h>
+843	+#include <AggregateFunctions/AggregateFunctionFactory.h>
+844	+#include <AggregateFunctions/Helpers.h>
+845	+#include <DataTypes/DataTypeDate.h>
+846	+#include <DataTypes/DataTypeDateTime.h>
+847	+#include <Core/Field.h>
+848	+
+849	+
+850	+namespace DB
+851	+{
+852	+struct Settings;
+853	+
+854	+namespace ErrorCodes
+855	+{
+856	+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+857	+}
+858	+
+859	+namespace
+860	+{
+861	+
+862	+template <typename Value, bool float_return> using FuncQuantileTDigest = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantileTDigest, false, std::conditional_t<float_return, Float32, void>, false>;
+863	+template <typename Value, bool float_return> using FuncQuantilesTDigest = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantilesTDigest, false, std::conditional_t<float_return, Float32, void>, true>;
+864	+
+865	+template <template <typename, bool> class Function>
+866	+AggregateFunctionPtr createAggregateFunctionQuantile(
+867	+    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+868	+{
+869	+    /// Second argument type check doesn't depend on the type of the first one.
+870	+    Function<void, true>::assertSecondArg(argument_types);
+871	+
+872	+    const DataTypePtr & argument_type = argument_types[0];
+873	+    WhichDataType which(argument_type);
+874	+
+875	+#define DISPATCH(TYPE) \
+876	+    if (which.idx == TypeIndex::TYPE) return std::make_shared<Function<TYPE, true>>(argument_types, params);
+877	+    FOR_BASIC_NUMERIC_TYPES(DISPATCH)
+878	+#undef DISPATCH
+879	+    if (which.idx == TypeIndex::Date) return std::make_shared<Function<DataTypeDate::FieldType, false>>(argument_types, params);
+880	+    if (which.idx == TypeIndex::DateTime) return std::make_shared<Function<DataTypeDateTime::FieldType, false>>(argument_types, params);
+881	+
+882	+    throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name,
+883	+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+884	+}
+885	+
+886	+}
+887	+
+888	+void registerAggregateFunctionsQuantileTDigest(AggregateFunctionFactory & factory)
+889	+{
+890	+    /// For aggregate functions returning array we cannot return NULL on empty set.
+891	+    AggregateFunctionProperties properties = { .returns_default_when_only_null = true };
+892	+
+893	+    factory.registerFunction(NameQuantileTDigest::name, createAggregateFunctionQuantile<FuncQuantileTDigest>);
+894	+    factory.registerFunction(NameQuantilesTDigest::name, { createAggregateFunctionQuantile<FuncQuantilesTDigest>, properties });
+895	+
+896	+    /// 'median' is an alias for 'quantile'
+897	+    factory.registerAlias("medianTDigest", NameQuantileTDigest::name);
+898	+}
+899	+
+900	+}
+901	diff --git a/src/AggregateFunctions/AggregateFunctionQuantileTDigestWeighted.cpp b/src/AggregateFunctions/AggregateFunctionQuantileTDigestWeighted.cpp
+902	new file mode 100644
+903	index 000000000000..1c44373d02bb
+904	--- /dev/null
+905	+++ b/src/AggregateFunctions/AggregateFunctionQuantileTDigestWeighted.cpp
+906	@@ -0,0 +1,60 @@
+907	+#include <AggregateFunctions/AggregateFunctionQuantile.h>
+908	+#include <AggregateFunctions/QuantileTDigest.h>
+909	+#include <AggregateFunctions/AggregateFunctionFactory.h>
+910	+#include <AggregateFunctions/Helpers.h>
+911	+#include <DataTypes/DataTypeDate.h>
+912	+#include <DataTypes/DataTypeDateTime.h>
+913	+#include <Core/Field.h>
+914	+
+915	+
+916	+namespace DB
+917	+{
+918	+struct Settings;
+919	+
+920	+namespace ErrorCodes
+921	+{
+922	+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+923	+}
+924	+
+925	+namespace
+926	+{
+927	+
+928	+template <typename Value, bool float_return> using FuncQuantileTDigestWeighted = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantileTDigestWeighted, true, std::conditional_t<float_return, Float32, void>, false>;
+929	+template <typename Value, bool float_return> using FuncQuantilesTDigestWeighted = AggregateFunctionQuantile<Value, QuantileTDigest<Value>, NameQuantilesTDigestWeighted, true, std::conditional_t<float_return, Float32, void>, true>;
+930	+
+931	+template <template <typename, bool> class Function>
+932	+AggregateFunctionPtr createAggregateFunctionQuantile(
+933	+    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+934	+{
+935	+    /// Second argument type check doesn't depend on the type of the first one.
+936	+    Function<void, true>::assertSecondArg(argument_types);
+937	+
+938	+    const DataTypePtr & argument_type = argument_types[0];
+939	+    WhichDataType which(argument_type);
+940	+
+941	+#define DISPATCH(TYPE) \
+942	+    if (which.idx == TypeIndex::TYPE) return std::make_shared<Function<TYPE, true>>(argument_types, params);
+943	+    FOR_BASIC_NUMERIC_TYPES(DISPATCH)
+944	+#undef DISPATCH
+945	+    if (which.idx == TypeIndex::Date) return std::make_shared<Function<DataTypeDate::FieldType, false>>(argument_types, params);
+946	+    if (which.idx == TypeIndex::DateTime) return std::make_shared<Function<DataTypeDateTime::FieldType, false>>(argument_types, params);
+947	+
+948	+    throw Exception("Illegal type " + argument_type->getName() + " of argument for aggregate function " + name,
+949	+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+950	+}
+951	+
+952	+}
+953	+
+954	+void registerAggregateFunctionsQuantileTDigestWeighted(AggregateFunctionFactory & factory)
+955	+{
+956	+    /// For aggregate functions returning array we cannot return NULL on empty set.
+957	+    AggregateFunctionProperties properties = { .returns_default_when_only_null = true };
+958	+
+959	+    factory.registerFunction(NameQuantileTDigestWeighted::name, createAggregateFunctionQuantile<FuncQuantileTDigestWeighted>);
+960	+    factory.registerFunction(NameQuantilesTDigestWeighted::name, { createAggregateFunctionQuantile<FuncQuantilesTDigestWeighted>, properties });
+961	+
+962	+    /// 'median' is an alias for 'quantile'
+963	+    factory.registerAlias("medianTDigestWeighted", NameQuantileTDigestWeighted::name);
+964	+}
+965	+
+966	+}
+967	diff --git a/src/AggregateFunctions/AggregateFunctionQuantileTiming.cpp b/src/AggregateFunctions/AggregateFunctionQuantileTiming.cpp
+968	new file mode 100644
+969	index 000000000000..d9d5c0aba7fe
+970	--- /dev/null
+971	+++ b/src/AggregateFunctions/AggregateFunctionQuantileTiming.cpp
+972	@@ -0,0 +1,60 @@
+973	+#include <AggregateFunctions/AggregateFunctionQuantile.h>
+974	+#include <AggregateFunctions/QuantileTiming.h>
+975	+#include <AggregateFunctions/AggregateFunctionFactory.h>
+976	+#include <AggregateFunctions/Helpers.h>
+977	+#include <DataTypes/DataTypeDate.h>
+978	+#include <DataTypes/DataTypeDateTime.h>
+979	+#include <Core/Field.h>
+980	+
+981	+
+982	+namespace DB
+983	+{
+984	+struct Settings;
+985	+
+986	+namespace ErrorCodes
+987	+{
+988	+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+989	+}
+990	+
+991	+namespace
+992	+{
+993	+
+994	+template <typename Value, bool _> using FuncQuantileTiming = AggregateFunctionQuantile<Value, QuantileTiming<Value>, NameQuantileTiming, false, Float32, false>;
+995	+template <typename Value, bool _> using FuncQuantilesTiming = AggregateFunctionQuantile<Value, QuantileTiming<Value>, NameQuantilesTiming, false, Float32, true>;
+996	+
+997	+template <template <typename, bool> class Function>
+998	+AggregateFunctionPtr createAggregateFunctionQuantile(
+999	+    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+1000	+{

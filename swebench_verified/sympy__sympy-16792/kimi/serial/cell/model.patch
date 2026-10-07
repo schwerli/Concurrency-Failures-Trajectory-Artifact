@@ -1,0 +1,48 @@
+diff --git a/sympy/utilities/codegen.py b/sympy/utilities/codegen.py
+index f0befb2bd..13aff3589 100644
+--- a/sympy/utilities/codegen.py
++++ b/sympy/utilities/codegen.py
+@@ -739,7 +739,11 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+                 try:
+                     new_args.append(name_arg_dict[symbol])
+                 except KeyError:
+-                    new_args.append(InputArgument(symbol))
++                    metadata = {}
++                    if isinstance(symbol, MatrixSymbol):
++                        dims = tuple([(S.Zero, dim - 1) for dim in symbol.shape])
++                        metadata = {'dimensions': dims}
++                    new_args.append(InputArgument(symbol, **metadata))
+             arg_list = new_args
+ 
+         return Routine(name, arg_list, return_val, local_vars, global_vars)
+diff --git a/sympy/utilities/tests/test_codegen.py b/sympy/utilities/tests/test_codegen.py
+index 1cd56e12d..d4b8c53e5 100644
+--- a/sympy/utilities/tests/test_codegen.py
++++ b/sympy/utilities/tests/test_codegen.py
+@@ -562,6 +562,26 @@ def test_ccode_matrixsymbol_slice():
+     )
+     assert source == expected
+ 
++
++def test_unused_matrixsymbol_argument():
++    # An argument that does not appear in the expression must still be
++    # declared with the correct type (pointer for MatrixSymbol).
++    A = MatrixSymbol('A', 3, 1)
++    name_expr = ("test", 1.0)
++    result = codegen(name_expr, "c99", "test", header=False, empty=False,
++                     argument_sequence=(A,))
++    source = result[0][1]
++    expected = (
++        '#include "test.h"\n'
++        '#include <math.h>\n'
++        'double test(double *A) {\n'
++        '   double test_result;\n'
++        '   test_result = 1.0;\n'
++        '   return test_result;\n'
++        '}\n'
++    )
++    assert source == expected
++
+ def test_ccode_cse():
+     a, b, c, d = symbols('a b c d')
+     e = MatrixSymbol('e', 3, 1)

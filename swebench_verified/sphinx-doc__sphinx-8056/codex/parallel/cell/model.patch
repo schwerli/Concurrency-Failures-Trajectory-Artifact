@@ -1,0 +1,106 @@
+diff --git a/sphinx/util/docfields.py b/sphinx/util/docfields.py
+index c07bc7f66..35ed55f42 100644
+--- a/sphinx/util/docfields.py
++++ b/sphinx/util/docfields.py
+@@ -40,6 +40,33 @@ def _is_single_paragraph(node: nodes.field_body) -> bool:
+     return False
+ 
+ 
++def _split_field_arg(fieldarg: str) -> List[str]:
++    parts = []
++    current = []
++    openers = {'(': ')', '[': ']', '{': '}'}
++    stack = []  # type: List[str]
++
++    for char in fieldarg:
++        if char in openers:
++            stack.append(openers[char])
++        elif stack and char == stack[-1]:
++            stack.pop()
++
++        if char == ',' and not stack:
++            parts.append(''.join(current).strip())
++            current = []
++        else:
++            current.append(char)
++
++    parts.append(''.join(current).strip())
++    return parts
++
++
++def _is_multiple_argument(fieldarg: str) -> bool:
++    parts = _split_field_arg(fieldarg)
++    return len(parts) > 1 and all(part and ' ' not in part for part in parts)
++
++
+ class Field:
+     """A doc field that is never grouped.  It can have an argument or not, the
+     argument can be linked using a specified *rolename*.  Field should be used
+@@ -318,10 +345,11 @@ class DocFieldTransformer:
+                     types.setdefault(typename, {})[fieldarg] = content
+                 continue
+ 
+-            # also support syntax like ``:param type name:``
+-            if typedesc.is_typed:
++            # also support syntax like ``:param type name:``, but do not
++            # misinterpret combined parameter names like ``x1, x2``.
++            if typedesc.is_typed and not _is_multiple_argument(fieldarg):
+                 try:
+-                    argtype, argname = fieldarg.split(None, 1)
++                    argtype, argname = fieldarg.rsplit(None, 1)
+                 except ValueError:
+                     pass
+                 else:
+diff --git a/tests/test_domain_py.py b/tests/test_domain_py.py
+index b98f37912..8e7d82168 100644
+--- a/tests/test_domain_py.py
++++ b/tests/test_domain_py.py
+@@ -402,6 +402,22 @@ def test_optional_pyfunction_signature(app):
+                                   [desc_optional, desc_parameter, "symbol"])]))
+ 
+ 
++def test_pyfunction_doc_fields_with_combined_parameter_names(app):
++    text = """\
++.. py:function:: f(x1, x2)
++   :param x1, x2: Input arrays, description of x1, x2.
++   :type x1, x2: array_like, optional
++"""
++    doctree = restructuredtext.parse(app, text)
++
++    field = doctree[1][1][0][0]
++    assert_node(field, nodes.field)
++    assert field[0].astext() == 'Parameters'
++    assert field[1].astext() == (
++        'x1, x2 (array_like, optional) -- Input arrays, description of x1, x2.'
++    )
++
++
+ def test_pyexception_signature(app):
+     text = ".. py:exception:: exceptions.IOError"
+     doctree = restructuredtext.parse(app, text)
+diff --git a/tests/test_ext_napoleon_docstring.py b/tests/test_ext_napoleon_docstring.py
+index bf3c878a8..aee402ada 100644
+--- a/tests/test_ext_napoleon_docstring.py
++++ b/tests/test_ext_napoleon_docstring.py
+@@ -2201,6 +2201,21 @@ definition_after_normal_text : int
+         actual = str(NumpyDocstring(docstring, config))
+         self.assertEqual(expected, actual)
+ 
++    def test_combined_parameter_names(self):
++        docstring = dedent("""\
++            Parameters
++            ----------
++            x1, x2 : array_like, optional
++                Input arrays, description of x1, x2.
++        """)
++        expected = dedent("""\
++            :param x1, x2: Input arrays, description of x1, x2.
++            :type x1, x2: :class:`array_like`, *optional*
++        """)
++        config = Config(napoleon_use_param=True)
++        actual = str(NumpyDocstring(docstring, config))
++        self.assertEqual(expected, actual)
++
+ 
+ @contextmanager
+ def warns(warning, match):

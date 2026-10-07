@@ -1,0 +1,28 @@
+Done. `in_bulk()` now accepts a field made unique by a total `UniqueConstraint`.
+
+**The fix** — `django/db/models/query.py:692`: the check now also accepts `field_name` when it's the sole field of a constraint in `Meta.total_unique_constraints` (that property already existed on `Options` and filters out conditional constraints):
+
+```python
+opts = self.model._meta
+unique_fields = [
+    constraint.fields[0]
+    for constraint in opts.total_unique_constraints
+    if len(constraint.fields) == 1
+]
+if (
+    field_name != 'pk' and
+    not opts.get_field(field_name).unique and
+    field_name not in unique_fields
+):
+    raise ValueError(...)
+```
+
+Two cases stay rejected, since neither guarantees uniqueness for all rows: multi-field constraints (`len(fields) == 1` filter) and partial/conditional ones (excluded by `total_unique_constraints`).
+
+**Tests** — added a total `UniqueConstraint` on `Season.year` in `tests/lookup/models.py`, plus `test_in_bulk_meta_constraint` (works) and `test_in_bulk_non_unique_meta_constaint` (multi-field and conditional constraints still raise, under `@isolate_apps`).
+
+**Docs** — clarified what "unique field" means in the `in_bulk()` reference, with a `versionchanged:: 3.1` note and a 3.1 release-note entry.
+
+**Verification** — `lookup queries constraints model_options basic prefetch_related`: 628 tests, OK (19 skipped, 2 expected failures). I also ran the ticket's exact scenario — `in_bulk(field_name='year')` with no `id_list`, previously the `ValueError` path — and it returned `{2001: <Season: 2001>, 2002: <Season: 2002>}`.
+
+One judgment call worth flagging: I did not extend this to multi-field constraints via a tuple `field_name`; that's a larger API change than the ticket asks for.

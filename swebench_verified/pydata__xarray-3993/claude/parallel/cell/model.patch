@@ -1,0 +1,166 @@
+diff --git a/dedent_patch.py b/dedent_patch.py
+new file mode 100644
+index 00000000..5f5efd43
+--- /dev/null
++++ b/dedent_patch.py
+@@ -0,0 +1,30 @@
++"""pytest plugin: replace DataArray.integrate with the DEDENTED variant
++(msg/warn moved out of the `if dim is not None and coord is None:` body)
++to see whether the existing test suite catches that failure mode."""
++import warnings
++from typing import Hashable, Sequence, Union
++import xarray.core.dataarray as dam
++
++
++def integrate_dedented(self, coord=None, datetime_unit=None, *, dim=None):
++    if dim is not None and coord is not None:
++        raise ValueError(
++            "Cannot pass both 'dim' and 'coord'. Please pass only 'coord' instead."
++        )
++
++    if dim is not None and coord is None:
++        coord = dim
++    msg = (
++        "The `dim` keyword argument to `DataArray.integrate` is "
++        "being replaced with `coord`, for consistency with "
++        "`Dataset.integrate`. Please pass `coord` instead."
++        " `dim` will be removed in version 0.19.0."
++    )
++    warnings.warn(msg, FutureWarning, stacklevel=2)
++
++    ds = self._to_temp_dataset().integrate(coord, datetime_unit)
++    return self._from_temp_dataset(ds)
++
++
++dam.DataArray.integrate = integrate_dedented
++print("PATCHED: DataArray.integrate replaced with DEDENTED variant")
+diff --git a/doc/whats-new.rst b/doc/whats-new.rst
+index 488d8baa..31ee0338 100644
+--- a/doc/whats-new.rst
++++ b/doc/whats-new.rst
+@@ -43,6 +43,15 @@ Breaking changes
+   By `Aureliana Barghini <https://github.com/aurghs>`_.
+ 
+ 
++Deprecations
++~~~~~~~~~~~~
++- ``dim`` argument to :py:meth:`DataArray.integrate` is being deprecated in
++  favour of a ``coord`` argument, for consistency with
++  :py:meth:`Dataset.integrate`. For now using ``dim`` issues a
++  ``FutureWarning``. It will be removed in version 0.19.0 (:issue:`3993`).
++  By `Tom Nicholas <https://github.com/TomNicholas>`_.
++
++
+ New Features
+ ~~~~~~~~~~~~
+ - Significantly higher ``unstack`` performance on numpy-backed arrays which
+diff --git a/xarray/core/dataarray.py b/xarray/core/dataarray.py
+index 2fef3edb..b8e47e81 100644
+--- a/xarray/core/dataarray.py
++++ b/xarray/core/dataarray.py
+@@ -3481,18 +3481,27 @@ class DataArray(AbstractArray, DataWithCoords):
+         return self._from_temp_dataset(ds)
+ 
+     def integrate(
+-        self, dim: Union[Hashable, Sequence[Hashable]], datetime_unit: str = None
++        self,
++        coord: Union[Hashable, Sequence[Hashable]] = None,
++        datetime_unit: str = None,
++        *,
++        dim: Union[Hashable, Sequence[Hashable]] = None,
+     ) -> "DataArray":
+         """ integrate the array with the trapezoidal rule.
+ 
+         .. note::
+-            This feature is limited to simple cartesian geometry, i.e. dim
++            This feature is limited to simple cartesian geometry, i.e. coord
+             must be one dimensional.
+ 
+         Parameters
+         ----------
++        coord: hashable, or a sequence of hashable
++            Coordinate(s) used for the integration.
+         dim : hashable, or sequence of hashable
+             Coordinate(s) used for the integration.
++
++            .. deprecated:: 0.17.0
++                Use ``coord`` instead. ``dim`` will be removed in version 0.19.0.
+         datetime_unit : {"Y", "M", "W", "D", "h", "m", "s", "ms", "us", "ns", \
+                          "ps", "fs", "as"}, optional
+             Can be used to specify the unit if datetime coordinate is used.
+@@ -3503,6 +3512,7 @@ class DataArray(AbstractArray, DataWithCoords):
+ 
+         See also
+         --------
++        Dataset.integrate
+         numpy.trapz: corresponding numpy function
+ 
+         Examples
+@@ -3528,7 +3538,22 @@ class DataArray(AbstractArray, DataWithCoords):
+         array([5.4, 6.6, 7.8])
+         Dimensions without coordinates: y
+         """
+-        ds = self._to_temp_dataset().integrate(dim, datetime_unit)
++        if dim is not None and coord is not None:
++            raise ValueError(
++                "Cannot pass both 'dim' and 'coord'. Please pass only 'coord' instead."
++            )
++
++        if dim is not None and coord is None:
++            coord = dim
++            msg = (
++                "The `dim` keyword argument to `DataArray.integrate` is "
++                "being replaced with `coord`, for consistency with "
++                "`Dataset.integrate`. Please pass `coord` instead."
++                " `dim` will be removed in version 0.19.0."
++            )
++            warnings.warn(msg, FutureWarning, stacklevel=2)
++
++        ds = self._to_temp_dataset().integrate(coord, datetime_unit)
+         return self._from_temp_dataset(ds)
+ 
+     def unify_chunks(self) -> "DataArray":
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index fed90987..70fe7c6a 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -6604,6 +6604,26 @@ def test_integrate(dask):
+         da.integrate("x2d")
+ 
+ 
++@pytest.mark.parametrize("dask", [True, False])
++def test_integrate_deprecated_dim_kwarg(dask):
++    # the `dim` kwarg was renamed to `coord` for consistency with
++    # Dataset.integrate and {Dataset,DataArray}.differentiate (GH3993)
++    rs = np.random.RandomState(42)
++    coord = [0.2, 0.35, 0.4, 0.6, 0.7, 0.75, 0.76, 0.8]
++
++    da = xr.DataArray(rs.randn(8, 6), dims=["x", "y"], coords={"x": coord})
++    if dask and has_dask:
++        da = da.chunk({"x": 4})
++
++    with pytest.warns(FutureWarning, match="`dim` will be removed"):
++        actual = da.integrate(dim="x")
++    assert_identical(da.integrate("x"), actual)
++
++    # passing both is ambiguous and must not silently pick one
++    with pytest.raises(ValueError, match="Cannot pass both"):
++        da.integrate(coord="x", dim="x")
++
++
+ @pytest.mark.parametrize("dask", [True, False])
+ @pytest.mark.parametrize("which_datetime", ["np", "cftime"])
+ def test_trapz_datetime(dask, which_datetime):
+diff --git a/xarray/tests/test_units.py b/xarray/tests/test_units.py
+index bb3127e9..76dd830d 100644
+--- a/xarray/tests/test_units.py
++++ b/xarray/tests/test_units.py
+@@ -3681,7 +3681,7 @@ class TestDataArray:
+         (
+             method("diff", dim="x"),
+             method("differentiate", coord="x"),
+-            method("integrate", dim="x"),
++            method("integrate", coord="x"),
+             method("quantile", q=[0.25, 0.75]),
+             method("reduce", func=np.sum, dim="x"),
+             pytest.param(lambda x: x.dot(x), id="method_dot"),

@@ -1,0 +1,94 @@
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+index 79d7e4f46..8df78f708 100644
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -1233,6 +1233,10 @@ class PythonDomain(Domain):
+             if mod.docname in docnames:
+                 self.modules[modname] = mod
+ 
++    def process_field_xref(self, pnode: pending_xref) -> None:
++        pnode['py:module'] = self.env.ref_context.get('py:module')
++        pnode['py:class'] = self.env.ref_context.get('py:class')
++
+     def find_obj(self, env: BuildEnvironment, modname: str, classname: str,
+                  name: str, type: str, searchmode: int = 0
+                  ) -> List[Tuple[str, ObjectEntry]]:
+diff --git a/sphinx/util/docfields.py b/sphinx/util/docfields.py
+index 404bb127f..3b8780717 100644
+--- a/sphinx/util/docfields.py
++++ b/sphinx/util/docfields.py
+@@ -295,6 +295,7 @@ class DocFieldTransformer:
+                         self.directive.domain,
+                         target,
+                         contnode=content[0],
++                        env=self.directive.env,
+                     )
+                     if _is_single_paragraph(field_body):
+                         paragraph = cast(nodes.paragraph, field_body[0])
+diff --git a/tests/roots/test-domain-py-field-xref/conf.py b/tests/roots/test-domain-py-field-xref/conf.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/roots/test-domain-py-field-xref/index.rst b/tests/roots/test-domain-py-field-xref/index.rst
+new file mode 100644
+index 000000000..f58c3fa47
+--- /dev/null
++++ b/tests/roots/test-domain-py-field-xref/index.rst
+@@ -0,0 +1,12 @@
++test-domain-py-field-xref
++=========================
++
++.. py:class:: mod.A
++.. py:class:: mod.submod.A
++
++.. py:currentmodule:: mod.submod
++
++.. py:function:: f()
++
++   :param A a:
++   :rtype: A
+diff --git a/tests/test_domain_py.py b/tests/test_domain_py.py
+index 2dc97bed9..9557a1083 100644
+--- a/tests/test_domain_py.py
++++ b/tests/test_domain_py.py
+@@ -113,12 +113,12 @@ def test_domain_py_xrefs(app, status, warning):
+                    'ModTopLevel', 'class')
+     assert_refnode(refnodes[8], 'module_b.submodule', 'ModTopLevel',
+                    'ModNoModule', 'class')
+-    assert_refnode(refnodes[9], False, False, 'int', 'class')
+-    assert_refnode(refnodes[10], False, False, 'tuple', 'class')
+-    assert_refnode(refnodes[11], False, False, 'str', 'class')
+-    assert_refnode(refnodes[12], False, False, 'float', 'class')
+-    assert_refnode(refnodes[13], False, False, 'list', 'class')
+-    assert_refnode(refnodes[14], False, False, 'ModTopLevel', 'class')
++    assert_refnode(refnodes[9], 'module_b.submodule', None, 'int', 'class')
++    assert_refnode(refnodes[10], 'module_b.submodule', None, 'tuple', 'class')
++    assert_refnode(refnodes[11], 'module_b.submodule', None, 'str', 'class')
++    assert_refnode(refnodes[12], 'module_b.submodule', None, 'float', 'class')
++    assert_refnode(refnodes[13], 'module_b.submodule', None, 'list', 'class')
++    assert_refnode(refnodes[14], 'module_b.submodule', None, 'ModTopLevel', 'class')
+     assert_refnode(refnodes[15], False, False, 'index', 'doc', domain='std')
+     assert len(refnodes) == 16
+ 
+@@ -865,3 +865,22 @@ def test_warn_missing_reference(app, status, warning):
+     assert 'index.rst:6: WARNING: undefined label: no-label' in warning.getvalue()
+     assert ('index.rst:6: WARNING: Failed to create a cross reference. A title or caption not found: existing-label'
+             in warning.getvalue())
++
++
++@pytest.mark.sphinx('dummy', testroot='domain-py-field-xref')
++def test_domain_py_field_xref(app, status, warning):
++    """Field xrefs (``:type:``, ``:rtype:``, ...) are resolved in the current
++    module context like explicit roles."""
++    app.build()
++    assert 'more than one target found for cross-reference' not in warning.getvalue()
++
++    doctree = app.env.get_doctree('index')
++    refnodes = list(doctree.traverse(pending_xref))
++    assert_node(refnodes[0], refdomain='py', reftype='class', reftarget='A',
++                **{'py:module': 'mod.submod', 'py:class': None})
++    assert_node(refnodes[1], refdomain='py', reftype='class', reftarget='A',
++                **{'py:module': 'mod.submod', 'py:class': None})
++
++    domain = app.env.domains['py']
++    assert (domain.find_obj(app.env, 'mod.submod', None, 'A', 'class', 1) ==
++            [('mod.submod.A', domain.objects['mod.submod.A'])])

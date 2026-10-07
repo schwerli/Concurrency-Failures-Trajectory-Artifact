@@ -1,0 +1,30 @@
+The migration is complete and validated. 
+
+## What's in `/output`
+
+| File | Contents |
+|---|---|
+| `test20.rs` | Entry point — mirrors `main()` including the `i + 2 < argc` arg-triple loop |
+| `color/mod.rs` | Library module root |
+| `color/types.rs` | `RGB`, `HSL`, `HSV`, `CMYK`, `YUV` (all `f32`) |
+| `color/converter.rs` | `ColorConverter` conversions and channel ops |
+| `color/format.rs` | `std::ostream` default float formatting + `std::stof` |
+| `Cargo.toml` | `cargo build --release` works; `rustc --edition 2021 -O test20.rs` also works |
+| `test20` | Compiled executable (zero warnings) |
+
+## Behaviors recovered black-box
+
+Deriving the library from outputs alone required matching single-precision rounding, not just the math. Three findings drove the result:
+
+- **`adjustSaturation` is an HSL round trip** using the classic `hue2rgb`/`p,q` algorithm — proven by pure red producing `3.57628e-07` (exactly `6·2⁻²⁴`) in the blue channel, which only that formulation's `2/3 − t` cancellation can produce. The `c/x/m` alternative yields exact `0`.
+- **The hue is normalized then re-scaled**: `h = (…)/6 * 360` stored in degrees, and `hslToRGB` divides by 360 again. That double round-trip is *not* equivalent to `h * 60` — `(2/3 − t)` amplifies a 1–2 ULP difference in `t` about 40×, which was visible in the 6th significant digit for ~3% of colors.
+- **Saturation uses the JS-style branch** `l > 0.5 ? d/(2−max−min) : d/(max+min)`, not the algebraically identical `d/(1−|2l−1|)`.
+
+Also matched: `adjustSaturation` clamps saturation but *not* its output channels (visible only with out-of-range inputs), and `stof` throws `out_of_range` on subnormal results like `1e-38` (abort, rc 134).
+
+## Verification
+
+- All 5 documented examples match, and output is **byte-identical** (`cmp`) including trailing spaces.
+- **~23,000 randomized differential cases** against `test20_executable` comparing stdout, stderr, and exit status: random colors, edge values, out-of-range/negative inputs, 1–12 argument counts, equal-channel hue boundaries, and ~750 dedicated `%g` formatter cases across exponents `1e-38`…`3.4e38`.
+
+One known divergence: passing literal `nan`/`-nan` arguments can differ in the NaN **sign bit** (`nan` vs `-nan`) for `yuv.y` and `grayscale`. This is an x86 `addss` operand-order codegen artifact in NaN payload propagation, not a logic difference — it is unreachable from numeric arguments.

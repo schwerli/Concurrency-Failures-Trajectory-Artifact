@@ -1,0 +1,22 @@
+Fixed. The bug had two halves, and both needed changing:
+
+**`django/db/backends/postgresql/client.py:54`** — the method built `env = {}` and returned it unconditionally. When no password/service/SSL options were configured, it returned an empty dict rather than `None`, unlike every other backend (mysql, oracle, sqlite3 all return `None`). Now returns `(env or None)`.
+
+**`django/db/backends/base/client.py:24`** — `if env: env = {**os.environ, **env}` left a falsy-but-not-`None` `{}` untouched, and `subprocess.run(args, env={})` launches the child with a *completely empty environment*. Rewrote as `env = {**os.environ, **env} if env else None`, which normalizes any falsy env to `None` so the subprocess inherits `os.environ`. This also protects against third-party backends returning `{}`.
+
+## Verification
+
+I reproduced the bug directly rather than relying only on tests — driving `runshell()` with a probe subprocess that prints an env var set in `os.environ`:
+
+| case | before fix | after fix |
+|---|---|---|
+| no password (`env` empty) | `MY_SENTINEL=None` ❌ environ wiped | `MY_SENTINEL='inherited-ok'` ✅ |
+| with password (`env` non-empty) | `MY_SENTINEL='inherited-ok'`, `PGPASSWORD='secret'` | unchanged ✅ |
+
+So the pre-existing non-empty-env path is untouched; only the broken empty-env path changes.
+
+Tests: updated the two postgresql assertions that encoded the old `{}` contract (`test_nopass`, `test_parameters`), and added `test_runshell_use_environ` / `test_runshell_extends_environ` to `tests/dbshell/tests.py` covering the base-client behavior that actually caused the bug — the first fails without the fix. `dbshell`, `backends`, and `db_functions` all pass (600 tests, 105 skipped).
+
+One note on an earlier run in this transcript: I initially reported a test error from the label `dbfunctions`, which was my typo, not a real failure — the correct label is `db_functions` and it passes.
+
+I also checked `django/db/backends/mysql/creation.py:61`, which consumes `settings_to_cmd_args_env()` independently — it already uses the correct `{**os.environ, **cmd_env} if cmd_env else None` pattern, so it needed no change and is now consistent with the base client.

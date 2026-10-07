@@ -1,0 +1,38 @@
+Fixed. (flake8 isn't installed in this env, so that one check couldn't run — everything else passed.)
+
+## Root cause
+
+`Model._check_default_pk` (`django/db/models/base.py:1299`) gated W042 solely on `cls._meta.pk.auto_created`. But that flag means "Django constructed this field object," not "`DEFAULT_AUTO_FIELD` decided this column's type." Django sets it in two unrelated places:
+
+1. The genuine default pk in `Options._prepare` (`options.py:285-287`) — the only caller of `_get_default_pk_class()`.
+2. The implicit **MTI parent link** in `ModelBase.__new__` (`base.py:242-248`), which `Options._prepare` then retroactively promotes to pk (`options.py:271-283`).
+
+For a model with concrete parents, path 2 always wins and path 1 is never reached. So `class User(Entity)` gets an auto-created `entity_ptr` `OneToOneField` as its pk and trips the check — even though its column type is purely a function of `Entity`'s pk. Setting `DEFAULT_AUTO_FIELD` would have silenced the warning **without changing the schema at all**, while the only actionable target (the parent's pk) is already reported by the parent's own warning.
+
+## The fix
+
+Skip the warning when the pk is a parent link, using the idiom already in the same file at `base.py:205`. `OneToOneField` was already imported (`base.py:26`); the `isinstance` guard is load-bearing, since a plain `AutoField` pk has `remote_field is None`.
+
+I also added four tests to `ModelDefaultAutoFieldTests` in `tests/check_framework/test_model_checks.py`.
+
+## Verification
+
+Reproduced your exact scenario (`Entity` with a `UUIDField` pk, `User(Entity)`) before and after:
+
+| Model | Before | After |
+|---|---|---|
+| `Entity` (explicit UUID pk) | — | — |
+| `User(Entity)` — **your bug** | **W042** | — |
+| `PlainParent` (real auto pk) | W042 | W042 ✓ still warns |
+| `PlainChild(PlainParent)` | W042 | — (parent already reports it) |
+| child w/ explicit `parent_ptr` | — | — |
+| child of *abstract* explicit-pk base | — | — |
+
+- Two of the four new tests fail without the fix and pass with it (genuine regression guards).
+- **Full suite: 13903 → 13907 tests, exactly +4, identical skips.** The 7 failures + 1 error are byte-identical to a pristine-tree baseline — all pre-existing environment issues (running as root, ASGI threading, `URLValidator` newline handling), none related.
+- A five-lens adversarial review (crash safety across 35 model shapes, false negatives, scope, idiom, test quality) failed to refute the patch.
+
+Two things worth flagging that I deliberately did **not** change:
+
+- **Proxy models still emit W042** for their concrete parent's auto-created pk. I verified this is bit-identical before and after — a proxy's pk is a plain `AutoField` with `remote_field is None`, so the new clause structurally can't match it. Suppressing it needs a different predicate and is a separate ticket.
+- **`manage.py check <app_label>` scoped to just the child's app** now reports nothing where it previously reported the child. That's correct: the old warning's hint was ineffective there anyway (I confirmed setting the child app's `default_auto_field` leaves the column `integer`), and `makemigrations`/`migrate` run an unscoped check that still surfaces the parent.

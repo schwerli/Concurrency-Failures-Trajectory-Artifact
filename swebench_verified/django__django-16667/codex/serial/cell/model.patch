@@ -1,0 +1,45 @@
+diff --git a/django/forms/widgets.py b/django/forms/widgets.py
+index 842b73e95c..5e000fe2af 100644
+--- a/django/forms/widgets.py
++++ b/django/forms/widgets.py
+@@ -1157,7 +1157,7 @@ class SelectDateWidget(Widget):
+             input_format = formats.sanitize_strftime_format(input_format)
+             try:
+                 date_value = datetime.date(int(y), int(m), int(d))
+-            except ValueError:
++            except (OverflowError, ValueError):
+                 # Return pseudo-ISO dates with zeros for any unselected values,
+                 # e.g. '2017-0-23'.
+                 return "%s-%s-%s" % (y or 0, m or 0, d or 0)
+diff --git a/tests/forms_tests/field_tests/test_datefield.py b/tests/forms_tests/field_tests/test_datefield.py
+index a9f93f40ed..3ad08a8bae 100644
+--- a/tests/forms_tests/field_tests/test_datefield.py
++++ b/tests/forms_tests/field_tests/test_datefield.py
+@@ -36,6 +36,13 @@ class DateFieldTest(SimpleTestCase):
+         d = GetDate({"mydate_month": "1", "mydate_day": "1", "mydate_year": "2010"})
+         self.assertIn('<label for="id_mydate_month">', d.as_p())
+ 
++    def test_form_field_overflow_date(self):
++        form = GetDate(
++            {"mydate_month": "1", "mydate_day": "1", "mydate_year": "9999999999"}
++        )
++        self.assertFalse(form.is_valid())
++        self.assertEqual(form.errors, {"mydate": ["Enter a valid date."]})
++
+     @translation.override("nl")
+     def test_l10n_date_changed(self):
+         """
+diff --git a/tests/forms_tests/widget_tests/test_selectdatewidget.py b/tests/forms_tests/widget_tests/test_selectdatewidget.py
+index cfcd037987..12c5d9a266 100644
+--- a/tests/forms_tests/widget_tests/test_selectdatewidget.py
++++ b/tests/forms_tests/widget_tests/test_selectdatewidget.py
+@@ -606,6 +606,9 @@ class SelectDateWidgetTest(WidgetTest):
+             (("", "12", "1"), "0-12-1"),
+             (("2000", "", "1"), "2000-0-1"),
+             (("2000", "12", ""), "2000-12-0"),
++            (("9999999999", "1", "1"), "9999999999-1-1"),
++            (("2000", "9999999999", "1"), "2000-9999999999-1"),
++            (("2000", "1", "9999999999"), "2000-1-9999999999"),
+             (("", "", "", ""), None),
+             ((None, "12", "1"), None),
+             (("2000", None, "1"), None),

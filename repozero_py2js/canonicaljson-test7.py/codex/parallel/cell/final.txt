@@ -1,0 +1,453 @@
+Saved under `/output` and verified against `/workspace/dataset/test7_executable`.
+
+**Library Files**
+[program_name.mjs](/output/lib/cli/program_name.mjs)
+```js
+export function getProgramName(argv) {
+  const scriptPath = argv[1] ?? "test7.mjs";
+  const pathParts = scriptPath.split(/[\\/]/);
+  return pathParts[pathParts.length - 1] || scriptPath;
+}
+```
+
+[help_text.mjs](/output/lib/cli/help_text.mjs)
+```js
+export function formatUsage(programName) {
+  return `usage: ${programName} [-h] --a A --b B\n`;
+}
+
+export function formatHelp(programName) {
+  return (
+    `${formatUsage(programName)}\n` +
+    "options:\n" +
+    "  -h, --help  show this help message and exit\n" +
+    "  --a A\n" +
+    "  --b B\n"
+  );
+}
+```
+
+[arg_parser.mjs](/output/lib/cli/arg_parser.mjs)
+```js
+import { formatHelp, formatUsage } from "./help_text.mjs";
+import { getProgramName } from "./program_name.mjs";
+
+const NEGATIVE_NUMBER_PATTERN = /^-\d+$|^-\d*\.\d+$/;
+const HELP_LONG_NAMES = new Set(["--h", "--he", "--hel", "--help"]);
+
+function isNegativeNumberLike(token) {
+  return NEGATIVE_NUMBER_PATTERN.test(token);
+}
+
+function parseInlineOption(token) {
+  const equalsIndex = token.indexOf("=");
+  if (equalsIndex === -1) {
+    return { name: token, hasInlineValue: false, inlineValue: "" };
+  }
+
+  return {
+    name: token.slice(0, equalsIndex),
+    hasInlineValue: true,
+    inlineValue: token.slice(equalsIndex + 1),
+  };
+}
+
+function classifyHelpToken(token) {
+  if (token === "-h") {
+    return { type: "help" };
+  }
+
+  if (token.startsWith("-h=")) {
+    return { type: "help_error", explicitArgument: token.slice(3) };
+  }
+
+  if (token.startsWith("-h") && !token.startsWith("--")) {
+    return { type: "help" };
+  }
+
+  const parsed = parseInlineOption(token);
+  if (!HELP_LONG_NAMES.has(parsed.name)) {
+    return null;
+  }
+
+  if (parsed.hasInlineValue) {
+    return { type: "help_error", explicitArgument: parsed.inlineValue };
+  }
+
+  return { type: "help" };
+}
+
+function formatError(programName, message) {
+  return `${formatUsage(programName)}${programName}: error: ${message}\n`;
+}
+
+function formatMissingRequiredError(programName, missingArguments) {
+  return formatError(
+    programName,
+    `the following arguments are required: ${missingArguments.join(", ")}`,
+  );
+}
+
+function formatMissingValueError(programName, optionName) {
+  return formatError(programName, `argument ${optionName}: expected one argument`);
+}
+
+function formatUnrecognizedError(programName, tokens) {
+  return formatError(programName, `unrecognized arguments: ${tokens.join(" ")}`);
+}
+
+function formatHelpArgumentError(programName, explicitArgument) {
+  return formatError(
+    programName,
+    `argument -h/--help: ignored explicit argument '${explicitArgument}'`,
+  );
+}
+
+export function parseCommandLine(argv) {
+  const programName = getProgramName(argv);
+  const tokens = argv.slice(2);
+  const values = {};
+  const unrecognized = [];
+  let stopOptions = false;
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+
+    if (stopOptions) {
+      unrecognized.push(token);
+      continue;
+    }
+
+    if (token === "--") {
+      stopOptions = true;
+      continue;
+    }
+
+    const helpClassification = classifyHelpToken(token);
+    if (helpClassification?.type === "help") {
+      return { kind: "help", text: formatHelp(programName), exitCode: 0 };
+    }
+
+    if (helpClassification?.type === "help_error") {
+      return {
+        kind: "error",
+        text: formatHelpArgumentError(programName, helpClassification.explicitArgument),
+        exitCode: 2,
+      };
+    }
+
+    if (token === "--a" || token === "--b") {
+      const nextToken = tokens[index + 1];
+
+      if (
+        nextToken === undefined ||
+        (nextToken.startsWith("-") && !isNegativeNumberLike(nextToken))
+      ) {
+        return {
+          kind: "error",
+          text: formatMissingValueError(programName, token),
+          exitCode: 2,
+        };
+      }
+
+      values[token.slice(2)] = nextToken;
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--a=") || token.startsWith("--b=")) {
+      const parsed = parseInlineOption(token);
+      values[parsed.name.slice(2)] = parsed.inlineValue;
+      continue;
+    }
+
+    unrecognized.push(token);
+  }
+
+  const missingArguments = [];
+  if (!Object.hasOwn(values, "a")) {
+    missingArguments.push("--a");
+  }
+  if (!Object.hasOwn(values, "b")) {
+    missingArguments.push("--b");
+  }
+
+  if (missingArguments.length > 0) {
+    return {
+      kind: "error",
+      text: formatMissingRequiredError(programName, missingArguments),
+      exitCode: 2,
+    };
+  }
+
+  if (unrecognized.length > 0) {
+    return {
+      kind: "error",
+      text: formatUnrecognizedError(programName, unrecognized),
+      exitCode: 2,
+    };
+  }
+
+  return { kind: "values", values, exitCode: 0 };
+}
+```
+
+[code_point_order.mjs](/output/lib/text/code_point_order.mjs)
+```js
+function nextCodePoint(text, index) {
+  const codePoint = text.codePointAt(index);
+  const width = codePoint > 0xffff ? 2 : 1;
+  return { codePoint, nextIndex: index + width };
+}
+
+export function compareStringsByCodePoint(left, right) {
+  let leftIndex = 0;
+  let rightIndex = 0;
+
+  while (leftIndex < left.length && rightIndex < right.length) {
+    const leftValue = nextCodePoint(left, leftIndex);
+    const rightValue = nextCodePoint(right, rightIndex);
+
+    if (leftValue.codePoint !== rightValue.codePoint) {
+      return leftValue.codePoint < rightValue.codePoint ? -1 : 1;
+    }
+
+    leftIndex = leftValue.nextIndex;
+    rightIndex = rightValue.nextIndex;
+  }
+
+  if (leftIndex === left.length && rightIndex === right.length) {
+    return 0;
+  }
+
+  return leftIndex === left.length ? -1 : 1;
+}
+
+export function sortStringsByCodePoint(values) {
+  return [...values].sort(compareStringsByCodePoint);
+}
+```
+
+[string_escape.mjs](/output/lib/canonical/string_escape.mjs)
+```js
+function escapeCodeUnit(codePoint) {
+  return `\\u${codePoint.toString(16).padStart(4, "0")}`;
+}
+
+export function quoteCanonicalString(value) {
+  let escaped = "\"";
+
+  for (let index = 0; index < value.length; ) {
+    const codePoint = value.codePointAt(index);
+    const width = codePoint > 0xffff ? 2 : 1;
+
+    if (codePoint === 0x22) {
+      escaped += "\\\"";
+    } else if (codePoint === 0x5c) {
+      escaped += "\\\\";
+    } else if (codePoint === 0x08) {
+      escaped += "\\b";
+    } else if (codePoint === 0x09) {
+      escaped += "\\t";
+    } else if (codePoint === 0x0a) {
+      escaped += "\\n";
+    } else if (codePoint === 0x0c) {
+      escaped += "\\f";
+    } else if (codePoint === 0x0d) {
+      escaped += "\\r";
+    } else if (codePoint <= 0x1f) {
+      escaped += escapeCodeUnit(codePoint);
+    } else {
+      escaped += String.fromCodePoint(codePoint);
+    }
+
+    index += width;
+  }
+
+  escaped += "\"";
+  return escaped;
+}
+```
+
+[value_serializer.mjs](/output/lib/canonical/value_serializer.mjs)
+```js
+import { quoteCanonicalString } from "./string_escape.mjs";
+import { compareStringsByCodePoint } from "../text/code_point_order.mjs";
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== "object") {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function serializeNumber(value) {
+  if (!Number.isFinite(value)) {
+    throw new TypeError("Canonical JSON only supports finite numbers.");
+  }
+
+  return String(value);
+}
+
+function serializeArray(value) {
+  const parts = value.map((entry) => serializeCanonicalJson(entry));
+  return `[${parts.join(",")}]`;
+}
+
+function serializeObject(value) {
+  const keys = Object.keys(value).sort(compareStringsByCodePoint);
+  const parts = [];
+
+  for (const key of keys) {
+    const entry = value[key];
+    if (entry === undefined) {
+      throw new TypeError("Canonical JSON does not support undefined values.");
+    }
+
+    parts.push(`${quoteCanonicalString(key)}:${serializeCanonicalJson(entry)}`);
+  }
+
+  return `{${parts.join(",")}}`;
+}
+
+export function serializeCanonicalJson(value) {
+  if (value === null) {
+    return "null";
+  }
+
+  if (typeof value === "string") {
+    return quoteCanonicalString(value);
+  }
+
+  if (typeof value === "number") {
+    return serializeNumber(value);
+  }
+
+  if (typeof value === "boolean") {
+    return value ? "true" : "false";
+  }
+
+  if (Array.isArray(value)) {
+    return serializeArray(value);
+  }
+
+  if (isPlainObject(value)) {
+    return serializeObject(value);
+  }
+
+  throw new TypeError(`Unsupported canonical JSON value type: ${typeof value}`);
+}
+```
+
+[encode_canonical_json.mjs](/output/lib/canonical/encode_canonical_json.mjs)
+```js
+import { serializeCanonicalJson } from "./value_serializer.mjs";
+
+const UTF8_ENCODER = new TextEncoder();
+
+export function encodeCanonicalJson(value) {
+  return UTF8_ENCODER.encode(serializeCanonicalJson(value));
+}
+```
+
+[bytes_repr.mjs](/output/lib/python/bytes_repr.mjs)
+```js
+function hex2(byte) {
+  return byte.toString(16).padStart(2, "0");
+}
+
+function quoteEscapeCost(bytes, quoteCode) {
+  let escapes = 0;
+
+  for (const byte of bytes) {
+    if (byte === quoteCode || byte === 0x5c) {
+      escapes += 1;
+    }
+  }
+
+  return escapes;
+}
+
+function chooseQuote(bytes) {
+  return quoteEscapeCost(bytes, 0x27) <= quoteEscapeCost(bytes, 0x22) ? 0x27 : 0x22;
+}
+
+export function formatPythonBytes(bytesLike) {
+  const bytes = bytesLike instanceof Uint8Array ? bytesLike : Uint8Array.from(bytesLike);
+  const quoteCode = chooseQuote(bytes);
+  const quote = String.fromCharCode(quoteCode);
+  let result = `b${quote}`;
+
+  for (const byte of bytes) {
+    if (byte === quoteCode || byte === 0x5c) {
+      result += `\\${String.fromCharCode(byte)}`;
+      continue;
+    }
+
+    if (byte === 0x09) {
+      result += "\\t";
+      continue;
+    }
+
+    if (byte === 0x0a) {
+      result += "\\n";
+      continue;
+    }
+
+    if (byte === 0x0d) {
+      result += "\\r";
+      continue;
+    }
+
+    if (byte >= 0x20 && byte <= 0x7e) {
+      result += String.fromCharCode(byte);
+      continue;
+    }
+
+    result += `\\x${hex2(byte)}`;
+  }
+
+  result += quote;
+  return result;
+}
+```
+
+**Entry File**
+[test7.mjs](/output/test7.mjs)
+```js
+import { parseCommandLine } from "./lib/cli/arg_parser.mjs";
+import { encodeCanonicalJson } from "./lib/canonical/encode_canonical_json.mjs";
+import { formatPythonBytes } from "./lib/python/bytes_repr.mjs";
+import { sortStringsByCodePoint } from "./lib/text/code_point_order.mjs";
+
+export function main(argv = process.argv) {
+  const parsed = parseCommandLine(argv);
+
+  if (parsed.kind === "help") {
+    process.stdout.write(parsed.text);
+    return 0;
+  }
+
+  if (parsed.kind === "error") {
+    process.stderr.write(parsed.text);
+    return parsed.exitCode;
+  }
+
+  const data = [parsed.values.a, parsed.values.b];
+  const result1 = encodeCanonicalJson(data);
+  const result2 = encodeCanonicalJson(sortStringsByCodePoint(data));
+
+  console.log(formatPythonBytes(result1));
+  console.log(formatPythonBytes(result2));
+  return 0;
+}
+
+const exitCode = main();
+if (exitCode !== 0) {
+  process.exitCode = exitCode;
+}
+```
+
+Parity checks passed for the sample inputs, Unicode sort edge cases, help output, and parser error behavior.

@@ -1,0 +1,74 @@
+diff --git a/sympy/sets/handlers/intersection.py b/sympy/sets/handlers/intersection.py
+index c54dc8f72a..09fb81b018 100644
+--- a/sympy/sets/handlers/intersection.py
++++ b/sympy/sets/handlers/intersection.py
+@@ -1,5 +1,5 @@
+ from sympy import (S, Dummy, Lambda, symbols, Interval, Intersection, Set,
+-                   EmptySet, FiniteSet, Union, ComplexRegion, Mul)
++                   EmptySet, FiniteSet, Union, ComplexRegion)
+ from sympy.multipledispatch import dispatch
+ from sympy.sets.conditionset import ConditionSet
+ from sympy.sets.fancysets import (Integers, Naturals, Reals, Range,
+@@ -277,9 +277,9 @@ def intersection_sets(self, other): # noqa:F811
+                 return FiniteSet(*(fn.subs(n, s[0]) for s in solns))
+ 
+     if other == S.Reals:
++        from sympy.solvers.solveset import solveset_real
+         from sympy.core.function import expand_complex
+-        from sympy.solvers.solvers import denoms, solve_linear
+-        from sympy.core.relational import Eq
++        from sympy.solvers.solvers import denoms
+         f = self.lamda.expr
+         n = self.lamda.variables[0]
+ 
+@@ -303,22 +303,12 @@ def intersection_sets(self, other): # noqa:F811
+         elif ifree != {n}:
+             return None
+         else:
+-            # univarite imaginary part in same variable
+-            x, xis = zip(*[solve_linear(i, 0) for i in Mul.make_args(im) if n in i.free_symbols])
+-            if x and all(i == n for i in x):
+-                base_set -= FiniteSet(xis)
+-            else:
+-                base_set -= ConditionSet(n, Eq(im, 0), S.Integers)
++            # Keep the parameter values that make the image real.
++            base_set = base_set.intersect(solveset_real(im, n))
+         # exclude values that make denominators 0
+         for i in denoms(f):
+             if i.has(n):
+-                sol = list(zip(*[solve_linear(i, 0) for i in Mul.make_args(im) if n in i.free_symbols]))
+-                if sol != []:
+-                    x, xis = sol
+-                    if x and all(i == n for i in x):
+-                        base_set -= FiniteSet(xis)
+-                else:
+-                    base_set -= ConditionSet(n, Eq(i, 0), S.Integers)
++                base_set -= solveset_real(i, n)
+         return imageset(lam, base_set)
+ 
+     elif isinstance(other, Interval):
+diff --git a/sympy/sets/tests/test_fancysets.py b/sympy/sets/tests/test_fancysets.py
+index 098020ca4e..f32ae808c7 100644
+--- a/sympy/sets/tests/test_fancysets.py
++++ b/sympy/sets/tests/test_fancysets.py
+@@ -2,7 +2,7 @@
+ from sympy.core.expr import unchanged
+ from sympy.sets.fancysets import (ImageSet, Range, normalize_theta_set,
+                                   ComplexRegion)
+-from sympy.sets.sets import (Complement, FiniteSet, Interval, Union, imageset,
++from sympy.sets.sets import (FiniteSet, Interval, Union, imageset,
+                              Intersection, ProductSet, Contains)
+ from sympy.simplify.simplify import simplify
+ from sympy import (S, Symbol, Lambda, symbols, cos, sin, pi, oo, Basic,
+@@ -657,7 +657,10 @@ def test_infinitely_indexed_set_2():
+ def test_imageset_intersect_real():
+     from sympy import I
+     from sympy.abc import n
+-    assert imageset(Lambda(n, n + (n - 1)*(n + 1)*I), S.Integers).intersect(S.Reals) == Complement(S.Integers, FiniteSet((-1, 1)))
++    s1 = imageset(Lambda(n, n + (n - 1)*(n + 1)*I), S.Integers)
++    assert 2 not in s1
++    assert s1.intersect(S.Reals) == FiniteSet(-1, 1)
++    assert 2 not in s1.intersect(S.Reals)
+     s = ImageSet(
+         Lambda(n, -I*(I*(2*pi*n - pi/4) + log(Abs(sqrt(-I))))),
+         S.Integers)

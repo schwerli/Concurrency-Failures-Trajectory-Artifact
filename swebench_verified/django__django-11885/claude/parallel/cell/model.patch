@@ -1,0 +1,2988 @@
+diff --git a/batchprobe/bapp/__init__.py b/batchprobe/bapp/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/batchprobe/bapp/models.py b/batchprobe/bapp/models.py
+new file mode 100644
+index 0000000000..80f035c72f
+--- /dev/null
++++ b/batchprobe/bapp/models.py
+@@ -0,0 +1,46 @@
++from django.db import models
++
++
++class Parent(models.Model):
++    pass
++
++
++class Child2(models.Model):
++    a = models.ForeignKey(Parent, models.CASCADE, related_name='c2a')
++    b = models.ForeignKey(Parent, models.CASCADE, related_name='c2b')
++
++
++class Child3(models.Model):
++    a = models.ForeignKey(Parent, models.CASCADE, related_name='c3a')
++    b = models.ForeignKey(Parent, models.CASCADE, related_name='c3b')
++    c = models.ForeignKey(Parent, models.CASCADE, related_name='c3c')
++
++
++class Parent1(models.Model):
++    pass
++
++
++class Child1(models.Model):
++    a = models.ForeignKey(Parent1, models.CASCADE, related_name='c1a')
++
++
++class FilteringManager(models.Manager):
++    def get_queryset(self):
++        # A base manager that adds a filter -> extra bind params in the DELETE.
++        return super().get_queryset().filter(tag='keep')
++
++
++class BParent(models.Model):
++    pass
++
++
++class BChild3(models.Model):
++    a = models.ForeignKey(BParent, models.CASCADE, related_name='b3a')
++    b = models.ForeignKey(BParent, models.CASCADE, related_name='b3b')
++    c = models.ForeignKey(BParent, models.CASCADE, related_name='b3c')
++    tag = models.CharField(max_length=10, default='keep')
++
++    objects = FilteringManager()
++
++    class Meta:
++        base_manager_name = 'objects'
+diff --git a/batchprobe/run.py b/batchprobe/run.py
+new file mode 100644
+index 0000000000..88dc672d09
+--- /dev/null
++++ b/batchprobe/run.py
+@@ -0,0 +1,97 @@
++"""Measure real parameter counts per emitted DELETE for N-FK fast deletes on sqlite."""
++import sys
++
++import django
++from django.conf import settings
++
++sys.path.insert(0, '/testbed')
++sys.path.insert(0, '/testbed/batchprobe')
++settings.configure(
++    DEBUG=False,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['bapp'],
++    USE_TZ=False,
++)
++django.setup()
++
++from django.db import connection  # noqa: E402
++from django.db.backends import utils as backend_utils  # noqa: E402
++from bapp.models import Child1, Child2, Child3, Parent, Parent1  # noqa: E402
++
++with connection.schema_editor() as editor:
++    for model in (Parent, Child2, Child3, Parent1, Child1):
++        editor.create_model(model)
++
++CAPTURED = []
++_orig_execute = backend_utils.CursorWrapper.execute
++
++
++def spy(self, sql, params=None):
++    if sql.lstrip().upper().startswith('DELETE'):
++        CAPTURED.append((sql, len(params or ())))
++    return _orig_execute(self, sql, params)
++
++
++backend_utils.CursorWrapper.execute = spy
++
++
++def report(label):
++    print('\n== %s ==' % label)
++    if not CAPTURED:
++        print('  (no DELETEs)')
++    counts = {}
++    for sql, n in CAPTURED:
++        table = sql.split('FROM')[1].split()[0]
++        counts.setdefault(table, []).append(n)
++    for table, ns in counts.items():
++        print('  %-28s %d queries, params per query: max=%d  %s'
++              % (table, len(ns), max(ns), sorted(set(ns), reverse=True)[:4]))
++    over = [(s[:70], n) for s, n in CAPTURED if n > connection.features.max_query_params]
++    if over:
++        print('  !! %d queries EXCEED max_query_params=%d' % (len(over), connection.features.max_query_params))
++        for s, n in over[:3]:
++            print('     %d params: %s...' % (n, s))
++    else:
++        print('  all queries <= max_query_params=%d' % connection.features.max_query_params)
++    CAPTURED.clear()
++
++
++N = 2000
++
++# --- 1 FK (baseline, unchanged by the patch) ---
++Parent1.objects.bulk_create([Parent1() for _ in range(N)], batch_size=100)
++p1s = list(Parent1.objects.all())
++Child1.objects.bulk_create([Child1(a=p) for p in p1s], batch_size=100)
++Parent1.objects.all().delete()
++report('1 FK, %d parents' % N)
++
++# --- 2 FKs ---
++Parent.objects.bulk_create([Parent() for _ in range(N)], batch_size=100)
++ps = list(Parent.objects.all())
++Child2.objects.bulk_create([Child2(a=p, b=p) for p in ps], batch_size=100)
++Parent.objects.all().delete()
++report('2 FKs (Child2), %d parents' % N)
++
++# --- 3 FKs ---
++Parent.objects.bulk_create([Parent() for _ in range(N)], batch_size=100)
++ps = list(Parent.objects.all())
++Child3.objects.bulk_create([Child3(a=p, b=p, c=p) for p in ps], batch_size=100)
++Parent.objects.all().delete()
++report('3 FKs (Child3), %d parents' % N)
++
++# --- 2 + 3 FKs at once, both related models ---
++Parent.objects.bulk_create([Parent() for _ in range(N)], batch_size=100)
++ps = list(Parent.objects.all())
++Child2.objects.bulk_create([Child2(a=p, b=p) for p in ps], batch_size=100)
++Child3.objects.bulk_create([Child3(a=p, b=p, c=p) for p in ps], batch_size=100)
++Parent.objects.all().delete()
++report('Child2 + Child3, %d parents' % N)
++print('\nleftover rows:', Child2.objects.count(), Child3.objects.count(), Child1.objects.count())
++
++print('\n--- bulk_batch_size arithmetic on sqlite (max_query_params=%d) ---'
++      % connection.features.max_query_params)
++ops = connection.ops
++for n in range(1, 11):
++    bs = ops.bulk_batch_size(['f%d' % i for i in range(n)], list(range(5000)))
++    print('  %2d fields -> batch %5d -> %5d params per query %s'
++          % (n, bs, n * bs, 'OVER' if n * bs > 999 else ''))
+diff --git a/batchprobe/run_extra.py b/batchprobe/run_extra.py
+new file mode 100644
+index 0000000000..c52acdeb28
+--- /dev/null
++++ b/batchprobe/run_extra.py
+@@ -0,0 +1,61 @@
++"""Does anything add params on top of N*batch_size, pushing the 3-FK case over 999?"""
++import sys
++
++import django
++from django.conf import settings
++
++sys.path.insert(0, '/testbed')
++sys.path.insert(0, '/testbed/batchprobe')
++settings.configure(
++    DEBUG=False,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['bapp'],
++    USE_TZ=False,
++)
++django.setup()
++
++from django.db import connection  # noqa: E402
++from django.db.backends import utils as backend_utils  # noqa: E402
++from bapp.models import BChild3, BParent  # noqa: E402
++
++with connection.schema_editor() as editor:
++    for model in (BParent, BChild3):
++        editor.create_model(model)
++
++CAPTURED = []
++_orig = backend_utils.CursorWrapper.execute
++
++
++def spy(self, sql, params=None):
++    if sql.lstrip().upper().startswith('DELETE'):
++        CAPTURED.append((sql, len(params or ())))
++    return _orig(self, sql, params)
++
++
++backend_utils.CursorWrapper.execute = spy
++
++N = 2000
++BParent.objects.bulk_create([BParent() for _ in range(N)], batch_size=100)
++ps = list(BParent.objects.all())
++BChild3.objects.bulk_create([BChild3(a=p, b=p, c=p) for p in ps], batch_size=100)
++
++BParent.objects.all().delete()
++
++limit = connection.features.max_query_params
++worst = max(CAPTURED, key=lambda t: t[1])
++print('max_query_params =', limit)
++for sql, n in CAPTURED:
++    if 'bchild3' in sql:
++        print('  %4d params  %s' % (n, sql[:100]))
++print('worst query: %d params -> %s' % (worst[1], 'OVER LIMIT' if worst[1] > limit else 'within limit'))
++
++# Now really try to execute a query of that size against a sqlite compiled with the
++# historical 999 limit by re-issuing it through a fresh connection with a lowered limit.
++import sqlite3  # noqa: E402
++print('\nsqlite3 lib version:', sqlite3.sqlite_version)
++try:
++    con = sqlite3.connect(':memory:')
++    print('SQLITE_LIMIT_VARIABLE_NUMBER =',
++          con.execute('SELECT 1').connection and 'n/a')
++except Exception as e:
++    print(e)
+diff --git a/django/contrib/admin/utils.py b/django/contrib/admin/utils.py
+index 15c8ef865f..14ae00a7de 100644
+--- a/django/contrib/admin/utils.py
++++ b/django/contrib/admin/utils.py
+@@ -182,9 +182,9 @@ class NestedObjects(Collector):
+         except models.ProtectedError as e:
+             self.protected.update(e.protected_objects)
+ 
+-    def related_objects(self, related, objs):
+-        qs = super().related_objects(related, objs)
+-        return qs.select_related(related.field.name)
++    def related_objects(self, related_model, related_fields, objs):
++        qs = super().related_objects(related_model, related_fields, objs)
++        return qs.select_related(*[related_field.name for related_field in related_fields])
+ 
+     def _nested(self, obj, seen, format_callback):
+         if obj in seen:
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index ae82d26340..776237790a 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -1,9 +1,10 @@
+-from collections import Counter
++from collections import Counter, defaultdict
++from functools import reduce
+ from itertools import chain
+-from operator import attrgetter
++from operator import attrgetter, or_
+ 
+ from django.db import IntegrityError, connections, transaction
+-from django.db.models import signals, sql
++from django.db.models import query_utils, signals, sql
+ 
+ 
+ class ProtectedError(IntegrityError):
+@@ -137,7 +138,7 @@ class Collector:
+         if from_field and from_field.remote_field.on_delete is not CASCADE:
+             return False
+         if hasattr(objs, '_meta'):
+-            model = type(objs)
++            model = objs._meta.model
+         elif hasattr(objs, 'model') and hasattr(objs, '_raw_delete'):
+             model = objs.model
+         else:
+@@ -159,12 +160,13 @@ class Collector:
+             )
+         )
+ 
+-    def get_del_batches(self, objs, field):
++    def get_del_batches(self, objs, fields):
+         """
+         Return the objs in suitably sized batches for the used connection.
+         """
++        field_names = [field.name for field in fields]
+         conn_batch_size = max(
+-            connections[self.using].ops.bulk_batch_size([field.name], objs), 1)
++            connections[self.using].ops.bulk_batch_size(field_names, objs), 1)
+         if len(objs) > conn_batch_size:
+             return [objs[i:i + conn_batch_size]
+                     for i in range(0, len(objs), conn_batch_size)]
+@@ -214,6 +216,7 @@ class Collector:
+         if collect_related:
+             if keep_parents:
+                 parents = set(model._meta.get_parent_list())
++            model_fast_deletes = defaultdict(list)
+             for related in get_candidate_relations_to_delete(model._meta):
+                 # Preserve parent reverse relationships if keep_parents=True.
+                 if keep_parents and related.model in parents:
+@@ -221,41 +224,48 @@ class Collector:
+                 field = related.field
+                 if field.remote_field.on_delete == DO_NOTHING:
+                     continue
+-                batches = self.get_del_batches(new_objs, field)
++                related_model = related.related_model
++                if self.can_fast_delete(related_model, from_field=field):
++                    model_fast_deletes[related_model].append(field)
++                    continue
++                batches = self.get_del_batches(new_objs, [field])
++                for batch in batches:
++                    sub_objs = self.related_objects(related_model, [field], batch)
++                    # Non-referenced fields can be deferred if no signal
++                    # receivers are connected for the related model as they'll
++                    # never be exposed to the user. Skip field deferring when
++                    # some relationships are select_related as interactions
++                    # between both features are hard to get right. This should
++                    # only happen in the rare cases where .related_objects is
++                    # overridden anyway.
++                    if not (sub_objs.query.select_related or self._has_signal_listeners(related_model)):
++                        referenced_fields = set(chain.from_iterable(
++                            (rf.attname for rf in rel.field.foreign_related_fields)
++                            for rel in get_candidate_relations_to_delete(related_model._meta)
++                        ))
++                        sub_objs = sub_objs.only(*tuple(referenced_fields))
++                    if sub_objs:
++                        field.remote_field.on_delete(self, field, sub_objs, self.using)
++            for related_model, related_fields in model_fast_deletes.items():
++                batches = self.get_del_batches(new_objs, related_fields)
+                 for batch in batches:
+-                    sub_objs = self.related_objects(related, batch)
+-                    if self.can_fast_delete(sub_objs, from_field=field):
+-                        self.fast_deletes.append(sub_objs)
+-                    else:
+-                        related_model = related.related_model
+-                        # Non-referenced fields can be deferred if no signal
+-                        # receivers are connected for the related model as
+-                        # they'll never be exposed to the user. Skip field
+-                        # deferring when some relationships are select_related
+-                        # as interactions between both features are hard to
+-                        # get right. This should only happen in the rare
+-                        # cases where .related_objects is overridden anyway.
+-                        if not (sub_objs.query.select_related or self._has_signal_listeners(related_model)):
+-                            referenced_fields = set(chain.from_iterable(
+-                                (rf.attname for rf in rel.field.foreign_related_fields)
+-                                for rel in get_candidate_relations_to_delete(related_model._meta)
+-                            ))
+-                            sub_objs = sub_objs.only(*tuple(referenced_fields))
+-                        if sub_objs:
+-                            field.remote_field.on_delete(self, field, sub_objs, self.using)
++                    sub_objs = self.related_objects(related_model, related_fields, batch)
++                    self.fast_deletes.append(sub_objs)
+             for field in model._meta.private_fields:
+                 if hasattr(field, 'bulk_related_objects'):
+                     # It's something like generic foreign key.
+                     sub_objs = field.bulk_related_objects(new_objs, self.using)
+                     self.collect(sub_objs, source=model, nullable=True)
+ 
+-    def related_objects(self, related, objs):
++    def related_objects(self, related_model, related_fields, objs):
+         """
+-        Get a QuerySet of objects related to `objs` via the relation `related`.
++        Get a QuerySet of the related model to objs via related fields.
+         """
+-        return related.related_model._base_manager.using(self.using).filter(
+-            **{"%s__in" % related.field.name: objs}
+-        )
++        predicate = reduce(or_, (
++            query_utils.Q(**{'%s__in' % related_field.name: objs})
++            for related_field in related_fields
++        ))
++        return related_model._base_manager.using(self.using).filter(predicate)
+ 
+     def instances_with_model(self):
+         for model, instances in self.data.items():
+diff --git a/fd2/app2/__init__.py b/fd2/app2/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/fd2/app2/models.py b/fd2/app2/models.py
+new file mode 100644
+index 0000000000..0008334de6
+--- /dev/null
++++ b/fd2/app2/models.py
+@@ -0,0 +1,59 @@
++from django.db import models
++from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
++from django.contrib.contenttypes.models import ContentType
++
++
++class Person(models.Model):
++    name = models.CharField(max_length=30)
++    friends = models.ManyToManyField('self', symmetrical=False, related_name='friend_of')
++
++
++class Doc(models.Model):
++    created_by = models.ForeignKey(Person, models.CASCADE, related_name='created_docs')
++    updated_by = models.ForeignKey(Person, models.CASCADE, related_name='updated_docs')
++
++
++class Mixed(models.Model):
++    a = models.ForeignKey(Person, models.DO_NOTHING, related_name='mixed_dn', null=True, db_constraint=False)
++    b = models.ForeignKey(Person, models.CASCADE, related_name='mixed_cascade')
++    c = models.ForeignKey(Person, models.SET_NULL, related_name='mixed_setnull', null=True)
++
++
++class Target(models.Model):
++    code = models.CharField(max_length=10, unique=True)
++
++
++class ToFieldRef(models.Model):
++    t1 = models.ForeignKey(Target, models.CASCADE, to_field='code', related_name='by_code')
++    t2 = models.ForeignKey(Target, models.CASCADE, related_name='by_pk')
++
++
++class Parent(models.Model):
++    name = models.CharField(max_length=10, default='')
++
++
++class Child(Parent):
++    # both a parent link and a plain FK to the same parent model
++    other = models.ForeignKey(Parent, models.CASCADE, related_name='children_other', null=True)
++
++
++class Ref(models.Model):
++    # one FK to the parent, one to the child
++    parent = models.ForeignKey(Parent, models.CASCADE, related_name='refs', null=True)
++    child = models.ForeignKey(Child, models.CASCADE, related_name='refs', null=True)
++
++
++class ParentProxy(Parent):
++    class Meta:
++        proxy = True
++
++
++class Tagged(models.Model):
++    content_type = models.ForeignKey(ContentType, models.CASCADE)
++    object_id = models.PositiveIntegerField()
++    content_object = GenericForeignKey()
++
++
++class HasGeneric(models.Model):
++    tags = GenericRelation(Tagged)
++    tags2 = GenericRelation(Tagged, related_query_name='hg2')
+diff --git a/fd2/probe4.py b/fd2/probe4.py
+new file mode 100644
+index 0000000000..48c3c1e844
+--- /dev/null
++++ b/fd2/probe4.py
+@@ -0,0 +1,83 @@
++import django, sys, os
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes', 'app2'],
++    USE_TZ=False,
++)
++sys.path.insert(0, '/workspace/fd2')
++django.setup()
++from django.apps import apps
++from django.db import connection
++from django.db.models.deletion import Collector
++from django.test.utils import CaptureQueriesContext
++from app2.models import *
++
++with connection.schema_editor() as se:
++    for m in apps.get_models():
++        if not m._meta.proxy:
++            se.create_model(m)
++
++def report(label, objs, **kw):
++    c = Collector(using='default')
++    c.collect(list(objs), **kw)
++    print('###', label)
++    for qs in c.fast_deletes:
++        print('   FAST', qs.model.__name__, '::', str(qs.query).split('WHERE', 1)[-1].strip())
++    print('   DATA', {m.__name__: sorted(o.pk for o in v) for m, v in c.data.items()})
++    print('   UPDATES', {m.__name__: [(f.name, v) for (f, v) in d] for m, d in c.field_updates.items()})
++    return c
++
++# --- self referential m2m with overlapping rows
++p1, p2, p3 = [Person.objects.create(name=str(i)) for i in range(3)]
++p1.friends.add(p2, p3)
++p2.friends.add(p1)
++p3.friends.add(p3)
++Through = Person._meta.get_field('friends').remote_field.through
++print('through rows before:', list(Through.objects.values_list('from_person', 'to_person')))
++Doc.objects.create(created_by=p1, updated_by=p1)   # both FKs point at p1 -> overlap
++Doc.objects.create(created_by=p1, updated_by=p2)
++Doc.objects.create(created_by=p2, updated_by=p1)
++Mixed.objects.create(a=p1, b=p1, c=p1)
++report('collect([p1]) self-m2m + 2fk + mixed on_delete', [p1])
++with CaptureQueriesContext(connection) as ctx:
++    res = Person.objects.filter(pk=p1.pk).delete()
++print('  delete() ->', res)
++for q in ctx.captured_queries:
++    print('   SQL:', q['sql'])
++print('  remaining through rows:', list(Through.objects.values_list('from_person', 'to_person')))
++print('  remaining docs:', list(Doc.objects.values_list('created_by', 'updated_by')))
++print('  remaining mixed:', list(Mixed.objects.values_list('a', 'b', 'c')))
++
++# --- to_field
++t1 = Target.objects.create(code='aa')
++t2 = Target.objects.create(code='bb')
++ToFieldRef.objects.create(t1=t1, t2=t1)
++ToFieldRef.objects.create(t1=t2, t2=t1)
++report('collect([t1]) to_field mix', [t1])
++with CaptureQueriesContext(connection) as ctx:
++    print('  delete() ->', Target.objects.filter(pk=t1.pk).delete())
++for q in ctx.captured_queries:
++    print('   SQL:', q['sql'], q['params'] if 'params' in q else '')
++print('  remaining tofieldrefs:', list(ToFieldRef.objects.values_list('t1', 't2')))
++
++# --- MTI: parent link + extra FK to parent, and Ref with FKs to parent and child
++par = Parent.objects.create(name='p')
++ch = Child.objects.create(name='c', other=par)
++Ref.objects.create(parent=par)
++Ref.objects.create(child=ch)
++report('collect([par]) MTI parent w/ child.parent_ptr + child.other + Ref', [par])
++report('collect([ch]) MTI child', [ch])
++report('collect([ch], keep_parents=True)', [ch], keep_parents=True)
++report('collect(proxy instance)', list(ParentProxy.objects.filter(pk=par.pk)))
++
++# --- GFK
++hg = HasGeneric.objects.create()
++ct = ContentType.objects.get_for_model(HasGeneric)
++Tagged.objects.create(content_type=ct, object_id=hg.pk)
++report('collect([hg]) generic relations x2', [hg])
++with CaptureQueriesContext(connection) as ctx:
++    print('  delete() ->', HasGeneric.objects.filter(pk=hg.pk).delete())
++for q in ctx.captured_queries:
++    print('   SQL:', q['sql'])
+diff --git a/fd3/app3/__init__.py b/fd3/app3/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/fd3/app3/models.py b/fd3/app3/models.py
+new file mode 100644
+index 0000000000..ded202ca3c
+--- /dev/null
++++ b/fd3/app3/models.py
+@@ -0,0 +1,20 @@
++from django.db import models
++
++
++class P(models.Model):
++    name = models.CharField(max_length=10, default='')
++
++
++class C(P):
++    # parent link + a second FK to the same parent model; nothing points at C
++    other = models.ForeignKey(P, models.CASCADE, related_name='c_other', null=True)
++
++
++class Prot(models.Model):
++    cascade = models.ForeignKey(P, models.CASCADE, related_name='prot_cascade')
++    protect = models.ForeignKey(P, models.PROTECT, related_name='prot_protect', null=True)
++
++
++class Big(models.Model):
++    x = models.ForeignKey(P, models.CASCADE, related_name='big_x')
++    y = models.ForeignKey(P, models.CASCADE, related_name='big_y', null=True)
+diff --git a/fd3/probe5.py b/fd3/probe5.py
+new file mode 100644
+index 0000000000..0fe8bb737b
+--- /dev/null
++++ b/fd3/probe5.py
+@@ -0,0 +1,52 @@
++import django, sys
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['app3'], USE_TZ=False,
++)
++sys.path.insert(0, '/workspace/fd3')
++django.setup()
++from django.apps import apps
++from django.db import connection
++from django.db.models.deletion import Collector, ProtectedError
++from django.test.utils import CaptureQueriesContext
++from app3.models import *
++
++with connection.schema_editor() as se:
++    for m in apps.get_models():
++        if not m._meta.proxy:
++            se.create_model(m)
++
++def report(label, objs, **kw):
++    c = Collector(using='default')
++    c.collect(list(objs), **kw)
++    print('###', label)
++    for qs in c.fast_deletes:
++        print('   FAST', qs.model.__name__, '::', str(qs.query).split('WHERE', 1)[-1].strip()[:160])
++    print('   DATA', {m.__name__: sorted(o.pk for o in v) for m, v in c.data.items()})
++    return c
++
++p1 = P.objects.create(name='p1')
++c1 = C.objects.create(name='c1', other=p1)
++report('parent_ptr fast + other FK non-fast, same related model C', [p1])
++
++print('PROTECT check')
++p2 = P.objects.create(name='p2')
++Prot.objects.create(cascade=p2, protect=p2)
++try:
++    P.objects.filter(pk=p2.pk).delete()
++    print('  NO ProtectedError (BAD)')
++except ProtectedError as e:
++    print('  ProtectedError raised OK;', 'Prot rows left:', Prot.objects.count())
++
++print('batching: 600 P objects, Big has 2 grouped FKs')
++ps = [P.objects.create(name=str(i)) for i in range(600)]
++c = Collector(using='default')
++c.collect(ps)
++print('  n fast_deletes:', len(c.fast_deletes))
++for qs in c.fast_deletes:
++    sql, params = qs.query.sql_with_params()
++    print('   ', qs.model.__name__, 'params:', len(params))
++from django.db import connections
++print('  bulk_batch_size(2 fields, 600):', connections['default'].ops.bulk_batch_size(['x','y'], ps))
+diff --git a/fd3/probe6.py b/fd3/probe6.py
+new file mode 100644
+index 0000000000..6cc4e5f621
+--- /dev/null
++++ b/fd3/probe6.py
+@@ -0,0 +1,23 @@
++import django, sys
++from django.conf import settings
++settings.configure(DEBUG=True, DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++                   INSTALLED_APPS=['app3'], USE_TZ=False)
++sys.path.insert(0, '/workspace/fd3')
++django.setup()
++from django.apps import apps
++from django.db import connection
++from django.db.models import Q
++from app3.models import *
++with connection.schema_editor() as se:
++    for m in apps.get_models():
++        se.create_model(m)
++ids = list(range(1, 501))
++qs = Big._base_manager.filter(Q(x_id__in=ids) | Q(y_id__in=ids))
++print('params:', len(qs.query.sql_with_params()[1]))
++try:
++    print('rows:', qs._raw_delete(using='default'))
++except Exception as e:
++    print('ERROR:', type(e).__name__, e)
++ids2 = list(range(1, 500))
++qs2 = Big._base_manager.filter(Q(x_id__in=ids2) | Q(y_id__in=ids2))
++print('params:', len(qs2.query.sql_with_params()[1]), '->', qs2._raw_delete(using='default'))
+diff --git a/fd3/probe7.py b/fd3/probe7.py
+new file mode 100644
+index 0000000000..d33d9e5894
+--- /dev/null
++++ b/fd3/probe7.py
+@@ -0,0 +1,26 @@
++import django, sys
++from django.conf import settings
++settings.configure(DEBUG=False, DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++                   INSTALLED_APPS=['app3'], USE_TZ=False)
++sys.path.insert(0, '/workspace/fd3')
++django.setup()
++from django.apps import apps
++from django.db import connection
++from app3.models import *
++with connection.schema_editor() as se:
++    for m in apps.get_models():
++        se.create_model(m)
++
++# NULL semantics + overlap across batch boundaries
++ps = [P.objects.create(name=str(i)) for i in range(600)]
++Big.objects.create(x=ps[0], y=None)          # y NULL, x matches
++Big.objects.create(x=ps[0], y=ps[1])         # both match, same batch
++Big.objects.create(x=ps[0], y=ps[550])       # both match, different batches
++Big.objects.create(x=ps[550], y=ps[0])       # both match, reversed
++total_big = Big.objects.count()
++n = Big.objects.count()
++res = P.objects.all().delete()
++print('Big rows before:', total_big, ' delete() ->', res)
++print('reported Big count:', res[1].get('app3.Big'), 'remaining:', Big.objects.count())
++assert res[1]['app3.Big'] == total_big, 'count mismatch!'
++print('OK: no double counting, NULL rows handled')
+diff --git a/fd4/app4/__init__.py b/fd4/app4/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/fd4/app4/models.py b/fd4/app4/models.py
+new file mode 100644
+index 0000000000..7377f441b8
+--- /dev/null
++++ b/fd4/app4/models.py
+@@ -0,0 +1,17 @@
++from django.db import models
++
++
++class Root(models.Model):
++    pass
++
++
++class Mid(models.Model):
++    root = models.ForeignKey(Root, models.CASCADE)
++    code = models.CharField(max_length=10, unique=True)
++    big = models.TextField(default='x' * 100)
++
++
++class Leaf(models.Model):
++    # two fast-deletable FKs to Mid: one to pk, one to the unique to_field
++    by_pk = models.ForeignKey(Mid, models.CASCADE, related_name='leaf_by_pk')
++    by_code = models.ForeignKey(Mid, models.CASCADE, to_field='code', related_name='leaf_by_code')
+diff --git a/fd4/probe8.py b/fd4/probe8.py
+new file mode 100644
+index 0000000000..b746e448f3
+--- /dev/null
++++ b/fd4/probe8.py
+@@ -0,0 +1,22 @@
++import django, sys
++from django.conf import settings
++settings.configure(DEBUG=True, DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++                   INSTALLED_APPS=['app4'], USE_TZ=False)
++sys.path.insert(0, '/workspace/fd4')
++django.setup()
++from django.apps import apps
++from django.db import connection
++from django.test.utils import CaptureQueriesContext
++from app4.models import *
++with connection.schema_editor() as se:
++    for m in apps.get_models():
++        se.create_model(m)
++r = Root.objects.create()
++m1 = Mid.objects.create(root=r, code='c1')
++m2 = Mid.objects.create(root=r, code='c2')
++Leaf.objects.create(by_pk=m1, by_code=m1)
++Leaf.objects.create(by_pk=m2, by_code=m1)
++with CaptureQueriesContext(connection) as ctx:
++    print('delete ->', Root.objects.filter(pk=r.pk).delete())
++for q in ctx.captured_queries:
++    print(' SQL:', q['sql'])
+diff --git a/fdprobe/probe.py b/fdprobe/probe.py
+new file mode 100644
+index 0000000000..792f8fc353
+--- /dev/null
++++ b/fdprobe/probe.py
+@@ -0,0 +1,28 @@
++import django
++from django.conf import settings
++
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 'probeapp'],
++    USE_TZ=False,
++)
++import sys
++sys.path.insert(0, '/workspace/fdprobe')
++django.setup()
++
++from django.db import models, connection
++from django.db.models.deletion import Collector, get_candidate_relations_to_delete, DO_NOTHING, CASCADE
++from probeapp.models import *
++
++def show(model):
++    print('=' * 70)
++    print('candidate relations to delete for', model.__name__)
++    for rel in get_candidate_relations_to_delete(model._meta):
++        f = rel.field
++        print('  rel=%-45r field=%s.%s on_delete=%s to_field=%s hidden=%s rel.name=%s' % (
++            rel, f.model.__name__, f.name, f.remote_field.on_delete.__name__,
++            f.target_field.name, rel.hidden, rel.name))
++
++for m in MODELS_TO_SHOW:
++    show(m)
+diff --git a/fdprobe/probe2.py b/fdprobe/probe2.py
+new file mode 100644
+index 0000000000..e650710704
+--- /dev/null
++++ b/fdprobe/probe2.py
+@@ -0,0 +1,60 @@
++import django, sys, functools, operator
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 'probeapp'],
++    USE_TZ=False,
++)
++sys.path.insert(0, '/workspace/fdprobe')
++django.setup()
++from django.db import models, connection
++from django.db.models import Q
++from django.db.models.sql import DeleteQuery
++from probeapp.models import *
++
++people = [Person(pk=1), Person(pk=2), Person(pk=3)]
++targets = [Target(pk=1, code='aa'), Target(pk=2, code='bb')]
++
++def sql_of(qs):
++    return str(qs.query)
++
++print('--- self m2m through (auto-created) ---')
++through = Person._meta.get_field('friends').remote_field.through
++q1 = through._base_manager.filter(from_person__in=people)
++q2 = through._base_manager.filter(to_person__in=people)
++qor = through._base_manager.filter(Q(from_person__in=people) | Q(to_person__in=people))
++for q in (q1, q2, qor):
++    print(sql_of(q))
++print('tables used:', {a for a, rc in qor.query.alias_map.items()}, qor.query.alias_refcount)
++
++print('--- doc created_by/updated_by ---')
++qor = Doc._base_manager.filter(Q(created_by__in=people) | Q(updated_by__in=people))
++print(sql_of(qor), qor.query.alias_refcount)
++
++print('--- to_field mix ---')
++qor = ToFieldRef._base_manager.filter(Q(t1__in=targets) | Q(t2__in=targets))
++print(sql_of(qor), qor.query.alias_refcount)
++
++print('--- what SQL would _raw_delete produce? ---')
++def show_raw_delete(qs):
++    dq = DeleteQuery(qs.model)
++    innerq = qs.query
++    innerq.get_initial_alias()
++    dq.get_initial_alias()
++    used = tuple(t for t in innerq.alias_map if innerq.alias_refcount[t])
++    print('  inner used tables:', used, ' delete alias_map:', tuple(dq.alias_map))
++    if not used or used == tuple(dq.alias_map):
++        dq.where = innerq.where
++        print('  SINGLE QUERY:', dq.get_compiler('default').as_sql())
++    else:
++        print('  NEEDS SUBQUERY / extra select')
++show_raw_delete(through._base_manager.filter(Q(from_person__in=people) | Q(to_person__in=people)))
++show_raw_delete(ToFieldRef._base_manager.filter(Q(t1__in=targets) | Q(t2__in=targets)))
++show_raw_delete(Doc._base_manager.filter(Q(created_by__in=people) | Q(updated_by__in=people)))
++
++print('--- bulk_batch_size on sqlite ---')
++ops = connection.ops
++objs = list(range(3000))
++print('1 field:', ops.bulk_batch_size(['a'], objs), '2 fields:', ops.bulk_batch_size(['a','b'], objs), '3:', ops.bulk_batch_size(['a','b','c'], objs))
++print('max_query_params', connection.features.max_query_params)
+diff --git a/fdprobe/probe3.py b/fdprobe/probe3.py
+new file mode 100644
+index 0000000000..331f62ffc3
+--- /dev/null
++++ b/fdprobe/probe3.py
+@@ -0,0 +1,53 @@
++import django, sys
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 'probeapp'],
++    USE_TZ=False,
++)
++sys.path.insert(0, '/workspace/fdprobe')
++django.setup()
++from django.db import connection, models
++from django.db.models.deletion import Collector
++from django.apps import apps
++from probeapp.models import *
++
++with connection.schema_editor() as se:
++    for m in apps.get_models():
++        try:
++            se.create_model(m)
++        except Exception as e:
++            print('skip', m, e)
++    for m2m in [Person._meta.get_field('friends').remote_field.through]:
++        pass
++
++p1, p2, p3 = [Person.objects.create(name=str(i)) for i in range(3)]
++p1.friends.add(p2, p3)
++p2.friends.add(p1)          # reciprocal row -> overlapping with p1 deletion
++p3.friends.add(p3)          # self row
++Colleague.objects.create(src=p1, dst=p2)
++Colleague.objects.create(src=p2, dst=p1)
++Doc.objects.create(created_by=p1, updated_by=p2)
++Doc.objects.create(created_by=p2, updated_by=p1)
++Mixed.objects.create(a=p1, b=p1)
++Mixed.objects.create(a=p1, b=p2)
++
++def collector_report(objs, **kw):
++    c = Collector(using='default')
++    c.collect(objs, **kw)
++    print('  fast_deletes:')
++    for qs in c.fast_deletes:
++        print('   ', qs.model.__name__, '::', str(qs.query).split('WHERE')[-1].strip())
++    print('  data:', {m.__name__: len(v) for m, v in c.data.items()})
++    return c
++
++print('=== collect([p1]) ===')
++collector_report([p1])
++
++from django.test.utils import CaptureQueriesContext
++with CaptureQueriesContext(connection) as ctx:
++    res = Person.objects.filter(pk=p1.pk).delete()
++print('delete result:', res)
++for q in ctx.captured_queries:
++    print('  Q:', q['sql'])
+diff --git a/fdprobe/probeapp/__init__.py b/fdprobe/probeapp/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/fdprobe/probeapp/models.py b/fdprobe/probeapp/models.py
+new file mode 100644
+index 0000000000..cb9a55ec98
+--- /dev/null
++++ b/fdprobe/probeapp/models.py
+@@ -0,0 +1,69 @@
++from django.db import models
++from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
++from django.contrib.contenttypes.models import ContentType
++
++
++class Person(models.Model):
++    name = models.CharField(max_length=30)
++    friends = models.ManyToManyField('self', symmetrical=False, related_name='friend_of')
++    colleagues = models.ManyToManyField('self', through='Colleague', symmetrical=False, related_name='colleague_of')
++
++
++class Colleague(models.Model):
++    src = models.ForeignKey(Person, models.CASCADE, related_name='+')
++    dst = models.ForeignKey(Person, models.CASCADE, related_name='++')
++    since = models.IntegerField(default=0)
++
++
++class Doc(models.Model):
++    created_by = models.ForeignKey(Person, models.CASCADE, related_name='created_docs')
++    updated_by = models.ForeignKey(Person, models.CASCADE, related_name='updated_docs')
++
++
++class Mixed(models.Model):
++    # DO_NOTHING + CASCADE on the same target model
++    a = models.ForeignKey(Person, models.DO_NOTHING, related_name='mixed_donothing', null=True)
++    b = models.ForeignKey(Person, models.CASCADE, related_name='mixed_cascade')
++
++
++class Target(models.Model):
++    code = models.CharField(max_length=10, unique=True)
++
++
++class ToFieldRef(models.Model):
++    t1 = models.ForeignKey(Target, models.CASCADE, to_field='code', related_name='by_code')
++    t2 = models.ForeignKey(Target, models.CASCADE, related_name='by_pk')
++
++
++class Parent(models.Model):
++    name = models.CharField(max_length=10)
++
++
++class Child(Parent):
++    extra = models.CharField(max_length=10)
++
++
++class ChildRef(models.Model):
++    child = models.ForeignKey(Child, models.CASCADE)
++
++
++class ParentRef(models.Model):
++    parent = models.ForeignKey(Parent, models.CASCADE)
++
++
++class ParentProxy(Parent):
++    class Meta:
++        proxy = True
++
++
++class Tagged(models.Model):
++    content_type = models.ForeignKey(ContentType, models.CASCADE)
++    object_id = models.PositiveIntegerField()
++    content_object = GenericForeignKey()
++
++
++class HasGeneric(models.Model):
++    tags = GenericRelation(Tagged)
++
++
++MODELS_TO_SHOW = [Person, Target, Parent, Child, ParentProxy, HasGeneric]
+diff --git a/full.log b/full.log
+new file mode 100644
+index 0000000000..111bf545dd
+--- /dev/null
++++ b/full.log
+@@ -0,0 +1,761 @@
++Testing against Django installed in '/testbed/django' with up to 4 processes
++System check identified no issues (14 silenced).
++Creating test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Creating test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++.......................................................................................................s...................................................................s...........sss..s....................s.....s.................................................................................................................................................................................................................................s...............s............................................s......................................................................s................................................................................................................................................................................................................sssss..................s............................................x........................................................................................................................................................................................s...........................s.......................sss..........................EEE.....................................................................................................................................................................................................s...................................s......................................F..........s........................................................s..ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss..............................................................................................................................................................................................................s............................s.............................................................................................................................s..........................................s....................................................................s..................................................................................................sss..ss............................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................E.................................s..........................ssss...............s.sss............s................s...........s.......................................s............x....x...................................................................................................s..................................s..................................................................................s.......ss....................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................sssssssssssssssssssssssssssssssssss................................................s............s....................................................................................................................................................................................................................................................................................................................................................................................s.ssss...................................s............s.s.............................................................................................................................................................................................................................................................................................................................................................s...............................................................................................................................................................................................................................s.....................................................................................s.s..s...s.s......s....s.s....................................................................s..........................................................................s.....................................................................................................................s...............................................................................................................................................................sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss...........................................................................s...s....................................................................................s...................................................................................................................................................................sss.ssssss.....................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................s......F..................................................................................................................................................................................................................................................................................................................................................................................................s...s................................................................................................................................ss........Forbidden (Referer checking failed - https://www.evil.org/somepage does not match any trusted origins.): 
++Forbidden (Referer checking failed - Referer is insecure while host is secure.): 
++Forbidden (Referer checking failed - Referer is malformed.): 
++Forbidden (Referer checking failed - Referer is malformed.): 
++Forbidden (Referer checking failed - Referer is malformed.): 
++Forbidden (Referer checking failed - Referer is malformed.): 
++Forbidden (Referer checking failed - Referer is insecure while host is secure.): 
++.....................................Forbidden (Referer checking failed - https://www.evil.org/somepage does not match any trusted origins.): 
++Forbidden (Referer checking failed - Referer is insecure while host is secure.): 
++Forbidden (Referer checking failed - Referer is malformed.): 
++Forbidden (Referer checking failed - Referer is malformed.): 
++Forbidden (Referer checking failed - Referer is malformed.): 
++Forbidden (Referer checking failed - Referer is malformed.): 
++Forbidden (Referer checking failed - Referer is insecure while host is secure.): 
++..................................................................................................................................................................................................................................................................................F...............................................................................................................................................................s................................................................................................s............ss........................................................................................................................................sssssss..F.............................................................................................................................................................................................................................................................................................ssssssssssssssssssss................................................................................................................................................................................................................................................................................................................................ss....ssssss....sssss..s.................................sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss.ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss.s...............................................................................................s.............................................................sss...........................................................................................s............s..s......s..ss.ssss.....sss.........s...................s........s................................s......s.s...s............................................................sssssssssssssss.........ss....................E...........E..........E.....sssssssssss.s.sssss.ssssss...................E.....................Internal Server Error: /static/test/\u2297.txt
++Traceback (most recent call last):
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/django/contrib/staticfiles/views.py", line 33, in serve
++    absolute_path = finders.find(normalized_path)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 268, in find
++    result = finder.find(path, all=all)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 103, in find
++    matched_path = self.find_location(root, path, prefix)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 121, in find_location
++    if os.path.exists(path):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 56: ordinal not in range(128)
++...E...Internal Server Error: /static/test/\u2297.txt
++Traceback (most recent call last):
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/django/contrib/staticfiles/views.py", line 33, in serve
++    absolute_path = finders.find(normalized_path)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 268, in find
++    result = finder.find(path, all=all)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 103, in find
++    matched_path = self.find_location(root, path, prefix)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 121, in find_location
++    if os.path.exists(path):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 56: ordinal not in range(128)
++................E........................................................................................................................................................................................................................................................................................................................................................................................................................................................s.......................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................sssssssssssss...ss.............................sss......ss...ss...s.s...s...............................................................................sFF.F................s......................................................................................F.....F.................................................................................................................................................E..........................................................................................................................s...........................s..................................................................................s..sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss..EEEE........................................................................................................................................................................................................................................................................................................................................................................................................................Bad Request: /raises400/
++Forbidden (Permission denied): /raises403/
++Traceback (most recent call last):
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/tests/view_tests/views.py", line 54, in raises403
++    raise PermissionDenied("Insufficient Permissions")
++django.core.exceptions.PermissionDenied: Insufficient Permissions
++Forbidden (Permission denied): /raises403/
++Traceback (most recent call last):
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/tests/view_tests/views.py", line 54, in raises403
++    raise PermissionDenied("Insufficient Permissions")
++django.core.exceptions.PermissionDenied: Insufficient Permissions
++Not Found: /raises404/
++Not Found: /
++Not Found: /not-in-urls
++Not Found: /classbased404/
++Not Found: /
++Not Found: /technical404/
++Not Found: /path-post/1/
++...............................................................Bad Request: /raises400/
++Forbidden (Permission denied): /raises403/
++Traceback (most recent call last):
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/tests/view_tests/views.py", line 54, in raises403
++    raise PermissionDenied("Insufficient Permissions")
++django.core.exceptions.PermissionDenied: Insufficient Permissions
++Not Found: /raises404/
++..............................ss................Not Found: /site_media/nonexistent_resource
++.................................................................................................................................................................................................................................................................................................................................................................................E..................ssssssss........................................x.............................ss.....................................................................................................................................................................................
++======================================================================
++ERROR: test_unicode_file_name (file_uploads.tests.FileUploadTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/file_uploads/tests.py", line 105, in test_unicode_file_name
++    with open(os.path.join(temp_dir, UNICODE_FILENAME), 'w+b') as file1:
++UnicodeEncodeError: 'ascii' codec can't encode characters in position 49-50: ordinal not in range(128)
++
++======================================================================
++ERROR: test_unicode_file_name_rfc2231 (file_uploads.tests.FileUploadTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/file_uploads/tests.py", line 133, in test_unicode_file_name_rfc2231
++    response = self.client.request(**r)
++  File "/testbed/django/test/client.py", line 496, in request
++    raise exc_value
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/tests/file_uploads/views.py", line 63, in file_upload_unicode_name
++    FileModel.objects.create(testfile=uni_named_file)
++  File "/testbed/django/db/models/manager.py", line 82, in manager_method
++    return getattr(self.get_queryset(), name)(*args, **kwargs)
++  File "/testbed/django/db/models/query.py", line 430, in create
++    obj.save(force_insert=True, using=self.db)
++  File "/testbed/django/db/models/base.py", line 746, in save
++    force_update=force_update, update_fields=update_fields)
++  File "/testbed/django/db/models/base.py", line 784, in save_base
++    force_update, using, update_fields,
++  File "/testbed/django/db/models/base.py", line 886, in _save_table
++    results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
++  File "/testbed/django/db/models/base.py", line 925, in _do_insert
++    using=using, raw=raw,
++  File "/testbed/django/db/models/manager.py", line 82, in manager_method
++    return getattr(self.get_queryset(), name)(*args, **kwargs)
++  File "/testbed/django/db/models/query.py", line 1201, in _insert
++    return query.get_compiler(using=using).execute_sql(returning_fields)
++  File "/testbed/django/db/models/sql/compiler.py", line 1330, in execute_sql
++    for sql, params in self.as_sql():
++  File "/testbed/django/db/models/sql/compiler.py", line 1275, in as_sql
++    for obj in self.query.objs
++  File "/testbed/django/db/models/sql/compiler.py", line 1275, in <listcomp>
++    for obj in self.query.objs
++  File "/testbed/django/db/models/sql/compiler.py", line 1274, in <listcomp>
++    [self.prepare_value(field, self.pre_save_val(field, obj)) for field in fields]
++  File "/testbed/django/db/models/sql/compiler.py", line 1225, in pre_save_val
++    return field.pre_save(obj, add=True)
++  File "/testbed/django/db/models/fields/files.py", line 288, in pre_save
++    file.save(file.name, file.file, save=False)
++  File "/testbed/django/db/models/fields/files.py", line 87, in save
++    self.name = self.storage.save(name, content, max_length=self.field.max_length)
++  File "/testbed/django/core/files/storage.py", line 51, in save
++    name = self.get_available_name(name, max_length=max_length)
++  File "/testbed/django/core/files/storage.py", line 82, in get_available_name
++    while self.exists(name) or (max_length and len(name) > max_length):
++  File "/testbed/django/core/files/storage.py", line 311, in exists
++    return os.path.exists(self.path(name))
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode characters in position 61-62: ordinal not in range(128)
++
++======================================================================
++ERROR: test_unicode_name_rfc2231 (file_uploads.tests.FileUploadTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/file_uploads/tests.py", line 162, in test_unicode_name_rfc2231
++    response = self.client.request(**r)
++  File "/testbed/django/test/client.py", line 496, in request
++    raise exc_value
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/tests/file_uploads/views.py", line 63, in file_upload_unicode_name
++    FileModel.objects.create(testfile=uni_named_file)
++  File "/testbed/django/db/models/manager.py", line 82, in manager_method
++    return getattr(self.get_queryset(), name)(*args, **kwargs)
++  File "/testbed/django/db/models/query.py", line 430, in create
++    obj.save(force_insert=True, using=self.db)
++  File "/testbed/django/db/models/base.py", line 746, in save
++    force_update=force_update, update_fields=update_fields)
++  File "/testbed/django/db/models/base.py", line 784, in save_base
++    force_update, using, update_fields,
++  File "/testbed/django/db/models/base.py", line 886, in _save_table
++    results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
++  File "/testbed/django/db/models/base.py", line 925, in _do_insert
++    using=using, raw=raw,
++  File "/testbed/django/db/models/manager.py", line 82, in manager_method
++    return getattr(self.get_queryset(), name)(*args, **kwargs)
++  File "/testbed/django/db/models/query.py", line 1201, in _insert
++    return query.get_compiler(using=using).execute_sql(returning_fields)
++  File "/testbed/django/db/models/sql/compiler.py", line 1330, in execute_sql
++    for sql, params in self.as_sql():
++  File "/testbed/django/db/models/sql/compiler.py", line 1275, in as_sql
++    for obj in self.query.objs
++  File "/testbed/django/db/models/sql/compiler.py", line 1275, in <listcomp>
++    for obj in self.query.objs
++  File "/testbed/django/db/models/sql/compiler.py", line 1274, in <listcomp>
++    [self.prepare_value(field, self.pre_save_val(field, obj)) for field in fields]
++  File "/testbed/django/db/models/sql/compiler.py", line 1225, in pre_save_val
++    return field.pre_save(obj, add=True)
++  File "/testbed/django/db/models/fields/files.py", line 288, in pre_save
++    file.save(file.name, file.file, save=False)
++  File "/testbed/django/db/models/fields/files.py", line 87, in save
++    self.name = self.storage.save(name, content, max_length=self.field.max_length)
++  File "/testbed/django/core/files/storage.py", line 51, in save
++    name = self.get_available_name(name, max_length=max_length)
++  File "/testbed/django/core/files/storage.py", line 82, in get_available_name
++    while self.exists(name) or (max_length and len(name) > max_length):
++  File "/testbed/django/core/files/storage.py", line 311, in exists
++    return os.path.exists(self.path(name))
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode characters in position 61-62: ordinal not in range(128)
++
++======================================================================
++ERROR: test_unicode_filename (forms_tests.tests.tests.FormsModelTestCase)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/forms_tests/tests/tests.py", line 158, in test_unicode_filename
++    m = FileModel.objects.create(file=f.cleaned_data['file1'])
++  File "/testbed/django/db/models/manager.py", line 82, in manager_method
++    return getattr(self.get_queryset(), name)(*args, **kwargs)
++  File "/testbed/django/db/models/query.py", line 430, in create
++    obj.save(force_insert=True, using=self.db)
++  File "/testbed/django/db/models/base.py", line 746, in save
++    force_update=force_update, update_fields=update_fields)
++  File "/testbed/django/db/models/base.py", line 784, in save_base
++    force_update, using, update_fields,
++  File "/testbed/django/db/models/base.py", line 886, in _save_table
++    results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
++  File "/testbed/django/db/models/base.py", line 925, in _do_insert
++    using=using, raw=raw,
++  File "/testbed/django/db/models/manager.py", line 82, in manager_method
++    return getattr(self.get_queryset(), name)(*args, **kwargs)
++  File "/testbed/django/db/models/query.py", line 1201, in _insert
++    return query.get_compiler(using=using).execute_sql(returning_fields)
++  File "/testbed/django/db/models/sql/compiler.py", line 1330, in execute_sql
++    for sql, params in self.as_sql():
++  File "/testbed/django/db/models/sql/compiler.py", line 1275, in as_sql
++    for obj in self.query.objs
++  File "/testbed/django/db/models/sql/compiler.py", line 1275, in <listcomp>
++    for obj in self.query.objs
++  File "/testbed/django/db/models/sql/compiler.py", line 1274, in <listcomp>
++    [self.prepare_value(field, self.pre_save_val(field, obj)) for field in fields]
++  File "/testbed/django/db/models/sql/compiler.py", line 1225, in pre_save_val
++    return field.pre_save(obj, add=True)
++  File "/testbed/django/db/models/fields/files.py", line 288, in pre_save
++    file.save(file.name, file.file, save=False)
++  File "/testbed/django/db/models/fields/files.py", line 87, in save
++    self.name = self.storage.save(name, content, max_length=self.field.max_length)
++  File "/testbed/django/core/files/storage.py", line 51, in save
++    name = self.get_available_name(name, max_length=max_length)
++  File "/testbed/django/core/files/storage.py", line 82, in get_available_name
++    while self.exists(name) or (max_length and len(name) > max_length):
++  File "/testbed/django/core/files/storage.py", line 311, in exists
++    return os.path.exists(self.path(name))
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode characters in position 39-47: ordinal not in range(128)
++
++======================================================================
++ERROR: test_strip_tags_files (utils_tests.test_html.TestUtilsHtml) [<object object at 0x790a67296400>] (filename='strip_tags1.html')
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 523, in subTest
++    yield
++  File "/testbed/tests/utils_tests/test_html.py", line 107, in test_strip_tags_files
++    content = fp.read()
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/encodings/ascii.py", line 26, in decode
++    return codecs.ascii_decode(input, self.errors)[0]
++UnicodeDecodeError: 'ascii' codec can't decode byte 0xc2 in position 257: ordinal not in range(128)
++
++======================================================================
++ERROR: test_nonascii_filenames (staticfiles_tests.test_management.TestCollection)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/staticfiles_tests/cases.py", line 126, in test_nonascii_filenames
++    self.assertFileContains('test/\u2297.txt', '\u2297 in the app dir')
++  File "/testbed/tests/staticfiles_tests/cases.py", line 21, in assertFileContains
++    self._get_file(filepath),
++  File "/testbed/tests/staticfiles_tests/cases.py", line 88, in _get_file
++    with open(filepath, encoding='utf-8') as f:
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 38: ordinal not in range(128)
++
++======================================================================
++ERROR: test_nonascii_filenames (staticfiles_tests.test_management.TestCollectionExcludeNoDefaultIgnore)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/staticfiles_tests/cases.py", line 126, in test_nonascii_filenames
++    self.assertFileContains('test/\u2297.txt', '\u2297 in the app dir')
++  File "/testbed/tests/staticfiles_tests/cases.py", line 21, in assertFileContains
++    self._get_file(filepath),
++  File "/testbed/tests/staticfiles_tests/cases.py", line 88, in _get_file
++    with open(filepath, encoding='utf-8') as f:
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 38: ordinal not in range(128)
++
++======================================================================
++ERROR: test_nonascii_filenames (staticfiles_tests.test_management.TestCollectionLinks)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/staticfiles_tests/cases.py", line 126, in test_nonascii_filenames
++    self.assertFileContains('test/\u2297.txt', '\u2297 in the app dir')
++  File "/testbed/tests/staticfiles_tests/cases.py", line 21, in assertFileContains
++    self._get_file(filepath),
++  File "/testbed/tests/staticfiles_tests/cases.py", line 88, in _get_file
++    with open(filepath, encoding='utf-8') as f:
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 38: ordinal not in range(128)
++
++======================================================================
++ERROR: test_nonascii_filenames (staticfiles_tests.test_management.TestFindStatic)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/staticfiles_tests/cases.py", line 126, in test_nonascii_filenames
++    self.assertFileContains('test/\u2297.txt', '\u2297 in the app dir')
++  File "/testbed/tests/staticfiles_tests/cases.py", line 21, in assertFileContains
++    self._get_file(filepath),
++  File "/testbed/tests/staticfiles_tests/test_management.py", line 64, in _get_file
++    path = call_command('findstatic', filepath, all=False, verbosity=0, stdout=StringIO())
++  File "/testbed/django/core/management/__init__.py", line 168, in call_command
++    return command.execute(*args, **defaults)
++  File "/testbed/django/core/management/base.py", line 369, in execute
++    output = self.handle(*args, **options)
++  File "/testbed/django/core/management/base.py", line 543, in handle
++    label_output = self.handle_label(label, **options)
++  File "/testbed/django/contrib/staticfiles/management/commands/findstatic.py", line 20, in handle_label
++    result = finders.find(path, all=options['all'])
++  File "/testbed/django/contrib/staticfiles/finders.py", line 268, in find
++    result = finder.find(path, all=all)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 103, in find
++    matched_path = self.find_location(root, path, prefix)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 121, in find_location
++    if os.path.exists(path):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 56: ordinal not in range(128)
++
++======================================================================
++ERROR: test_nonascii_filenames (staticfiles_tests.test_views.TestServeStaticWithDefaultURL)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/staticfiles_tests/cases.py", line 126, in test_nonascii_filenames
++    self.assertFileContains('test/\u2297.txt', '\u2297 in the app dir')
++  File "/testbed/tests/staticfiles_tests/test_views.py", line 19, in assertFileContains
++    self.assertContains(self._response(filepath), text)
++  File "/testbed/tests/staticfiles_tests/test_views.py", line 16, in _response
++    return self.client.get(quote(posixpath.join(settings.STATIC_URL, filepath)))
++  File "/testbed/django/test/client.py", line 518, in get
++    response = super().get(path, data=data, secure=secure, **extra)
++  File "/testbed/django/test/client.py", line 346, in get
++    **extra,
++  File "/testbed/django/test/client.py", line 421, in generic
++    return self.request(**r)
++  File "/testbed/django/test/client.py", line 496, in request
++    raise exc_value
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/django/contrib/staticfiles/views.py", line 33, in serve
++    absolute_path = finders.find(normalized_path)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 268, in find
++    result = finder.find(path, all=all)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 103, in find
++    matched_path = self.find_location(root, path, prefix)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 121, in find_location
++    if os.path.exists(path):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 56: ordinal not in range(128)
++
++======================================================================
++ERROR: test_nonascii_filenames (staticfiles_tests.test_views.TestServeStaticWithURLHelper)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/staticfiles_tests/cases.py", line 126, in test_nonascii_filenames
++    self.assertFileContains('test/\u2297.txt', '\u2297 in the app dir')
++  File "/testbed/tests/staticfiles_tests/test_views.py", line 19, in assertFileContains
++    self.assertContains(self._response(filepath), text)
++  File "/testbed/tests/staticfiles_tests/test_views.py", line 16, in _response
++    return self.client.get(quote(posixpath.join(settings.STATIC_URL, filepath)))
++  File "/testbed/django/test/client.py", line 518, in get
++    response = super().get(path, data=data, secure=secure, **extra)
++  File "/testbed/django/test/client.py", line 346, in get
++    **extra,
++  File "/testbed/django/test/client.py", line 421, in generic
++    return self.request(**r)
++  File "/testbed/django/test/client.py", line 496, in request
++    raise exc_value
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/django/contrib/staticfiles/views.py", line 33, in serve
++    absolute_path = finders.find(normalized_path)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 268, in find
++    result = finder.find(path, all=all)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 103, in find
++    matched_path = self.find_location(root, path, prefix)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 121, in find_location
++    if os.path.exists(path):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 56: ordinal not in range(128)
++
++======================================================================
++ERROR: test_startapp_unicode_name (admin_scripts.tests.DjangoAdminSettingsDirectory)
++directory: startapp creates the correct directory with unicode characters
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/admin_scripts/tests.py", line 580, in test_startapp_unicode_name
++    out, err = self.run_django_admin(args, 'test_project.settings')
++  File "/testbed/tests/admin_scripts/tests.py", line 131, in run_django_admin
++    return self.run_test(os.path.join(script_dir, 'django-admin.py'), args, settings_file)
++  File "/testbed/tests/admin_scripts/tests.py", line 125, in run_test
++    env=test_environ, universal_newlines=True,
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/subprocess.py", line 423, in run
++    with Popen(*popenargs, **kwargs) as process:
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/subprocess.py", line 729, in __init__
++    restore_signals, start_new_session)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/subprocess.py", line 1295, in _execute_child
++    restore_signals, start_new_session, preexec_fn)
++UnicodeEncodeError: 'ascii' codec can't encode characters in position 0-4: ordinal not in range(128)
++
++======================================================================
++ERROR: test_adds_python_format_to_all_percent_signs (i18n.test_percents.ExtractingStringsWithPercentSigns)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 601, in run
++    self.setUp()
++  File "/testbed/tests/i18n/test_percents.py", line 42, in setUp
++    self.po_contents = fp.read()
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/encodings/ascii.py", line 26, in decode
++    return codecs.ascii_decode(input, self.errors)[0]
++UnicodeDecodeError: 'ascii' codec can't decode byte 0xc3 in position 223: ordinal not in range(128)
++
++======================================================================
++ERROR: test_trans_tag_with_percent_symbol_at_the_end (i18n.test_percents.ExtractingStringsWithPercentSigns)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 601, in run
++    self.setUp()
++  File "/testbed/tests/i18n/test_percents.py", line 42, in setUp
++    self.po_contents = fp.read()
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/encodings/ascii.py", line 26, in decode
++    return codecs.ascii_decode(input, self.errors)[0]
++UnicodeDecodeError: 'ascii' codec can't decode byte 0xc3 in position 223: ordinal not in range(128)
++
++======================================================================
++ERROR: test_trans_tag_with_percent_symbol_in_the_middle (i18n.test_percents.ExtractingStringsWithPercentSigns)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 601, in run
++    self.setUp()
++  File "/testbed/tests/i18n/test_percents.py", line 42, in setUp
++    self.po_contents = fp.read()
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/encodings/ascii.py", line 26, in decode
++    return codecs.ascii_decode(input, self.errors)[0]
++UnicodeDecodeError: 'ascii' codec can't decode byte 0xc3 in position 223: ordinal not in range(128)
++
++======================================================================
++ERROR: test_trans_tag_with_string_that_look_like_fmt_spec (i18n.test_percents.ExtractingStringsWithPercentSigns)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 601, in run
++    self.setUp()
++  File "/testbed/tests/i18n/test_percents.py", line 42, in setUp
++    self.po_contents = fp.read()
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/encodings/ascii.py", line 26, in decode
++    return codecs.ascii_decode(input, self.errors)[0]
++UnicodeDecodeError: 'ascii' codec can't decode byte 0xc3 in position 223: ordinal not in range(128)
++
++======================================================================
++ERROR: test_content_saving (file_storage.tests.ContentFileStorageTestCase)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/file_storage/tests.py", line 977, in test_content_saving
++    self.storage.save('unicode.txt', ContentFile("espa\xf1ol"))
++  File "/testbed/django/core/files/storage.py", line 52, in save
++    return self._save(name, content)
++  File "/testbed/django/core/files/storage.py", line 275, in _save
++    _file.write(chunk)
++UnicodeEncodeError: 'ascii' codec can't encode character '\xf1' in position 4: ordinal not in range(128)
++
++======================================================================
++FAIL: test_custom_fields (inspectdb.tests.InspectDBTestCase)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/inspectdb/tests.py", line 267, in test_custom_fields
++    self.assertIn("text_field = myfields.TextField()", output)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 1089, in assertIn
++    self.fail(self._formatMessage(msg, standardMsg))
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 670, in fail
++    raise self.failureException(msg)
++AssertionError: 'text_field = myfields.TextField()' not found in "# This is an auto-generated Django model module.\n# You'll have to do the following manually to clean this up:\n#   * Rearrange models' order\n#   * Make sure each model has one field with primary_key=True\n#   * Make sure each ForeignKey and OneToOneField has `on_delete` set to the desired behavior\n#   * Remove `managed = False` lines if you wish to allow Django to create, modify, and delete the table\n# Feel free to rename the models, but don't rename db_table values or field names.\nfrom django.db import models\n\n\nclass InspectdbColumntypes(models.Model):\n    id = models.TextField(primary_key=True)  # This field type is a guess.\n    big_int_field = models.BigIntegerField()\n    bool_field = models.TextField()  # This field type is a guess.\n    null_bool_field = models.TextField(blank=True, null=True)  # This field type is a guess.\n    char_field = models.TextField()  # This field type is a guess.\n    null_char_field = models.TextField(blank=True, null=True)  # This field type is a guess.\n    date_field = models.TextField()  # This field type is a guess.\n    date_time_field = models.TextField()  # This field type is a guess.\n    decimal_field = models.TextField()  # This field type is a guess.\n    email_field = models.TextField()  # This field type is a guess.\n    file_field = models.TextField()  # This field type is a guess.\n    file_path_field = models.TextField()  # This field type is a guess.\n    float_field = models.TextField()  # This field type is a guess.\n    int_field = models.TextField()  # This field type is a guess.\n    gen_ip_address_field = models.TextField()  # This field type is a guess.\n    pos_int_field = models.TextField()  # This field type is a guess.\n    pos_small_int_field = models.TextField()  # This field type is a guess.\n    slug_field = models.TextField()  # This field type is a guess.\n    small_int_field = models.TextField()  # This field type is a guess.\n    text_field = models.TextField()  # This field type is a guess.\n    time_field = models.TextField()  # This field type is a guess.\n    url_field = models.TextField()  # This field type is a guess.\n    uuid_field = models.TextField()  # This field type is a guess.\n\n    class Meta:\n        managed = False\n        db_table = 'inspectdb_columntypes'\n"
++
++======================================================================
++FAIL: test_permissions_error (template_tests.test_loaders.FileSystemLoaderTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/template_tests/test_loaders.py", line 195, in test_permissions_error
++    self.engine.get_template(tmpfile.name)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/contextlib.py", line 88, in __exit__
++    next(self.gen)
++  File "/testbed/django/test/testcases.py", line 654, in _assert_raises_or_warns_cm
++    yield cm
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 203, in __exit__
++    self._raiseFailure("{} not raised".format(exc_name))
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 135, in _raiseFailure
++    raise self.test_case.failureException(msg)
++AssertionError: PermissionError not raised
++
++======================================================================
++FAIL: test_readonly_root (file_uploads.tests.DirectoryCreationTests)
++Permission errors are not swallowed
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/file_uploads/tests.py", line 546, in test_readonly_root
++    self.obj.testfile.save('foo.txt', SimpleUploadedFile('foo.txt', b'x'), save=False)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 203, in __exit__
++    self._raiseFailure("{} not raised".format(exc_name))
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 135, in _raiseFailure
++    raise self.test_case.failureException(msg)
++AssertionError: PermissionError not raised
++
++======================================================================
++FAIL: test_strips_underscore_headers (servers.test_basehttp.WSGIRequestHandlerTestCase)
++WSGIRequestHandler ignores headers containing underscores.
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/servers/test_basehttp.py", line 104, in test_strips_underscore_headers
++    self.assertEqual(body, b'HTTP_SOME_HEADER:good')
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 829, in assertEqual
++    assertion_func(first, second, msg=msg)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 822, in _baseAssertEqual
++    raise self.failureException(msg)
++AssertionError: b'HTTP_PROXY:,HTTP_SOME_HEADER:good' != b'HTTP_SOME_HEADER:good'
++
++======================================================================
++FAIL: test_aware_datetime_in_local_timezone (timezones.tests.SerializationTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/timezones/tests.py", line 761, in test_aware_datetime_in_local_timezone
++    self.assertEqual(obj.dt.replace(tzinfo=UTC), dt)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 829, in assertEqual
++    assertion_func(first, second, msg=msg)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 822, in _baseAssertEqual
++    raise self.failureException(msg)
++AssertionError: datet[38 chars]zinfo=<UTC>) != datet[38 chars]zinfo=datetime.timezone(datetime.timedelta(0, 10800), '+0300'))
++
++======================================================================
++FAIL: test_aware_datetime_in_other_timezone (timezones.tests.SerializationTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/timezones/tests.py", line 785, in test_aware_datetime_in_other_timezone
++    self.assertEqual(obj.dt.replace(tzinfo=UTC), dt)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 829, in assertEqual
++    assertion_func(first, second, msg=msg)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 822, in _baseAssertEqual
++    raise self.failureException(msg)
++AssertionError: datet[38 chars]zinfo=<UTC>) != datet[38 chars]zinfo=datetime.timezone(datetime.timedelta(0, 25200), '+0700'))
++
++======================================================================
++FAIL: test_aware_datetime_with_microsecond (timezones.tests.SerializationTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/timezones/tests.py", line 713, in test_aware_datetime_with_microsecond
++    self.assertEqual(obj.dt.replace(tzinfo=UTC), dt)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 829, in assertEqual
++    assertion_func(first, second, msg=msg)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 822, in _baseAssertEqual
++    raise self.failureException(msg)
++AssertionError: datet[46 chars]zinfo=<UTC>) != datet[46 chars]zinfo=datetime.timezone(datetime.timedelta(0, 25200), '+0700'))
++
++======================================================================
++FAIL: test_all (admin_scripts.tests.DiffSettings)
++The all option also shows settings with the default value.
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/admin_scripts/tests.py", line 2196, in test_all
++    self.assertNoOutput(err)
++  File "/testbed/tests/admin_scripts/tests.py", line 153, in assertNoOutput
++    self.assertEqual(len(stream), 0, "Stream should be empty: actually contains '%s'" % stream)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 829, in assertEqual
++    assertion_func(first, second, msg=msg)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 822, in _baseAssertEqual
++    raise self.failureException(msg)
++AssertionError: 849 != 0 : Stream should be empty: actually contains 'Traceback (most recent call last):
++  File "./manage.py", line 21, in <module>
++    main()
++  File "./manage.py", line 17, in main
++    execute_from_command_line(sys.argv)
++  File "/testbed/django/core/management/__init__.py", line 401, in execute_from_command_line
++    utility.execute()
++  File "/testbed/django/core/management/__init__.py", line 395, in execute
++    self.fetch_command(subcommand).run_from_argv(self.argv)
++  File "/testbed/django/core/management/base.py", line 328, in run_from_argv
++    self.execute(*args, **cmd_options)
++  File "/testbed/django/core/management/base.py", line 378, in execute
++    self.stdout.write(output)
++  File "/testbed/django/core/management/base.py", line 145, in write
++    self._out.write(style_func(msg))
++UnicodeEncodeError: 'ascii' codec can't encode character '\xe5' in position 4826: ordinal not in range(128)
++'
++
++======================================================================
++FAIL: test_unified_all (admin_scripts.tests.DiffSettings)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/admin_scripts/tests.py", line 2230, in test_unified_all
++    self.assertNoOutput(err)
++  File "/testbed/tests/admin_scripts/tests.py", line 153, in assertNoOutput
++    self.assertEqual(len(stream), 0, "Stream should be empty: actually contains '%s'" % stream)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 829, in assertEqual
++    assertion_func(first, second, msg=msg)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 822, in _baseAssertEqual
++    raise self.failureException(msg)
++AssertionError: 849 != 0 : Stream should be empty: actually contains 'Traceback (most recent call last):
++  File "./manage.py", line 21, in <module>
++    main()
++  File "./manage.py", line 17, in main
++    execute_from_command_line(sys.argv)
++  File "/testbed/django/core/management/__init__.py", line 401, in execute_from_command_line
++    utility.execute()
++  File "/testbed/django/core/management/__init__.py", line 395, in execute
++    self.fetch_command(subcommand).run_from_argv(self.argv)
++  File "/testbed/django/core/management/base.py", line 328, in run_from_argv
++    self.execute(*args, **cmd_options)
++  File "/testbed/django/core/management/base.py", line 378, in execute
++    self.stdout.write(output)
++  File "/testbed/django/core/management/base.py", line 145, in write
++    self._out.write(style_func(msg))
++UnicodeEncodeError: 'ascii' codec can't encode character '\xe5' in position 4755: ordinal not in range(128)
++'
++
++----------------------------------------------------------------------
++Ran 13062 tests in 88.849s
++
++FAILED (failures=9, errors=17, skipped=956, expected failures=4)
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
+diff --git a/full_suite.log b/full_suite.log
+new file mode 100644
+index 0000000000..6bdcbb0832
+--- /dev/null
++++ b/full_suite.log
+@@ -0,0 +1,943 @@
++Testing against Django installed in '/testbed/django' with up to 64 processes
++System check identified no issues (14 silenced).
++Creating test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Cloning test database for alias 'default'...
++Creating test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++Cloning test database for alias 'other'...
++s....................................................................................................s....................s..................sssss.............................................................................................................................................s............................................................................................................................................................s.........................................s...........sss..ss.....s.......................................................................................sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss..................s................sssssssssss.......s......................sssssssssssssssssssssssssssssssssssssssssssssss.......sssssssss..........sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss....sssssssssssssssssssssssssssssss..s..s........sssssssssssssss.......................sssss......................ssssssssssssss................................................................................................................s.........................................................................................................................................................s..............................................s.....F..........s...............x.............................................s.......................sss..............................................................................................................................................................................................................................................................................................s..................................................................................................EEE.........................................................................................................................................................s..........................................................................................s...............s.....E.......ssss.................s....sss...............................s.........s...................................s......................................................s...........x...................................................................................................................................................................................................x...............................ss..............................................................................ss........sss..ss........................................................s..................................................................................................................................................................................................................................................................................................................................................s...........s.............................................................ss.......ss..............sss.......ssssssssssssss..........s..............sssssssssss.........................ss.........................s................................................................................s......s.....................................................................................................................................................................................................................................................................................................................................................................ssss.........................................................................................................................................s.............................................................................................s.s..............................................................s.s..............s.s..................................................................................s.s..s...............................................................................................s...............................................................................................................................................................sssssssssssssssssssssssssssssssssssssssssssssssssssssssss..........................................................s.....ssssssssssssssssssssssssssssssssssssssssssssssssssssssss.......................s........................................s...................................................................................s...s...............................................................................................s.................................................................................ssssss......s.........s.............................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................s............................................................................................................................................................................................................................................................................................................................................................................s.....................................................................................................................................................................................................................................................................................................................................................................................................................................................................s......F....................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................s...s..................................................................................................................................................................ss................................................................................................................................................s...............................................................................................................F..........................................................................................................................................................................................................................................................................................................ss.......................................................F........................................sssssss.....................................................................................................ssssssssssssssssssss..................................................................................................................................................................................................................................................................................................................ss............s..................sssss............................................................s.............................................................sssss..............................................................s............................................ssssss.sss.sssssssssssssssssssssssssssssssssssssss...ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss...ssssssssssssssssssssssssssssssssssssssssssss.ss.......................s...............................................................................................................................................................................................................................................................ssssssssssss............................sss...................................................sss..................................s........................s............Internal Server Error: /static/test/\u2297.txt
++Traceback (most recent call last):
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/django/contrib/staticfiles/views.py", line 33, in serve
++    absolute_path = finders.find(normalized_path)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 268, in find
++    result = finder.find(path, all=all)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 103, in find
++    matched_path = self.find_location(root, path, prefix)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 121, in find_location
++    if os.path.exists(path):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 56: ordinal not in range(128)
++Internal Server Error: /static/test/\u2297.txt
++Traceback (most recent call last):
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/django/contrib/staticfiles/views.py", line 33, in serve
++    absolute_path = finders.find(normalized_path)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 268, in find
++    result = finder.find(path, all=all)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 103, in find
++    matched_path = self.find_location(root, path, prefix)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 121, in find_location
++    if os.path.exists(path):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 56: ordinal not in range(128)
++.........................................................................................................................................E.........E......E.............................E......................................................E......................................................................................................................E.....................................................................................................sss..........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................sssssssssss.s.sssss.ssssss...........................................................................................................................................................................................................................sss...............................sssssssss...........................ssss.......................................................................................................sss.s.................ss..............................................................FF.F...........................................................................................................................................................ss.................................s............................................s...............ss...ss...s.s....................s..........................sssssss........sssss........sssssssssssssssssssssssssssssssssssssssssssssssssssss.......................EEEE....................................................................................................................................................................................................................................................................................................................................................................................................................................................ss................................................................................................................................................................................................................................................................................................................................................................................................................................................................................ss..ssssss...................................................x.............................ss......................................................................E...............................................................................................................................................................................................................E..................................................F.....F...............................................................................................................................................................................................s............s..s......s..ss.ssss.....sss.........s...................s........s................................s......s.s...s...........................................................................................................................................................................................................................................................................................................................................................
++======================================================================
++ERROR: test_unicode_file_name (file_uploads.tests.FileUploadTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/file_uploads/tests.py", line 105, in test_unicode_file_name
++    with open(os.path.join(temp_dir, UNICODE_FILENAME), 'w+b') as file1:
++UnicodeEncodeError: 'ascii' codec can't encode characters in position 49-50: ordinal not in range(128)
++
++======================================================================
++ERROR: test_unicode_file_name_rfc2231 (file_uploads.tests.FileUploadTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/file_uploads/tests.py", line 133, in test_unicode_file_name_rfc2231
++    response = self.client.request(**r)
++  File "/testbed/django/test/client.py", line 496, in request
++    raise exc_value
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/tests/file_uploads/views.py", line 63, in file_upload_unicode_name
++    FileModel.objects.create(testfile=uni_named_file)
++  File "/testbed/django/db/models/manager.py", line 82, in manager_method
++    return getattr(self.get_queryset(), name)(*args, **kwargs)
++  File "/testbed/django/db/models/query.py", line 430, in create
++    obj.save(force_insert=True, using=self.db)
++  File "/testbed/django/db/models/base.py", line 746, in save
++    force_update=force_update, update_fields=update_fields)
++  File "/testbed/django/db/models/base.py", line 784, in save_base
++    force_update, using, update_fields,
++  File "/testbed/django/db/models/base.py", line 886, in _save_table
++    results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
++  File "/testbed/django/db/models/base.py", line 925, in _do_insert
++    using=using, raw=raw,
++  File "/testbed/django/db/models/manager.py", line 82, in manager_method
++    return getattr(self.get_queryset(), name)(*args, **kwargs)
++  File "/testbed/django/db/models/query.py", line 1201, in _insert
++    return query.get_compiler(using=using).execute_sql(returning_fields)
++  File "/testbed/django/db/models/sql/compiler.py", line 1330, in execute_sql
++    for sql, params in self.as_sql():
++  File "/testbed/django/db/models/sql/compiler.py", line 1275, in as_sql
++    for obj in self.query.objs
++  File "/testbed/django/db/models/sql/compiler.py", line 1275, in <listcomp>
++    for obj in self.query.objs
++  File "/testbed/django/db/models/sql/compiler.py", line 1274, in <listcomp>
++    [self.prepare_value(field, self.pre_save_val(field, obj)) for field in fields]
++  File "/testbed/django/db/models/sql/compiler.py", line 1225, in pre_save_val
++    return field.pre_save(obj, add=True)
++  File "/testbed/django/db/models/fields/files.py", line 288, in pre_save
++    file.save(file.name, file.file, save=False)
++  File "/testbed/django/db/models/fields/files.py", line 87, in save
++    self.name = self.storage.save(name, content, max_length=self.field.max_length)
++  File "/testbed/django/core/files/storage.py", line 51, in save
++    name = self.get_available_name(name, max_length=max_length)
++  File "/testbed/django/core/files/storage.py", line 82, in get_available_name
++    while self.exists(name) or (max_length and len(name) > max_length):
++  File "/testbed/django/core/files/storage.py", line 311, in exists
++    return os.path.exists(self.path(name))
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode characters in position 61-62: ordinal not in range(128)
++
++======================================================================
++ERROR: test_unicode_name_rfc2231 (file_uploads.tests.FileUploadTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/file_uploads/tests.py", line 162, in test_unicode_name_rfc2231
++    response = self.client.request(**r)
++  File "/testbed/django/test/client.py", line 496, in request
++    raise exc_value
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/tests/file_uploads/views.py", line 63, in file_upload_unicode_name
++    FileModel.objects.create(testfile=uni_named_file)
++  File "/testbed/django/db/models/manager.py", line 82, in manager_method
++    return getattr(self.get_queryset(), name)(*args, **kwargs)
++  File "/testbed/django/db/models/query.py", line 430, in create
++    obj.save(force_insert=True, using=self.db)
++  File "/testbed/django/db/models/base.py", line 746, in save
++    force_update=force_update, update_fields=update_fields)
++  File "/testbed/django/db/models/base.py", line 784, in save_base
++    force_update, using, update_fields,
++  File "/testbed/django/db/models/base.py", line 886, in _save_table
++    results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
++  File "/testbed/django/db/models/base.py", line 925, in _do_insert
++    using=using, raw=raw,
++  File "/testbed/django/db/models/manager.py", line 82, in manager_method
++    return getattr(self.get_queryset(), name)(*args, **kwargs)
++  File "/testbed/django/db/models/query.py", line 1201, in _insert
++    return query.get_compiler(using=using).execute_sql(returning_fields)
++  File "/testbed/django/db/models/sql/compiler.py", line 1330, in execute_sql
++    for sql, params in self.as_sql():
++  File "/testbed/django/db/models/sql/compiler.py", line 1275, in as_sql
++    for obj in self.query.objs
++  File "/testbed/django/db/models/sql/compiler.py", line 1275, in <listcomp>
++    for obj in self.query.objs
++  File "/testbed/django/db/models/sql/compiler.py", line 1274, in <listcomp>
++    [self.prepare_value(field, self.pre_save_val(field, obj)) for field in fields]
++  File "/testbed/django/db/models/sql/compiler.py", line 1225, in pre_save_val
++    return field.pre_save(obj, add=True)
++  File "/testbed/django/db/models/fields/files.py", line 288, in pre_save
++    file.save(file.name, file.file, save=False)
++  File "/testbed/django/db/models/fields/files.py", line 87, in save
++    self.name = self.storage.save(name, content, max_length=self.field.max_length)
++  File "/testbed/django/core/files/storage.py", line 51, in save
++    name = self.get_available_name(name, max_length=max_length)
++  File "/testbed/django/core/files/storage.py", line 82, in get_available_name
++    while self.exists(name) or (max_length and len(name) > max_length):
++  File "/testbed/django/core/files/storage.py", line 311, in exists
++    return os.path.exists(self.path(name))
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode characters in position 61-62: ordinal not in range(128)
++
++======================================================================
++ERROR: test_unicode_filename (forms_tests.tests.tests.FormsModelTestCase)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/forms_tests/tests/tests.py", line 158, in test_unicode_filename
++    m = FileModel.objects.create(file=f.cleaned_data['file1'])
++  File "/testbed/django/db/models/manager.py", line 82, in manager_method
++    return getattr(self.get_queryset(), name)(*args, **kwargs)
++  File "/testbed/django/db/models/query.py", line 430, in create
++    obj.save(force_insert=True, using=self.db)
++  File "/testbed/django/db/models/base.py", line 746, in save
++    force_update=force_update, update_fields=update_fields)
++  File "/testbed/django/db/models/base.py", line 784, in save_base
++    force_update, using, update_fields,
++  File "/testbed/django/db/models/base.py", line 886, in _save_table
++    results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
++  File "/testbed/django/db/models/base.py", line 925, in _do_insert
++    using=using, raw=raw,
++  File "/testbed/django/db/models/manager.py", line 82, in manager_method
++    return getattr(self.get_queryset(), name)(*args, **kwargs)
++  File "/testbed/django/db/models/query.py", line 1201, in _insert
++    return query.get_compiler(using=using).execute_sql(returning_fields)
++  File "/testbed/django/db/models/sql/compiler.py", line 1330, in execute_sql
++    for sql, params in self.as_sql():
++  File "/testbed/django/db/models/sql/compiler.py", line 1275, in as_sql
++    for obj in self.query.objs
++  File "/testbed/django/db/models/sql/compiler.py", line 1275, in <listcomp>
++    for obj in self.query.objs
++  File "/testbed/django/db/models/sql/compiler.py", line 1274, in <listcomp>
++    [self.prepare_value(field, self.pre_save_val(field, obj)) for field in fields]
++  File "/testbed/django/db/models/sql/compiler.py", line 1225, in pre_save_val
++    return field.pre_save(obj, add=True)
++  File "/testbed/django/db/models/fields/files.py", line 288, in pre_save
++    file.save(file.name, file.file, save=False)
++  File "/testbed/django/db/models/fields/files.py", line 87, in save
++    self.name = self.storage.save(name, content, max_length=self.field.max_length)
++  File "/testbed/django/core/files/storage.py", line 51, in save
++    name = self.get_available_name(name, max_length=max_length)
++  File "/testbed/django/core/files/storage.py", line 82, in get_available_name
++    while self.exists(name) or (max_length and len(name) > max_length):
++  File "/testbed/django/core/files/storage.py", line 311, in exists
++    return os.path.exists(self.path(name))
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode characters in position 39-47: ordinal not in range(128)
++
++======================================================================
++ERROR: test_strip_tags_files (utils_tests.test_html.TestUtilsHtml) [<object object at 0x7b72fa61f290>] (filename='strip_tags1.html')
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 523, in subTest
++    yield
++  File "/testbed/tests/utils_tests/test_html.py", line 107, in test_strip_tags_files
++    content = fp.read()
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/encodings/ascii.py", line 26, in decode
++    return codecs.ascii_decode(input, self.errors)[0]
++UnicodeDecodeError: 'ascii' codec can't decode byte 0xc2 in position 257: ordinal not in range(128)
++
++======================================================================
++ERROR: test_nonascii_filenames (staticfiles_tests.test_management.TestCollection)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/staticfiles_tests/cases.py", line 126, in test_nonascii_filenames
++    self.assertFileContains('test/\u2297.txt', '\u2297 in the app dir')
++  File "/testbed/tests/staticfiles_tests/cases.py", line 21, in assertFileContains
++    self._get_file(filepath),
++  File "/testbed/tests/staticfiles_tests/cases.py", line 88, in _get_file
++    with open(filepath, encoding='utf-8') as f:
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 38: ordinal not in range(128)
++
++======================================================================
++ERROR: test_nonascii_filenames (staticfiles_tests.test_management.TestFindStatic)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/staticfiles_tests/cases.py", line 126, in test_nonascii_filenames
++    self.assertFileContains('test/\u2297.txt', '\u2297 in the app dir')
++  File "/testbed/tests/staticfiles_tests/cases.py", line 21, in assertFileContains
++    self._get_file(filepath),
++  File "/testbed/tests/staticfiles_tests/test_management.py", line 64, in _get_file
++    path = call_command('findstatic', filepath, all=False, verbosity=0, stdout=StringIO())
++  File "/testbed/django/core/management/__init__.py", line 168, in call_command
++    return command.execute(*args, **defaults)
++  File "/testbed/django/core/management/base.py", line 369, in execute
++    output = self.handle(*args, **options)
++  File "/testbed/django/core/management/base.py", line 543, in handle
++    label_output = self.handle_label(label, **options)
++  File "/testbed/django/contrib/staticfiles/management/commands/findstatic.py", line 20, in handle_label
++    result = finders.find(path, all=options['all'])
++  File "/testbed/django/contrib/staticfiles/finders.py", line 268, in find
++    result = finder.find(path, all=all)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 103, in find
++    matched_path = self.find_location(root, path, prefix)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 121, in find_location
++    if os.path.exists(path):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 56: ordinal not in range(128)
++
++======================================================================
++ERROR: test_nonascii_filenames (staticfiles_tests.test_views.TestServeStaticWithURLHelper)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/staticfiles_tests/cases.py", line 126, in test_nonascii_filenames
++    self.assertFileContains('test/\u2297.txt', '\u2297 in the app dir')
++  File "/testbed/tests/staticfiles_tests/test_views.py", line 19, in assertFileContains
++    self.assertContains(self._response(filepath), text)
++  File "/testbed/tests/staticfiles_tests/test_views.py", line 16, in _response
++    return self.client.get(quote(posixpath.join(settings.STATIC_URL, filepath)))
++  File "/testbed/django/test/client.py", line 518, in get
++    response = super().get(path, data=data, secure=secure, **extra)
++  File "/testbed/django/test/client.py", line 346, in get
++    **extra,
++  File "/testbed/django/test/client.py", line 421, in generic
++    return self.request(**r)
++  File "/testbed/django/test/client.py", line 496, in request
++    raise exc_value
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/django/contrib/staticfiles/views.py", line 33, in serve
++    absolute_path = finders.find(normalized_path)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 268, in find
++    result = finder.find(path, all=all)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 103, in find
++    matched_path = self.find_location(root, path, prefix)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 121, in find_location
++    if os.path.exists(path):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 56: ordinal not in range(128)
++
++======================================================================
++ERROR: test_nonascii_filenames (staticfiles_tests.test_management.TestCollectionExcludeNoDefaultIgnore)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/staticfiles_tests/cases.py", line 126, in test_nonascii_filenames
++    self.assertFileContains('test/\u2297.txt', '\u2297 in the app dir')
++  File "/testbed/tests/staticfiles_tests/cases.py", line 21, in assertFileContains
++    self._get_file(filepath),
++  File "/testbed/tests/staticfiles_tests/cases.py", line 88, in _get_file
++    with open(filepath, encoding='utf-8') as f:
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 38: ordinal not in range(128)
++
++======================================================================
++ERROR: test_nonascii_filenames (staticfiles_tests.test_views.TestServeStaticWithDefaultURL)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/staticfiles_tests/cases.py", line 126, in test_nonascii_filenames
++    self.assertFileContains('test/\u2297.txt', '\u2297 in the app dir')
++  File "/testbed/tests/staticfiles_tests/test_views.py", line 19, in assertFileContains
++    self.assertContains(self._response(filepath), text)
++  File "/testbed/tests/staticfiles_tests/test_views.py", line 16, in _response
++    return self.client.get(quote(posixpath.join(settings.STATIC_URL, filepath)))
++  File "/testbed/django/test/client.py", line 518, in get
++    response = super().get(path, data=data, secure=secure, **extra)
++  File "/testbed/django/test/client.py", line 346, in get
++    **extra,
++  File "/testbed/django/test/client.py", line 421, in generic
++    return self.request(**r)
++  File "/testbed/django/test/client.py", line 496, in request
++    raise exc_value
++  File "/testbed/django/core/handlers/exception.py", line 34, in inner
++    response = get_response(request)
++  File "/testbed/django/core/handlers/base.py", line 115, in _get_response
++    response = self.process_exception_by_middleware(e, request)
++  File "/testbed/django/core/handlers/base.py", line 113, in _get_response
++    response = wrapped_callback(request, *callback_args, **callback_kwargs)
++  File "/testbed/django/contrib/staticfiles/views.py", line 33, in serve
++    absolute_path = finders.find(normalized_path)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 268, in find
++    result = finder.find(path, all=all)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 103, in find
++    matched_path = self.find_location(root, path, prefix)
++  File "/testbed/django/contrib/staticfiles/finders.py", line 121, in find_location
++    if os.path.exists(path):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/genericpath.py", line 19, in exists
++    os.stat(path)
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 56: ordinal not in range(128)
++
++======================================================================
++ERROR: test_nonascii_filenames (staticfiles_tests.test_management.TestCollectionLinks)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/staticfiles_tests/cases.py", line 126, in test_nonascii_filenames
++    self.assertFileContains('test/\u2297.txt', '\u2297 in the app dir')
++  File "/testbed/tests/staticfiles_tests/cases.py", line 21, in assertFileContains
++    self._get_file(filepath),
++  File "/testbed/tests/staticfiles_tests/cases.py", line 88, in _get_file
++    with open(filepath, encoding='utf-8') as f:
++UnicodeEncodeError: 'ascii' codec can't encode character '\u2297' in position 38: ordinal not in range(128)
++
++======================================================================
++ERROR: test_adds_python_format_to_all_percent_signs (i18n.test_percents.ExtractingStringsWithPercentSigns)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 601, in run
++    self.setUp()
++  File "/testbed/tests/i18n/test_percents.py", line 42, in setUp
++    self.po_contents = fp.read()
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/encodings/ascii.py", line 26, in decode
++    return codecs.ascii_decode(input, self.errors)[0]
++UnicodeDecodeError: 'ascii' codec can't decode byte 0xc3 in position 223: ordinal not in range(128)
++
++======================================================================
++ERROR: test_trans_tag_with_percent_symbol_at_the_end (i18n.test_percents.ExtractingStringsWithPercentSigns)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 601, in run
++    self.setUp()
++  File "/testbed/tests/i18n/test_percents.py", line 42, in setUp
++    self.po_contents = fp.read()
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/encodings/ascii.py", line 26, in decode
++    return codecs.ascii_decode(input, self.errors)[0]
++UnicodeDecodeError: 'ascii' codec can't decode byte 0xc3 in position 223: ordinal not in range(128)
++
++======================================================================
++ERROR: test_trans_tag_with_percent_symbol_in_the_middle (i18n.test_percents.ExtractingStringsWithPercentSigns)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 601, in run
++    self.setUp()
++  File "/testbed/tests/i18n/test_percents.py", line 42, in setUp
++    self.po_contents = fp.read()
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/encodings/ascii.py", line 26, in decode
++    return codecs.ascii_decode(input, self.errors)[0]
++UnicodeDecodeError: 'ascii' codec can't decode byte 0xc3 in position 223: ordinal not in range(128)
++
++======================================================================
++ERROR: test_trans_tag_with_string_that_look_like_fmt_spec (i18n.test_percents.ExtractingStringsWithPercentSigns)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 601, in run
++    self.setUp()
++  File "/testbed/tests/i18n/test_percents.py", line 42, in setUp
++    self.po_contents = fp.read()
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/encodings/ascii.py", line 26, in decode
++    return codecs.ascii_decode(input, self.errors)[0]
++UnicodeDecodeError: 'ascii' codec can't decode byte 0xc3 in position 223: ordinal not in range(128)
++
++======================================================================
++ERROR: test_content_saving (file_storage.tests.ContentFileStorageTestCase)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/file_storage/tests.py", line 977, in test_content_saving
++    self.storage.save('unicode.txt', ContentFile("espa\xf1ol"))
++  File "/testbed/django/core/files/storage.py", line 52, in save
++    return self._save(name, content)
++  File "/testbed/django/core/files/storage.py", line 275, in _save
++    _file.write(chunk)
++UnicodeEncodeError: 'ascii' codec can't encode character '\xf1' in position 4: ordinal not in range(128)
++
++======================================================================
++ERROR: test_startapp_unicode_name (admin_scripts.tests.DjangoAdminSettingsDirectory)
++directory: startapp creates the correct directory with unicode characters
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/admin_scripts/tests.py", line 580, in test_startapp_unicode_name
++    out, err = self.run_django_admin(args, 'test_project.settings')
++  File "/testbed/tests/admin_scripts/tests.py", line 131, in run_django_admin
++    return self.run_test(os.path.join(script_dir, 'django-admin.py'), args, settings_file)
++  File "/testbed/tests/admin_scripts/tests.py", line 125, in run_test
++    env=test_environ, universal_newlines=True,
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/subprocess.py", line 423, in run
++    with Popen(*popenargs, **kwargs) as process:
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/subprocess.py", line 729, in __init__
++    restore_signals, start_new_session)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/subprocess.py", line 1295, in _execute_child
++    restore_signals, start_new_session, preexec_fn)
++UnicodeEncodeError: 'ascii' codec can't encode characters in position 0-4: ordinal not in range(128)
++
++======================================================================
++FAIL: test_custom_fields (inspectdb.tests.InspectDBTestCase)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/inspectdb/tests.py", line 267, in test_custom_fields
++    self.assertIn("text_field = myfields.TextField()", output)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 1089, in assertIn
++    self.fail(self._formatMessage(msg, standardMsg))
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 670, in fail
++    raise self.failureException(msg)
++AssertionError: 'text_field = myfields.TextField()' not found in "# This is an auto-generated Django model module.\n# You'll have to do the following manually to clean this up:\n#   * Rearrange models' order\n#   * Make sure each model has one field with primary_key=True\n#   * Make sure each ForeignKey and OneToOneField has `on_delete` set to the desired behavior\n#   * Remove `managed = False` lines if you wish to allow Django to create, modify, and delete the table\n# Feel free to rename the models, but don't rename db_table values or field names.\nfrom django.db import models\n\n\nclass InspectdbColumntypes(models.Model):\n    id = models.TextField(primary_key=True)  # This field type is a guess.\n    big_int_field = models.BigIntegerField()\n    bool_field = models.TextField()  # This field type is a guess.\n    null_bool_field = models.TextField(blank=True, null=True)  # This field type is a guess.\n    char_field = models.TextField()  # This field type is a guess.\n    null_char_field = models.TextField(blank=True, null=True)  # This field type is a guess.\n    date_field = models.TextField()  # This field type is a guess.\n    date_time_field = models.TextField()  # This field type is a guess.\n    decimal_field = models.TextField()  # This field type is a guess.\n    email_field = models.TextField()  # This field type is a guess.\n    file_field = models.TextField()  # This field type is a guess.\n    file_path_field = models.TextField()  # This field type is a guess.\n    float_field = models.TextField()  # This field type is a guess.\n    int_field = models.TextField()  # This field type is a guess.\n    gen_ip_address_field = models.TextField()  # This field type is a guess.\n    pos_int_field = models.TextField()  # This field type is a guess.\n    pos_small_int_field = models.TextField()  # This field type is a guess.\n    slug_field = models.TextField()  # This field type is a guess.\n    small_int_field = models.TextField()  # This field type is a guess.\n    text_field = models.TextField()  # This field type is a guess.\n    time_field = models.TextField()  # This field type is a guess.\n    url_field = models.TextField()  # This field type is a guess.\n    uuid_field = models.TextField()  # This field type is a guess.\n\n    class Meta:\n        managed = False\n        db_table = 'inspectdb_columntypes'\n"
++
++======================================================================
++FAIL: test_permissions_error (template_tests.test_loaders.FileSystemLoaderTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/template_tests/test_loaders.py", line 195, in test_permissions_error
++    self.engine.get_template(tmpfile.name)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/contextlib.py", line 88, in __exit__
++    next(self.gen)
++  File "/testbed/django/test/testcases.py", line 654, in _assert_raises_or_warns_cm
++    yield cm
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 203, in __exit__
++    self._raiseFailure("{} not raised".format(exc_name))
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 135, in _raiseFailure
++    raise self.test_case.failureException(msg)
++AssertionError: PermissionError not raised
++
++======================================================================
++FAIL: test_readonly_root (file_uploads.tests.DirectoryCreationTests)
++Permission errors are not swallowed
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/file_uploads/tests.py", line 546, in test_readonly_root
++    self.obj.testfile.save('foo.txt', SimpleUploadedFile('foo.txt', b'x'), save=False)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 203, in __exit__
++    self._raiseFailure("{} not raised".format(exc_name))
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 135, in _raiseFailure
++    raise self.test_case.failureException(msg)
++AssertionError: PermissionError not raised
++
++======================================================================
++FAIL: test_strips_underscore_headers (servers.test_basehttp.WSGIRequestHandlerTestCase)
++WSGIRequestHandler ignores headers containing underscores.
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/servers/test_basehttp.py", line 104, in test_strips_underscore_headers
++    self.assertEqual(body, b'HTTP_SOME_HEADER:good')
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 829, in assertEqual
++    assertion_func(first, second, msg=msg)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 822, in _baseAssertEqual
++    raise self.failureException(msg)
++AssertionError: b'HTTP_PROXY:,HTTP_SOME_HEADER:good' != b'HTTP_SOME_HEADER:good'
++
++======================================================================
++FAIL: test_aware_datetime_in_local_timezone (timezones.tests.SerializationTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/timezones/tests.py", line 761, in test_aware_datetime_in_local_timezone
++    self.assertEqual(obj.dt.replace(tzinfo=UTC), dt)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 829, in assertEqual
++    assertion_func(first, second, msg=msg)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 822, in _baseAssertEqual
++    raise self.failureException(msg)
++AssertionError: datet[38 chars]zinfo=<UTC>) != datet[38 chars]zinfo=datetime.timezone(datetime.timedelta(0, 10800), '+0300'))
++
++======================================================================
++FAIL: test_aware_datetime_in_other_timezone (timezones.tests.SerializationTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/timezones/tests.py", line 785, in test_aware_datetime_in_other_timezone
++    self.assertEqual(obj.dt.replace(tzinfo=UTC), dt)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 829, in assertEqual
++    assertion_func(first, second, msg=msg)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 822, in _baseAssertEqual
++    raise self.failureException(msg)
++AssertionError: datet[38 chars]zinfo=<UTC>) != datet[38 chars]zinfo=datetime.timezone(datetime.timedelta(0, 25200), '+0700'))
++
++======================================================================
++FAIL: test_aware_datetime_with_microsecond (timezones.tests.SerializationTests)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/timezones/tests.py", line 713, in test_aware_datetime_with_microsecond
++    self.assertEqual(obj.dt.replace(tzinfo=UTC), dt)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 829, in assertEqual
++    assertion_func(first, second, msg=msg)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 822, in _baseAssertEqual
++    raise self.failureException(msg)
++AssertionError: datet[46 chars]zinfo=<UTC>) != datet[46 chars]zinfo=datetime.timezone(datetime.timedelta(0, 25200), '+0700'))
++
++======================================================================
++FAIL: test_all (admin_scripts.tests.DiffSettings)
++The all option also shows settings with the default value.
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/admin_scripts/tests.py", line 2196, in test_all
++    self.assertNoOutput(err)
++  File "/testbed/tests/admin_scripts/tests.py", line 153, in assertNoOutput
++    self.assertEqual(len(stream), 0, "Stream should be empty: actually contains '%s'" % stream)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 829, in assertEqual
++    assertion_func(first, second, msg=msg)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 822, in _baseAssertEqual
++    raise self.failureException(msg)
++AssertionError: 849 != 0 : Stream should be empty: actually contains 'Traceback (most recent call last):
++  File "./manage.py", line 21, in <module>
++    main()
++  File "./manage.py", line 17, in main
++    execute_from_command_line(sys.argv)
++  File "/testbed/django/core/management/__init__.py", line 401, in execute_from_command_line
++    utility.execute()
++  File "/testbed/django/core/management/__init__.py", line 395, in execute
++    self.fetch_command(subcommand).run_from_argv(self.argv)
++  File "/testbed/django/core/management/base.py", line 328, in run_from_argv
++    self.execute(*args, **cmd_options)
++  File "/testbed/django/core/management/base.py", line 378, in execute
++    self.stdout.write(output)
++  File "/testbed/django/core/management/base.py", line 145, in write
++    self._out.write(style_func(msg))
++UnicodeEncodeError: 'ascii' codec can't encode character '\xe5' in position 4826: ordinal not in range(128)
++'
++
++======================================================================
++FAIL: test_unified_all (admin_scripts.tests.DiffSettings)
++----------------------------------------------------------------------
++Traceback (most recent call last):
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 59, in testPartExecutor
++    yield
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 605, in run
++    testMethod()
++  File "/testbed/tests/admin_scripts/tests.py", line 2230, in test_unified_all
++    self.assertNoOutput(err)
++  File "/testbed/tests/admin_scripts/tests.py", line 153, in assertNoOutput
++    self.assertEqual(len(stream), 0, "Stream should be empty: actually contains '%s'" % stream)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 829, in assertEqual
++    assertion_func(first, second, msg=msg)
++  File "/opt/miniconda3/envs/testbed/lib/python3.6/unittest/case.py", line 822, in _baseAssertEqual
++    raise self.failureException(msg)
++AssertionError: 849 != 0 : Stream should be empty: actually contains 'Traceback (most recent call last):
++  File "./manage.py", line 21, in <module>
++    main()
++  File "./manage.py", line 17, in main
++    execute_from_command_line(sys.argv)
++  File "/testbed/django/core/management/__init__.py", line 401, in execute_from_command_line
++    utility.execute()
++  File "/testbed/django/core/management/__init__.py", line 395, in execute
++    self.fetch_command(subcommand).run_from_argv(self.argv)
++  File "/testbed/django/core/management/base.py", line 328, in run_from_argv
++    self.execute(*args, **cmd_options)
++  File "/testbed/django/core/management/base.py", line 378, in execute
++    self.stdout.write(output)
++  File "/testbed/django/core/management/base.py", line 145, in write
++    self._out.write(style_func(msg))
++UnicodeEncodeError: 'ascii' codec can't encode character '\xe5' in position 4755: ordinal not in range(128)
++'
++
++----------------------------------------------------------------------
++Ran 13061 tests in 21.633s
++
++FAILED (failures=9, errors=17, skipped=956, expected failures=4)
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'default'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
++Destroying test database for alias 'other'...
+diff --git a/instr_settings.py b/instr_settings.py
+new file mode 100644
+index 0000000000..89f0913019
+--- /dev/null
++++ b/instr_settings.py
+@@ -0,0 +1,48 @@
++from tests.test_sqlite import *  # noqa
++
++import atexit
++from django.db.models import deletion
++
++STATS = {'ro_lens': set(), 'batch_lens': set(), 'ro_empty': 0, 'batch_empty': 0,
++         'admin_ro_lens': set(), 'multi': []}
++
++_orig_ro = deletion.Collector.related_objects
++_orig_gb = deletion.Collector.get_del_batches
++
++
++def related_objects(self, related_model, related_fields, objs):
++    n = len(list(related_fields))
++    STATS['ro_lens'].add(n)
++    if n == 0:
++        STATS['ro_empty'] += 1
++    if type(self).__name__ != 'Collector':
++        STATS['admin_ro_lens'].add((type(self).__name__, n))
++    if n > 1:
++        STATS['multi'].append((type(self).__name__, related_model.__name__,
++                               tuple(f.name for f in related_fields)))
++    return _orig_ro(self, related_model, related_fields, objs)
++
++
++def get_del_batches(self, objs, fields):
++    n = len(list(fields))
++    STATS['batch_lens'].add(n)
++    if n == 0:
++        STATS['batch_empty'] += 1
++    return _orig_gb(self, objs, fields)
++
++
++deletion.Collector.related_objects = related_objects
++deletion.Collector.get_del_batches = get_del_batches
++
++
++@atexit.register
++def _dump():
++    import sys
++    print('\n=== INSTRUMENTATION ===', file=sys.stderr)
++    print('related_objects arities:', sorted(STATS['ro_lens']), file=sys.stderr)
++    print('get_del_batches arities:', sorted(STATS['batch_lens']), file=sys.stderr)
++    print('related_objects EMPTY calls:', STATS['ro_empty'], file=sys.stderr)
++    print('get_del_batches EMPTY calls:', STATS['batch_empty'], file=sys.stderr)
++    print('non-base Collector subclass arities:', sorted(STATS['admin_ro_lens']), file=sys.stderr)
++    print('multi-field calls (sample 15):', STATS['multi'][:15], file=sys.stderr)
++    print('multi-field call count:', len(STATS['multi']), file=sys.stderr)
+diff --git a/probe10.py b/probe10.py
+new file mode 100644
+index 0000000000..8fc629e498
+--- /dev/null
++++ b/probe10.py
+@@ -0,0 +1,23 @@
++import django, sys
++from django.conf import settings
++settings.configure(DEBUG=True, DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++                   INSTALLED_APPS=['delete'], USE_TZ=False)
++sys.path.insert(0, '/testbed/tests')
++django.setup()
++from django.apps import apps
++from django.db import connection
++from django.test.utils import CaptureQueriesContext
++from delete.models import *
++with connection.schema_editor() as se:
++    for m in apps.get_models():
++        if not m._meta.proxy:
++            se.create_model(m)
++
++r = R.objects.create()
++a = A.objects.create(name='a', auto=r, auto_nullable=r, setvalue=r, setnull=r, setdefault=r,
++                     cascade=r, cascade_nullable=r, protect=None, donothing=None,
++                     child=RChild.objects.create(), o2o_setnull=r)
++with CaptureQueriesContext(connection) as ctx:
++    print('delete ->', R.objects.filter(pk=r.pk).delete())
++for q in ctx.captured_queries:
++    print(' SQL:', q['sql'][:170])
+diff --git a/probe9.py b/probe9.py
+new file mode 100644
+index 0000000000..38657a1404
+--- /dev/null
++++ b/probe9.py
+@@ -0,0 +1,15 @@
++import django, sys
++from django.conf import settings
++settings.configure(DEBUG=True, DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++                   INSTALLED_APPS=['delete'], USE_TZ=False)
++sys.path.insert(0, '/testbed/tests')
++django.setup()
++from django.db.models.deletion import Collector, get_candidate_relations_to_delete
++from delete.models import *
++c = Collector('default')
++print('can_fast_delete(A, from auto):', c.can_fast_delete(A, from_field=A._meta.get_field('auto')))
++print('candidates of R:')
++for rel in get_candidate_relations_to_delete(R._meta):
++    f = rel.field
++    print('   %-14s %-18s %s' % (f.model.__name__, f.name, f.remote_field.on_delete.__name__),
++          'fast=', c.can_fast_delete(rel.related_model, from_field=f))
+diff --git a/tests/delete/tests.py b/tests/delete/tests.py
+index 505fd843d7..8cb028344b 100644
+--- a/tests/delete/tests.py
++++ b/tests/delete/tests.py
+@@ -582,3 +582,11 @@ class FastDeleteTests(TestCase):
+                 User.objects.filter(avatar__desc='missing').delete(),
+                 (0, {'delete.User': 0})
+             )
++
++    def test_fast_delete_combined_relationships(self):
++        # The cascading fast-delete of SecondReferrer should be combined
++        # in a single DELETE WHERE referrer_id OR unique_field.
++        origin = Origin.objects.create()
++        referer = Referrer.objects.create(origin=origin, unique_field=42)
++        with self.assertNumQueries(2):
++            referer.delete()
+diff --git a/ticketapp/__init__.py b/ticketapp/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/ticketapp/models.py b/ticketapp/models.py
+new file mode 100644
+index 0000000000..c8c30a3555
+--- /dev/null
++++ b/ticketapp/models.py
+@@ -0,0 +1,40 @@
++from django.db import models
++
++
++class Person(models.Model):
++    friends = models.ManyToManyField('self')
++
++
++class User(models.Model):
++    pass
++
++
++class Entry(models.Model):
++    created_by = models.ForeignKey(User, models.CASCADE, related_name='created')
++    updated_by = models.ForeignKey(User, models.CASCADE, related_name='updated')
++
++
++class Note(models.Model):
++    """Three FKs to the same target, plus one that must not be combined."""
++    author = models.ForeignKey(User, models.CASCADE, related_name='authored')
++    editor = models.ForeignKey(User, models.CASCADE, related_name='edited')
++    reviewer = models.ForeignKey(User, models.CASCADE, related_name='reviewed')
++    mentioned = models.ForeignKey(User, models.DO_NOTHING, null=True, related_name='mentioned')
++    nulled = models.ForeignKey(User, models.SET_NULL, null=True, related_name='nulled')
++
++
++class Origin(models.Model):
++    pass
++
++
++class Referrer(models.Model):
++    origin = models.ForeignKey(Origin, models.CASCADE)
++    unique_field = models.IntegerField(unique=True)
++
++
++class SecondReferrer(models.Model):
++    """Second FK targets a non-pk column (to_field)."""
++    referrer = models.ForeignKey(Referrer, models.CASCADE)
++    other_referrer = models.ForeignKey(
++        Referrer, models.CASCADE, to_field='unique_field', related_name='+'
++    )
+diff --git a/verify_combine.py b/verify_combine.py
+new file mode 100644
+index 0000000000..874b523250
+--- /dev/null
++++ b/verify_combine.py
+@@ -0,0 +1,69 @@
++"""Reproduce the ticket's scenario and show the SQL actually issued."""
++import sys
++from collections import deque
++
++import django
++from django.conf import settings
++
++sys.path.insert(0, '/workspace')
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['ticketapp'],
++    USE_TZ=False,
++)
++django.setup()
++
++from django.db import connection  # noqa: E402
++from ticketapp.models import (  # noqa: E402
++    Entry, Note, Origin, Person, Referrer, SecondReferrer, User,
++)
++
++with connection.schema_editor() as editor:
++    for model in (Person, User, Entry, Note, Origin, Referrer, SecondReferrer):
++        editor.create_model(model)
++
++
++def show(label, fn):
++    connection.queries_log = deque(maxlen=200)
++    result = fn()
++    print('\n== %s ==' % label)
++    for q in connection.queries:
++        sql = q['sql']
++        if sql.startswith(('BEGIN', 'COMMIT', 'SAVEPOINT', 'RELEASE')):
++            continue
++        print('  ' + sql)
++    print('  -> returned %r' % (result,))
++
++
++p1, p2 = Person.objects.create(), Person.objects.create()
++p1.friends.add(p2)
++show('person.delete() -- self-referential m2m', lambda: p1.delete())
++print('  through rows left:', Person.friends.through.objects.count())
++
++u = User.objects.create()
++Entry.objects.create(created_by=u, updated_by=u)
++Note.objects.create(author=u, editor=u, reviewer=u, mentioned=u, nulled=u)
++show('user.delete() -- 2 FKs from Entry, 3 CASCADE + DO_NOTHING + SET_NULL from Note',
++     lambda: u.delete())
++print('  entries left:', Entry.objects.count(), ' notes left:', Note.objects.count())
++
++u2 = User.objects.create()
++Entry.objects.create(created_by=u2, updated_by=u2)
++Entry.objects.create(created_by=u2, updated_by=User.objects.create())
++show('User.objects.all().delete() -- queryset path', lambda: User.objects.all().delete())
++print('  entries left:', Entry.objects.count())
++
++# to_field / non-pk target, cascading from a non-fast-deletable parent.
++origin = Origin.objects.create()
++referrer = Referrer.objects.create(origin=origin, unique_field=42)
++SecondReferrer.objects.create(referrer=referrer, other_referrer=referrer)
++show('referrer.delete() -- combined FK + to_field FK', lambda: referrer.delete())
++print('  second referrers left:', SecondReferrer.objects.count())
++
++origin2 = Origin.objects.create()
++r2 = Referrer.objects.create(origin=origin2, unique_field=43)
++SecondReferrer.objects.create(referrer=r2, other_referrer=r2)
++show('origin.delete() -- nested cascade', lambda: origin2.delete())
++print('  second referrers left:', SecondReferrer.objects.count(),
++      ' referrers left:', Referrer.objects.count())
+diff --git a/verify_limits.py b/verify_limits.py
+new file mode 100644
+index 0000000000..1d2b26fb81
+--- /dev/null
++++ b/verify_limits.py
+@@ -0,0 +1,58 @@
++"""Stress the parameter-limit arithmetic: 2000 parents, related model with 2 and 3 FKs."""
++import sys
++from collections import deque
++
++import django
++from django.conf import settings
++
++sys.path.insert(0, '/workspace')
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['ticketapp'],
++    USE_TZ=False,
++)
++django.setup()
++
++from django.db import connection  # noqa: E402
++from ticketapp.models import Entry, Note, Origin, Person, Referrer, SecondReferrer, User  # noqa: E402
++
++with connection.schema_editor() as editor:
++    for model in (Person, User, Entry, Note, Origin, Referrer, SecondReferrer):
++        editor.create_model(model)
++
++print('sqlite max_query_params:', connection.features.max_query_params)
++for n in (1, 2, 3, 5):
++    print('  bulk_batch_size for %d field(s):' % n,
++          connection.ops.bulk_batch_size(['f'] * n, range(5000)))
++
++N = 2000
++User.objects.bulk_create((User() for _ in range(N)), batch_size=100)
++users = list(User.objects.all())
++Entry.objects.bulk_create((Entry(created_by=u, updated_by=u) for u in users), batch_size=100)
++Note.objects.bulk_create(
++    (Note(author=u, editor=u, reviewer=u) for u in users), batch_size=100
++)
++
++connection.queries_log = deque(maxlen=1000)
++deleted, per_model = User.objects.all().delete()
++qs = [q['sql'] for q in connection.queries
++      if not q['sql'].startswith(('BEGIN', 'COMMIT', 'SAVEPOINT', 'RELEASE'))]
++print('\ndeleting %d users with 2-FK Entry + 3-FK Note children' % N)
++print('  total queries:', len(qs))
++print('  max params in any single query:', max(q.count('%s') + q.count(',') + 1 for q in qs))
++maxlist = 0
++for q in qs:
++    # count actual literal params: sqlite DEBUG log inlines them, so count commas in IN lists
++    maxlist = max(maxlist, q.count(','))
++print('  largest comma count (proxy for param count):', maxlist)
++print('  returned:', deleted, per_model)
++print('  entries left:', Entry.objects.count(), 'notes left:', Note.objects.count(),
++      'users left:', User.objects.count())
++print('\n  query shapes:')
++seen = set()
++for q in qs:
++    shape = q.split(' WHERE ')[0] + (' WHERE ...' if ' WHERE ' in q else '')
++    if shape not in seen:
++        seen.add(shape)
++        print('   ', shape, '  (x%d)' % sum(1 for x in qs if x.startswith(q.split(' WHERE ')[0])))

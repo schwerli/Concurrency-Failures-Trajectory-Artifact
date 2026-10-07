@@ -1,0 +1,912 @@
+=== QueuePath.java ===
+     1	/**
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *
+    10	 *     http://www.apache.org/licenses/LICENSE-2.0
+    11	 *
+    12	 * Unless required by applicable law or agreed to in writing, software
+    13	 * distributed under the License is distributed on an "AS IS" BASIS,
+    14	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    15	 * See the License for the specific language governing permissions and
+    16	 * limitations under the License.
+    17	 */
+    18	
+    19	package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity;
+    20	
+    21	import java.util.Arrays;
+    22	import java.util.Iterator;
+    23	import java.util.NoSuchElementException;
+    24	import java.util.Objects;
+    25	
+    26	import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.DOT;
+    27	import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.ROOT;
+    28	
+    29	/**
+    30	 * This is a helper class which represents a queue path, and has easy access
+    31	 * methods to get the path's parent or leaf part, or as a whole.
+    32	 */
+    33	public class QueuePath implements Iterable<String> {
+    34	  private static final String QUEUE_REGEX_DELIMITER = "\\.";
+    35	  /**
+    36	   * The parent part of the queue path.
+    37	   */
+    38	  private String parent;
+    39	
+    40	  /**
+    41	   * The leaf part of the parent path.
+    42	   */
+    43	  private String leaf;
+    44	
+    45	  /**
+    46	   * Constructor to create mapping queue path from parent path and leaf name.
+    47	   * @param parent Parent path of the queue
+    48	   * @param leaf Name of the leaf queue
+    49	   */
+    50	  public QueuePath(String parent, String leaf) {
+    51	    this.parent = parent;
+    52	    this.leaf = leaf;
+    53	  }
+    54	
+    55	  /**
+    56	   * Constructor creates a MappingQueuePath object using the queue's full path.
+    57	   * @param fullPath Full path of the queue
+    58	   */
+    59	  public QueuePath(String fullPath) {
+    60	    setFromFullPath(fullPath);
+    61	  }
+    62	
+    63	  /**
+    64	   * Concatenate queue path parts into one queue path string.
+    65	   * @param parts Parts of the full queue pathAutoCreatedQueueTemplate
+    66	   * @return full path of the given queue parts
+    67	   */
+    68	  public static String concatenatePath(String... parts) {
+    69	    return String.join(DOT, parts);
+    70	  }
+    71	
+    72	  /**
+    73	   * This method is responsible for splitting up a full queue path into parent
+    74	   * path and leaf name.
+    75	   * @param fullPath Full path of the queue to be processed
+    76	   */
+    77	  private void setFromFullPath(String fullPath) {
+    78	    parent = null;
+    79	    leaf = fullPath;
+    80	
+    81	    if (leaf == null) {
+    82	      leaf = "";
+    83	      return;
+    84	    }
+    85	
+    86	    int lastDotIdx = fullPath.lastIndexOf(DOT);
+    87	    if (lastDotIdx > -1) {
+    88	      parent = fullPath.substring(0, lastDotIdx).trim();
+    89	      leaf = fullPath.substring(lastDotIdx + 1).trim();
+    90	    }
+    91	  }
+    92	
+    93	  /**
+    94	   * Simple helper method to determine if the path contains any empty parts.
+    95	   * @return true if there is at least one empty part of the path
+    96	   */
+    97	  public boolean hasEmptyPart() {
+    98	    for (String part : this) {
+    99	      if (part.isEmpty()) {
+   100	        return true;
+   101	      }
+   102	    }
+   103	
+   104	    return false;
+   105	  }
+   106	
+   107	  /**
+   108	   * Getter for the parent part of the path.
+   109	   * @return Parent path of the queue, null if there is no parent.
+   110	   */
+   111	  public String getParent() {
+   112	    return parent;
+   113	  }
+   114	
+   115	  /**
+   116	   * Getter for the leaf part of the path.
+   117	   * @return The leaf queue name
+   118	   */
+   119	  public String getLeafName() {
+   120	    return leaf;
+   121	  }
+   122	
+   123	  /**
+   124	   * Getter for the full path of the queue.
+   125	   * @return Full path of the queue
+   126	   */
+   127	  public String getFullPath() {
+   128	    return hasParent() ? (parent + DOT + leaf) : leaf;
+   129	  }
+   130	
+   131	  /**
+   132	   * Convenience getter to check if the queue has a parent path defined.
+   133	   * @return True if there is a parent path provided
+   134	   */
+   135	  public boolean hasParent() {
+   136	    return parent != null;
+   137	  }
+   138	
+   139	  /**
+   140	   * Convenience getter to check if the queue is the root queue.
+   141	   * @return True if the path is root
+   142	   */
+   143	  public boolean isRoot() {
+   144	    return !hasParent() && leaf.equals(ROOT);
+   145	  }
+   146	
+   147	  /**
+   148	   * Creates a new {@code QueuePath} from the current full path as parent, and
+   149	   * the appended child queue path as leaf.
+   150	   * @param childQueue path of leaf queue
+   151	   * @return new queue path made of current full path and appended leaf path
+   152	   */
+   153	  public QueuePath createNewLeaf(String childQueue) {
+   154	    return new QueuePath(getFullPath(), childQueue);
+   155	  }
+   156	
+   157	  /**
+   158	   * Returns an iterator of queue path parts, starting from the highest level
+   159	   * (generally root).
+   160	   * @return queue part iterator
+   161	   */
+   162	  @Override
+   163	  public Iterator<String> iterator() {
+   164	    return Arrays.asList(getFullPath().split(QUEUE_REGEX_DELIMITER)).iterator();
+   165	  }
+   166	
+   167	  /**
+   168	   * Returns an iterator that provides a way to traverse the queue path from
+   169	   * current queue through its parents.
+   170	   * @return queue path iterator
+   171	   */
+   172	  public Iterator<String> reverseIterator() {
+   173	
+   174	    return new Iterator<String>() {
+   175	      private String current = getFullPath();
+   176	
+   177	      @Override
+   178	      public boolean hasNext() {
+   179	        return current != null;
+   180	      }
+   181	
+   182	      @Override
+   183	      public String next() {
+   184	        if (!hasNext()) {
+   185	          throw new NoSuchElementException();
+   186	        }
+   187	
+   188	        int parentQueueNameEndIndex = current.lastIndexOf(".");
+   189	        String old = current;
+   190	        if (parentQueueNameEndIndex > -1) {
+   191	          current = current.substring(0, parentQueueNameEndIndex).trim();
+   192	        } else {
+   193	          current = null;
+   194	        }
+   195	
+   196	        return old;
+   197	      }
+   198	    };
+   199	  }
+   200	
+   201	  @Override
+   202	  public String toString() {
+   203	    return getFullPath();
+   204	  }
+   205	
+   206	  @Override
+   207	  public boolean equals(Object o) {
+   208	    if (this == o) {
+   209	      return true;
+   210	    }
+   211	    if (o == null || getClass() != o.getClass()) {
+   212	      return false;
+   213	    }
+   214	    QueuePath other = (QueuePath) o;
+   215	    return Objects.equals(parent, other.parent) &&
+   216	        Objects.equals(leaf, other.leaf);
+   217	  }
+   218	
+   219	  @Override
+   220	  public int hashCode() {
+   221	    return Objects.hash(parent, leaf);
+   222	  }
+   223	}
+=== QueueAllocationSettings.java ===
+     1	/*
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *     http://www.apache.org/licenses/LICENSE-2.0
+    10	 * Unless required by applicable law or agreed to in writing, software
+    11	 * distributed under the License is distributed on an "AS IS" BASIS,
+    12	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    13	 * See the License for the specific language governing permissions and
+    14	 * limitations under the License.
+    15	 */
+    16	
+    17	package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity;
+    18	
+    19	import org.apache.hadoop.yarn.api.records.Resource;
+    20	import org.apache.hadoop.yarn.api.records.ResourceInformation;
+    21	import org.apache.hadoop.yarn.util.resource.ResourceUtils;
+    22	import org.apache.hadoop.yarn.util.resource.Resources;
+    23	
+    24	import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacitySchedulerConfiguration.UNDEFINED;
+    25	
+    26	/**
+    27	 * This class determines minimum and maximum allocation settings based on the
+    28	 * {@link CapacitySchedulerConfiguration} and other queue
+    29	 * properties.
+    30	 **/
+    31	public class QueueAllocationSettings {
+    32	  private final Resource minimumAllocation;
+    33	  private Resource maximumAllocation;
+    34	
+    35	  public QueueAllocationSettings(Resource minimumAllocation) {
+    36	    this.minimumAllocation = minimumAllocation;
+    37	  }
+    38	
+    39	  void setupMaximumAllocation(CapacitySchedulerConfiguration configuration, QueuePath queuePath,
+    40	      CSQueue parent) {
+    41	    Resource clusterMax = ResourceUtils
+    42	        .fetchMaximumAllocationFromConfig(configuration);
+    43	    Resource queueMax = configuration.getQueueMaximumAllocation(queuePath);
+    44	
+    45	    maximumAllocation = Resources.clone(
+    46	        parent == null ? clusterMax : parent.getMaximumAllocation());
+    47	
+    48	    String errMsg =
+    49	        "Queue maximum allocation cannot be larger than the cluster setting"
+    50	            + " for queue " + queuePath
+    51	            + " max allocation per queue: %s"
+    52	            + " cluster setting: " + clusterMax;
+    53	
+    54	    if (queueMax == Resources.none()) {
+    55	      // Handle backward compatibility
+    56	      long queueMemory = configuration.getQueueMaximumAllocationMb(queuePath);
+    57	      int queueVcores = configuration.getQueueMaximumAllocationVcores(queuePath);
+    58	      if (queueMemory != UNDEFINED) {
+    59	        maximumAllocation.setMemorySize(queueMemory);
+    60	      }
+    61	
+    62	      if (queueVcores != UNDEFINED) {
+    63	        maximumAllocation.setVirtualCores(queueVcores);
+    64	      }
+    65	
+    66	      if ((queueMemory != UNDEFINED && queueMemory > clusterMax.getMemorySize()
+    67	          || (queueVcores != UNDEFINED
+    68	          && queueVcores > clusterMax.getVirtualCores()))) {
+    69	        throw new IllegalArgumentException(
+    70	            String.format(errMsg, maximumAllocation));
+    71	      }
+    72	    } else {
+    73	      // Queue level maximum-allocation can't be larger than cluster setting
+    74	      for (ResourceInformation ri : queueMax.getResources()) {
+    75	        if (ri.compareTo(clusterMax.getResourceInformation(ri.getName())) > 0) {
+    76	          throw new IllegalArgumentException(String.format(errMsg, queueMax));
+    77	        }
+    78	
+    79	        maximumAllocation.setResourceInformation(ri.getName(), ri);
+    80	      }
+    81	    }
+    82	  }
+    83	
+    84	  public Resource getMinimumAllocation() {
+    85	    return minimumAllocation;
+    86	  }
+    87	
+    88	  public Resource getMaximumAllocation() {
+    89	    return maximumAllocation;
+    90	  }
+    91	}
+=== QueueNodeLabelsSettings.java ===
+     1	/*
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *     http://www.apache.org/licenses/LICENSE-2.0
+    10	 * Unless required by applicable law or agreed to in writing, software
+    11	 * distributed under the License is distributed on an "AS IS" BASIS,
+    12	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    13	 * See the License for the specific language governing permissions and
+    14	 * limitations under the License.
+    15	 */
+    16	
+    17	package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity;
+    18	
+    19	import org.apache.commons.lang3.StringUtils;
+    20	import org.apache.hadoop.util.Sets;
+    21	import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
+    22	import java.io.IOException;
+    23	import java.util.Set;
+    24	
+    25	/**
+    26	 * This class determines accessible node labels, configured node labels and the default node
+    27	 * label expression based on the {@link CapacitySchedulerConfiguration} object and other queue
+    28	 * properties.
+    29	 */
+    30	public class QueueNodeLabelsSettings {
+    31	  private final CSQueue parent;
+    32	  private final QueuePath queuePath;
+    33	  private Set<String> accessibleLabels;
+    34	  private Set<String> configuredNodeLabels;
+    35	  private String defaultLabelExpression;
+    36	
+    37	  public QueueNodeLabelsSettings(CapacitySchedulerConfiguration configuration,
+    38	      CSQueue parent,
+    39	      QueuePath queuePath,
+    40	      ConfiguredNodeLabels configuredNodeLabels) throws IOException {
+    41	    this.parent = parent;
+    42	    this.queuePath = queuePath;
+    43	    initializeNodeLabels(configuration, configuredNodeLabels);
+    44	  }
+    45	
+    46	  private void initializeNodeLabels(CapacitySchedulerConfiguration configuration,
+    47	      ConfiguredNodeLabels configuredNodeLabels)
+    48	      throws IOException {
+    49	    initializeAccessibleLabels(configuration);
+    50	    initializeDefaultLabelExpression(configuration);
+    51	    initializeConfiguredNodeLabels(configuration, configuredNodeLabels);
+    52	    validateNodeLabels();
+    53	  }
+    54	
+    55	  private void initializeAccessibleLabels(CapacitySchedulerConfiguration configuration) {
+    56	    this.accessibleLabels = configuration.getAccessibleNodeLabels(queuePath);
+    57	    // Inherit labels from parent if not set
+    58	    if (this.accessibleLabels == null && parent != null) {
+    59	      this.accessibleLabels = parent.getAccessibleNodeLabels();
+    60	    }
+    61	  }
+    62	
+    63	  private void initializeDefaultLabelExpression(CapacitySchedulerConfiguration configuration) {
+    64	    this.defaultLabelExpression = configuration.getDefaultNodeLabelExpression(
+    65	        queuePath);
+    66	    // If the accessible labels is not null and the queue has a parent with a
+    67	    // similar set of labels copy the defaultNodeLabelExpression from the parent
+    68	    if (this.accessibleLabels != null && parent != null
+    69	        && this.defaultLabelExpression == null &&
+    70	        this.accessibleLabels.containsAll(parent.getAccessibleNodeLabels())) {
+    71	      this.defaultLabelExpression = parent.getDefaultNodeLabelExpression();
+    72	    }
+    73	  }
+    74	
+    75	  private void initializeConfiguredNodeLabels(CapacitySchedulerConfiguration configuration,
+    76	      ConfiguredNodeLabels configuredNodeLabelsParam) {
+    77	    if (configuredNodeLabelsParam != null) {
+    78	      if (queuePath.isRoot()) {
+    79	        this.configuredNodeLabels = configuredNodeLabelsParam.getAllConfiguredLabels();
+    80	      } else {
+    81	        this.configuredNodeLabels = configuredNodeLabelsParam.getLabelsByQueue(
+    82	            queuePath.getFullPath());
+    83	      }
+    84	    } else {
+    85	      // Fallback to suboptimal but correct logic
+    86	      this.configuredNodeLabels = configuration.getConfiguredNodeLabels(queuePath);
+    87	    }
+    88	  }
+    89	
+    90	  private void validateNodeLabels() throws IOException {
+    91	    // Check if labels of this queue is a subset of parent queue, only do this
+    92	    // when the queue in question is not root
+    93	    if (!queuePath.isRoot()) {
+    94	      if (parent.getAccessibleNodeLabels() != null && !parent
+    95	          .getAccessibleNodeLabels().contains(RMNodeLabelsManager.ANY)) {
+    96	        // If parent isn't "*", child shouldn't be "*" too
+    97	        if (this.getAccessibleNodeLabels().contains(RMNodeLabelsManager.ANY)) {
+    98	          throw new IOException("Parent's accessible queue is not ANY(*), "
+    99	              + "but child's accessible queue is " + RMNodeLabelsManager.ANY);
+   100	        } else {
+   101	          Set<String> diff = Sets.difference(this.getAccessibleNodeLabels(),
+   102	              parent.getAccessibleNodeLabels());
+   103	          if (!diff.isEmpty()) {
+   104	            throw new IOException(String.format(
+   105	                "Some labels of child queue is not a subset of parent queue, these labels=[%s]",
+   106	                StringUtils.join(diff, ",")));
+   107	          }
+   108	        }
+   109	      }
+   110	    }
+   111	  }
+   112	
+   113	  public boolean isAccessibleToPartition(String nodePartition) {
+   114	    // if queue's label is *, it can access any node
+   115	    if (accessibleLabels != null && accessibleLabels.contains(RMNodeLabelsManager.ANY)) {
+   116	      return true;
+   117	    }
+   118	    // any queue can access to a node without label
+   119	    if (nodePartition == null || nodePartition.equals(RMNodeLabelsManager.NO_LABEL)) {
+   120	      return true;
+   121	    }
+   122	    // a queue can access to a node only if it contains any label of the node
+   123	    if (accessibleLabels != null && accessibleLabels.contains(nodePartition)) {
+   124	      return true;
+   125	    }
+   126	    // The partition cannot be accessed
+   127	    return false;
+   128	  }
+   129	
+   130	  public Set<String> getAccessibleNodeLabels() {
+   131	    return accessibleLabels;
+   132	  }
+   133	
+   134	  public Set<String> getConfiguredNodeLabels() {
+   135	    return configuredNodeLabels;
+   136	  }
+   137	
+   138	  public String getDefaultLabelExpression() {
+   139	    return defaultLabelExpression;
+   140	  }
+   141	}
+=== CSQueuePreemptionSettings.java ===
+     1	/*
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *     http://www.apache.org/licenses/LICENSE-2.0
+    10	 * Unless required by applicable law or agreed to in writing, software
+    11	 * distributed under the License is distributed on an "AS IS" BASIS,
+    12	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    13	 * See the License for the specific language governing permissions and
+    14	 * limitations under the License.
+    15	 */
+    16	
+    17	package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity;
+    18	
+    19	import org.apache.hadoop.yarn.conf.YarnConfiguration;
+    20	
+    21	public class CSQueuePreemptionSettings {
+    22	  private final boolean preemptionDisabled;
+    23	  // Indicates if the in-queue preemption setting is ever disabled within the
+    24	  // hierarchy of this queue.
+    25	  private final boolean intraQueuePreemptionDisabledInHierarchy;
+    26	
+    27	  public CSQueuePreemptionSettings(
+    28	      CSQueue queue,
+    29	      CapacitySchedulerConfiguration configuration) {
+    30	    this.preemptionDisabled = isQueueHierarchyPreemptionDisabled(queue, configuration);
+    31	    this.intraQueuePreemptionDisabledInHierarchy =
+    32	        isIntraQueueHierarchyPreemptionDisabled(queue, configuration);
+    33	  }
+    34	
+    35	  /**
+    36	   * The specified queue is cross-queue preemptable if system-wide cross-queue
+    37	   * preemption is turned on unless any queue in the <em>qPath</em> hierarchy
+    38	   * has explicitly turned cross-queue preemption off.
+    39	   * NOTE: Cross-queue preemptability is inherited from a queue's parent.
+    40	   *
+    41	   * @param q queue to check preemption state
+    42	   * @param configuration capacity scheduler config
+    43	   * @return true if queue has cross-queue preemption disabled, false otherwise
+    44	   */
+    45	  private boolean isQueueHierarchyPreemptionDisabled(CSQueue q,
+    46	      CapacitySchedulerConfiguration configuration) {
+    47	    boolean systemWidePreemption =
+    48	        configuration
+    49	            .getBoolean(YarnConfiguration.RM_SCHEDULER_ENABLE_MONITORS,
+    50	                YarnConfiguration.DEFAULT_RM_SCHEDULER_ENABLE_MONITORS);
+    51	    CSQueue parentQ = q.getParent();
+    52	
+    53	    // If the system-wide preemption switch is turned off, all of the queues in
+    54	    // the qPath hierarchy have preemption disabled, so return true.
+    55	    if (!systemWidePreemption) return true;
+    56	
+    57	    // If q is the root queue and the system-wide preemption switch is turned
+    58	    // on, then q does not have preemption disabled (default=false, below)
+    59	    // unless the preemption_disabled property is explicitly set.
+    60	    if (parentQ == null) {
+    61	      return configuration.getPreemptionDisabled(q.getQueuePathObject(), false);
+    62	    }
+    63	
+    64	    // If this is not the root queue, inherit the default value for the
+    65	    // preemption_disabled property from the parent. Preemptability will be
+    66	    // inherited from the parent's hierarchy unless explicitly overridden at
+    67	    // this level.
+    68	    return configuration.getPreemptionDisabled(q.getQueuePathObject(),
+    69	        parentQ.getPreemptionDisabled());
+    70	  }
+    71	
+    72	  /**
+    73	   * The specified queue is intra-queue preemptable if
+    74	   * 1) system-wide intra-queue preemption is turned on
+    75	   * 2) no queue in the <em>qPath</em> hierarchy has explicitly turned off intra
+    76	   *    queue preemption.
+    77	   * NOTE: Intra-queue preemptability is inherited from a queue's parent.
+    78	   *
+    79	   * @param q queue to check intra-queue preemption state
+    80	   * @param configuration capacity scheduler config
+    81	   * @return true if queue has intra-queue preemption disabled, false otherwise
+    82	   */
+    83	  private boolean isIntraQueueHierarchyPreemptionDisabled(CSQueue q,
+    84	      CapacitySchedulerConfiguration configuration) {
+    85	    boolean systemWideIntraQueuePreemption =
+    86	        configuration.getBoolean(
+    87	            CapacitySchedulerConfiguration.INTRAQUEUE_PREEMPTION_ENABLED,
+    88	            CapacitySchedulerConfiguration
+    89	                .DEFAULT_INTRAQUEUE_PREEMPTION_ENABLED);
+    90	    // Intra-queue preemption is disabled for this queue if the system-wide
+    91	    // intra-queue preemption flag is false
+    92	    if (!systemWideIntraQueuePreemption) return true;
+    93	
+    94	    // Check if this is the root queue and the root queue's intra-queue
+    95	    // preemption disable switch is set
+    96	    CSQueue parentQ = q.getParent();
+    97	    if (parentQ == null) {
+    98	      return configuration
+    99	          .getIntraQueuePreemptionDisabled(q.getQueuePathObject(), false);
+   100	    }
+   101	
+   102	    // At this point, the master preemption switch is enabled down to this
+   103	    // queue's level. Determine whether intra-queue preemption is enabled
+   104	    // down to this queue's level and return that value.
+   105	    return configuration.getIntraQueuePreemptionDisabled(q.getQueuePathObject(),
+   106	        parentQ.getIntraQueuePreemptionDisabledInHierarchy());
+   107	  }
+   108	
+   109	  public boolean isIntraQueuePreemptionDisabled() {
+   110	    return intraQueuePreemptionDisabledInHierarchy || preemptionDisabled;
+   111	  }
+   112	
+   113	  public boolean isIntraQueuePreemptionDisabledInHierarchy() {
+   114	    return intraQueuePreemptionDisabledInHierarchy;
+   115	  }
+   116	
+   117	  public boolean isPreemptionDisabled() {
+   118	    return preemptionDisabled;
+   119	  }
+   120	}
+=== CSQueuePreemption.java ===
+     1	/*
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *     http://www.apache.org/licenses/LICENSE-2.0
+    10	 * Unless required by applicable law or agreed to in writing, software
+    11	 * distributed under the License is distributed on an "AS IS" BASIS,
+    12	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    13	 * See the License for the specific language governing permissions and
+    14	 * limitations under the License.
+    15	 */
+    16	
+    17	package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity;
+    18	
+    19	import org.apache.hadoop.yarn.conf.YarnConfiguration;
+    20	
+    21	public class CSQueuePreemption {
+    22	  private final boolean preemptionDisabled;
+    23	  // Indicates if the in-queue preemption setting is ever disabled within the
+    24	  // hierarchy of this queue.
+    25	  private final boolean intraQueuePreemptionDisabledInHierarchy;
+    26	
+    27	  public CSQueuePreemption(
+    28	      CSQueue queue,
+    29	      CapacitySchedulerContext csContext,
+    30	      CapacitySchedulerConfiguration configuration) {
+    31	    this.preemptionDisabled = isQueueHierarchyPreemptionDisabled(queue, csContext, configuration);
+    32	    this.intraQueuePreemptionDisabledInHierarchy =
+    33	        isIntraQueueHierarchyPreemptionDisabled(queue, csContext, configuration);
+    34	  }
+    35	
+    36	  /**
+    37	   * The specified queue is cross-queue preemptable if system-wide cross-queue
+    38	   * preemption is turned on unless any queue in the <em>qPath</em> hierarchy
+    39	   * has explicitly turned cross-queue preemption off.
+    40	   * NOTE: Cross-queue preemptability is inherited from a queue's parent.
+    41	   *
+    42	   * @param q queue to check preemption state
+    43	   * @param csContext
+    44	   * @param configuration capacity scheduler config
+    45	   * @return true if queue has cross-queue preemption disabled, false otherwise
+    46	   */
+    47	  private boolean isQueueHierarchyPreemptionDisabled(CSQueue q,
+    48	      CapacitySchedulerContext csContext, CapacitySchedulerConfiguration configuration) {
+    49	    boolean systemWidePreemption =
+    50	        csContext.getConfiguration()
+    51	            .getBoolean(YarnConfiguration.RM_SCHEDULER_ENABLE_MONITORS,
+    52	                YarnConfiguration.DEFAULT_RM_SCHEDULER_ENABLE_MONITORS);
+    53	    CSQueue parentQ = q.getParent();
+    54	
+    55	    // If the system-wide preemption switch is turned off, all of the queues in
+    56	    // the qPath hierarchy have preemption disabled, so return true.
+    57	    if (!systemWidePreemption) return true;
+    58	
+    59	    // If q is the root queue and the system-wide preemption switch is turned
+    60	    // on, then q does not have preemption disabled (default=false, below)
+    61	    // unless the preemption_disabled property is explicitly set.
+    62	    if (parentQ == null) {
+    63	      return configuration.getPreemptionDisabled(q.getQueuePath(), false);
+    64	    }
+    65	
+    66	    // If this is not the root queue, inherit the default value for the
+    67	    // preemption_disabled property from the parent. Preemptability will be
+    68	    // inherited from the parent's hierarchy unless explicitly overridden at
+    69	    // this level.
+    70	    return configuration.getPreemptionDisabled(q.getQueuePath(),
+    71	        parentQ.getPreemptionDisabled());
+    72	  }
+    73	
+    74	  /**
+    75	   * The specified queue is intra-queue preemptable if
+    76	   * 1) system-wide intra-queue preemption is turned on
+    77	   * 2) no queue in the <em>qPath</em> hierarchy has explicitly turned off intra
+    78	   *    queue preemption.
+    79	   * NOTE: Intra-queue preemptability is inherited from a queue's parent.
+    80	   *
+    81	   * @param q queue to check intra-queue preemption state
+    82	   * @param csContext
+    83	   * @param configuration capacity scheduler config
+    84	   * @return true if queue has intra-queue preemption disabled, false otherwise
+    85	   */
+    86	  private boolean isIntraQueueHierarchyPreemptionDisabled(CSQueue q,
+    87	      CapacitySchedulerContext csContext, CapacitySchedulerConfiguration configuration) {
+    88	    boolean systemWideIntraQueuePreemption =
+    89	        csContext.getConfiguration().getBoolean(
+    90	            CapacitySchedulerConfiguration.INTRAQUEUE_PREEMPTION_ENABLED,
+    91	            CapacitySchedulerConfiguration
+    92	                .DEFAULT_INTRAQUEUE_PREEMPTION_ENABLED);
+    93	    // Intra-queue preemption is disabled for this queue if the system-wide
+    94	    // intra-queue preemption flag is false
+    95	    if (!systemWideIntraQueuePreemption) return true;
+    96	
+    97	    // Check if this is the root queue and the root queue's intra-queue
+    98	    // preemption disable switch is set
+    99	    CSQueue parentQ = q.getParent();
+   100	    if (parentQ == null) {
+   101	      return configuration
+   102	          .getIntraQueuePreemptionDisabled(q.getQueuePath(), false);
+   103	    }
+   104	
+   105	    // At this point, the master preemption switch is enabled down to this
+   106	    // queue's level. Determine whether intra-queue preemption is enabled
+   107	    // down to this queue's level and return that value.
+   108	    return configuration.getIntraQueuePreemptionDisabled(q.getQueuePath(),
+   109	        parentQ.getIntraQueuePreemptionDisabledInHierarchy());
+   110	  }
+   111	
+   112	  public boolean isIntraQueuePreemptionDisabledInHierarchy() {
+   113	    return intraQueuePreemptionDisabledInHierarchy;
+   114	  }
+   115	
+   116	  public boolean isPreemptionDisabled() {
+   117	    return preemptionDisabled;
+   118	  }
+   119	}
+=== CSQueueUsageTracker.java ===
+     1	/**
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *
+    10	 *     http://www.apache.org/licenses/LICENSE-2.0
+    11	 *
+    12	 * Unless required by applicable law or agreed to in writing, software
+    13	 * distributed under the License is distributed on an "AS IS" BASIS,
+    14	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    15	 * See the License for the specific language governing permissions and
+    16	 * limitations under the License.
+    17	 */
+    18	
+    19	package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity;
+    20	
+    21	import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueResourceQuotas;
+    22	import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceUsage;
+    23	
+    24	public class CSQueueUsageTracker {
+    25	  private final CSQueueMetrics metrics;
+    26	  private int numContainers;
+    27	
+    28	  /**
+    29	   * The timestamp of the last submitted application to this queue.
+    30	   * Only applies to dynamic queues.
+    31	   */
+    32	  private long lastSubmittedTimestamp;
+    33	
+    34	  /**
+    35	   * Tracks resource usage by label like used-resource / pending-resource.
+    36	   */
+    37	  private final ResourceUsage queueUsage;
+    38	
+    39	  private final QueueResourceQuotas queueResourceQuotas;
+    40	
+    41	  public CSQueueUsageTracker(CSQueueMetrics metrics) {
+    42	    this.metrics = metrics;
+    43	    this.queueUsage = new ResourceUsage();
+    44	    this.queueResourceQuotas = new QueueResourceQuotas();
+    45	  }
+    46	
+    47	  public int getNumContainers() {
+    48	    return numContainers;
+    49	  }
+    50	
+    51	  public synchronized void increaseNumContainers() {
+    52	    numContainers++;
+    53	  }
+    54	
+    55	  public synchronized void decreaseNumContainers() {
+    56	    numContainers--;
+    57	  }
+    58	
+    59	  public CSQueueMetrics getMetrics() {
+    60	    return metrics;
+    61	  }
+    62	
+    63	  public long getLastSubmittedTimestamp() {
+    64	    return lastSubmittedTimestamp;
+    65	  }
+    66	
+    67	  public void setLastSubmittedTimestamp(long lastSubmittedTimestamp) {
+    68	    this.lastSubmittedTimestamp = lastSubmittedTimestamp;
+    69	  }
+    70	
+    71	  public ResourceUsage getQueueUsage() {
+    72	    return queueUsage;
+    73	  }
+    74	
+    75	  public QueueResourceQuotas getQueueResourceQuotas() {
+    76	    return queueResourceQuotas;
+    77	  }
+    78	
+    79	}
+=== QueueAppLifetimeAndLimitSettings.java ===
+     1	/*
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *     http://www.apache.org/licenses/LICENSE-2.0
+    10	 * Unless required by applicable law or agreed to in writing, software
+    11	 * distributed under the License is distributed on an "AS IS" BASIS,
+    12	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    13	 * See the License for the specific language governing permissions and
+    14	 * limitations under the License.
+    15	 */
+    16	
+    17	package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity;
+    18	
+    19	import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
+    20	
+    21	/**
+    22	 * This class determines application lifetime and max parallel apps settings based on the
+    23	 * {@link CapacitySchedulerConfiguration} and other queue
+    24	 * properties.
+    25	 **/
+    26	public class QueueAppLifetimeAndLimitSettings {
+    27	  // -1 indicates lifetime is disabled
+    28	  private final long maxApplicationLifetime;
+    29	  private final long defaultApplicationLifetime;
+    30	
+    31	  // Indicates if this queue's default lifetime was set by a config property,
+    32	  // either at this level or anywhere in the queue's hierarchy.
+    33	  private boolean defaultAppLifetimeWasSpecifiedInConfig = false;
+    34	
+    35	  private int maxParallelApps;
+    36	
+    37	  public QueueAppLifetimeAndLimitSettings(CapacitySchedulerConfiguration configuration,
+    38	      AbstractCSQueue q, QueuePath queuePath) {
+    39	    // Store max parallel apps property
+    40	    this.maxParallelApps = configuration.getMaxParallelAppsForQueue(queuePath);
+    41	    this.maxApplicationLifetime = getInheritedMaxAppLifetime(q, configuration);
+    42	    this.defaultApplicationLifetime = setupInheritedDefaultAppLifetime(q, queuePath, configuration,
+    43	        maxApplicationLifetime);
+    44	  }
+    45	
+    46	  private long getInheritedMaxAppLifetime(CSQueue q, CapacitySchedulerConfiguration conf) {
+    47	    CSQueue parentQ = q.getParent();
+    48	    long maxAppLifetime = conf.getMaximumLifetimePerQueue(q.getQueuePathObject());
+    49	
+    50	    // If q is the root queue, then get max app lifetime from conf.
+    51	    if (q.getQueuePathObject().isRoot()) {
+    52	      return maxAppLifetime;
+    53	    }
+    54	
+    55	    // If this is not the root queue, get this queue's max app lifetime
+    56	    // from the conf. The parent's max app lifetime will be used if it's
+    57	    // not set for this queue.
+    58	    // A value of 0 will override the parent's value and means no max lifetime.
+    59	    // A negative value means that the parent's max should be used.
+    60	    long parentsMaxAppLifetime = parentQ.getMaximumApplicationLifetime();
+    61	    return (maxAppLifetime >= 0) ? maxAppLifetime : parentsMaxAppLifetime;
+    62	  }
+    63	
+    64	  private long setupInheritedDefaultAppLifetime(CSQueue q,
+    65	      QueuePath queuePath, CapacitySchedulerConfiguration conf, long myMaxAppLifetime) {
+    66	    CSQueue parentQ = q.getParent();
+    67	    long defaultAppLifetime = conf.getDefaultLifetimePerQueue(queuePath);
+    68	    defaultAppLifetimeWasSpecifiedInConfig =
+    69	        (defaultAppLifetime >= 0
+    70	            || (!queuePath.isRoot() &&
+    71	            parentQ.getDefaultAppLifetimeWasSpecifiedInConfig()));
+    72	
+    73	    // If q is the root queue, then get default app lifetime from conf.
+    74	    if (queuePath.isRoot()) {
+    75	      return defaultAppLifetime;
+    76	    }
+    77	
+    78	    // If this is not the root queue, get the parent's default app lifetime. The
+    79	    // parent's default app lifetime will be used if not set for this queue.
+    80	    long parentsDefaultAppLifetime = parentQ.getDefaultApplicationLifetime();
+    81	
+    82	    // Negative value indicates default lifetime was not set at this level.
+    83	    // If default lifetime was not set at this level, calculate it based on
+    84	    // parent's default lifetime or current queue's max lifetime.
+    85	    if (defaultAppLifetime < 0) {
+    86	      // If default lifetime was not set at this level but was set somewhere in
+    87	      // the parent's hierarchy, set default lifetime to parent queue's default
+    88	      // only if parent queue's lifetime is less than current queue's max
+    89	      // lifetime. Otherwise, use current queue's max lifetime value for its
+    90	      // default lifetime.
+    91	      if (defaultAppLifetimeWasSpecifiedInConfig) {
+    92	        defaultAppLifetime =
+    93	            Math.min(parentsDefaultAppLifetime, myMaxAppLifetime);
+    94	      } else {
+    95	        // Default app lifetime value was not set anywhere in this queue's
+    96	        // hierarchy. Use current queue's max lifetime as its default.
+    97	        defaultAppLifetime = myMaxAppLifetime;
+    98	      }
+    99	    } // else if >= 0, default lifetime was set at this level. Just use it.
+   100	
+   101	    if (myMaxAppLifetime > 0 && defaultAppLifetime > myMaxAppLifetime) {
+   102	      throw new YarnRuntimeException(
+   103	          "Default lifetime " + defaultAppLifetime
+   104	              + " can't exceed maximum lifetime " + myMaxAppLifetime);
+   105	    }
+   106	
+   107	    if (defaultAppLifetime <= 0) {
+   108	      defaultAppLifetime = myMaxAppLifetime;
+   109	    }
+   110	    return defaultAppLifetime;
+   111	  }
+   112	
+   113	  public int getMaxParallelApps() {
+   114	    return maxParallelApps;
+   115	  }
+   116	
+   117	  public void setMaxParallelApps(int maxParallelApps) {
+   118	    this.maxParallelApps = maxParallelApps;
+   119	  }
+   120	
+   121	  public long getMaxApplicationLifetime() {
+   122	    return maxApplicationLifetime;
+   123	  }
+   124	
+   125	  public long getDefaultApplicationLifetime() {
+   126	    return defaultApplicationLifetime;
+   127	  }
+   128	
+   129	  public boolean isDefaultAppLifetimeWasSpecifiedInConfig() {
+   130	    return defaultAppLifetimeWasSpecifiedInConfig;
+   131	  }
+   132	}

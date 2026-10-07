@@ -1,0 +1,113 @@
+diff --git a/django/db/migrations/operations/utils.py b/django/db/migrations/operations/utils.py
+index 6e2bacd549..facfd9fc60 100644
+--- a/django/db/migrations/operations/utils.py
++++ b/django/db/migrations/operations/utils.py
+@@ -19,7 +19,8 @@ def resolve_relation(model, app_label=None, model_name=None):
+                 )
+             return app_label, model_name
+         if '.' in model:
+-            return tuple(model.lower().split('.', 1))
++            app_label, model_name = model.split('.', 1)
++            return app_label, model_name.lower()
+         if app_label is None:
+             raise TypeError(
+                 'app_label must be provided to resolve unscoped model '
+diff --git a/django/db/models/fields/related.py b/django/db/models/fields/related.py
+index c2aea9c730..ea1efd5ccb 100644
+--- a/django/db/models/fields/related.py
++++ b/django/db/models/fields/related.py
+@@ -582,7 +582,11 @@ class ForeignObject(RelatedField):
+         if self.remote_field.parent_link:
+             kwargs['parent_link'] = self.remote_field.parent_link
+         if isinstance(self.remote_field.model, str):
+-            kwargs['to'] = self.remote_field.model.lower()
++            if '.' in self.remote_field.model:
++                app_label, model_name = self.remote_field.model.split('.', 1)
++                kwargs['to'] = '%s.%s' % (app_label, model_name.lower())
++            else:
++                kwargs['to'] = self.remote_field.model.lower()
+         else:
+             kwargs['to'] = self.remote_field.model._meta.label_lower
+         # If swappable is True, then see if we're actually pointing to the target
+diff --git a/tests/migrations/test_operations.py b/tests/migrations/test_operations.py
+index 588186fae4..731d315127 100644
+--- a/tests/migrations/test_operations.py
++++ b/tests/migrations/test_operations.py
+@@ -132,6 +132,15 @@ class OperationTests(OperationTestBase):
+                 ],
+             )
+ 
++    def test_create_model_references_model_with_mixed_case_app_label(self):
++        operation = migrations.CreateModel(
++            "Content",
++            [
++                ("category", models.ForeignKey("MiXeD_Case.Category", models.CASCADE)),
++            ],
++        )
++        self.assertIs(operation.references_model("Category", "MiXeD_Case"), True)
++
+     def test_create_model_with_unique_after(self):
+         """
+         Tests the CreateModel operation directly followed by an
+diff --git a/tests/migrations/test_state.py b/tests/migrations/test_state.py
+index 40277bf506..b92cf469e0 100644
+--- a/tests/migrations/test_state.py
++++ b/tests/migrations/test_state.py
+@@ -532,6 +532,26 @@ class StateTests(SimpleTestCase):
+         project_state.add_model(ModelState.from_model(B))
+         self.assertEqual(len(project_state.apps.get_models()), 2)
+ 
++    def test_render_model_with_mixed_case_app_label(self):
++        new_apps = Apps()
++
++        class Category(models.Model):
++            class Meta:
++                app_label = 'MiXeD_Case'
++                apps = new_apps
++
++        class Content(models.Model):
++            category = models.ForeignKey('MiXeD_Case.Category', models.CASCADE)
++
++            class Meta:
++                app_label = 'MiXeD_Case'
++                apps = new_apps
++
++        project_state = ProjectState()
++        project_state.add_model(ModelState.from_model(Category))
++        project_state.add_model(ModelState.from_model(Content))
++        self.assertEqual(len(project_state.apps.get_models()), 2)
++
+     def test_reload_related_model_on_non_relational_fields(self):
+         """
+         The model is reloaded even on changes that are not involved in
+@@ -867,6 +887,30 @@ class StateTests(SimpleTestCase):
+         with self.assertRaisesMessage(ValueError, msg):
+             project_state.apps
+ 
++    def test_render_model_with_mixed_case_app_label_and_class_reference(self):
++        new_apps = Apps()
++
++        class Category(models.Model):
++            class Meta:
++                app_label = 'MiXeD_Case'
++                apps = new_apps
++
++        class Content(models.Model):
++            category = models.ForeignKey(Category, models.CASCADE)
++
++            class Meta:
++                app_label = 'MiXeD_Case'
++                apps = new_apps
++
++        project_state = ProjectState()
++        project_state.add_model(ModelState.from_model(Category))
++        project_state.add_model(ModelState.from_model(Content))
++
++        rendered_state = project_state.apps
++        content = rendered_state.get_model('MiXeD_Case', 'Content')
++        category = rendered_state.get_model('MiXeD_Case', 'Category')
++        self.assertIs(content._meta.get_field('category').remote_field.model, category)
++
+     def test_real_apps(self):
+         """
+         Including real apps can resolve dangling FK errors.

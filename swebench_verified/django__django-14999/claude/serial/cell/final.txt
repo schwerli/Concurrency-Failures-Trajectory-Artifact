@@ -1,0 +1,40 @@
+Fixed in `django/db/migrations/operations/models.py:319`.
+
+## The problem
+
+`alter_db_table()` already short-circuits when the table name is unchanged (`django/db/backends/base/schema.py:470`), so the main table was safe. But `database_forwards` kept going and called `schema_editor.alter_field()` for every related object — with `from_field` and `to_field` being effectively identical. That's what produced the reported damage: Postgres drops and recreates the FK constraints, and SQLite does a full `_remake_table`.
+
+## The fix
+
+Return early when the table name doesn't change:
+
+```python
+old_db_table = old_model._meta.db_table
+new_db_table = new_model._meta.db_table
+# Don't alter when a table name is not changed.
+if old_db_table == new_db_table:
+    return
+```
+
+This covers the auto-created M2M tables too — their names derive from the model's `db_table`, so they're unchanged whenever it is.
+
+## Verification
+
+Added `test_rename_model_with_db_table_noop`, which runs both `database_forwards` and `database_backwards` against a real database under `assertNumQueries(0)` for a `db_table`-bearing model with an incoming FK.
+
+- Without the fix: `FAILED — AssertionError: 5 != 0` (the SQLite table rebuild).
+- With the fix: passes.
+- `migrations` (615 tests) and `schema` (171 tests) both OK on SQLite. I couldn't exercise the Postgres FK path — no server in this environment — but that path is the same `alter_field` calls now skipped.
+
+## One caveat worth your call
+
+The early return is a *full* noop, which also skips one thing the old code did do. For a model with an explicit `db_table` **and** an auto-created M2M, the M2M table name is derived from `db_table` (unchanged), but the M2M column name is derived from the *model* name, so it does change. I confirmed this with a scratch test:
+
+```
+model table : pony_foo -> pony_foo
+m2m table   : pony_foo_riders -> pony_foo_riders
+m2m column  : pony_id -> pony2_id     # state expects this...
+actual cols : ['id', 'pony_id', 'rider_id']   # ...db keeps pony_id
+```
+
+So that corner case trades a spurious FK rebuild for a stale M2M column name. I went with the full noop since it's what the ticket asks for, but if you'd rather keep the M2M column rename, the early return should move to after the related-object loop and be scoped to it instead.

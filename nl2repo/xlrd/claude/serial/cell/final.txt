@@ -1,0 +1,25 @@
+The project is complete in `/workspace` and matches the specified directory layout. **117 tests pass** (84 from the reference test suite + 33 I added).
+
+## What's there
+
+`xlrd/` — the ten modules from the spec (`biffh`, `book`, `compdoc`, `formatting`, `formula`, `info`, `sheet`, `timemachine`, `xldate`, `__init__`), plus `setup.py`, `setup.cfg`, `MANIFEST.in`, `requirements.txt`, `scripts/runxlrd.py` (CLI), `docs/`, `tests/` with 17 binary sample files, `examples/read_excel.py`, and the CI/config dotfiles.
+
+## Verified, not just written
+
+- Every name in the spec's import block imports; all 28 documented API items and both `Book`/`Sheet` attribute lists resolve.
+- All 24 `.xls` samples fully decode in both `formatting_info` modes — pictures, names, and formulas are safely ignored per item 3.
+- Error paths behave as documented: `FileNotFoundError`, `IndexError`, `XLRDError` for unknown sheet, `"Excel xlsx file; not supported"`, plus empty/junk/ODS/XLSB/ZIP inputs.
+- `pip install .` works in a clean venv; `sdist` builds; `python examples/read_excel.py` and every `runxlrd.py` subcommand run clean.
+
+## Three real bugs I found and fixed
+
+1. **`scripts/runxlrd.py` was entirely broken** — it referenced `xlrd.USE_MMAP`, which no longer exists in 2.x, so *every* documented CLI invocation (`ov`, `3rows`, …) died on `AttributeError`. Restored `USE_MMAP` in the package.
+2. **Four documented `Book` attributes were missing** (`filename`, `file_contents`, `_data`, `_sheets`). I added them as live aliases over `filestr`/`_sheet_list` rather than copies, so they can't drift and don't defeat `release_resources()`'s memory management. Note `file_contents` is `None` after a normal load — that's `release_resources` freeing the buffer, and it's only non-`None` under `on_demand=True`.
+3. **`MANIFEST.in` shipped a nonexistent `README.md`**; corrected to `README.rst` and extended so sdists actually contain the tests and samples.
+
+## Two spec points worth flagging
+
+- **`hex_char_dump` conflicts with the spec.** The spec says non-printables render as `.`; the implementation renders NUL as `~` and others as `?`. I kept the existing behavior because `tests/test_biffh.py` asserts `"abc~e?"` — changing it to match the prose would fail that test. Flagging in case the prose is what you actually want.
+- **`install_requires` is intentionally empty.** The spec asks for pinned deps like `coverage==7.2.7`, but those are test-only — this library is pure stdlib. Pinning them as install requirements would make `pip install` fail in any environment lacking them. They're declared in `extras_require['test']` and `requirements.txt` instead (`pip install -e .[test]`).
+
+One thing I couldn't do: **there's no `submit` tool available in this session**, so I wasn't able to run the official suite for a score. Everything above is from the suite and checks I ran locally.

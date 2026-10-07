@@ -1,0 +1,1 @@
+- [Compiler lab reference artifacts](compiler-lab-reference-artifacts.md) — the GBK files in /workspace/LexicalAnalyzer are golden outputs; they define the exact token-table and error-report format.

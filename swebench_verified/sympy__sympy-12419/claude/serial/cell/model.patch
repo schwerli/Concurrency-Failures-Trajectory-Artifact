@@ -1,0 +1,170 @@
+diff --git a/sympy/concrete/summations.py b/sympy/concrete/summations.py
+index 372487664..aa100b6af 100644
+--- a/sympy/concrete/summations.py
++++ b/sympy/concrete/summations.py
+@@ -11,7 +11,7 @@
+ from sympy.concrete.gosper import gosper_sum
+ from sympy.functions.special.zeta_functions import zeta
+ from sympy.functions.elementary.piecewise import Piecewise
+-from sympy.logic.boolalg import And
++from sympy.logic.boolalg import And, Not, true
+ from sympy.polys import apart, PolynomialError
+ from sympy.solvers import solve
+ from sympy.series.limits import limit
+@@ -843,6 +843,57 @@ def telescopic(L, R, limits):
+         return telescopic_direct(L, R, s, (i, a, b))
+ 
+ 
++def _eval_piecewise_on_range(f, i, a, b):
++    """Rewrite the Piecewise ``f`` knowing that ``i`` is restricted to [a, b].
++
++    Branches whose condition cannot hold anywhere on the range are dropped,
++    and once a condition is found to hold on the whole range the branches
++    after it are discarded.  ``None`` is returned if nothing could be
++    decided, so that the caller does not loop on an unchanged expression.
++
++    Examples
++    ========
++
++    >>> from sympy import Piecewise, Symbol
++    >>> from sympy.concrete.summations import _eval_piecewise_on_range
++    >>> n = Symbol('n', integer=True, positive=True)
++    >>> j = Symbol('j', integer=True)
++    >>> _eval_piecewise_on_range(
++    ...     Piecewise((1, (0 <= j) & (j <= n - 1)), (0, True)), j, 0, n - 1)
++    1
++    """
++    from sympy.logic.boolalg import _find_predicates, simplify_logic
++
++    def _is_false(cond):
++        # is ``cond`` unsatisfiable, i.e. inconsistent with the range?
++        if cond is S.false:
++            return True
++        # simplify_logic tabulates 2**n rows, so only reason about conditions
++        # built from a handful of relations
++        if len(_find_predicates(cond)) > 8:
++            return False
++        return simplify_logic(cond) is S.false
++
++    domain = And(a <= i, i <= b)
++    newargs = []
++    for expr, cond in f.args:
++        if _is_false(And(domain, cond)):
++            # this branch is never taken
++            continue
++        if _is_false(And(domain, Not(cond))):
++            # this branch is always taken, so it shadows the remaining ones
++            newargs.append((expr, true))
++            break
++        newargs.append((expr, cond))
++
++    if not newargs:
++        return None
++    newf = f.func(*newargs)
++    if newf == f:
++        return None
++    return newf
++
++
+ def eval_sum(f, limits):
+     from sympy.concrete.delta import deltasummation, _has_simple_delta
+     from sympy.functions import KroneckerDelta
+@@ -866,6 +917,13 @@ def eval_sum(f, limits):
+                     return None
+                 newargs.append((newexpr, arg.cond))
+             return f.func(*newargs)
++        else:
++            # The conditions do depend on the summation variable, but that
++            # variable only ever takes values in [a, b], which may be enough
++            # to settle some of them.
++            newf = _eval_piecewise_on_range(f, i, a, b)
++            if newf is not None:
++                return eval_sum(newf, limits)
+ 
+     if f.has(KroneckerDelta) and _has_simple_delta(f, limits[0]):
+         return deltasummation(f, limits)
+diff --git a/sympy/concrete/tests/test_sums_products.py b/sympy/concrete/tests/test_sums_products.py
+index 1e3a81141..fa030296b 100644
+--- a/sympy/concrete/tests/test_sums_products.py
++++ b/sympy/concrete/tests/test_sums_products.py
+@@ -570,7 +570,10 @@ def test_Sum_doit():
+     # issue 2597
+     nmax = symbols('N', integer=True, positive=True)
+     pw = Piecewise((1, And(S(1) <= n, n <= nmax)), (0, True))
+-    assert Sum(pw, (n, 1, nmax)).doit() == Sum(pw, (n, 1, nmax))
++    # the condition holds on the whole summation range, so every term is 1
++    assert Sum(pw, (n, 1, nmax)).doit() == nmax
++    # ... but nothing can be said when the range is not known to be covered
++    assert Sum(pw, (n, 1, nmax + 1)).doit() == Sum(pw, (n, 1, nmax + 1))
+ 
+     q, s = symbols('q, s')
+     assert summation(1/n**(2*s), (n, 1, oo)) == Piecewise((zeta(2*s), 2*s > 1),
+diff --git a/sympy/matrices/expressions/matexpr.py b/sympy/matrices/expressions/matexpr.py
+index b4d759836..b584d5080 100644
+--- a/sympy/matrices/expressions/matexpr.py
++++ b/sympy/matrices/expressions/matexpr.py
+@@ -6,7 +6,9 @@
+ from sympy.core.decorators import call_highest_priority
+ from sympy.core.compatibility import range
+ from sympy.core.sympify import SympifyError, sympify
++from sympy.core.relational import Eq
+ from sympy.functions import conjugate, adjoint
++from sympy.functions.special.tensor_functions import KroneckerDelta
+ from sympy.matrices import ShapeError
+ from sympy.simplify import simplify
+ 
+@@ -476,10 +478,12 @@ def conjugate(self):
+         return self
+ 
+     def _entry(self, i, j):
+-        if i == j:
++        eq = Eq(i, j)
++        if eq is S.true:
+             return S.One
+-        else:
++        elif eq is S.false:
+             return S.Zero
++        return KroneckerDelta(i, j)
+ 
+     def _eval_determinant(self):
+         return S.One
+diff --git a/sympy/matrices/expressions/tests/test_matexpr.py b/sympy/matrices/expressions/tests/test_matexpr.py
+index dbc548594..5eb81ebe8 100644
+--- a/sympy/matrices/expressions/tests/test_matexpr.py
++++ b/sympy/matrices/expressions/tests/test_matexpr.py
+@@ -84,6 +84,15 @@ def test_Identity():
+     assert In.inverse() == In
+     assert In.conjugate() == In
+ 
++    i, j = symbols('i j')
++    assert In[i, i] == 1
++    assert In[0, 0] == 1
++    assert In[0, 1] == 0
++    # indices that are not known to be (un)equal give a KroneckerDelta,
++    # not 0 -- see issue 12419
++    assert In[i, j] == KroneckerDelta(i, j)
++    assert In[i, i + 1] == 0
++
+ def test_Identity_doit():
+     Inn = Identity(Add(n, n, evaluate=False))
+     assert isinstance(Inn.rows, Add)
+@@ -305,3 +314,19 @@ def test_MatrixElement_with_values():
+     raises(ValueError, lambda: M[i, -1])
+     raises(ValueError, lambda: M[2, i])
+     raises(ValueError, lambda: M[-1, i])
++
++
++def test_identity_sum():
++    # issue 12419
++    i, j = symbols('i j')
++    N = symbols('N', integer=True, positive=True)
++    e = Identity(N)
++
++    # the diagonal already worked, the total sum used to come out as 0
++    assert Sum(e[i, i], (i, 0, N - 1)).doit() == N
++    assert Sum(Sum(e[i, j], (i, 0, N - 1)), (j, 0, N - 1)).doit() == N
++    # summing a single row/column picks out the one non-zero entry
++    assert Sum(e[i, 0], (i, 0, N - 1)).doit() == 1
++
++    # explicit sizes agree
++    assert Sum(Sum(Identity(3)[i, j], (i, 0, 2)), (j, 0, 2)).doit() == 3

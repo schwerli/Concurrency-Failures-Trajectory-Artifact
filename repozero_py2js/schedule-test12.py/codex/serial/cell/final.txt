@@ -1,0 +1,406 @@
+Files were written under `/output` and the normal-run stdout matches the bundled executable.
+
+[argparse.mjs](/output/lib/cli/argparse.mjs)
+```js
+const ARGUMENT_SPECS = [
+  { flag: '--a', key: 'a', metavar: 'A' },
+  { flag: '--b', key: 'b', metavar: 'B' },
+  { flag: '--c', key: 'c', metavar: 'C' },
+];
+
+const SPEC_BY_FLAG = new Map(ARGUMENT_SPECS.map((spec) => [spec.flag, spec]));
+const INTEGER_PATTERN = /^[+-]?\d+$/;
+
+function getProgramName(scriptPath) {
+  if (!scriptPath) {
+    return 'test12.mjs';
+  }
+
+  const normalized = String(scriptPath).replace(/\\/g, '/');
+  const segments = normalized.split('/');
+  return segments[segments.length - 1] || normalized;
+}
+
+function formatUsage(programName) {
+  return `usage: ${programName} [-h] --a A --b B --c C`;
+}
+
+function formatHelp(programName) {
+  return `${formatUsage(programName)}\n\noptions:\n  -h, --help  show this help message and exit\n  --a A\n  --b B\n  --c C\n`;
+}
+
+function buildMissingRequiredMessage(missingFlags) {
+  return `the following arguments are required: ${missingFlags.join(', ')}`;
+}
+
+function parseIntegerValue(flag, rawValue) {
+  if (!INTEGER_PATTERN.test(rawValue)) {
+    throw new CliExit(2, `argument ${flag}: invalid int value: '${rawValue}'`, false);
+  }
+
+  return Number.parseInt(rawValue, 10);
+}
+
+function parseOptionToken(token) {
+  const equalIndex = token.indexOf('=');
+  if (equalIndex === -1) {
+    return null;
+  }
+
+  return {
+    flag: token.slice(0, equalIndex),
+    value: token.slice(equalIndex + 1),
+  };
+}
+
+function isValueLikeToken(token) {
+  return INTEGER_PATTERN.test(token);
+}
+
+export class CliExit extends Error {
+  constructor(code, message, useStdout) {
+    super(message);
+    this.code = code;
+    this.useStdout = useStdout;
+  }
+}
+
+export function handleCliExit(error, programName, processRef = process) {
+  if (!(error instanceof CliExit)) {
+    throw error;
+  }
+
+  const usage = formatUsage(programName);
+  const stream = error.useStdout ? processRef.stdout : processRef.stderr;
+  const output = error.useStdout
+    ? error.message
+    : `${usage}\n${programName}: error: ${error.message}\n`;
+
+  stream.write(output);
+  processRef.exit(error.code);
+}
+
+export function parseCommandLine(argv, scriptPath) {
+  const programName = getProgramName(scriptPath);
+
+  if (argv.includes('-h') || argv.includes('--help')) {
+    throw new CliExit(0, formatHelp(programName), true);
+  }
+
+  const parsedValues = {};
+  const extras = [];
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (token === '--') {
+      extras.push(...argv.slice(index + 1));
+      break;
+    }
+
+    const inlineOption = parseOptionToken(token);
+    if (inlineOption !== null) {
+      const spec = SPEC_BY_FLAG.get(inlineOption.flag);
+      if (spec === undefined) {
+        extras.push(token);
+        continue;
+      }
+
+      parsedValues[spec.key] = parseIntegerValue(spec.flag, inlineOption.value);
+      continue;
+    }
+
+    const spec = SPEC_BY_FLAG.get(token);
+    if (spec !== undefined) {
+      const nextToken = argv[index + 1];
+      if (nextToken === undefined) {
+        throw new CliExit(2, `argument ${spec.flag}: expected one argument`, false);
+      }
+
+      if (nextToken.startsWith('-') && !isValueLikeToken(nextToken)) {
+        throw new CliExit(2, `argument ${spec.flag}: expected one argument`, false);
+      }
+
+      parsedValues[spec.key] = parseIntegerValue(spec.flag, nextToken);
+      index += 1;
+      continue;
+    }
+
+    extras.push(token);
+  }
+
+  const missingFlags = ARGUMENT_SPECS
+    .filter((spec) => !(spec.key in parsedValues))
+    .map((spec) => spec.flag);
+
+  if (missingFlags.length > 0) {
+    throw new CliExit(2, buildMissingRequiredMessage(missingFlags), false);
+  }
+
+  if (extras.length > 0) {
+    throw new CliExit(2, `unrecognized arguments: ${extras.join(' ')}`, false);
+  }
+
+  return parsedValues;
+}
+```
+
+[job.mjs](/output/lib/schedule/job.mjs)
+```js
+const UNIT_TO_MILLISECONDS = {
+  seconds: 1000,
+  minutes: 60 * 1000,
+  hours: 60 * 60 * 1000,
+  days: 24 * 60 * 60 * 1000,
+  weeks: 7 * 24 * 60 * 60 * 1000,
+};
+
+const PYTHON_MIN_YEAR = 1;
+const PYTHON_MAX_YEAR = 9999;
+
+const WEEKDAY_TO_JS_DAY = {
+  monday: 1,
+  tuesday: 2,
+  wednesday: 3,
+  thursday: 4,
+  friday: 5,
+  saturday: 6,
+  sunday: 0,
+};
+
+function assertPythonDateRange(date) {
+  const year = date.getFullYear();
+  if (year < PYTHON_MIN_YEAR || year > PYTHON_MAX_YEAR) {
+    throw new Error('date value out of range');
+  }
+}
+
+function moveToNextWeekday(date, startDay) {
+  const targetDay = WEEKDAY_TO_JS_DAY[startDay];
+  const shifted = new Date(date.getTime());
+  const currentDay = shifted.getDay();
+  const delta = (targetDay - currentDay + 7) % 7;
+  shifted.setDate(shifted.getDate() + delta);
+  return shifted;
+}
+
+export class Job {
+  constructor(interval, scheduler) {
+    this.interval = interval;
+    this.scheduler = scheduler;
+    this.unit = null;
+    this.startDay = null;
+    this.jobFunc = null;
+    this.nextRun = null;
+  }
+
+  get seconds() {
+    this.unit = 'seconds';
+    return this;
+  }
+
+  get minutes() {
+    this.unit = 'minutes';
+    return this;
+  }
+
+  get hours() {
+    this.unit = 'hours';
+    return this;
+  }
+
+  get day() {
+    this.unit = 'days';
+    return this;
+  }
+
+  get week() {
+    this.unit = 'weeks';
+    return this;
+  }
+
+  get monday() {
+    this.unit = 'weeks';
+    this.startDay = 'monday';
+    return this;
+  }
+
+  get tuesday() {
+    this.unit = 'weeks';
+    this.startDay = 'tuesday';
+    return this;
+  }
+
+  get wednesday() {
+    this.unit = 'weeks';
+    this.startDay = 'wednesday';
+    return this;
+  }
+
+  get thursday() {
+    this.unit = 'weeks';
+    this.startDay = 'thursday';
+    return this;
+  }
+
+  get friday() {
+    this.unit = 'weeks';
+    this.startDay = 'friday';
+    return this;
+  }
+
+  get saturday() {
+    this.unit = 'weeks';
+    this.startDay = 'saturday';
+    return this;
+  }
+
+  get sunday() {
+    this.unit = 'weeks';
+    this.startDay = 'sunday';
+    return this;
+  }
+
+  do(jobFunc) {
+    this.jobFunc = jobFunc;
+    this.#scheduleNextRun();
+    this.scheduler.add(this);
+    return this;
+  }
+
+  toString() {
+    return `Job(interval=${this.interval}, unit=${this.unit}, do=<lambda>, args=(), kwargs={})`;
+  }
+
+  #scheduleNextRun() {
+    if (!(this.unit in UNIT_TO_MILLISECONDS)) {
+      throw new Error('Invalid unit');
+    }
+
+    if (this.interval === 0) {
+      for (;;) {
+        // Mirrors the Python schedule library behavior for zero intervals.
+      }
+    }
+
+    if (this.interval < 0 && (this.unit === 'seconds' || this.unit === 'minutes')) {
+      for (;;) {
+        // Negative second/minute intervals effectively never finish scheduling.
+      }
+    }
+
+    if (this.interval < 0) {
+      throw new Error('date value out of range');
+    }
+
+    const now = new Date();
+    let nextRun = new Date(now.getTime());
+
+    if (this.startDay !== null) {
+      nextRun = moveToNextWeekday(nextRun, this.startDay);
+    }
+
+    const periodMilliseconds = UNIT_TO_MILLISECONDS[this.unit] * this.interval;
+    if (this.interval !== 1) {
+      nextRun = new Date(nextRun.getTime() + periodMilliseconds);
+    }
+
+    while (nextRun.getTime() <= now.getTime()) {
+      nextRun = new Date(nextRun.getTime() + periodMilliseconds);
+      assertPythonDateRange(nextRun);
+    }
+
+    this.nextRun = nextRun;
+  }
+}
+```
+
+[scheduler.mjs](/output/lib/schedule/scheduler.mjs)
+```js
+import { Job } from './job.mjs';
+
+export class Scheduler {
+  constructor() {
+    this.jobs = [];
+  }
+
+  every(interval = 1) {
+    return new Job(interval, this);
+  }
+
+  add(job) {
+    this.jobs.push(job);
+  }
+
+  getJobs() {
+    return this.jobs.slice();
+  }
+}
+```
+
+[index.mjs](/output/lib/schedule/index.mjs)
+```js
+import { Scheduler } from './scheduler.mjs';
+
+const defaultScheduler = new Scheduler();
+
+export function every(interval = 1) {
+  return defaultScheduler.every(interval);
+}
+
+export function getJobs() {
+  return defaultScheduler.getJobs();
+}
+
+export { Job } from './job.mjs';
+export { Scheduler } from './scheduler.mjs';
+```
+
+[test12.mjs](/output/test12.mjs)
+```js
+import { handleCliExit, parseCommandLine } from './lib/cli/argparse.mjs';
+import { every, getJobs } from './lib/schedule/index.mjs';
+
+function println(value) {
+  process.stdout.write(`${value}\n`);
+}
+
+let args;
+
+try {
+  args = parseCommandLine(process.argv.slice(2), process.argv[1]);
+} catch (error) {
+  handleCliExit(error, process.argv[1] ? process.argv[1].replace(/^.*[\\/]/, '') : 'test12.mjs');
+}
+
+const job1 = every(args.a).seconds.do(() => {});
+println(job1.interval);
+const job2 = every(args.b).minutes.do(() => {});
+println(job2.interval);
+const job3 = every(args.c).hours.do(() => {});
+println(job3.interval);
+
+const job4 = every().day.do(() => {});
+println(job4.toString());
+const job5 = every().week.do(() => {});
+println(job5.toString());
+const job6 = every().monday.do(() => {});
+println(job6.toString());
+const job7 = every().tuesday.do(() => {});
+println(job7.toString());
+const job8 = every().wednesday.do(() => {});
+println(job8.toString());
+const job9 = every().thursday.do(() => {});
+println(job9.toString());
+const job10 = every().friday.do(() => {});
+println(job10.toString());
+const job11 = every().saturday.do(() => {});
+println(job11.toString());
+const job12 = every().sunday.do(() => {});
+println(job12.toString());
+
+const allJobs = getJobs();
+println(allJobs.length);
+```
+
+Verification: `node /output/test12.mjs --a 2 --b 3 --c 4` matches the executable’s normal stdout exactly, and sampled CLI cases match `argparse`-style help/error behavior.

@@ -1,0 +1,19 @@
+Fixed. `django/contrib/admindocs/utils.py:39`
+
+```python
+indent = min((len(line) - len(line.lstrip()) for line in lines[1:] if line.lstrip()), default=0)
+```
+
+Two parts to the change:
+
+1. **`lines[1:]`** — the ticket's fix. The first line of a docstring sits right after the opening quotes, so its indentation is always 0; including it forced `indent = 0` and left the body indented, which docutils parsed as content of the injected `.. default-role:: cmsreference` directive → `Error in "default-role" directive: no content permitted.`
+2. **`default=0`** — required, not cosmetic. Slicing off line 0 makes the generator empty for a one-line docstring, so a bare `min()` raises `ValueError: min() arg is an empty sequence`. This is not a synthetic case: `views.template_filter_index` runs `parse_docstring(filter_func.__doc__)` over every registered filter, and 34 built-in filters (`add`, `capfirst`, `cut`, `date`, …) have single-line docstrings — without the guard, `/admindocs/filters/` would 500. Same for any model method with a one-line docstring via `views.py:259`.
+
+**Tests** (`tests/admin_docs/test_utils.py`, in `TestUtils`): `test_trim_docstring_first_line_not_empty`, `test_trim_docstring_single_line` (covers both empty and all-blank `lines[1:]`), and `test_docstring_with_first_line_not_empty_output`, which renders through `parse_docstring` + `parse_rst`.
+
+**Verification**
+- `admin_docs` + `admin_views`: 418 tests, OK (skipped=15).
+- Stashing only the `utils.py` change makes 2 of the 3 new tests fail, and the failure output is verbatim the reported symptom: `Error in "default-role" directive: no content permitted.` / `.. default-role:: cmsreference Display an individual :model:...` — so these are genuine fail-before/pass-after tests.
+- A parallel audit (5 auditors + adversarial refutation) found no must-fix defects: no second dedent implementation exists in the tree; classic blank-first-line docstrings are byte-identical to before; new output matches `inspect.cleandoc()` (the PEP 257 reference the function cites) on all shapes tested; repo-wide, 109 of 8261 docstrings trim differently with none rendering worse.
+
+One accepted trade-off worth knowing: a docstring whose *first* line opens an indentation-scoped RST construct (e.g. `"""Usage::` with an indented block below and nothing at the base indent) now has that block dedented to column 0, so the literal block is lost and docutils warns. This is exactly `inspect.cleandoc()`'s behavior, no in-repo docstring has that shape, and the alternative would reinstate the bug — so I left it. No release note was added; `docs/releases/3.1.txt` only has an empty admindocs stub, and there's no 3.0.x bugfix file in this checkout.

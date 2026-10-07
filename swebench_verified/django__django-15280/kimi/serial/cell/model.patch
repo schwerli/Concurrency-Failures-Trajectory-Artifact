@@ -1,0 +1,93 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index d5aa968400..ccddbc5a90 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -145,7 +145,8 @@ class ForwardManyToOneDescriptor:
+         if not remote_field.multiple:
+             for rel_obj in queryset:
+                 instance = instances_dict[rel_obj_attr(rel_obj)]
+-                remote_field.set_cached_value(rel_obj, instance)
++                if not remote_field.is_cached(rel_obj):
++                    remote_field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.field.get_cache_name(), False
+ 
+     def get_object(self, instance):
+@@ -377,7 +378,10 @@ class ReverseOneToOneDescriptor:
+         # we must manage the reverse relation cache manually.
+         for rel_obj in queryset:
+             instance = instances_dict[rel_obj_attr(rel_obj)]
+-            self.related.field.set_cached_value(rel_obj, instance)
++            # Don't clobber the related object cache if it was already
++            # populated by, e.g., a nested prefetch with a custom queryset.
++            if not self.related.field.is_cached(rel_obj):
++                self.related.field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.related.get_cache_name(), False
+ 
+     def __get__(self, instance, cls=None):
+@@ -647,7 +651,8 @@ def create_reverse_many_to_one_manager(superclass, rel):
+             # the reverse relation manually.
+             for rel_obj in queryset:
+                 instance = instances_dict[rel_obj_attr(rel_obj)]
+-                setattr(rel_obj, self.field.name, instance)
++                if not self.field.is_cached(rel_obj):
++                    setattr(rel_obj, self.field.name, instance)
+             cache_name = self.field.remote_field.get_cache_name()
+             return queryset, rel_obj_attr, instance_attr, False, cache_name, False
+ 
+diff --git a/tests/prefetch_related/tests.py b/tests/prefetch_related/tests.py
+index 4ea7fccd5e..091145bad2 100644
+--- a/tests/prefetch_related/tests.py
++++ b/tests/prefetch_related/tests.py
+@@ -872,6 +872,52 @@ class CustomPrefetchTests(TestCase):
+             ))
+             self.assertEqual(add_q_mock.call_count, 1)
+ 
++    def test_nested_prefetch_back_to_parent_one_to_one(self):
++        """
++        The related object cache populated by a nested Prefetch with a custom
++        queryset isn't overwritten by the reverse one-to-one descriptor when
++        the relation points back to the parent object.
++        """
++        queryset = Room.objects.only('name').prefetch_related(
++            Prefetch(
++                'main_room_of',
++                queryset=House.objects.prefetch_related(
++                    Prefetch('main_room', queryset=Room.objects.only('house')),
++                ),
++            ),
++        )
++        with self.assertNumQueries(3):
++            room = queryset.get(id=self.room1_1.id)
++        with self.assertNumQueries(0):
++            self.assertEqual(room.main_room_of.main_room.house_id, self.house1.id)
++        self.assertEqual(
++            room.main_room_of.main_room.get_deferred_fields(), {'name'},
++        )
++
++    def test_nested_prefetch_back_to_parent_foreign_key(self):
++        """
++        The related object cache populated by a nested Prefetch with a custom
++        queryset isn't overwritten by the reverse many-to-one manager when
++        the relation points back to the parent object.
++        """
++        queryset = House.objects.only('name').prefetch_related(
++            Prefetch(
++                'rooms',
++                queryset=Room.objects.prefetch_related(
++                    Prefetch('house', queryset=House.objects.only('address')),
++                ),
++            ),
++        )
++        with self.assertNumQueries(3):
++            house = queryset.get(id=self.house1.id)
++        with self.assertNumQueries(0):
++            rooms = list(house.rooms.all())
++            self.assertEqual(rooms[0].house.address, '123 Main St')
++        self.assertEqual(
++            rooms[0].house.get_deferred_fields(),
++            {'name', 'owner_id', 'main_room_id'},
++        )
++
+ 
+ class DefaultManagerTests(TestCase):
+ 

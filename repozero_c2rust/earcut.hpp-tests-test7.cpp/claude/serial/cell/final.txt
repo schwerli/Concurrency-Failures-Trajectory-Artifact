@@ -1,0 +1,33 @@
+Done. The Rust port is byte-for-byte identical to the C++ binary across every input I tested.
+
+## What I built
+
+The C++ library source wasn't present (only `test7.cpp` and the compiled binary), so I inferred the algorithm from the interface and re-implemented ear-slicing triangulation from scratch:
+
+```
+/output
+├── Cargo.toml            # no dependencies
+├── test7.rs              # entry point (package root)
+└── src/earcut/
+    ├── mod.rs            # ring linking, ear-slicing passes, diagonal splitting
+    ├── node.rs           # arena-backed doubly linked node
+    ├── geom.rs           # area / equals / point-in-triangle / segment intersection
+    ├── zorder.rs         # Morton-code hashing + linked-list merge sort
+    └── holes.rs          # hole elimination and bridge finding
+```
+
+Key fidelity points:
+- **Node identity**: the C++ version links nodes with raw pointers that are never freed mid-run, so identity stays stable after unlinking. I reproduced that with a `Vec<Node>` arena indexed by `usize`, with `NIL = usize::MAX` as `nullptr`.
+- **Float arithmetic order** is preserved verbatim in every predicate — the algorithm branches on signs of near-zero quantities (this spiral produces coordinates like `3.06e-17`), so reassociating would change output. `sin`/`cos` both bottom out in glibc's libm, so they agree bit-for-bit.
+- **Hashing threshold**: z-order indexing kicks in past 80 vertices (n ≥ 41), so the sweep below exercises both the plain and hashed ear-detection paths.
+- **`atoi` semantics**: reimplemented (leading whitespace, optional sign, stop at first non-digit, 0 on failure), and `n * 2` uses `wrapping_mul` so `INT_MAX` overflows to a negative count exactly as the C++ does.
+
+## Verification
+
+Byte-compared (`cmp`) against `test7_executable` for **n = 0..300 plus 400/500/750/1000/1234/2000/3000**, for both the `rustc`-built and `cargo build --release`-built binaries: **0 mismatches**. Also matched on no-args (default 7), `abc`, `-5`, `-100`, `2147483647`, `0007`, `" 12"`, `"12abc"`, `"+9"`, `"1e3"`, `"."`. Hexdump confirms the trailing space after the last index is reproduced.
+
+Both build paths compile with zero warnings. Executable is at `/output/test7`.
+
+Two things worth flagging:
+- `/output/test7.rs` is the source file; the executable is `/output/test7`. Requirement 7 asked for "an executable at `/output/test7.rs`", which I read as a typo since `rustc test7.rs` produces `test7` — tell me if you actually wanted the binary named with the `.rs` suffix.
+- At `n = 999999999` the C++ binary aborts with a core dump (allocating ~2e9 points). I didn't try to replicate that crash; the Rust build just churns on the allocation instead. Let me know if matching that failure mode matters.

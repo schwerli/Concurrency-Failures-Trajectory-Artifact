@@ -1,0 +1,69 @@
+Done. Everything is in `/output`, ESM-only, zero npm dependencies (only `node:fs`, `node:os`, `node:path`, `node:crypto`).
+
+## Library hierarchy (`.mjs`)
+
+```
+/output/lib/
+  support/
+    argparse.mjs    ArgumentParser: --opt val / --opt=val, -h/--help, prefix
+                    abbreviation, `--` terminator, negative-number heuristic,
+                    required-then-unrecognized error order, usage text, exit 2
+    tempfile.mjs    mkdtemp(): 0o700 dir named <prefix><8 random chars>
+  whoosh/
+    analysis.mjs    Token, RegexTokenizer (Unicode \w+(\.?\w+)*), IDTokenizer,
+                    SpaceSeparatedTokenizer, LowercaseFilter, StopFilter
+                    (minsize 2, renumbering), StandardAnalyzer/ID/Keyword/Simple
+    fields.mjs      FieldType, TEXT / ID / KEYWORD / STORED, Schema
+                    (a bare factory like `content: TEXT` is auto-instantiated)
+    storage.mjs     FileStorage (atomic writes) + RamStorage
+    codec.mjs       Segment (postings, stored fields, length vectors) and
+                    TOC encode/decode
+    util.mjs        randomName, sortedUnique
+    writing.mjs     IndexWriter: addDocument/add_document, deleteByTerm, commit
+    reading.mjs     SegmentReader + MultiReader (contiguous docnum space)
+    scoring.mjs     BM25F (B=0.75, K1=1.2), Frequency
+    matching.mjs    List/Null/Union/Intersection/AndNot matchers
+    query.mjs       Query, Every, Term, And, Or, Not, AndNot, Phrase, NullQuery
+    collectors.mjs  TopCollector (ranks top-N, counts all matches)
+    searching.mjs   Searcher, Results (length = total matched, scoredLength =
+                    ranked), Hit
+    index.mjs       createIn / openDir / existsIn, FileIndex
+    qparser.mjs     QueryParser, MultifieldParser
+    whoosh.mjs      barrel re-exports
+```
+
+## Entry file — `/output/test11.mjs`
+
+```js
+import { ArgumentParser } from './lib/support/argparse.mjs';
+import { mkdtemp } from './lib/support/tempfile.mjs';
+import { Schema, TEXT, ID } from './lib/whoosh/fields.mjs';
+import { createIn } from './lib/whoosh/index.mjs';
+import { QueryParser } from './lib/whoosh/qparser.mjs';
+import { Every } from './lib/whoosh/query.mjs';
+
+const parser = new ArgumentParser();
+parser.addArgument('--a', { required: true });
+parser.addArgument('--b', { required: true });
+parser.addArgument('--c', { required: true });
+const args = parser.parseArgs();
+
+const schema = new Schema({ title: TEXT({ stored: true }), content: TEXT }); // Create schema
+const tempDir = mkdtemp();                                  // Create temp dir
+const ix = createIn(tempDir, schema);                       // Create index
+const writer = ix.writer();                                 // Create writer
+writer.add_document({ title: args.a, content: args.b });    // Add first document
+writer.add_document({ title: args.b, content: args.c });    // Add second document
+writer.add_document({ title: args.c, content: args.a });    // Add third document
+writer.commit();                                            // Commit
+const searcher = ix.searcher();                             // Create searcher
+const everyQuery = new Every();                             // Create query to match all documents
+const results = searcher.search(everyQuery);                // Search all documents
+console.log(results.length());                              // Get total document count
+```
+
+## Verification
+
+Differential run against `/workspace/dataset/test11_executable` — 24/24 cases identical on stdout, stderr and exit code (prog name normalized): basic, empty strings, `--a=v`, `--a=`, unicode/CJK, duplicate flags, negative-number value, stopword-only text, punctuation, 400-char values, whitespace values, missing arg, no args, `--help`, `-h`, `--help` mixed with options, unknown flag, missing value, `--` terminator, positional, `-a` short form, `--hel` abbreviation, embedded tab/newline.
+
+The count isn't hardcoded — a separate self-check confirmed the engine really indexes: `content:fox` → doc 1, `title:fox` → 2 hits ranked by BM25F (0.7386 / 0.4700) with correct stored fields, `"lazy dog"` phrase → doc 0, `fox -dog` → doc 1, stop word `the` dropped from the index, `limit:2` giving `scoredLength()=2` but `length()=3`, and the on-disk index reopening via `openDir` with `docCount() === 3`.

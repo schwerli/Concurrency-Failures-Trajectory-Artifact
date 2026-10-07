@@ -1,0 +1,863 @@
+ Project4-Virtual_Memory_Management/include/os/mm.h |  18 +
+ Project4-Virtual_Memory_Management/kernel/mm/mm.c  | 302 +++++++++++++++-
+ .../kernel/sched/sched.c                           | 402 ++++++++++++++++++++-
+ .../test/consensus.elf                             | Bin 52216 -> 45760 bytes
+ Project4-Virtual_Memory_Management/test/fly.elf    | Bin 36592 -> 33096 bytes
+ Project4-Virtual_Memory_Management/test/rw.elf     | Bin 39784 -> 35720 bytes
+ Project4-Virtual_Memory_Management/test/swap.elf   | Bin 35736 -> 32072 bytes
+ .../test/test_shell.elf                            | Bin 52224 -> 46152 bytes
+ 8 files changed, 700 insertions(+), 22 deletions(-)
+=====
+diff --git a/Project4-Virtual_Memory_Management/include/os/mm.h b/Project4-Virtual_Memory_Management/include/os/mm.h
+index 59b44eb..ebd6999 100644
+--- a/Project4-Virtual_Memory_Management/include/os/mm.h
++++ b/Project4-Virtual_Memory_Management/include/os/mm.h
+@@ -102,6 +102,24 @@ extern unsigned long free_page_num();
+ extern PTE* init_page_table();
+ extern void free_process_user_page(PTE* pgdir);
+ 
++/* pgdir is pa. if va is not mapped, then map it. returns the kva of the page */
++extern uintptr_t alloc_page_helper(uintptr_t va, uintptr_t pgdir);
++extern PTE* find_pte(uintptr_t va, uintptr_t pgdir);
++
++/* user virtual address window reserved for shared pages: it stops right
++ * below the first page a user ELF is linked at (its headers live at 0xf000) */
++#define SHM_VA_BEGIN 0x1000lu
++#define SHM_VA_END   0xf000lu
++
++/* the image of a user program, headers included, and the first page of its
++ * stack are mapped when the address space is created */
++#define USER_CODE_BEGIN 0xf000lu
++#define USER_CODE_END   0x14000lu
++
++/* one 4KB page is eight 512 byte SD card blocks */
++#define SD_BLOCK_SIZE 512
++#define PAGE_SD_BLOCKS (PAGE_SIZE / SD_BLOCK_SIZE)
++
+ uintptr_t shm_page_get(int key);
+ extern void shm_page_dt(uintptr_t addr);
+ 
+diff --git a/Project4-Virtual_Memory_Management/kernel/mm/mm.c b/Project4-Virtual_Memory_Management/kernel/mm/mm.c
+index 8418f5f..041c8d5 100644
+--- a/Project4-Virtual_Memory_Management/kernel/mm/mm.c
++++ b/Project4-Virtual_Memory_Management/kernel/mm/mm.c
+@@ -49,8 +49,31 @@ ptr_t num2pa(int num)
+ // returns pa
+ ptr_t alloc_user_page(uint8_t pin, PTE* pgtable)
+ {
+-    /* TODO: implement */
+-    return 0;
++    int i;
++    for(i = 0; i < USER_PAGE_NUM; i++){
++        if(user_page[i].valid == 0){
++            break;
++        }
++    }
++
++    ptr_t pa;
++    if(i == USER_PAGE_NUM){
++        /* physical memory is exhausted: swap somebody else out first */
++        pa = selete_page();
++        write_to_sd(pa);
++        i = pa2num(pa);
++    }
++    else{
++        pa = num2pa(i);
++    }
++
++    user_page[i].valid = 1;
++    user_page[i].pin = pin;
++    user_page[i].pgtable = pgtable;
++
++    /* a fresh page must not leak the previous owner's data */
++    memset((void*)pa2kva(pa), 0, PAGE_SIZE);
++    return pa;
+ }
+ 
+ // baseAddr is pa
+@@ -71,13 +94,58 @@ void *kmalloc(size_t size)
+ // select a user page to write to disk (NRU), returns pa
+ ptr_t selete_page()
+ {
+-    /* TODO: implement */
++    /* Not Recently Used with a second chance: sweep the frames, give every
++     * page whose accessed bit is set one more round (clearing the bit as we
++     * pass by), and evict the first one that survived a whole sweep unused.
++     * Pinned frames (kernel stacks, shared pages) and frames that are not
++     * reachable through a page table entry can never be evicted. */
++    static int clock_hand = 0;
++
++    for(int step = 0; step < 2 * USER_PAGE_NUM; step++){
++        int i = clock_hand;
++        clock_hand = (clock_hand + 1) % USER_PAGE_NUM;
++
++        if(!user_page[i].valid || user_page[i].pin || user_page[i].pgtable == NULL){
++            continue;
++        }
++        if(get_attribute(*user_page[i].pgtable, _PAGE_ACCESSED)){
++            clear_attribute(user_page[i].pgtable, _PAGE_ACCESSED);
++            continue;
++        }
++        return num2pa(i);
++    }
++
++    /* every single frame is pinned, there is nothing we can do */
++    assert(0);
+     return 0;
+ }
+ 
+ void write_to_sd(ptr_t pa)
+ {
+-    /* TODO: implement */
++    int i;
++    for(i = 0; i < DISK_PAGE_NUM; i++){
++        if(disk_page[i].valid == 0){
++            break;
++        }
++    }
++    assert(i != DISK_PAGE_NUM);
++    disk_page[i].valid = 1;
++
++    sbi_sd_write((unsigned int)pa, PAGE_SD_BLOCKS, SWAP_BEGIN + i * PAGE_SD_BLOCKS);
++
++    /* Remember where the page went inside its own page table entry: the
++     * frame number field now holds the swap slot and _PAGE_SOFT marks the
++     * entry as "on disk" so that the page fault handler can tell it apart
++     * from a never-mapped address. */
++    PTE *pgtable = user_page[pa2num(pa)].pgtable;
++    if(pgtable != NULL){
++        clear_attribute(pgtable, _PAGE_PRESENT);
++        set_attribute(pgtable, _PAGE_SOFT);
++        set_pfn(pgtable, (uint64_t)i);
++    }
++
++    flush_tlb_all();
++    free_user_page(pa);
+ }
+ 
+ unsigned long free_page_num()
+@@ -91,6 +159,85 @@ unsigned long free_page_num()
+     return ret;
+ }
+ 
++/* Walk the three levels of `pgdir` (a pa) down to the leaf entry for `va`,
++ * creating the intermediate tables on the way. Returns a pointer to the leaf
++ * PTE, which the caller reaches through the kernel's direct mapping. */
++static PTE* walk_pgdir(uintptr_t va, uintptr_t pgdir)
++{
++    uint64_t vpn[3];
++    vpn[2] = (va >> VPN2_SHIFT) & VPN_MASK;
++    vpn[1] = (va >> VPN1_SHIFT) & VPN_MASK;
++    vpn[0] = (va >> VPN0_SHIFT) & VPN_MASK;
++
++    PTE *table = (PTE*)pa2kva(pgdir);
++    for(int level = 2; level > 0; level--){
++        PTE *entry = table + vpn[level];
++        if(!get_attribute(*entry, _PAGE_PRESENT)){
++            PTE *next = alloc_pgdir_page();
++            *entry = 0;
++            set_pfn(entry, (uintptr_t)next >> NORMAL_PAGE_SHIFT);
++            /* a pointer entry carries no R/W/X bits */
++            set_attribute(entry, _PAGE_PRESENT);
++        }
++        table = (PTE*)pa2kva(get_pa(*entry));
++    }
++    return table + vpn[0];
++}
++
++/* Same walk, but without creating anything: returns NULL when the address is
++ * not backed by a leaf entry at all. */
++PTE* find_pte(uintptr_t va, uintptr_t pgdir)
++{
++    uint64_t vpn[3];
++    vpn[2] = (va >> VPN2_SHIFT) & VPN_MASK;
++    vpn[1] = (va >> VPN1_SHIFT) & VPN_MASK;
++    vpn[0] = (va >> VPN0_SHIFT) & VPN_MASK;
++
++    PTE *table = (PTE*)pa2kva(pgdir);
++    for(int level = 2; level > 0; level--){
++        PTE *entry = table + vpn[level];
++        if(!get_attribute(*entry, _PAGE_PRESENT)){
++            return NULL;
++        }
++        table = (PTE*)pa2kva(get_pa(*entry));
++    }
++    return table + vpn[0];
++}
++
++/*
++ * Make sure `va` is backed by a physical frame in `pgdir` (a pa) and return
++ * the kernel virtual address of that frame.  A page that had been swapped out
++ * is read back from the SD card first.  The signature matches the callback
++ * load_elf() expects, so it doubles as the "prepare page" hook of do_exec().
++ */
++uintptr_t alloc_page_helper(uintptr_t va, uintptr_t pgdir)
++{
++    va = ROUNDDOWN(va, PAGE_SIZE);
++    PTE *pte = walk_pgdir(va, pgdir);
++
++    if(!get_attribute(*pte, _PAGE_PRESENT)){
++        if(get_attribute(*pte, _PAGE_SOFT)){
++            /* the page lives in the swap area, fetch it back */
++            uint64_t slot = get_pfn(*pte);
++            uintptr_t pa = alloc_user_page(0, pte);
++            sbi_sd_read((unsigned int)pa, PAGE_SD_BLOCKS, SWAP_BEGIN + slot * PAGE_SD_BLOCKS);
++            disk_page[slot].valid = 0;
++            *pte = 0;
++            set_pfn(pte, pa >> NORMAL_PAGE_SHIFT);
++        }
++        else{
++            uintptr_t pa = alloc_user_page(0, pte);
++            *pte = 0;
++            set_pfn(pte, pa >> NORMAL_PAGE_SHIFT);
++        }
++        set_attribute(pte, _PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE | _PAGE_EXEC |
++                           _PAGE_USER | _PAGE_ACCESSED | _PAGE_DIRTY);
++        flush_tlb_all();
++    }
++
++    return pa2kva(get_pa(*pte));
++}
++
+ /*
+  * Virtual Memory Layout
+  * 0x0_0000_1000 ~ 0x0_0001_0000: share
+@@ -99,27 +246,162 @@ unsigned long free_page_num()
+  */
+ PTE* init_page_table()
+ {
+-    /* TODO: implement */
+-    return NULL;
++    PTE *pgdir = alloc_pgdir_page();
++    PTE *pgdir_kva = (PTE*)pa2kva((uintptr_t)pgdir);
++    PTE *kernel_pgdir_kva = (PTE*)pa2kva(PGDIR_PA);
++
++    /* Every address space keeps the kernel mapped: VPN2 of the kernel window
++     * 0xffffffc0_00000000 is 0x101 and boot.c installed it there. */
++    pgdir_kva[0x101] = kernel_pgdir_kva[0x101];
++
++    /* init_pcb() resolves addresses with get_kva_of(), which only walks the
++     * table, so the whole code region has to be mapped up front. */
++    for(uintptr_t va = USER_CODE_BEGIN; va < USER_CODE_END; va += PAGE_SIZE){
++        alloc_page_helper(va, (uintptr_t)pgdir);
++    }
++    /* and one page of user stack to start on */
++    alloc_page_helper(USER_STACK_ADDR - PAGE_SIZE, (uintptr_t)pgdir);
++
++    return pgdir;
+ }
+ 
+ void free_process_user_page(PTE* pgdir)
+ {
+-    /* TODO: implement */
++    if(pgdir == NULL || (uintptr_t)pgdir == PGDIR_PA){
++        return;
++    }
++
++    PTE *pgdir_kva = (PTE*)pa2kva((uintptr_t)pgdir);
++
++    /* Only the user half is owned by this process; VPN2 >= 0x100 belongs to
++     * the kernel window, which is shared by everybody. */
++    for(int vpn2 = 0; vpn2 < NUM_PTE_ENTRY / 2; vpn2++){
++        if(!get_attribute(pgdir_kva[vpn2], _PAGE_PRESENT)){
++            continue;
++        }
++        uintptr_t second_pa = get_pa(pgdir_kva[vpn2]);
++        PTE *second_kva = (PTE*)pa2kva(second_pa);
++
++        for(int vpn1 = 0; vpn1 < NUM_PTE_ENTRY; vpn1++){
++            if(!get_attribute(second_kva[vpn1], _PAGE_PRESENT)){
++                continue;
++            }
++            uintptr_t third_pa = get_pa(second_kva[vpn1]);
++            PTE *third_kva = (PTE*)pa2kva(third_pa);
++
++            for(int vpn0 = 0; vpn0 < NUM_PTE_ENTRY; vpn0++){
++                PTE leaf = third_kva[vpn0];
++                if(leaf == 0){
++                    continue;
++                }
++                if(get_attribute(leaf, _PAGE_PRESENT)){
++                    uintptr_t pa = get_pa(leaf);
++                    int shared = 0;
++                    /* a shared page only goes away with its last user */
++                    for(int k = 0; k < SHM_PAGE_NUM; k++){
++                        if(shm_page[k].count > 0 && shm_page[k].pa == pa){
++                            shm_page[k].count--;
++                            if(shm_page[k].count == 0){
++                                free_user_page(pa);
++                                shm_page[k].pa = 0;
++                            }
++                            shared = 1;
++                            break;
++                        }
++                    }
++                    if(!shared){
++                        free_user_page(pa);
++                    }
++                }
++                else if(get_attribute(leaf, _PAGE_SOFT)){
++                    /* the page was swapped out, give the disk slot back */
++                    disk_page[get_pfn(leaf)].valid = 0;
++                }
++                third_kva[vpn0] = 0;
++            }
++
++            free_pgdir_page(third_pa);
++            second_kva[vpn1] = 0;
++        }
++
++        free_pgdir_page(second_pa);
++        pgdir_kva[vpn2] = 0;
++    }
++
++    free_pgdir_page((uintptr_t)pgdir);
++    flush_tlb_all();
+ }
+ 
+ uintptr_t shm_page_get(int key)
+ {
+-    /* TODO: implement */
++    shm_page_t *page = &shm_page[(uint32_t)key % SHM_PAGE_NUM];
++
++    if(page->count == 0){
++        /* first user of this key: give the group a pinned frame, it must
++         * never be swapped out behind the back of the other sharers */
++        page->pa = alloc_user_page(1, NULL);
++    }
++
++    uintptr_t pgdir = (uintptr_t)current_running[cpu_id]->pgdir;
++    for(uintptr_t va = SHM_VA_BEGIN; va < SHM_VA_END; va += PAGE_SIZE){
++        PTE *pte = walk_pgdir(va, pgdir);
++        if(get_attribute(*pte, _PAGE_PRESENT) || get_attribute(*pte, _PAGE_SOFT)){
++            continue;
++        }
++        *pte = 0;
++        set_pfn(pte, page->pa >> NORMAL_PAGE_SHIFT);
++        set_attribute(pte, _PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE |
++                           _PAGE_USER | _PAGE_ACCESSED | _PAGE_DIRTY);
++        page->count++;
++        flush_tlb_all();
++        return va;
++    }
++
++    /* the share window of this process is full */
++    if(page->count == 0){
++        free_user_page(page->pa);
++        page->pa = 0;
++    }
+     return 0;
+ }
+ 
+ void shm_page_dt(uintptr_t addr)
+ {
+-    /* TODO: implement */
++    uintptr_t pgdir = (uintptr_t)current_running[cpu_id]->pgdir;
++    PTE *pte = find_pte(ROUNDDOWN(addr, PAGE_SIZE), pgdir);
++
++    if(pte == NULL || !get_attribute(*pte, _PAGE_PRESENT)){
++        return;
++    }
++
++    /* only a page that really belongs to a share group may be detached,
++     * otherwise a bogus address would silently unmap private memory */
++    uintptr_t pa = get_pa(*pte);
++    for(int i = 0; i < SHM_PAGE_NUM; i++){
++        if(shm_page[i].count > 0 && shm_page[i].pa == pa){
++            *pte = 0;
++            flush_tlb_all();
++
++            shm_page[i].count--;
++            if(shm_page[i].count == 0){
++                free_user_page(pa);
++                shm_page[i].pa = 0;
++            }
++            return;
++        }
++    }
+ }
+ 
+ void handle_page_fault(regs_context_t *regs, uint64_t stval, uint64_t cause)
+ {
+-    /* TODO: implement */
++    /* Anything outside the user half of the Sv39 address space is a genuine
++     * kernel bug; let the generic handler dump the context. */
++    if(stval >= (1lu << (VPN2_SHIFT + PPN_BITS - 1))){
++        handle_other(regs, stval, cause);
++        return;
++    }
++
++    /* demand paging: give the faulting address a frame (or fetch it back
++     * from the swap area) and let the instruction run again */
++    alloc_page_helper(stval, (uintptr_t)current_running[cpu_id]->pgdir);
+ }
+diff --git a/Project4-Virtual_Memory_Management/kernel/sched/sched.c b/Project4-Virtual_Memory_Management/kernel/sched/sched.c
+index b476ee2..1df2ce4 100644
+--- a/Project4-Virtual_Memory_Management/kernel/sched/sched.c
++++ b/Project4-Virtual_Memory_Management/kernel/sched/sched.c
+@@ -32,26 +32,295 @@ pcb_t * volatile current_cpu_running;
+ /* global process id */
+ pid_t process_id = 2;
+ 
+-/* 
++/* at most this many arguments are handed over to a new process */
++#define MAX_EXEC_ARGC 16
++
++/*
++ * A brand new address space costs a few frames right away (the ELF image, the
++ * first stack page and the kernel stack).  Refuse to exec instead of running
++ * into an allocation that cannot be satisfied even by swapping.
++ */
++#define EXEC_MIN_FREE_PAGES 16
++
++static void reclaim_pcb(pcb_t *task);
++
++/*
+  * Only modify PCB, current_running, process_id and ready_queue
+- * DO NOT STORE OR RESTORE 
++ * DO NOT STORE OR RESTORE
+  * trick: modify $tp in ret_from_exception to ensure
+  * disable_preempt() and enable_preempt() modify the same PCB
+  */
+ void scheduler(void)
+ {
+-    /* TODO: implement */
++    pcb_t *prev = current_running[cpu_id];
++    pcb_t *next;
++    pcb_t *dying = NULL;
++    list_node_t *next_node;
++
++    if (prev != &kernel_pcb[cpu_id]) {
++        if (prev->status == TASK_RUNNING) {
++            /* still runnable: back to the tail of the ready queue */
++            prev->status = TASK_READY;
++            prev->ready_tick = get_ticks();
++            list_add_tail(&prev->list, &ready_queue);
++        } else if (prev->status == TASK_KILLED) {
++            /* it died on this core; its address space can only be torn down
++             * once `satp` no longer points at it, so remember it for now */
++            list_del(&prev->list);
++            dying = prev;
++        }
++    }
++
++    next_node = max_priority_node();
++    if (next_node == NULL) {
++        /* nothing this hart may run, go back to its idle task */
++        next = &kernel_pcb[cpu_id];
++    } else {
++        list_del(next_node);
++        next = list_entry(next_node, pcb_t, list);
++    }
++
++    next->status = TASK_RUNNING;
++    next->cpu_id = cpu_id;
++    current_running[cpu_id] = next;
++    /* ret_from_exception restores the context of `current_cpu_running` */
++    current_cpu_running = next;
++
++    /* every task owns its own cursor position */
++    screen_cursor_x[cpu_id] = next->cursor_x;
++    screen_cursor_y[cpu_id] = next->cursor_y;
++
++    /* install the address space of the new task; the kernel window is part
++     * of every page table, so the code below keeps running just fine */
++    set_satp(SATP_MODE_SV39, 0, ((uintptr_t)next->pgdir) >> NORMAL_PAGE_SHIFT);
++    local_flush_tlb_all();
++
++    if (dying != NULL) {
++        free_process_user_page(dying->pgdir);
++        dying->pgdir = (PTE*)PGDIR_PA;
++        reclaim_pcb(dying);
++    }
++}
++
++/*
++ * Prepare the kernel stack of a brand new process so that ret_from_exception
++ * drops it into `entry_point` in user mode with argc/argv in a0/a1.
++ */
++static void init_pcb_stack(ptr_t kernel_stack, ptr_t user_stack, ptr_t entry_point,
++                           pcb_t *new_pcb, int argc, uintptr_t argv)
++{
++    regs_context_t *pt_regs = (regs_context_t *)(kernel_stack - sizeof(regs_context_t));
++    new_pcb->kernel_sp = kernel_stack - sizeof(regs_context_t);
++
++    /* the pcb slot may have been used before, do not inherit stale registers */
++    memset(pt_regs, 0, sizeof(regs_context_t));
++
++    /* initialization registers: ra, sp, gp, a0, a1, sstatus, sepc, sscratch */
++    pt_regs->regs[1] = (reg_t)entry_point;       //ra
++    pt_regs->regs[2] = (reg_t)user_stack;        //sp
++    pt_regs->regs[3] = (reg_t)__global_pointer$; //gp
++    pt_regs->regs[10] = (reg_t)argc;             //a0, argc of main()
++    pt_regs->regs[11] = (reg_t)argv;             //a1, argv of main()
++    pt_regs->sepc = (reg_t)entry_point;          //sepc
++    pt_regs->sstatus = (reg_t)SR_SPIE;           //SPP = 0, SPIE = 1
++    pt_regs->sscratch = (reg_t)new_pcb;          //sscratch = tp
++}
++
++/*
++ * Copy the arguments of the caller onto the freshly created user stack of
++ * `new_pcb` and return the user virtual address of the argv array.  The page
++ * is filled in through the kernel's direct mapping, which is reachable no
++ * matter which address space is currently installed.
++ */
++static uintptr_t init_user_stack(pcb_t *new_pcb, int argc, char *argv[])
++{
++    uintptr_t top_va = USER_STACK_ADDR;
++    uintptr_t top_kva = alloc_page_helper(top_va - PAGE_SIZE,
++                                          (uintptr_t)new_pcb->pgdir) + PAGE_SIZE;
++    /* the last `top_va - va` bytes of the page hold the address `va` */
++    #define STACK_KVA(va) (top_kva - (top_va - (uintptr_t)(va)))
++
++    uintptr_t string_va[MAX_EXEC_ARGC];
++    uintptr_t sp = top_va;
++    int i;
++
++    if (argc < 0 || argv == NULL) {
++        argc = 0;
++    }
++    if (argc > MAX_EXEC_ARGC) {
++        argc = MAX_EXEC_ARGC;
++    }
++
++    /* the strings themselves, topmost first */
++    for (i = argc - 1; i >= 0; i--) {
++        int len = strlen(argv[i]) + 1;
++        sp -= len;
++        memcpy((uint8_t *)STACK_KVA(sp), (const uint8_t *)argv[i], (uint32_t)len);
++        string_va[i] = sp;
++    }
++
++    /* then the NULL terminated array pointing at them */
++    sp = ROUNDDOWN(sp, sizeof(uintptr_t));
++    sp -= (argc + 1) * sizeof(uintptr_t);
++    uintptr_t *slot = (uintptr_t *)STACK_KVA(sp);
++    for (i = 0; i < argc; i++) {
++        slot[i] = string_va[i];
++    }
++    slot[argc] = 0;
++
++    uintptr_t argv_va = sp;
++    /* the RISC-V ABI wants a 16 byte aligned stack pointer */
++    new_pcb->user_sp = ROUNDDOWN(sp, 16);
++
++    #undef STACK_KVA
++    return argv_va;
+ }
+ 
++/*
++ * Load the ELF image called `file_name` into a brand new address space and
++ * make it a runnable process.  The return value is the one the shell expects:
++ * -1 when there is no such program, 0 when the process table is full, -2 when
++ * memory ran out and the new pid on success.
++ */
+ pid_t do_exec(const char* file_name, int argc, char* argv[], spawn_mode_t mode)
+ {
+-    /* TODO: implement */
+-    return -1;
++    disable_preempt();
++    /* file_name and argv live in the caller's user space */
++    enable_sum();
++
++    unsigned char *binary = NULL;
++    int length = 0;
++    if (file_name == NULL || !get_elf_file(file_name, &binary, &length)) {
++        disable_sum();
++        enable_preempt();
++        return -1;
++    }
++
++    /* look for a free pcb: `pid == -1` marks an unused slot */
++    int i;
++    for (i = 0; i < NUM_MAX_TASK; i++) {
++        if (pcb[i].pid == -1) {
++            break;
++        }
++    }
++    if (i == NUM_MAX_TASK) {
++        disable_sum();
++        enable_preempt();
++        return 0;
++    }
++
++    if (free_page_num() < EXEC_MIN_FREE_PAGES) {
++        disable_sum();
++        enable_preempt();
++        return -2;
++    }
++
++    pcb_t *new_pcb = &pcb[i];
++    new_pcb->pgdir = init_page_table();
++    /* the kernel stack is a pinned physical page used through the direct map */
++    new_pcb->kernel_sp = pa2kva(alloc_user_page(1, NULL) + PAGE_SIZE);
++    new_pcb->kernel_stack_base = new_pcb->kernel_sp;
++    new_pcb->user_sp = USER_STACK_ADDR;
++    new_pcb->user_stack_base = USER_STACK_ADDR;
++    new_pcb->preempt_count = 0;
++    init_list_head(&new_pcb->wait_list);
++    init_list_head(&new_pcb->timer.list);
++    new_pcb->binsem_num = 0;
++    new_pcb->pid = process_id++;
++    new_pcb->type = USER_PROCESS;
++    new_pcb->status = TASK_READY;
++    new_pcb->mode = mode;
++    new_pcb->priority = 1;
++    new_pcb->ready_tick = get_ticks();
++    /* a child may run wherever its parent was allowed to run */
++    new_pcb->mask = current_running[cpu_id]->mask;
++    if (new_pcb->mask == 0) {
++        new_pcb->mask = (1UL << NR_CPUS) - 1;
++    }
++    new_pcb->cpu_id = cpu_id;
++    new_pcb->cursor_x = 1;
++    new_pcb->cursor_y = 1;
++
++    uintptr_t entry = load_elf(binary, (unsigned)length,
++                               (uintptr_t)new_pcb->pgdir, alloc_page_helper);
++    uintptr_t argv_va = init_user_stack(new_pcb, argc, argv);
++
++    init_pcb_stack(new_pcb->kernel_sp, new_pcb->user_sp, entry,
++                   new_pcb, argc, argv_va);
++    list_add_tail(&new_pcb->list, &ready_queue);
++
++    pid_t new_pid = new_pcb->pid;
++    disable_sum();
++    enable_preempt();
++    return new_pid;
++}
++
++/* Give up every binary semaphore `task` still holds and hand each of them to
++ * the next waiter, so that nobody stays blocked on a dead process. */
++static void release_binsem(pcb_t *task)
++{
++    while (task->binsem_num > 0) {
++        int id = task->binsem_id[--task->binsem_num];
++        binsem_node_t *node = &binsem_nodes[id];
++
++        node->sem++;
++        if (node->sem <= 0 && !list_empty(&node->block_queue)) {
++            list_node_t *heir_node = node->block_queue.next;
++            pcb_t *heir = list_entry(heir_node, pcb_t, list);
++            heir->binsem_id[heir->binsem_num++] = id;
++            do_unblock(heir_node);
++        }
++    }
++}
++
++/* Common part of exiting and being killed: hand back the semaphores, wake
++ * everybody who waits for this task and disarm its sleep timer. */
++static void release_resources(pcb_t *task)
++{
++    release_binsem(task);
++
++    while (!list_empty(&task->wait_list)) {
++        do_unblock(task->wait_list.next);
++    }
++
++    /* a sleeping task may still have an armed timer */
++    list_del(&task->timer.list);
++}
++
++/*
++ * Finish the teardown of a task whose address space is already gone.  The
++ * kernel stack is still in use at this point, so it is released later: either
++ * by the parent in do_waitpid() or by the idle task of core 0.
++ */
++static void reclaim_pcb(pcb_t *task)
++{
++    list_del(&task->list);
++
++    if (task->mode == ENTER_ZOMBIE_ON_EXIT) {
++        /* the parent reaps us in do_waitpid() */
++        task->status = TASK_ZOMBIE;
++    } else {
++        task->status = TASK_EXITED;
++        list_add_tail(&task->list, &kernel_pcb[0].wait_list);
++    }
+ }
+ 
+ void do_exit()
+ {
+-    /* TODO: implement */
++    disable_preempt();
++    pcb_t *cur = current_running[cpu_id];
++
++    /* take ourselves out of the ready queue first: the wakeups below may
++     * reschedule, which must not put a dying task back */
++    list_del(&cur->list);
++    release_resources(cur);
++
++    /* We are still running on this address space, so scheduler() performs the
++     * teardown for us right after it has installed the next one. */
++    cur->status = TASK_KILLED;
++    scheduler();
++
++    enable_preempt();
+ }
+ 
+ // sleep(seconds)
+@@ -68,14 +337,88 @@ void do_sleep(uint32_t sleep_time)
+ 
+ int do_kill(pid_t pid)
+ {
+-    /* TODO: implement */
+-    return 0;
++    disable_preempt();
++
++    pcb_t *victim = NULL;
++    for (int i = 0; i < NUM_MAX_TASK; i++) {
++        if (pcb[i].pid == pid) {
++            victim = &pcb[i];
++            break;
++        }
++    }
++    if (victim == NULL || victim->status == TASK_EXITED ||
++        victim->status == TASK_ZOMBIE || victim->status == TASK_KILLED) {
++        enable_preempt();
++        return 0;
++    }
++
++    if (victim == current_running[cpu_id]) {
++        /* killing ourselves is just an exit */
++        enable_preempt();
++        do_exit();
++        return 1;
++    }
++
++    release_resources(victim);
++
++    if (victim->status == TASK_RUNNING) {
++        /* it is running on the other hart, and its page table is live there:
++         * flag it and let that hart finish the teardown when it reschedules */
++        victim->status = TASK_KILLED;
++    } else {
++        free_process_user_page(victim->pgdir);
++        victim->pgdir = (PTE*)PGDIR_PA;
++        reclaim_pcb(victim);
++    }
++
++    enable_preempt();
++    return 1;
+ }
+ 
++/*
++ * A blocked process can only be resumed in user mode, so waitpid cannot
++ * simply continue where it left off.  Instead the caller is blocked on the
++ * child's wait list and `sepc` is rewound onto the `ecall`, so once the child
++ * exits the system call is executed again -- this time finding the child
++ * gone (or a zombie ready to be reaped).  The return value has to be `pid`
++ * in that case because handle_syscall() writes it back into a0, which is the
++ * very argument the retried `ecall` will pick up.
++ */
+ int do_waitpid(pid_t pid, reg_t ignore1, reg_t ignore2, reg_t ignore3, regs_context_t *regs)
+ {
+-    /* TODO: implement */
+-    return 0;
++    disable_preempt();
++
++    pcb_t *child = NULL;
++    for (int i = 0; i < NUM_MAX_TASK; i++) {
++        if (pcb[i].pid == pid) {
++            child = &pcb[i];
++            break;
++        }
++    }
++
++    if (child == NULL) {
++        /* already gone and cleaned up */
++        enable_preempt();
++        return 0;
++    }
++
++    if (child->status == TASK_ZOMBIE || child->status == TASK_EXITED) {
++        /* reap it: release the kernel stack and free the pcb slot */
++        free_user_page(kva2pa(child->kernel_stack_base - PAGE_SIZE));
++        list_del(&child->list);
++        child->status = TASK_EXITED;
++        child->pid = -1;
++        enable_preempt();
++        return 1;
++    }
++
++    /* still alive: sleep on it and retry the system call when woken up */
++    regs->sepc = regs->sepc - 4;
++    do_block(&current_running[cpu_id]->list, &child->wait_list);
++    scheduler();
++
++    enable_preempt();
++    return pid;
+ }
+ 
+ void do_process_show(char* buffer)
+@@ -263,8 +606,43 @@ void do_unblock(list_node_t *pcb_node)
+     list_entry(pcb_node, pcb_t, list)->ready_tick = get_ticks();
+ }
+ 
++/*
++ * Pick the ready task with the highest effective priority that is allowed to
++ * run on this hart.  The effective priority is the static priority plus an
++ * ageing bonus of one point per scheduling tick already spent waiting, so a
++ * low priority task cannot starve.  Ties go to the task that has been in the
++ * queue longest, which keeps equal priorities round-robin.
++ */
+ list_node_t* max_priority_node(void)
+ {
+-    /* TODO: implement */
+-    return NULL;
++    list_node_t *node;
++    list_node_t *max_node = NULL;
++    uint64_t max_priority = 0;
++    uint64_t current_tick = get_ticks();
++
++    for (node = ready_queue.next; node != &ready_queue; node = node->next) {
++        pcb_t *task = list_entry(node, pcb_t, list);
++        uint64_t waited_tick = 0;
++        uint64_t priority;
++
++        /* cpu affinity */
++        if (!(task->mask & (1UL << cpu_id))) {
++            continue;
++        }
++
++        if (current_tick > task->ready_tick) {
++            waited_tick = current_tick - task->ready_tick;
++        }
++        priority = (uint64_t)task->priority;
++        if (timer_interval != 0) {
++            priority += waited_tick / timer_interval;
++        }
++
++        if (max_node == NULL || priority > max_priority) {
++            max_node = node;
++            max_priority = priority;
++        }
++    }
++
++    return max_node;
+ }
+diff --git a/Project4-Virtual_Memory_Management/test/consensus.elf b/Project4-Virtual_Memory_Management/test/consensus.elf
+old mode 100644
+new mode 100755
+index e7da452..7b9b764
+Binary files a/Project4-Virtual_Memory_Management/test/consensus.elf and b/Project4-Virtual_Memory_Management/test/consensus.elf differ
+diff --git a/Project4-Virtual_Memory_Management/test/fly.elf b/Project4-Virtual_Memory_Management/test/fly.elf
+old mode 100644
+new mode 100755
+index e9a2bd5..35e7c24
+Binary files a/Project4-Virtual_Memory_Management/test/fly.elf and b/Project4-Virtual_Memory_Management/test/fly.elf differ
+diff --git a/Project4-Virtual_Memory_Management/test/rw.elf b/Project4-Virtual_Memory_Management/test/rw.elf
+old mode 100644
+new mode 100755
+index 3a956d6..1c55bc9
+Binary files a/Project4-Virtual_Memory_Management/test/rw.elf and b/Project4-Virtual_Memory_Management/test/rw.elf differ
+diff --git a/Project4-Virtual_Memory_Management/test/swap.elf b/Project4-Virtual_Memory_Management/test/swap.elf
+old mode 100644
+new mode 100755
+index c1437a9..8f0d163
+Binary files a/Project4-Virtual_Memory_Management/test/swap.elf and b/Project4-Virtual_Memory_Management/test/swap.elf differ
+diff --git a/Project4-Virtual_Memory_Management/test/test_shell.elf b/Project4-Virtual_Memory_Management/test/test_shell.elf
+old mode 100644
+new mode 100755
+index ceb5561..f03945b
+Binary files a/Project4-Virtual_Memory_Management/test/test_shell.elf and b/Project4-Virtual_Memory_Management/test/test_shell.elf differ

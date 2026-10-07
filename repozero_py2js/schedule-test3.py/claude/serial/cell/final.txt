@@ -1,0 +1,40 @@
+Everything verified. Here is the delivered code.
+
+## Layer 1 — Python runtime shims (`/output/lib/python/`)
+
+**`unicode.mjs`** — character classification. The key finding here came from probing the executable: `int()` strips a *narrower* whitespace set than `str.strip()` — U+001C–U+001F are rejected. Digit values are computed by walking to the start of the maximal `\p{Nd}` run and taking the offset mod 10, which handles back-to-back decades like the mathematical digits U+1D7CE–U+1D7FF.
+
+**`int.mjs`** — `int(str)` semantics returning `BigInt`, so `--a 123456789012345678901234567890` round-trips exactly. Underscores allowed only between digits; ASCII sign only (`－５` correctly rejected while `５` is accepted).
+
+**`repr.mjs`** — `repr(str)` for error messages: quote selection, `\x`/`\u`/`\U` escapes gated on `str.isprintable()`.
+
+**`builtins.mjs`** / **`sys.mjs`** / **`index.mjs`** — `print()`, synchronous `writeSync` streams, `argv`, and `shutil.get_terminal_size()` (honors `COLUMNS`).
+
+## Layer 2 — argparse port (`/output/lib/argparse/`)
+
+`errors.mjs`, `actions.mjs`, `types.mjs`, `textwrap.mjs`, `formatter.mjs`, `parser.mjs`, `index.mjs` — covering `--opt=value`, prefix abbreviation (`--h` → `--help`), the negative-number heuristic (`--b -3.5` is a value, `--b -x` is an error), `--` separation, error ordering (required-check before unrecognized), and exact column alignment/wrapping.
+
+## Layer 3 — schedule port (`/output/lib/schedule/`)
+
+`job.mjs` (chainable unit properties; singular forms assert `interval == 1`), `scheduler.mjs`, `index.mjs`.
+
+## Entry — `/output/test3.mjs`
+
+```javascript
+const parser = new argparse.ArgumentParser();
+parser.addArgument('--a', { type: argparse.int, required: true });
+parser.addArgument('--b', { type: argparse.str, required: true });
+const args = parser.parseArgs();
+
+const job = schedule.every(args.a).minutes; // 创建分钟间隔作业
+pyPrint(job.interval);
+```
+
+## Verification
+
+I built a differential harness comparing stdout, stderr, and exit code against the executable. One caveat worth flagging: my first run showed 132 failures at `COLUMNS=30`, which turned out to be an artifact — usage wrapping depends on the prog-name length, and `test3_executable` (16 chars) wraps differently from `test3.mjs` (9). Symlinking the executable to `/tmp/test3.mjs` made argparse's own `basename(argv[0])` produce a matching prog, and the outputs then aligned byte-for-byte.
+
+- **240/240** curated cases (4 terminal widths × 60 vectors: valid inputs, Unicode digits, all int-parse failures, `--`/`-`/abbreviation edge cases, help)
+- **1800/1800** randomized fuzz cases across two runs
+
+Constraints confirmed by audit: zero `require`/`module.exports`, all imports are relative with explicit `.mjs` suffixes except `node:fs` and `node:path`.

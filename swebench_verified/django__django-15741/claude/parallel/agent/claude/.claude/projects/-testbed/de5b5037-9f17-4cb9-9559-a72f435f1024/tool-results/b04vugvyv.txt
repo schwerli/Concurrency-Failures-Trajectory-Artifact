@@ -1,0 +1,275 @@
+==================== None
+SUMMARY: ALL CLAIMS BELOW WERE EXECUTED against /testbed with /opt/miniconda3/envs/testbed/bin/python (PYTHONPATH=/testbed, settings.configure(USE_I18N=True, LANGUAGE_CODE='en-us')). Scratch scripts: /tmp/probe1.py … /tmp/probe5.py. No files in /testbed were modified.
+
+=== 1. cache_key = (format_type, lang) — hashable, but a LIVE, language-dependent key ===
+__proxy__ (functional.py:87-196) defines __hash__ = hash(self.__cast()) and __eq__ that casts both sides, so a proxy IS hashable and is fully interchangeable with the resolved str in dicts/sets. Observed: hash(lazystr('DATE_FORMAT')) == hash('DATE_FORMAT') (both -7189584492942393029); p == 'DATE_FORMAT' and 'DATE_FORMAT' == p are True; hash((p,'x')) == hash(('DATE_FORMAT','x')); {('DATE_FORMAT','en-us'):v}[(p,'en-us')] returns v and vice versa. So line 118 (_format_cache[cache_key]) does NOT raise TypeError — it silently succeeds or misses.
+Cost/semantics: the hash is recomputed from the *current* resolution on every use. Measured: 3 tuple-hashes => 3 invocations of the underlying callable; a single dict .get() => 2 invocations (hash + __eq__). For gettext_lazy the value and therefore the hash change per active language: gettext_lazy('Yes') gave ('Yes', -2687506424445757266) under en, ('Ja', -4902477523185822107) under de, ('Oui', 3937126196437558642) under fr — one object, three hashes.
+Consequences, both directions:
+ (a) FALSE HIT / order dependence. Because the proxy hashes like its resolved text, a lazy lookup can hit an entry stored earlier under a plain str. Demonstrated end-to-end: cold cache, get_format(lazystr('DATE_FORMAT')) -> TypeError; then get_format('DATE_FORMAT') (caches ('DATE_FORMAT','en-us')); then get_format(lazystr('DATE_FORMAT')) -> 'N j, Y' OK. Switch to de -> TypeError again. Same for templates: cold {{ d|date:_("DATE_FORMAT") }} crashes, but after {{ d|date:"DATE_FORMAT" }} has rendered once it returns 'April 1, 2022'. The bug is therefore intermittent and depends on request ordering, active language and cache warmth.
+ (b) CACHE POLLUTION if a proxy is ever stored. Verified with a plain dict: insert d[(g,None)] under en, look up under de -> KeyError('Ja', None); insert again -> len(d)==2 with the *same key object* stored twice ([k[0] is g for k in d] == [True, True]); a third locale -> len 3. Python stores the hash in the entry, so resized dicts never rehash: the old entries stay permanently unreachable (leak) until reset_format_cache(). Iterating the cache is misleading — every key renders as the *currently* active language.
+ IMPORTANT NUANCE: with the code exactly as it stands today, a proxy never actually reaches the cache-WRITE at line 142 — both routes to it (line 128 and line 134) raise TypeError first, and the surviving route returns early at line 133 without caching. Verified: after running every lazy variant, _format_cache == {} and no key is a Promise. So (b) is a *latent* hazard that becomes real the moment someone "fixes" only the getattr calls. I simulated exactly that partial fix (str() at the getattr sites, cache_key left as (proxy, lang)): with a proxy whose resolution changes, the cache grew to 2 entries whose keys both render as ('DATE_FORMAT','en-us') but hold 'N j, Y' and 'm/d/Y'. That is a genuinely corrupt cache. Note also that when use_l10n is False lang is None, so nothing in the key distinguishes locales — a value-varying proxy would then serve one language's format to another.
+
+=== 2. getattr(module, format_type, None) — formats.py:128 — the actual crash ===
+TypeError: getattr(): attribute name must be string. The 3-arg default does not help: CPython validates the name before the lookup, and TypeError is not AttributeError. Traceback observed exactly as in the ticket: django/utils/formats.py, line 128, in get_format.
+
+=== 3. format_type not in FORMAT_SETTINGS (frozenset of str) — line 132 ===
+Works correctly by hash/eq: lazystr('DATE_FORMAT') in FORMAT_SETTINGS -> True; lazystr('Y-m-d') -> False. No exception, no false negative. So the membership test is not the problem — it just routes a proxy into line 134 or returns the proxy at line 133.
+
+=== 4. getattr(settings, format_type) — line 134 ===
+Second crash site, reached whenever l10n is off (or no format module supplied a value) and the proxy resolves to a real format setting name: get_format(lazystr('DATE_FORMAT'), use_l10n=False) -> TypeError: getattr(): attribute name must be string. So str()-ing only line 128 would leave this one live.
+
+=== 5. format_type in ISO_INPUT_FORMATS (a dict) — line 135, and .get() at 139 ===
+Both work fine with a proxy (True / ['%Y-%m-%d']) — again pure hash/eq. But the branch is unreachable with a lazy today because reaching it requires line 128 to have succeeded.
+
+=== 6. get_format_lazy = lazy(get_format, str, list, tuple) — line 146 ===
+It only defers the problem: get_format_lazy(lazystr('Y-m-d')) constructs fine; the TypeError fires later, at str()/render time, far from the caller. Also, lazy() memoizes nothing, so every coercion re-runs get_format, re-hashing the inner proxy (another gettext lookup each time). Independent pre-existing wart observed: str(get_format_lazy('DATE_INPUT_FORMATS')) -> "TypeError: __str__ returned non-string (type list)" because str in resultclasses makes __str__ = __text_cast; list(...) works.
+
+=== Downstream / "subtle misbehaviour" beyond the crash ===
+* Non-crashing path leaks a Promise to callers: get_format(lazystr('Y-m-d'), use_l10n=False) returns the *proxy* (line 133), not a str, uncached. Same when the active language has no format modules at all (get_format(lazystr('Y-m-d'), lang='zz') -> proxy, no crash), so whether you crash depends on the locale. date_format() then only works by accident because dateformat.Formatter.format() does str(formatstr) (dateformat.py:41).
+* localize_input()/sanitize_strftime_format() do not tolerate it: sanitize_strftime_format(lazystr('%Y-%m-%d')) -> TypeError: expected string or bytes-like object (re.sub) on this glibc box; formats.localize_input(date, lazystr('%Y-%m-%d')) raises the same. sanitize_strftime_format is also @functools.lru_cache'd, so it would be keyed on a live proxy too.
+* Asymmetric filter behaviour: defaultfilters.date (line 759) catches only AttributeError -> the TypeError escapes and 500s the request. defaultfilters.time (line 773) catches TypeError -> it silently swallows the bug and falls back to dateformat.time_format(value, arg), bypassing get_format entirely. Measured cold-cache: {{ t|time:"TIME_FORMAT" }} -> '2:05 p.m.' but {{ t|time:_("TIME_FORMAT") }} -> '' (empty output, no error).
+
+=== Git history: why the regression happened ===
+659d2421c7adb IS in this checkout: "Fixed #20296 -- Prevented mark_safe() from evaluating lazy objects" (Theo Alexiou, 2022-02-18, Django 4.1). Its whole payload is adding @keep_lazy(SafeString) to mark_safe (safestring.py:58). Before it, mark_safe(promise) fell through to SafeString(s), which is a str subclass constructor and therefore *evaluated* the proxy immediately; verified: SafeString(gettext_lazy('Y-m-d')) -> plain SafeString 'Y-m-d' (Promise=False), whereas today mark_safe(same) -> __proxy__ (Promise=True, isinstance(str)=False).
+Delivery path: template/base.py:695 resolves a filter's constant arg at parse time via Variable(constant_arg).resolve({}), and Variable.resolve returns gettext_lazy(msgid) for _('...') (base.py:851-857). At render, FilterExpression.resolve does arg_vals.append(mark_safe(arg)) (base.py:734). Pre-4.1 that mark_safe collapsed the proxy to a real str, so get_format never saw a Promise. Post-4.1 the proxy survives into date_format() -> get_format() -> getattr(module, proxy). Verified: for Template("{{ d|date:_('Y-m-d') }}") the parsed arg is a __proxy__, mark_safe(arg) is still a __proxy__, and rendering raises the TypeError at formats.py:128, while "{{ d|date:'Y-m-d' }}" renders '2022-04-01'.
+But #20296 only *exposed* the hole; the tolerance had been deleted five years earlier. git log -S shows get_format() began with a coercion of format_type from 2010 to 2017:
+  - ac371ccac8 (2010, #12435) added `format_type = smart_str(format_type)`; the py2 smart_str of that era explicitly did `if isinstance(s, Promise): return unicode(s).encode(...)`.
+  - ae88e73fa6 (2012) changed it to `format_type = force_str(format_type)` — force_str resolves a Promise (verified today: force_str(lazystr('DATE_FORMAT')) -> plain str; note modern smart_str does NOT, it returns the __proxy__).
+  - dc8834cad4 (2017, "Refs #23919 -- Removed unneeded force_str calls", Claude Paroz) deleted that line as part of the py2 cleanup, on the assumption that format_type is always a native str. Nothing else in the function ever guarded against non-str input; 3188b49ee2's older `try: getattr(...) except AttributeError` would not have helped either, since a proxy raises TypeError.
+So: 2017 removed the coercion (latent), 2022's #20296 started feeding real Promises through the |date/|time filter-argument path (manifest). The upstream fix (`format_type = str(format_type)  # format_type may be lazy.`) is NOT present in this checkout — formats.py goes straight from lang resolution (line 115) to cache_key (line 116) — and tests/i18n/tests.py has no lazy get_format test.
+FILES: /testbed/django/utils/formats.py:116
+  /testbed/django/utils/formats.py:118
+  /testbed/django/utils/formats.py:128
+  /testbed/django/utils/formats.py:132
+  /testbed/django/utils/formats.py:134
+  /testbed/django/utils/formats.py:135
+  /testbed/django/utils/formats.py:142
+  /testbed/django/utils/formats.py:146
+  /testbed/django/utils/formats.py:248
+  /testbed/django/utils/functional.py:87
+  /testbed/django/utils/functional.py:176
+  /testbed/django/utils/functional.py:186
+  /testbed/django/utils/functional.py:219
+  /testbed/django/utils/functional.py:226
+  /testbed/django/utils/safestring.py:58
+  /testbed/django/template/base.py:695
+  /testbed/django/template/base.py:734
+  /testbed/django/template/base.py:851
+  /testbed/django/template/defaultfilters.py:759
+  /testbed/django/template/defaultfilters.py:773
+  /testbed/django/utils/dateformat.py:41
+  /tmp/probe1.py
+  /tmp/probe2.py
+  /tmp/probe3.py
+  /tmp/probe4.py
+  /tmp/probe5.py
+RISKS: Fixing only the getattr at formats.py:128 leaves the second crash site at line 134 (getattr(settings, format_type)) live for the use_l10n=False / no-format-module paths - verified to raise TypeError today.
+  - Coercing at the getattr sites but leaving `cache_key = (format_type, lang)` holding the live proxy turns a crash into silent cache corruption: I reproduced a cache with two entries whose keys both render as ('DATE_FORMAT','en-us') but store 'N j, Y' and 'm/d/Y'. Entries stored under one resolution become permanently unreachable (dict caches the hash, resize never rehashes) - an unbounded leak that only reset_format_cache() clears. When use_l10n is False, lang is None, so nothing in the key separates locales.
+  - The bug is order- and locale-dependent, so tests can pass by accident: after any plain-str call has warmed (format_type, lang), the identical lazy call succeeds via the proxy's hash. Any regression test must call reset_format_cache() first and should also assert a second language.
+  - django.template.defaultfilters.time catches TypeError and silently renders '' (verified cold-cache), so this class of bug is invisible there; verify any fix against |time as well as |date, not just against the crash traceback.
+  - get_format currently returns the Promise itself at line 133 for non-setting names (verified isinstance(str) is False). Callers that do more than str-coercion break: sanitize_strftime_format()/localize_input() raise 'expected string or bytes-like object', and sanitize_strftime_format is @lru_cache'd on that live proxy.
+  - Hashing a proxy re-invokes the underlying callable on every dict probe (measured 2 gettext evaluations per cache lookup: hash + __eq__), so leaving proxies in the hot get_format path is also a per-render performance cost.
+  - get_format_lazy defers the failure to str()/render time, so a lazy format_type passed through it surfaces with a traceback far from the offending call site.
+
+==================== None
+SUMMARY: ROOT CAUSE
+
+The lazy value is minted inside the template engine, not by user code:
+- django/template/base.py:695 — at *parse* time a constant filter arg is resolved: `args.append((False, Variable(constant_arg).resolve({})))`.
+- django/template/base.py:851-858 — `Variable.resolve()` sees the `_("...")` wrapper (`self.translate`) and returns `gettext_lazy(msgid)` / `pgettext_lazy(...)`, i.e. a `django.utils.functional.lazy.__proxy__` (a `Promise`).
+- django/template/base.py:734 — at *render* time `arg_vals.append(mark_safe(arg))`.
+
+Before 659d2421c7adb, `mark_safe()` coerced the Promise to a real `SafeString`, so every downstream consumer got a `str`. After that commit, django/utils/safestring.py:58 decorates `mark_safe` with `@keep_lazy(SafeString)`, so line 734 now hands a Promise straight to the filter. Nothing between the template engine and `get_format()` calls `str()`.
+
+CRASH POINT
+
+django/utils/formats.py:128 — `val = getattr(module, format_type, None)` -> `TypeError: getattr(): attribute name must be string`. Reproduced.
+
+Three neighbouring lines in `get_format()` are also Promise-unsafe in a *silent* way:
+- formats.py:116/118/142 — `cache_key = (format_type, lang)` and `_format_cache[cache_key] = val`. `__proxy__.__hash__`/`__eq__` (django/utils/functional.py:181-186) resolve the translation, so a Promise hashes equal to its currently active translation. Consequence: the crash is cache-order dependent. Verified: `get_format(gettext_lazy("TIME_FORMAT"))` raises on a cold cache, but after any prior `get_format("TIME_FORMAT")` it silently hits the cached entry and returns 'P'. So the bug appears/disappears depending on request ordering and worker warm-up. If a Promise ever *is* inserted as a key, the cache also grows one entry per active language per proxy and pins the Promise forever.
+- formats.py:132-133 — `if format_type not in FORMAT_SETTINGS: return format_type` returns the Promise itself, un-stringified. This is the `use_l10n=False` path (verified: with `USE_L10N=False`, `{{ d|date:_("Y-m-d") }}` renders fine but `get_format()` returns a `__proxy__`). Any fix must `str()` the return value here too, or the Promise just leaks one frame further.
+- formats.py:134 — `getattr(settings, format_type)` would raise the same TypeError for a lazy name in `FORMAT_SETTINGS` (unreachable today only because line 128 fires first when l10n is on).
+
+CALL PATHS THAT REACH get_format(format_type=<lazy>) — all verified by execution
+
+1. `date` filter — django/template/defaultfilters.py:759-769 -> :764 `formats.date_format(value, arg)` -> formats.py:157-159. Hard 500. The filter only catches `AttributeError` (line 765), so the `TypeError` escapes. `{{ d|date:_("Y-m-d") }}` and `{{ d|date:_("DATE_FORMAT") }}` both crash; so does `{{ d|date:f }}` when `f` is a lazy context variable.
+2. `time` filter — defaultfilters.py:773-783 -> :778 `formats.time_format`. Silently wrong, not a crash. Line :779 catches `(AttributeError, TypeError)` and falls back to :781 `dateformat.time_format(value, arg)`, which bypasses locale lookup. `{{ d|time:_("H:i") }}` accidentally works; `{{ d|time:_("TIME_FORMAT") }}` returns `''` (verified) instead of `'3:04 a.m.'`, because the fallback treats the literal name as a PHP format string and the inner `AttributeError` is swallowed. This asymmetry hides the bug from tests that only exercise `time`.
+3. `humanize.naturalday` — django/contrib/humanize/templatetags/humanize.py:193 `return defaultfilters.date(value, arg)`. `{{ d|naturalday:_("Y-m-d") }}` -> same 500 (verified).
+4. Direct public API: `formats.get_format()`, `formats.date_format(value, format)` (formats.py:157), `formats.time_format(value, format)` (formats.py:169), and `formats.get_format_lazy` (formats.py:146) when handed a lazy `format_type`.
+5. `{% now %}` is NOT a path: django/template/defaulttags.py:1160 does `format_string = bits[1][1:-1]` (raw slicing, never `Variable.resolve`), so `NowNode.format_string` (defaulttags.py:385-390) is always a plain str. Only third-party code constructing `NowNode` directly could inject a Promise.
+6. django/views/i18n.py:85 and django/contrib/admin/templatetags/admin_list.py:397,400,422,440 use hard-coded literal names — safe.
+
+SECONDARY FUNCTIONS THAT STAY BROKEN EVEN AFTER get_format IS FIXED
+
+A. `sanitize_strftime_format` — django/utils/formats.py:248-278. Both branches are Promise-hostile, and which one you get is platform-dependent:
+   - glibc/Linux (`%Y` unpadded): formats.py:274-278 `re.sub(..., fmt)` -> `TypeError: expected string or bytes-like object` (verified on this box).
+   - macOS/FreeBSD/Windows (`%Y` padded natively): formats.py:271-272 `return fmt` returns the Promise unchanged, which is then memoised as the cache *value* and handed to `value.strftime(...)` -> `TypeError: strftime() argument 1 must be str, not __proxy__` (verified by simulating that branch). Linux-only CI sees a different traceback than macOS devs.
+   - The `@functools.lru_cache` at formats.py:248 does NOT raise on a Promise key: `_make_key`/`_HashedSeq` call `hash()`, which `__proxy__.__hash__` (functional.py:181) satisfies by resolving the translation. Measured: one `__proxy__` object passed 5 times across en/de/en/de/en produces 2 misses + 3 hits — the cache silently keys on the evaluated translation snapshot, so it grows one entry per language, pins strong references to Promise objects (and their closure args) in a 128-slot LRU, and two distinct proxies that currently translate identically share an entry. Values stay correct only by accident.
+B. `localize_input` — formats.py:222-245. The `default` parameter is never stringified: :235-237 and :239-241 feed it to `sanitize_strftime_format` then `strftime`; :243-244 feeds a lazy straight to `value.strftime(format)` with no sanitize call at all on the `datetime.time` branch -> `TypeError: strftime() argument 1 must be str, not __proxy__`. Verified for all three branches.
+C. Widget `format=` kwargs — django/forms/widgets.py:523-530 (`DateTimeBaseInput.__init__`/`format_value`) store `self.format` verbatim and pass it as `localize_input`'s `default`. Verified crashes: `DateInput(format=_("%Y-%m-%d"))`, `TimeInput(format=_("%H:%M"))`, `DateTimeInput(...)`, `SplitDateTimeWidget(date_format=..., time_format=...)` (widgets.py:970-988), and rendering a whole `Form` containing such a widget. The admin re-exposes the same kwarg at django/contrib/admin/widgets.py:58-60 (`AdminDateWidget`) and :70-72 (`AdminTimeWidget`).
+D. `BaseTemporalField.input_formats` — django/forms/fields.py:452-457. `strptime(value, format)` raises `TypeError` for a Promise, but line 455 catches `(ValueError, TypeError)` and `continue`s, so the field silently rejects valid input with `ValidationError(['Enter a valid date.'])` rather than crashing. Verified: `DateField(input_formats=[_("%Y-%m-%d")]).clean("2022-01-02")` raises ValidationError while the plain-str control returns the date. Worst failure mode in the set — no traceback, looks like user error.
+E. django/forms/widgets.py:1163-1164 (`SelectDateWidget.value_from_datadict`) and :1126, :1137 use literal `get_format("DATE_INPUT_FORMATS"/"DATE_FORMAT")`, so they are safe today, but they call `sanitize_strftime_format` and `strptime` and would inherit the problem if `get_format` is ever changed to return its `format_type` argument unwrapped (formats.py:132-133).
+
+ALREADY SAFE — do not "fix"
+
+- `dateformat.format` (django/utils/dateformat.py:326-329) and `dateformat.time_format` (:332-335) are lazy-clean because `Formatter.format` does `re_formatchars.split(str(formatstr))` at django/utils/dateformat.py:41. Verified both accept a Promise.
+- `number_format` (formats.py:174-198) and `sanitize_separators` (formats.py:281+) only pass hard-coded names (`DECIMAL_SEPARATOR`, `NUMBER_GROUPING`, `THOUSAND_SEPARATOR`), and `numberformat.format` (django/utils/numberformat.py:7-15) is never reached with a caller-supplied lazy name. Only a custom `FORMAT_MODULE_PATH` module defining a lazy `DECIMAL_SEPARATOR` could leak one in.
+- django/utils/timesince.py — the `timesince`/`timeuntil` filter arg (defaultfilters.py:787-806) is a datetime, not a format string; `TIME_STRINGS` (timesince.py:9-14) are `ngettext_lazy` but consumed via `%` (timesince.py:88), which resolves them. No get_format involvement.
+- django/forms/fields.py:465,489 `formats.get_format_lazy("DATE_INPUT_FORMATS")` and `DateTimeFormatsIterator` (fields.py:507-510) use literal names.
+
+No files under /testbed were modified.
+FILES: /testbed/django/utils/formats.py:128
+  /testbed/django/utils/formats.py:116
+  /testbed/django/utils/formats.py:132
+  /testbed/django/utils/formats.py:134
+  /testbed/django/utils/formats.py:142
+  /testbed/django/utils/formats.py:157
+  /testbed/django/utils/formats.py:169
+  /testbed/django/utils/formats.py:235
+  /testbed/django/utils/formats.py:239
+  /testbed/django/utils/formats.py:243
+  /testbed/django/utils/formats.py:248
+  /testbed/django/utils/formats.py:272
+  /testbed/django/utils/formats.py:274
+  /testbed/django/template/base.py:695
+  /testbed/django/template/base.py:734
+  /testbed/django/template/base.py:851
+  /testbed/django/utils/safestring.py:58
+  /testbed/django/utils/functional.py:181
+  /testbed/django/template/defaultfilters.py:764
+  /testbed/django/template/defaultfilters.py:778
+  /testbed/django/template/defaultfilters.py:781
+  /testbed/django/contrib/humanize/templatetags/humanize.py:193
+  /testbed/django/forms/widgets.py:527
+  /testbed/django/forms/widgets.py:970
+  /testbed/django/forms/fields.py:452
+  /testbed/django/contrib/admin/widgets.py:58
+  /testbed/django/contrib/admin/widgets.py:70
+  /testbed/django/utils/dateformat.py:41
+  /testbed/django/template/defaulttags.py:1160
+RISKS: Fixing only `getattr(module, format_type)` at formats.py:128 leaves four other leaks: the `_format_cache` key at :116/:142, the un-stringified `return format_type` at :132-133, `getattr(settings, format_type)` at :134, and every `localize_input`/`sanitize_strftime_format`/widget-`format=` path (B, C, D), which never touch get_format at all.
+  - The bug is cache-order dependent. `get_format(gettext_lazy('TIME_FORMAT'))` raises on a cold `_format_cache` but silently succeeds once the same string was cached under a plain-str key, because `__proxy__.__hash__` (functional.py:181) resolves the translation. A regression test running after other l10n tests in the same process can pass on a broken tree — call `formats.reset_format_cache()` in setUp.
+  - `sanitize_strftime_format` fails differently per platform: `re.sub` TypeError on glibc/Linux (formats.py:274) vs. returning and memoising the Promise on macOS/FreeBSD/Windows (formats.py:271-272), where the TypeError surfaces later at `strftime()`. Linux-only CI will not exercise the second branch.
+  - `DateField(input_formats=[<lazy>])` does not crash — fields.py:455 swallows the TypeError and the field reports 'Enter a valid date.' Silent data rejection, invisible in logs, easy to miss when writing tests.
+  - The `time` filter masks the bug (defaultfilters.py:779 catches TypeError) while `date` does not. `{{ d|time:_('TIME_FORMAT') }}` returns '' — wrong output rather than an error. Any fix should be regression-tested on both filters and on the named-format-type form (`_('DATE_FORMAT')`), not just raw format strings like `_('Y-m-d')`.
+  - Passing Promises as `functools.lru_cache` keys (formats.py:248) is not an error but pins Promise objects and their closures in a 128-entry cache and creates one entry per active language for a single proxy. Coercing to `str` before the cached call fixes both the crash and the churn; adding `str()` inside the cached function does not.
+  - `get_format` returning the Promise at formats.py:132-133 (the `use_l10n=False` / unknown-name path) means downstream `strftime`/`strptime` consumers such as widgets.py:1163 could start receiving Promises if that path is reached with lazy input.
+
+==================== None
+SUMMARY: WHERE THE FIX BELONGS / IS TESTED
+
+`get_format()` lives at /testbed/django/utils/formats.py:100. With a lazy `format_type` it currently blows up at `getattr(module, format_type, None)` (formats.py:127) and `getattr(settings, format_type)` (formats.py:134): I reproduced `TypeError: getattr(): attribute name must be string` for `get_format(gettext_lazy("DATE_FORMAT"))`. The lazy path is not exotic — django/template/base.py:851-858 (`Variable.resolve`) returns `gettext_lazy(msgid)` for `_("...")`, so `{{ d|date:_("DATE_FORMAT") }}` hits it. Today that template raises TypeError (the `date` filter, defaultfilters.py:759-769, only catches AttributeError), while `{{ d|time:_("TIME_FORMAT") }}` silently renders `""` (the `time` filter, defaultfilters.py:772-783, swallows TypeError). Coercion must happen at the top of get_format (before the `cache_key` tuple at formats.py:114), not only before the getattr calls, because the unknown-format branch `if format_type not in FORMAT_SETTINGS: return format_type` (formats.py:132-133) must also return a real str — otherwise `dateformat`'s `re.split()` chokes on the proxy for a lazy format *string* like `_("y")`.
+
+1) UNIT TEST — /testbed/tests/i18n/tests.py, class `FormattingTests` (starts line 521, SimpleTestCase). Insert immediately after `test_format_arbitrary_settings` (lines 1652-1653), i.e. as a new method at line 1654-1655, before `test_get_custom_format` (line 1655). No new imports needed: `get_format` is imported at line 32, `gettext_lazy` at line 52, `translation` at line 28. Verified expected values under the test runner's LANGUAGE_CODE="en" (tests/runtests.py:230) with an in-memory `str()` patch: `get_format(gettext_lazy("DATE_FORMAT")) == "N j, Y"`, `get_format(gettext_lazy("TIME_FORMAT")) == "P"`. Upstream-style body: `self.assertEqual(get_format(gettext_lazy("DATE_FORMAT")), "N j, Y")`.
+
+2) TEMPLATE TESTS — /testbed/tests/template_tests/filter_tests/test_date.py, class `DateTests` (line 11, extends TimezoneTestCase). Last method is `test_date09` ending at line 73; `class FunctionTests` starts line 76 — new `date10` goes at lines 74-75+. Verified post-fix outputs: `{{ d|date:_("Y") }}` -> "2008", `{{ d|date:_("y") }}` -> "08", `{{ d|date:_("DATE_FORMAT") }}` -> "Jan. 1, 2008", `{{ d|date:_("SHORT_DATE_FORMAT") }}` -> "01/01/2008" for d=datetime(2008,1,1). No `{% load i18n %}` needed — `_()` in a filter argument is handled by the template Variable parser.
+   /testbed/tests/template_tests/filter_tests/test_time.py, class `TimeTests` (line 11). Last method `test_time06` ends line 57; `class FunctionTests` starts line 60 — new `time07` goes at lines 58-59+. Verified: `{{ t|time:_("TIME_FORMAT") }}` with time(16,25) currently renders "" and renders "4:25 p.m." after the fix. This is the only place that catches the *silent* failure mode, so it is worth adding.
+
+3) NOT the right places: /testbed/tests/utils_tests/test_dateformat.py exercises `django.utils.dateformat.format` directly and never calls get_format (grep confirms zero references) — a lazy fmt there fails inside `re.split`, which the get_format fix does not address. /testbed/tests/i18n/test_extraction.py is entirely makemessages/xgettext; nothing format-related.
+
+CONVENTIONS IN THOSE FILES
+- i18n/tests.py FormattingTests: plain `SimpleTestCase`; `setUp` builds self.n/f/d/dt/t/long plus `self.ctxt` Context (lines 522-539). Locale switching is `with translation.override("ca", deactivate=True):` (deactivate=True whenever the test must not fall back to the previously active language — lines 679, 864, 1518, 1658); method-level settings use `with self.settings(...)` (lines 848, 856, 1657) or a decorator stack such as `@ignore_warnings(category=RemovedInDjango50Warning)` + `@override_settings(USE_L10N=False)` (lines 852-854); loops use `with self.subTest(...)` (lines 545, 1391, 1664); custom format modules require `reset_format_cache()` first (line 1656). Assertions are `assertEqual(expected, actual)` in the older blocks, `assertEqual(actual, expected)` in newer one-liners (line 1653) — either matches local style.
+- template_tests filter tests: `@setup({"<name>": "<template>"})` from `..utils`, where the dict key equals the test's template name and the numbering follows `dateNN`/`timeNN`; body renders via `self.engine.render_to_string("<name>", {...})`. The `setup` decorator (tests/template_tests/utils.py:71-140) applies `@override_settings(TEMPLATES=None)` and reruns the body six times (cached/uncached x debug x string_if_invalid="INVALID"), so keep bodies idempotent. Locale via `with translation.override("fr"):` (test_date.py:25, test_time.py:23).
+
+HOW TO RUN (interpreter is /opt/miniconda3/envs/testbed/bin/python; run from /testbed/tests)
+- cd /testbed/tests && python runtests.py i18n.tests.FormattingTests
+- cd /testbed/tests && python runtests.py template_tests.filter_tests.test_date template_tests.filter_tests.test_time
+- Combined: cd /testbed/tests && python runtests.py i18n.tests.FormattingTests template_tests.filter_tests.test_date template_tests.filter_tests.test_time utils_tests.test_dateformat view_tests.tests.test_i18n --parallel 1
+- Broad sweep: cd /testbed/tests && python runtests.py i18n template_tests utils_tests forms_tests view_tests.tests.test_i18n --parallel 1
+  (Pre-existing unrelated failure on this box: template_tests.test_loaders.FileSystemLoaderTests.test_permissions_error — fails at baseline too because tests run as root.)
+
+WOULD ANY EXISTING TEST CATCH `str()`-ING THE ARGUMENT?
+No. I monkeypatched get_format to `_orig(str(format_type), lang=lang, use_l10n=use_l10n)` and ran i18n + template_tests + utils_tests.test_dateformat + view_tests.tests.test_i18n + forms_tests (2613 tests): the only failure was the pre-existing root/permissions one. Nothing in the suite passes a non-str format_type, so the coercion is completely unguarded — which is exactly why the new tests are required. The closest existing guards, all of which constrain *how* you implement it: tests/i18n/tests.py:1652-1653 `test_format_arbitrary_settings` pins the unknown-format pass-through (`get_format("DEBUG") == "DEBUG"`); tests/i18n/tests.py:681-683 (`test_l10n_disabled`) and 855-862 (`test_false_like_locale_formats`) assert integer returns (`0`/`1`) and would fail loudly if someone str()'d the *return value* instead of the argument; tests/view_tests/tests/test_i18n.py:252-259 `test_get_formats` pins int/str/list return types across all FORMAT_SETTINGS; tests/i18n/tests.py:1661 `test_admin_javascript_supported_input_formats` indexes a list return; tests/i18n/tests.py:1517 `test_get_format_modules_lang` and 1655 `test_get_custom_format` cover the `lang=` and FORMAT_MODULE_PATH branches where the getattr on a format module happens.
+FILES: /testbed/django/utils/formats.py:100
+  /testbed/django/utils/formats.py:114
+  /testbed/django/utils/formats.py:127
+  /testbed/django/utils/formats.py:132
+  /testbed/django/utils/formats.py:146
+  /testbed/django/template/base.py:851
+  /testbed/django/template/defaultfilters.py:759
+  /testbed/django/template/defaultfilters.py:772
+  /testbed/django/utils/functional.py:186
+  /testbed/tests/i18n/tests.py:521
+  /testbed/tests/i18n/tests.py:1652
+  /testbed/tests/i18n/tests.py:1655
+  /testbed/tests/i18n/tests.py:681
+  /testbed/tests/i18n/tests.py:847
+  /testbed/tests/i18n/tests.py:1517
+  /testbed/tests/i18n/tests.py:1661
+  /testbed/tests/i18n/tests.py:1382
+  /testbed/tests/template_tests/filter_tests/test_date.py:11
+  /testbed/tests/template_tests/filter_tests/test_date.py:70
+  /testbed/tests/template_tests/filter_tests/test_date.py:76
+  /testbed/tests/template_tests/filter_tests/test_time.py:11
+  /testbed/tests/template_tests/filter_tests/test_time.py:54
+  /testbed/tests/template_tests/filter_tests/test_time.py:60
+  /testbed/tests/template_tests/utils.py:71
+  /testbed/tests/view_tests/tests/test_i18n.py:252
+  /testbed/tests/runtests.py:230
+RISKS: Coercing only before the getattr() calls is not enough: the cache key is built at formats.py:114 and the unknown-format branch returns the raw argument at formats.py:132-133. A lazy format *string* (e.g. _("y")) would then be returned as a proxy and blow up later in dateformat's re.split(). Coerce at the top of the function.
+  - Lazy proxies hash and compare equal to their evaluated str (django/utils/functional.py:186), so caching a proxy as a key currently 'works' but stores the proxy in the module-level _format_cache, keeping the translation object alive and re-evaluating the translation on every hash. Another reason to str() before line 114.
+  - The `time` template filter swallows TypeError (defaultfilters.py:779), so a lazy format silently renders an empty string instead of raising. A test that only asserts 'no exception' would pass on broken code; assert the exact rendered value.
+  - Don't str() the *return* value: get_format legitimately returns ints (FIRST_DAY_OF_WEEK) and lists (DATE_INPUT_FORMATS). tests/i18n/tests.py:682 and tests/view_tests/tests/test_i18n.py:255 would fail, but only after the fact.
+  - sanitize_strftime_format() (formats.py:249) and localize_input(value, default=...) (formats.py:223-247) still reject lazy arguments; the get_format fix does not cover them. If the ticket scope includes those, tests belong near tests/i18n/tests.py:1382 and :1371.
+  - template_tests' @setup reruns each test body six times across engine configurations; avoid per-test state (e.g. reset_format_cache side effects) in those bodies.
+  - The whole i18n/template suite shares the module-level _format_cache; a new test that populates it under a translated key should either use reset_format_cache() (as tests/i18n/tests.py:1656 does) or stick to the default 'en' language so ordering stays deterministic.
+
+==================== None
+SUMMARY: ROOT CAUSE
+`get_format()` passes `format_type` straight to `getattr()` at django/utils/formats.py:128 (`getattr(module, format_type, None)`) and :134 (`getattr(settings, format_type)`). CPython's `getattr` demands an exact `str`; a `gettext_lazy` `__proxy__` is not one, hence `TypeError: getattr(): attribute name must be string`. Everything else in the function already tolerates a proxy — I confirmed `lazy in FORMAT_SETTINGS` (frozenset) and `lazy in ISO_INPUT_FORMATS` (dict) both return True, because `__proxy__.__hash__`/`__eq__` delegate to the cast value (django/utils/functional.py:170-180).
+
+Symptoms reproduced in this checkout:
+- `{{ d|date:_('Y-m-d') }}` -> TypeError propagates (the `date` filter only catches AttributeError, defaultfilters.py:765).
+- `{{ t|time:_('H:i') }}` -> works by accident; `time` catches TypeError (defaultfilters.py:777) and falls through to `dateformat.time_format`, silently bypassing l10n.
+- `{{ t|time:_('TIME_FORMAT') }}` -> silently renders '' (vs '1:45 p.m.' for the plain str). Silent wrong output, not a crash.
+- `formats.date_format(d, _('Y-m-d'))` / `formats.time_format(...)` crash directly, so this is not template-only.
+
+RECOMMENDATION: design (a), one line, as the new django/utils/formats.py:116, between `lang = get_language()` (:115) and `cache_key = (format_type, lang)` (currently :116):
+
+    format_type = str(format_type)  # format_type may be lazy.
+
+60 chars, black/flake8-clean.
+
+COMPARISON
+(a) str() before cache_key — WINNER. Fixes every entry point at once (template filters, formats.date_format/time_format/number_format/localize_input, forms widgets/fields, views.i18n.JavaScriptCatalog, third-party callers) because they all funnel through get_format. Keeps `_format_cache` keys plain `str`, and the early `return format_type` at :133 hands callers a real str instead of a proxy. Cost: `str()` on an existing str measured ~45ns over baseline; an `isinstance` guard is ~35ns, i.e. no meaningful saving for uglier code. Minor wart: `get_format(None)` now returns 'None' instead of raising; no in-tree caller does that.
+
+(b) Coerce only at the getattr call sites — REJECT. 2-3 edits instead of 1, and two real defects remain. (i) The `__proxy__` becomes part of the `_format_cache` key, and a lazy translation's hash is NOT stable: I measured hash(proxy) differing between `translation.override('en')` and `('de')`, and a dict entry stored under 'en' was unreachable via the *same key object* under 'de'. That is a mutable-hash dict key — permanent cache misses, unbounded growth, proxies pinned in a module global. (ii) The `if format_type not in FORMAT_SETTINGS: return format_type` path at :133 returns the proxy to callers; downstream then blows up — confirmed `sanitize_strftime_format(proxy)` -> "TypeError: expected string or bytes-like object" and `date.strftime(proxy)` -> "TypeError: strftime() argument 1 must be str, not __proxy__".
+
+(c) Fix in django/template/defaultfilters.py date/time — REJECT. Wrong layer: leaves formats.date_format/time_format, localize_input, form fields/widgets and every direct get_format() caller broken. Also 2 edits, and would need the `time` filter's TypeError swallow reordered so it stops masking the failure.
+
+(d) force_str/str() in dateformat — NO-OP. django/utils/dateformat.py:41 already does `re_formatchars.split(str(formatstr))` (since 301de774c2, 2017); `dateformat.format(d, _('Y-m-d'))` works today. The crash happens in get_format, before dateformat is reached.
+
+WHY str() AND NOT force_str(): Django's own convention. django/core/mail/message.py:58 `val = str(val)  # val may be lazy`; django/views/generic/edit.py:61 `return str(self.success_url)  # success_url may be lazy`; django/template/base.py:153 `self.source = str(template_string)  # May be lazy.`; django/urls/resolvers.py:633 `path = str(path)  # path may be a reverse_lazy object`; django/test/client.py:519,610. Commit 301de774c2 "Refs #27795 -- Replaced many force_text() with str()" is the explicit precedent. `force_str` is for bytes/arbitrary objects; for lazy-only input `str()` is house style, and the trailing `# format_type may be lazy.` comment matches message.py:58 in shape.
+
+RELEASE NOTES / DOCS
+- docs/releases/4.1.txt exists but is a *feature* release note ("Django 4.1 release notes - UNDER DEVELOPMENT", expected Aug 2022) with NO Bugfixes section; neither has 4.2.txt. Only point-release notes carry one (docs/releases/4.0.5.txt). There is no 4.1.1.txt yet.
+- This tree is main at 4.2 alpha (django/__init__.py:3) with 4.1 unreleased, so the fix lands on main and, as a crashing bug, is eligible for stable/4.1.x under docs/internals/release-process.txt:142 — which is pre-release, so no release-note entry is required. It is a longstanding bug, not a regression, so it does not qualify for stable/4.0.x (which would have needed a new 4.0.6.txt).
+- No docs change warranted. `django.utils.formats` has no `.. module::` section in docs/ref/utils.txt at all (documented: cache, dateparse, decorators, encoding, feedgenerator, functional, html, http, module_loading, safestring, text, timezone, translation). get_format() appears only as prose at docs/topics/i18n/formatting.txt:167. Documenting lazy acceptance would newly expand a semi-private API surface.
+
+VERIFICATION (done in a throwaway copy under /tmp; /testbed untouched, no files edited)
+- Applied (a); ran i18n + template_tests + forms_tests + utils_tests: 3164 tests, sole failure was the pre-existing, unrelated template_tests.test_loaders.FileSystemLoaderTests.test_permissions_error (running as root defeats chmod 0).
+- Added the two candidate regression tests below: pass with the fix, error (2) without it.
+FILES: /testbed/django/utils/formats.py:116 — insertion point; the new line goes here, immediately before `cache_key = (format_type, lang)`
+  /testbed/django/utils/formats.py:128 — `val = getattr(module, format_type, None)`, the actual crash site
+  /testbed/django/utils/formats.py:134 — `val = getattr(settings, format_type)`, second unguarded getattr
+  /testbed/django/utils/formats.py:133 — `return format_type` early exit that would leak a lazy proxy to callers under design (b)
+  /testbed/django/utils/functional.py:170 — `__proxy__.__eq__`/`__hash__` delegate to the cast value, so the proxy's hash tracks the active language
+  /testbed/django/utils/dateformat.py:41 — already does `str(formatstr)`; proves design (d) is a no-op
+  /testbed/django/template/defaultfilters.py:765 — `date` filter catches only AttributeError, so the TypeError escapes
+  /testbed/django/template/defaultfilters.py:777 — `time` filter catches TypeError and silently degrades to unlocalized/empty output
+  /testbed/django/core/mail/message.py:58 — `val = str(val)  # val may be lazy`, the style precedent for the comment
+  /testbed/django/template/base.py:153 — `self.source = str(template_string)  # May be lazy.`
+  /testbed/django/urls/resolvers.py:633 — `path = str(path)  # path may be a reverse_lazy object`
+  /testbed/tests/i18n/tests.py:1652 — `test_format_arbitrary_settings` in FormattingTests; add the unit test right after (gettext_lazy already imported at :52, get_format at :32)
+  /testbed/tests/template_tests/filter_tests/test_date.py:72 — end of DateTests; add the template-level regression test after `test_date09`
+  /testbed/docs/releases/4.1.txt:1 — feature release note, UNDER DEVELOPMENT, no Bugfixes section
+  /testbed/docs/releases/4.0.5.txt:10 — the only shape of release note that has a Bugfixes section
+  /testbed/docs/internals/release-process.txt:142 — "Crashing bugs" backport policy
+  /testbed/docs/topics/i18n/formatting.txt:167 — the only prose mention of get_format(); docs/ref/utils.txt has no formats module section
+RISKS: Behavior change on garbage input: `get_format(None)` / `get_format(object())` now returns the `str()` of that object instead of raising TypeError, converting a loud failure into a quiet one. No in-tree caller does this, and the same laxity already exists at formats.py:133.
+  - Bytes input (`get_format(b'DATE_FORMAT')`) becomes "b'DATE_FORMAT'" rather than decoding. `force_str` would decode, but using it here contradicts the str() convention and adds call cost on a hot path. Not a real scenario in Django.
+  - SafeString/str-subclass inputs are copied to a plain str (`str()` does not return the same object for subclasses), one extra allocation per uncached call. Immaterial — the value is only used as a dict key and an attribute name.
+  - Design (b), if anyone argues for it, silently poisons `_format_cache` with hash-unstable keys. Invisible to the existing test suite (all tests pass with it) but leaks memory and permanently misses across language switches — call this out explicitly if it comes up in review.
+  - Adjacent, out-of-scope bug this patch does NOT fix: `forms.DateInput(format=gettext_lazy('Y-m-d'))` still raises TypeError via `localize_input` -> `sanitize_strftime_format` (formats.py:236-244, :249) and `value.strftime()`. That path never calls get_format; it needs its own ticket rather than being folded in here.
+  - `sanitize_strftime_format` is `functools.lru_cache`d (formats.py:248); if a lazy ever reaches it, it both crashes and would cache on a proxy key — another reason to normalize as early as possible rather than at leaf call sites.
+

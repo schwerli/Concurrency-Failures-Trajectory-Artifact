@@ -1,0 +1,933 @@
+diff --git a/netsim/__pycache__/wifi_net.cpython-312.pyc b/netsim/__pycache__/wifi_net.cpython-312.pyc
+new file mode 100644
+index 0000000..1392555
+Binary files /dev/null and b/netsim/__pycache__/wifi_net.cpython-312.pyc differ
+diff --git a/netsim/experiments/__pycache__/wifi_exp.cpython-312.pyc b/netsim/experiments/__pycache__/wifi_exp.cpython-312.pyc
+new file mode 100644
+index 0000000..6e53c0c
+Binary files /dev/null and b/netsim/experiments/__pycache__/wifi_exp.cpython-312.pyc differ
+diff --git a/netsim/experiments/wifi_exp.py b/netsim/experiments/wifi_exp.py
+new file mode 100644
+index 0000000..454a8bf
+--- /dev/null
++++ b/netsim/experiments/wifi_exp.py
+@@ -0,0 +1,78 @@
++"""Mininet-WiFi experiments: prints KEY: VALUE lines to stdout."""
++
++from ..targets.configs import WIFI_EXPERIMENTS
++from ..wifi.mobility import RandomWaypointMobility
++from ..wifi.propagation import (log_distance_path_loss,
++                                received_signal_strength)
++from ..wifi_net import MininetWifi
++
++
++def run_wifi_experiments():
++    pl_cfg = WIFI_EXPERIMENTS["pathloss"]
++    freq_hz = pl_cfg["freq_ghz"] * 1e9
++
++    # Experiment 1: log-distance path loss at 50m (f=2.4GHz, n=3)
++    pl = log_distance_path_loss(freq_hz, pl_cfg["test_distance_m"],
++                                path_loss_exp=pl_cfg["path_loss_exp"],
++                                ref_distance_m=pl_cfg["ref_distance_m"])
++    print(f"WIFI_PATHLOSS_50M: {round(pl, 4)}")
++
++    # Experiment 2: RSSI at 100m with tx=20dBm
++    sig_cfg = WIFI_EXPERIMENTS["signal_strength"]
++    rssi = received_signal_strength(sig_cfg["tx_power_dbm"], freq_hz,
++                                    sig_cfg["test_distance_m"],
++                                    path_loss_exp=sig_cfg["path_loss_exp"],
++                                    ref_distance_m=sig_cfg["ref_distance_m"])
++    print(f"WIFI_SIGNAL_100M: {round(rssi, 4)}")
++
++    # Experiment 3: associated stations (10 stations at distances 10-190m)
++    assoc_cfg = WIFI_EXPERIMENTS["association"]
++    net = MininetWifi()
++    net.addAccessPoint("ap1", position=(0.0, 0.0),
++                       tx_power_dbm=assoc_cfg["tx_power_dbm"],
++                       freq_ghz=assoc_cfg["freq_ghz"],
++                       path_loss_exp=assoc_cfg["path_loss_exp"],
++                       min_rssi_dbm=assoc_cfg["min_rssi_dbm"])
++    for i, d in enumerate(assoc_cfg["distances"], start=1):
++        net.addStation(f"sta{i}", position=(float(d), 0.0))
++    net.auto_associate()
++    print(f"WIFI_ASSOC_COUNT: {net.count_associated()}")
++
++    # Experiments 4-5: handovers and coverage during a random waypoint trace
++    mob_cfg = WIFI_EXPERIMENTS["mobility"]
++    net = MininetWifi()
++    for i, pos in enumerate(mob_cfg["ap_positions"], start=1):
++        net.addAccessPoint(f"ap{i}", position=pos,
++                           tx_power_dbm=mob_cfg["tx_power_dbm"],
++                           freq_ghz=mob_cfg["freq_ghz"],
++                           path_loss_exp=mob_cfg["path_loss_exp"],
++                           min_rssi_dbm=mob_cfg["min_rssi_dbm"])
++    sta = net.addStation("sta1", position=(mob_cfg["area_width"] / 2.0,
++                                           mob_cfg["area_height"] / 2.0))
++    mobility = RandomWaypointMobility(
++        area_width=mob_cfg["area_width"],
++        area_height=mob_cfg["area_height"],
++        speed_range=mob_cfg["speed_range"],
++        pause_time=mob_cfg["pause_time"],
++        seed=mob_cfg["seed"])
++    trace = mobility.generate_trace(sta.position, mob_cfg["num_steps"])
++
++    handovers = 0
++    covered_steps = 0
++    prev_ap = None
++    for pos in trace:
++        sta.set_position(pos)
++        net.auto_associate()
++        if sta.associated_ap is not prev_ap:
++            if prev_ap is not None or sta.associated_ap is not None:
++                handovers += 1
++        prev_ap = sta.associated_ap
++        if sta.associated_ap is not None:
++            covered_steps += 1
++    print(f"WIFI_HANDOVER_COUNT: {handovers}")
++    coverage = 100.0 * covered_steps / len(trace)
++    print(f"WIFI_COVERAGE_PCT: {round(coverage, 4)}")
++
++
++if __name__ == "__main__":
++    run_wifi_experiments()
+diff --git a/netsim/targets/__pycache__/__init__.cpython-312.pyc b/netsim/targets/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000..a258750
+Binary files /dev/null and b/netsim/targets/__pycache__/__init__.cpython-312.pyc differ
+diff --git a/netsim/targets/__pycache__/configs.cpython-312.pyc b/netsim/targets/__pycache__/configs.cpython-312.pyc
+new file mode 100644
+index 0000000..4ecb10d
+Binary files /dev/null and b/netsim/targets/__pycache__/configs.cpython-312.pyc differ
+diff --git a/netsim/wifi/__init__.py b/netsim/wifi/__init__.py
+index e69de29..248c054 100644
+--- a/netsim/wifi/__init__.py
++++ b/netsim/wifi/__init__.py
+@@ -0,0 +1,20 @@
++"""Mininet-WiFi extensions: wireless nodes, propagation, and mobility."""
++
++from .accesspoint import AccessPoint
++from .mobility import RandomWaypointMobility
++from .propagation import (friis_free_space_loss, log_distance_path_loss,
++                          max_range, received_signal_strength)
++from .station import Station
++from .wireless_link import WirelessLink, bandwidth_from_rssi
++
++__all__ = [
++    "AccessPoint",
++    "RandomWaypointMobility",
++    "Station",
++    "WirelessLink",
++    "bandwidth_from_rssi",
++    "friis_free_space_loss",
++    "log_distance_path_loss",
++    "max_range",
++    "received_signal_strength",
++]
+diff --git a/netsim/wifi/__pycache__/__init__.cpython-312.pyc b/netsim/wifi/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000..eb12755
+Binary files /dev/null and b/netsim/wifi/__pycache__/__init__.cpython-312.pyc differ
+diff --git a/netsim/wifi/__pycache__/accesspoint.cpython-312.pyc b/netsim/wifi/__pycache__/accesspoint.cpython-312.pyc
+new file mode 100644
+index 0000000..ddded0d
+Binary files /dev/null and b/netsim/wifi/__pycache__/accesspoint.cpython-312.pyc differ
+diff --git a/netsim/wifi/__pycache__/mobility.cpython-312.pyc b/netsim/wifi/__pycache__/mobility.cpython-312.pyc
+new file mode 100644
+index 0000000..000e32e
+Binary files /dev/null and b/netsim/wifi/__pycache__/mobility.cpython-312.pyc differ
+diff --git a/netsim/wifi/__pycache__/propagation.cpython-312.pyc b/netsim/wifi/__pycache__/propagation.cpython-312.pyc
+new file mode 100644
+index 0000000..60ae63b
+Binary files /dev/null and b/netsim/wifi/__pycache__/propagation.cpython-312.pyc differ
+diff --git a/netsim/wifi/__pycache__/station.cpython-312.pyc b/netsim/wifi/__pycache__/station.cpython-312.pyc
+new file mode 100644
+index 0000000..88fa3e9
+Binary files /dev/null and b/netsim/wifi/__pycache__/station.cpython-312.pyc differ
+diff --git a/netsim/wifi/__pycache__/wireless_link.cpython-312.pyc b/netsim/wifi/__pycache__/wireless_link.cpython-312.pyc
+new file mode 100644
+index 0000000..eccc4bf
+Binary files /dev/null and b/netsim/wifi/__pycache__/wireless_link.cpython-312.pyc differ
+diff --git a/netsim/wifi/accesspoint.py b/netsim/wifi/accesspoint.py
+new file mode 100644
+index 0000000..5ea403d
+--- /dev/null
++++ b/netsim/wifi/accesspoint.py
+@@ -0,0 +1,26 @@
++"""WiFi access point node."""
++
++from ..node import Switch
++
++
++class AccessPoint(Switch):
++    """WiFi access point with radio and association parameters."""
++
++    def __init__(self, name, position=(0.0, 0.0), ssid="netsim-ssid",
++                 channel=1, tx_power_dbm=20.0, freq_ghz=2.4,
++                 path_loss_exp=3.0, min_rssi_dbm=-80.0, **params):
++        super().__init__(name, **params)
++        self.position = tuple(position)
++        self.ssid = ssid
++        self.channel = channel
++        self.tx_power_dbm = tx_power_dbm
++        self.freq_ghz = freq_ghz
++        self.path_loss_exp = path_loss_exp
++        self.min_rssi_dbm = min_rssi_dbm
++        self.associated_stations = []
++
++    def set_position(self, x, y=None):
++        if y is None:
++            self.position = tuple(x)
++        else:
++            self.position = (x, y)
+diff --git a/netsim/wifi/mobility.py b/netsim/wifi/mobility.py
+new file mode 100644
+index 0000000..c5b215b
+--- /dev/null
++++ b/netsim/wifi/mobility.py
+@@ -0,0 +1,49 @@
++"""Mobility models for wireless stations."""
++
++import numpy as np
++
++
++class RandomWaypointMobility:
++    """Random waypoint mobility within a rectangular area.
++
++    At each step the station moves toward a random target at a random
++    speed; on arrival a new target is chosen. Uses a numpy RandomState
++    with a configurable seed for reproducibility.
++    """
++
++    def __init__(self, area_width=200.0, area_height=200.0,
++                 speed_range=(1.0, 5.0), pause_time=0, seed=None):
++        self.area_width = area_width
++        self.area_height = area_height
++        self.speed_range = speed_range
++        self.pause_time = pause_time
++        self.seed = seed
++        self.rng = np.random.RandomState(seed)
++
++    def _pick_target(self):
++        x = self.rng.uniform(0.0, self.area_width)
++        y = self.rng.uniform(0.0, self.area_height)
++        return np.array([x, y])
++
++    def _pick_speed(self):
++        return self.rng.uniform(self.speed_range[0], self.speed_range[1])
++
++    def generate_trace(self, start_pos, num_steps):
++        """Return a list of num_steps (x, y) positions."""
++        positions = []
++        pos = np.array(start_pos, dtype=float)
++        target = None
++        speed = 0.0
++        for _ in range(num_steps):
++            if target is None:
++                target = self._pick_target()
++                speed = self._pick_speed()
++            direction = target - pos
++            dist = float(np.linalg.norm(direction))
++            if dist <= speed:
++                pos = target
++                target = None
++            else:
++                pos = pos + direction / dist * speed
++            positions.append((float(pos[0]), float(pos[1])))
++        return positions
+diff --git a/netsim/wifi/propagation.py b/netsim/wifi/propagation.py
+new file mode 100644
+index 0000000..679005f
+--- /dev/null
++++ b/netsim/wifi/propagation.py
+@@ -0,0 +1,36 @@
++"""Wireless propagation models (Friis free-space and log-distance)."""
++
++import math
++
++SPEED_OF_LIGHT = 3e8  # m/s
++
++
++def friis_free_space_loss(freq_hz, distance_m):
++    """Free-space path loss in dB: 20*log10(4*pi*d*f/c)."""
++    distance_m = max(distance_m, 1e-9)
++    return 20.0 * math.log10(4.0 * math.pi * distance_m * freq_hz / SPEED_OF_LIGHT)
++
++
++def log_distance_path_loss(freq_hz, distance_m, path_loss_exp=3.0,
++                           ref_distance_m=1.0):
++    """Log-distance path loss: PL(d) = PL(d0) + 10*n*log10(d/d0)."""
++    distance_m = max(distance_m, 1e-9)
++    pl_ref = friis_free_space_loss(freq_hz, ref_distance_m)
++    return pl_ref + 10.0 * path_loss_exp * math.log10(distance_m / ref_distance_m)
++
++
++def received_signal_strength(tx_power_dbm, freq_hz, distance_m,
++                             tx_gain_dbi=0.0, rx_gain_dbi=0.0,
++                             path_loss_exp=3.0, ref_distance_m=1.0):
++    """RSSI = tx_power + antenna gains - path loss."""
++    pl = log_distance_path_loss(freq_hz, distance_m, path_loss_exp,
++                                ref_distance_m)
++    return tx_power_dbm + tx_gain_dbi + rx_gain_dbi - pl
++
++
++def max_range(tx_power_dbm, min_rssi_dbm, freq_hz, tx_gain_dbi=0.0,
++              rx_gain_dbi=0.0, path_loss_exp=3.0, ref_distance_m=1.0):
++    """Solve for the distance where RSSI equals min_rssi_dbm."""
++    pl_ref = friis_free_space_loss(freq_hz, ref_distance_m)
++    budget = tx_power_dbm + tx_gain_dbi + rx_gain_dbi - min_rssi_dbm - pl_ref
++    return ref_distance_m * 10.0 ** (budget / (10.0 * path_loss_exp))
+diff --git a/netsim/wifi/station.py b/netsim/wifi/station.py
+new file mode 100644
+index 0000000..be8a9c5
+--- /dev/null
++++ b/netsim/wifi/station.py
+@@ -0,0 +1,18 @@
++"""WiFi station node."""
++
++from ..node import Host
++
++
++class Station(Host):
++    """WiFi client with a 2D position and an associated access point."""
++
++    def __init__(self, name, position=(0.0, 0.0), **params):
++        super().__init__(name, **params)
++        self.position = tuple(position)
++        self.associated_ap = None
++
++    def set_position(self, x, y=None):
++        if y is None:
++            self.position = tuple(x)
++        else:
++            self.position = (x, y)
+diff --git a/netsim/wifi/wireless_link.py b/netsim/wifi/wireless_link.py
+new file mode 100644
+index 0000000..1e2bf13
+--- /dev/null
++++ b/netsim/wifi/wireless_link.py
+@@ -0,0 +1,45 @@
++"""Signal-aware wireless link with RSSI-dependent bandwidth."""
++
++from ..link import TCLink
++from ..utils import distance_2d
++from .propagation import received_signal_strength
++
++# Simplified 802.11g rate table: (min_rssi_dbm, bandwidth_mbps)
++RSSI_BW_TABLE = [
++    (-50.0, 54.0),
++    (-60.0, 48.0),
++    (-65.0, 36.0),
++    (-70.0, 24.0),
++    (-75.0, 12.0),
++    (-80.0, 6.0),
++]
++
++
++def bandwidth_from_rssi(rssi_dbm):
++    """Map RSSI to link bandwidth using the simplified 802.11g model."""
++    for threshold, bw in RSSI_BW_TABLE:
++        if rssi_dbm >= threshold:
++            return bw
++    return 0.0
++
++
++class WirelessLink(TCLink):
++    """A wireless link whose bandwidth depends on signal strength."""
++
++    def __init__(self, sta, ap, delay=0.0, loss=0.0, **params):
++        self.rssi_dbm = self._compute_rssi(sta, ap)
++        bw = bandwidth_from_rssi(self.rssi_dbm)
++        super().__init__(sta, ap, bw=bw, delay=delay, loss=loss, **params)
++
++    @staticmethod
++    def _compute_rssi(sta, ap):
++        distance = distance_2d(sta.position, ap.position)
++        return received_signal_strength(
++            ap.tx_power_dbm, ap.freq_ghz * 1e9, distance,
++            path_loss_exp=ap.path_loss_exp)
++
++    def update(self):
++        """Recompute RSSI and bandwidth from current node positions."""
++        self.rssi_dbm = self._compute_rssi(self.node1, self.node2)
++        self.bw = bandwidth_from_rssi(self.rssi_dbm)
++        return self.bw
+diff --git a/netsim/wifi_net.py b/netsim/wifi_net.py
+new file mode 100644
+index 0000000..e7643c6
+--- /dev/null
++++ b/netsim/wifi_net.py
+@@ -0,0 +1,59 @@
++"""Mininet-WiFi network engine: extends Mininet with wireless nodes."""
++
++from .net import Mininet
++from .utils import distance_2d
++from .wifi.accesspoint import AccessPoint
++from .wifi.propagation import received_signal_strength
++from .wifi.station import Station
++
++
++class MininetWifi(Mininet):
++    """Mininet extended with WiFi stations, access points, and association."""
++
++    def __init__(self, *args, **kwargs):
++        self.stations = []
++        self.access_points = []
++        super().__init__(*args, **kwargs)
++
++    def addStation(self, name, position=(0.0, 0.0), **params):
++        sta = Station(name, position=position, **params)
++        self.stations.append(sta)
++        self.hosts.append(sta)
++        self.name_to_node[name] = sta
++        self.graph.add_node(name)
++        return sta
++
++    def addAccessPoint(self, name, position=(0.0, 0.0), **params):
++        ap = AccessPoint(name, position=position, **params)
++        self.access_points.append(ap)
++        self.switches.append(ap)
++        self.name_to_node[name] = ap
++        self.graph.add_node(name)
++        return ap
++
++    def rssi_between(self, sta, ap):
++        """Signal strength (dBm) a station would receive from an AP."""
++        distance = distance_2d(sta.position, ap.position)
++        return received_signal_strength(
++            ap.tx_power_dbm, ap.freq_ghz * 1e9, distance,
++            path_loss_exp=ap.path_loss_exp)
++
++    def auto_associate(self):
++        """Associate each station with the strongest-signal AP in range."""
++        for ap in self.access_points:
++            ap.associated_stations = []
++        for sta in self.stations:
++            best_ap = None
++            best_rssi = float("-inf")
++            for ap in self.access_points:
++                rssi = self.rssi_between(sta, ap)
++                if rssi >= ap.min_rssi_dbm and rssi > best_rssi:
++                    best_ap = ap
++                    best_rssi = rssi
++            sta.associated_ap = best_ap
++            if best_ap is not None:
++                best_ap.associated_stations.append(sta)
++
++    def count_associated(self):
++        """Number of stations currently associated with an AP."""
++        return sum(1 for sta in self.stations if sta.associated_ap is not None)
+diff --git a/requirement_patches/mininet.diff b/requirement_patches/mininet.diff
+new file mode 100644
+index 0000000..53c2d96
+--- /dev/null
++++ b/requirement_patches/mininet.diff
+@@ -0,0 +1,500 @@
++diff --git a/agent_plans/plan.json b/agent_plans/plan.json
++new file mode 100644
++index 0000000..d857b5e
++--- /dev/null
+++++ b/agent_plans/plan.json
++@@ -0,0 +1,15 @@
+++{
+++  "nodes": [
+++    {"id": "mininet", "label": "Mininet core: nodes, links, topos, engine", "layer": 1},
+++    {"id": "mininet_wifi", "label": "Mininet-WiFi: propagation, stations, APs, mobility", "layer": 2},
+++    {"id": "containernet", "label": "Containernet: docker hosts, SFC, fairness", "layer": 3},
+++    {"id": "p4_switch", "label": "P4 programmable data plane", "layer": 4},
+++    {"id": "sdn_controller", "label": "SDN controller with flow rule management", "layer": 5}
+++  ],
+++  "edges": [
+++    {"from": "mininet", "to": "mininet_wifi"},
+++    {"from": "mininet_wifi", "to": "containernet"},
+++    {"from": "containernet", "to": "p4_switch"},
+++    {"from": "p4_switch", "to": "sdn_controller"}
+++  ]
+++}
++diff --git a/netsim/__pycache__/__init__.cpython-312.pyc b/netsim/__pycache__/__init__.cpython-312.pyc
++new file mode 100644
++index 0000000..ae01ab1
++Binary files /dev/null and b/netsim/__pycache__/__init__.cpython-312.pyc differ
++diff --git a/netsim/__pycache__/graph.cpython-312.pyc b/netsim/__pycache__/graph.cpython-312.pyc
++new file mode 100644
++index 0000000..8d71878
++Binary files /dev/null and b/netsim/__pycache__/graph.cpython-312.pyc differ
++diff --git a/netsim/__pycache__/link.cpython-312.pyc b/netsim/__pycache__/link.cpython-312.pyc
++new file mode 100644
++index 0000000..c5111a0
++Binary files /dev/null and b/netsim/__pycache__/link.cpython-312.pyc differ
++diff --git a/netsim/__pycache__/net.cpython-312.pyc b/netsim/__pycache__/net.cpython-312.pyc
++new file mode 100644
++index 0000000..956eeb7
++Binary files /dev/null and b/netsim/__pycache__/net.cpython-312.pyc differ
++diff --git a/netsim/__pycache__/node.cpython-312.pyc b/netsim/__pycache__/node.cpython-312.pyc
++new file mode 100644
++index 0000000..9632c0b
++Binary files /dev/null and b/netsim/__pycache__/node.cpython-312.pyc differ
++diff --git a/netsim/__pycache__/topo.cpython-312.pyc b/netsim/__pycache__/topo.cpython-312.pyc
++new file mode 100644
++index 0000000..7539937
++Binary files /dev/null and b/netsim/__pycache__/topo.cpython-312.pyc differ
++diff --git a/netsim/__pycache__/utils.cpython-312.pyc b/netsim/__pycache__/utils.cpython-312.pyc
++new file mode 100644
++index 0000000..cf872df
++Binary files /dev/null and b/netsim/__pycache__/utils.cpython-312.pyc differ
++diff --git a/netsim/experiments/__pycache__/__init__.cpython-312.pyc b/netsim/experiments/__pycache__/__init__.cpython-312.pyc
++new file mode 100644
++index 0000000..58f3d8d
++Binary files /dev/null and b/netsim/experiments/__pycache__/__init__.cpython-312.pyc differ
++diff --git a/netsim/experiments/__pycache__/mininet_exp.cpython-312.pyc b/netsim/experiments/__pycache__/mininet_exp.cpython-312.pyc
++new file mode 100644
++index 0000000..d4e7b0a
++Binary files /dev/null and b/netsim/experiments/__pycache__/mininet_exp.cpython-312.pyc differ
++diff --git a/netsim/experiments/mininet_exp.py b/netsim/experiments/mininet_exp.py
++new file mode 100644
++index 0000000..70c1a7f
++--- /dev/null
+++++ b/netsim/experiments/mininet_exp.py
++@@ -0,0 +1,36 @@
+++"""Mininet core experiments: prints KEY: VALUE lines to stdout."""
+++
+++from ..net import Mininet
+++from ..topo import LinearTopo, TreeTopo
+++
+++
+++def run_mininet_experiments():
+++    # Experiment 1: total nodes in LinearTopo(k=10)
+++    net = Mininet(topo=LinearTopo(k=10))
+++    net.start()
+++    print(f"MININET_LINEAR10_NODES: {len(net.hosts) + len(net.switches)}")
+++
+++    # Experiment 2: host count in TreeTopo(depth=2, fanout=3)
+++    net = Mininet(topo=TreeTopo(depth=2, fanout=3))
+++    net.start()
+++    print(f"MININET_TREE_HOSTS: {len(net.hosts)}")
+++
+++    # Experiment 3: iperf bandwidth through LinearTopo(k=5), 1000 Mbps links
+++    net = Mininet(topo=LinearTopo(k=5, bw=1000.0, delay=1.0))
+++    net.start()
+++    bw = net.iperf([net.hosts[0], net.hosts[-1]])
+++    print(f"MININET_IPERF_5SW: {round(bw, 4)}")
+++
+++    # Experiment 4: ping loss in TreeTopo(depth=2, fanout=2)
+++    net = Mininet(topo=TreeTopo(depth=2, fanout=2))
+++    net.start()
+++    print(f"MININET_PINGALL_LOSS: {net.pingAll()}")
+++
+++    # Experiment 5: average RTT in LinearTopo(k=4) with 2ms link delay
+++    net = Mininet(topo=LinearTopo(k=4, bw=1000.0, delay=2.0))
+++    net.start()
+++    print(f"MININET_AVG_RTT: {round(net.avg_rtt(), 4)}")
+++
+++
+++if __name__ == "__main__":
+++    run_mininet_experiments()
++diff --git a/netsim/link.py b/netsim/link.py
++new file mode 100644
++index 0000000..e6332d0
++--- /dev/null
+++++ b/netsim/link.py
++@@ -0,0 +1,54 @@
+++"""Link and interface classes for Mininet-style network emulation."""
+++
+++
+++class Intf:
+++    """A network interface attached to a node."""
+++
+++    def __init__(self, name, node, port=None, link=None):
+++        self.name = name
+++        self.node = node
+++        self.port = port
+++        self.link = link
+++
+++    def __repr__(self):
+++        return f"<Intf {self.name} port={self.port}>"
+++
+++
+++class Link:
+++    """A link connecting two nodes, creating one interface on each side."""
+++
+++    def __init__(self, node1, node2, port1=None, port2=None,
+++                 bw=None, delay=None, loss=None, **params):
+++        self.node1 = node1
+++        self.node2 = node2
+++        self.bw = bw
+++        self.delay = delay
+++        self.loss = loss
+++        self.params = dict(params)
+++
+++        if port1 is None:
+++            port1 = node1.new_port()
+++        if port2 is None:
+++            port2 = node2.new_port()
+++
+++        self.intf1 = Intf(f"{node1.name}-eth{port1}", node1, port=port1, link=self)
+++        self.intf2 = Intf(f"{node2.name}-eth{port2}", node2, port=port2, link=self)
+++        node1.add_intf(self.intf1)
+++        node2.add_intf(self.intf2)
+++
+++    def other_node(self, node):
+++        if node is self.node1:
+++            return self.node2
+++        if node is self.node2:
+++            return self.node1
+++        return None
+++
+++    def __repr__(self):
+++        return f"<{self.__class__.__name__} {self.node1.name}-{self.node2.name}>"
+++
+++
+++class TCLink(Link):
+++    """Traffic-controlled link with explicit bandwidth, delay, and loss."""
+++
+++    def __init__(self, node1, node2, bw=1000.0, delay=0.0, loss=0.0, **params):
+++        super().__init__(node1, node2, bw=bw, delay=delay, loss=loss, **params)
++diff --git a/netsim/net.py b/netsim/net.py
++new file mode 100644
++index 0000000..d5cb811
++--- /dev/null
+++++ b/netsim/net.py
++@@ -0,0 +1,154 @@
+++"""Mininet-style network emulation engine."""
+++
+++from .graph import WeightedGraph
+++from .link import TCLink
+++from .node import Controller, Host, OVSSwitch, Switch
+++from .utils import compute_bottleneck_bw, compute_path_delay, generate_ip
+++
+++
+++class Mininet:
+++    """Builds and runs an emulated network from a topology."""
+++
+++    def __init__(self, topo=None, link=TCLink, switch=OVSSwitch,
+++                 host=Host, controller=Controller):
+++        self.topo = topo
+++        self.link_cls = link
+++        self.switch_cls = switch
+++        self.host_cls = host
+++        self.controller_cls = controller
+++        self.hosts = []
+++        self.switches = []
+++        self.controllers = []
+++        self.links = []
+++        self.graph = WeightedGraph()
+++        self.name_to_node = {}
+++        self._host_count = 0
+++        self._switch_count = 0
+++        self._controller_count = 0
+++        if topo is not None:
+++            self.build()
+++
+++    def addHost(self, name, cls=None, **params):
+++        cls = cls or self.host_cls
+++        host = cls(name, **params)
+++        self.hosts.append(host)
+++        self.name_to_node[name] = host
+++        self.graph.add_node(name)
+++        return host
+++
+++    def addSwitch(self, name, cls=None, **params):
+++        cls = cls or self.switch_cls
+++        switch = cls(name, **params)
+++        self.switches.append(switch)
+++        self.name_to_node[name] = switch
+++        self.graph.add_node(name)
+++        return switch
+++
+++    def addController(self, name=None, cls=None, **params):
+++        cls = cls or self.controller_cls
+++        if name is None:
+++            self._controller_count += 1
+++            name = f"c{self._controller_count}"
+++        controller = cls(name, **params)
+++        self.controllers.append(controller)
+++        self.name_to_node[name] = controller
+++        return controller
+++
+++    def _node(self, node):
+++        if isinstance(node, str):
+++            return self.name_to_node[node]
+++        return node
+++
+++    def addLink(self, node1, node2, cls=None, **params):
+++        cls = cls or self.link_cls
+++        n1 = self._node(node1)
+++        n2 = self._node(node2)
+++        link = cls(n1, n2, **params)
+++        self.links.append(link)
+++        self.graph.add_edge(n1.name, n2.name,
+++                            bw=link.bw, delay=link.delay, loss=link.loss)
+++        return link
+++
+++    def build(self):
+++        """Build the network from the assigned topology."""
+++        self.addController()
+++        for switch_name in self.topo.switches():
+++            self.addSwitch(switch_name, **self.topo.node_info(switch_name))
+++        for host_name in self.topo.hosts():
+++            self.addHost(host_name, **self.topo.node_info(host_name))
+++        for n1, n2 in self.topo.links():
+++            self.addLink(n1, n2, **self.topo.link_params(n1, n2))
+++
+++    def start(self):
+++        """Assign IP addresses to hosts."""
+++        for i, host in enumerate(self.hosts):
+++            host.ip = generate_ip(i)
+++
+++    def _resolve_hosts(self, hosts):
+++        if hosts is None:
+++            return list(self.hosts)
+++        return [self._node(h) for h in hosts]
+++
+++    def ping(self, hosts=None):
+++        """Simulate ping between all pairs; return loss percentage."""
+++        hosts = self._resolve_hosts(hosts)
+++        if len(hosts) < 2:
+++            return 0.0
+++        total = 0
+++        lost = 0
+++        for i, src in enumerate(hosts):
+++            for dst in hosts[i + 1:]:
+++                total += 1
+++                path = self.graph.shortest_path(src.name, dst.name)
+++                if path is None:
+++                    lost += 1
+++        return 100.0 * lost / total
+++
+++    def pingAll(self):
+++        """Ping between all hosts; return loss percentage."""
+++        return self.ping(self.hosts)
+++
+++    def _path_edge_attrs(self, path, attr):
+++        values = []
+++        for u, v in zip(path, path[1:]):
+++            values.append(self.graph.get_edge(u, v).get(attr))
+++        return values
+++
+++    def iperf(self, hosts=None):
+++        """Simulate a bandwidth measurement between two hosts.
+++
+++        Finds the shortest path, computes the bottleneck bandwidth, and
+++        applies a per-switch forwarding overhead to each switch hop.
+++        Returns throughput in Mbps.
+++        """
+++        hosts = self._resolve_hosts(hosts)
+++        if len(hosts) < 2:
+++            return 0.0
+++        src, dst = hosts[0], hosts[-1]
+++        path = self.graph.shortest_path(src.name, dst.name)
+++        if path is None:
+++            return 0.0
+++        bandwidths = [bw for bw in self._path_edge_attrs(path, "bw")
+++                      if bw is not None]
+++        bottleneck = compute_bottleneck_bw(bandwidths)
+++        num_switches = sum(1 for n in path
+++                           if isinstance(self.name_to_node.get(n), Switch))
+++        return bottleneck * (1.0 - Switch.FORWARDING_OVERHEAD) ** num_switches
+++
+++    def avg_rtt(self, hosts=None):
+++        """Average round-trip time (ms) across all host pairs."""
+++        hosts = self._resolve_hosts(hosts)
+++        if len(hosts) < 2:
+++            return 0.0
+++        rtts = []
+++        for i, src in enumerate(hosts):
+++            for dst in hosts[i + 1:]:
+++                path = self.graph.shortest_path(src.name, dst.name)
+++                if path is None:
+++                    continue
+++                delays = [d for d in self._path_edge_attrs(path, "delay")
+++                          if d is not None]
+++                rtts.append(2.0 * compute_path_delay(delays))
+++        if not rtts:
+++            return 0.0
+++        return sum(rtts) / len(rtts)
++diff --git a/netsim/node.py b/netsim/node.py
++new file mode 100644
++index 0000000..ae533be
++--- /dev/null
+++++ b/netsim/node.py
++@@ -0,0 +1,59 @@
+++"""Node classes for Mininet-style network emulation."""
+++
+++
+++class Node:
+++    """Base class for all emulated network nodes."""
+++
+++    def __init__(self, name, **params):
+++        self.name = name
+++        self.params = dict(params)
+++        self.intfs = {}  # intf name -> Intf
+++        self.ip = params.get("ip", None)
+++
+++    def new_port(self):
+++        """Return the next free port number on this node."""
+++        port = 0
+++        used = {intf.port for intf in self.intfs.values()}
+++        while port in used:
+++            port += 1
+++        return port
+++
+++    def add_intf(self, intf):
+++        self.intfs[intf.name] = intf
+++
+++    def __repr__(self):
+++        return f"<{self.__class__.__name__} {self.name}>"
+++
+++
+++class Host(Node):
+++    """Emulated network host."""
+++
+++    def __init__(self, name, **params):
+++        super().__init__(name, **params)
+++
+++
+++class Switch(Node):
+++    """OpenFlow switch.
+++
+++    FORWARDING_OVERHEAD: fraction of throughput lost per switch hop
+++    (2% reduction per switch traversed).
+++    """
+++
+++    FORWARDING_OVERHEAD = 0.02
+++
+++    def __init__(self, name, **params):
+++        super().__init__(name, **params)
+++
+++
+++class OVSSwitch(Switch):
+++    """Open vSwitch implementation."""
+++
+++    def __init__(self, name, **params):
+++        super().__init__(name, **params)
+++
+++
+++class Controller(Node):
+++    """SDN controller."""
+++
+++    def __init__(self, name, **params):
+++        super().__init__(name, **params)
++diff --git a/netsim/topo.py b/netsim/topo.py
++new file mode 100644
++index 0000000..7dd7c20
++--- /dev/null
+++++ b/netsim/topo.py
++@@ -0,0 +1,100 @@
+++"""Topology classes for Mininet-style network emulation."""
+++
+++
+++class Topo:
+++    """Base topology: an abstract description of hosts, switches, and links."""
+++
+++    def __init__(self, **link_params):
+++        self._hosts = []
+++        self._switches = []
+++        self._links = []  # list of (node1, node2, params)
+++        self._node_params = {}
+++        self._link_params = dict(link_params)
+++
+++    def addHost(self, name, **params):
+++        self._hosts.append(name)
+++        self._node_params[name] = dict(params)
+++        return name
+++
+++    def addSwitch(self, name, **params):
+++        self._switches.append(name)
+++        self._node_params[name] = dict(params)
+++        return name
+++
+++    def addLink(self, node1, node2, **params):
+++        merged = dict(self._link_params)
+++        merged.update(params)
+++        self._links.append((node1, node2, merged))
+++        return (node1, node2)
+++
+++    def hosts(self):
+++        return list(self._hosts)
+++
+++    def switches(self):
+++        return list(self._switches)
+++
+++    def links(self):
+++        return [(n1, n2) for n1, n2, _ in self._links]
+++
+++    def link_params(self, node1, node2):
+++        for n1, n2, params in self._links:
+++            if (n1, n2) == (node1, node2) or (n1, n2) == (node2, node1):
+++                return params
+++        return {}
+++
+++    def node_info(self, name):
+++        return self._node_params.get(name, {})
+++
+++
+++class LinearTopo(Topo):
+++    """k switches in a line, each with one attached host: h1-s1-s2-...-sN-hN."""
+++
+++    def __init__(self, k=2, **link_params):
+++        super().__init__(**link_params)
+++        self.k = k
+++        for i in range(1, k + 1):
+++            self.addSwitch(f"s{i}")
+++            self.addHost(f"h{i}")
+++            self.addLink(f"h{i}", f"s{i}")
+++            if i > 1:
+++                self.addLink(f"s{i - 1}", f"s{i}")
+++
+++
+++class SingleSwitchTopo(Topo):
+++    """One switch connected to k hosts."""
+++
+++    def __init__(self, k=2, **link_params):
+++        super().__init__(**link_params)
+++        self.k = k
+++        self.addSwitch("s1")
+++        for i in range(1, k + 1):
+++            self.addHost(f"h{i}")
+++            self.addLink(f"h{i}", "s1")
+++
+++
+++class TreeTopo(Topo):
+++    """Tree of switches with given depth and fanout; hosts at the leaves."""
+++
+++    def __init__(self, depth=1, fanout=2, **link_params):
+++        super().__init__(**link_params)
+++        self.depth = depth
+++        self.fanout = fanout
+++        self._host_count = 0
+++        self._switch_count = 0
+++        self._build_tree(parent=None, depth=depth)
+++
+++    def _build_tree(self, parent, depth):
+++        self._switch_count += 1
+++        switch = f"s{self._switch_count}"
+++        self.addSwitch(switch)
+++        if parent is not None:
+++            self.addLink(parent, switch)
+++        if depth > 1:
+++            for _ in range(self.fanout):
+++                self._build_tree(parent=switch, depth=depth - 1)
+++        else:
+++            for _ in range(self.fanout):
+++                self._host_count += 1
+++                host = f"h{self._host_count}"
+++                self.addHost(host)
+++                self.addLink(switch, host)
++diff --git a/run.sh b/run.sh
++index 094fd78..75a071e 100755
++--- a/run.sh
+++++ b/run.sh
++@@ -1,4 +1,4 @@
++ #!/bin/bash
++ set -e
++ cd /workspace
++-echo "No experiments implemented yet."
+++python3 -m netsim.experiments.mininet_exp
+diff --git a/run.sh b/run.sh
+index 75a071e..2ffddde 100755
+--- a/run.sh
++++ b/run.sh
+@@ -2,3 +2,4 @@
+ set -e
+ cd /workspace
+ python3 -m netsim.experiments.mininet_exp
++python3 -m netsim.experiments.wifi_exp

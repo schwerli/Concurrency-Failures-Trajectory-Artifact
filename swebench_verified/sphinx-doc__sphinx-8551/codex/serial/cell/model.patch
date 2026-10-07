@@ -1,0 +1,71 @@
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+index 79d7e4f46..0e496fcfb 100644
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -1233,6 +1233,9 @@ class PythonDomain(Domain):
+             if mod.docname in docnames:
+                 self.modules[modname] = mod
+ 
++    def process_field_xref(self, pnode: pending_xref) -> None:
++        pnode.attributes.update(self.env.ref_context)
++
+     def find_obj(self, env: BuildEnvironment, modname: str, classname: str,
+                  name: str, type: str, searchmode: int = 0
+                  ) -> List[Tuple[str, ObjectEntry]]:
+diff --git a/tests/test_domain_py.py b/tests/test_domain_py.py
+index 2dc97bed9..cfc86c5b8 100644
+--- a/tests/test_domain_py.py
++++ b/tests/test_domain_py.py
+@@ -744,6 +744,52 @@ def test_pyattribute(app):
+     assert domain.objects['Class.attr'] == ('index', 'Class.attr', 'attribute')
+ 
+ 
++@pytest.mark.sphinx(freshenv=True)
++def test_docfield_xrefs_resolve_using_currentmodule(app):
++    text = (".. py:class:: mod.A\n"
++            ".. py:class:: mod.submod.A\n"
++            "\n"
++            ".. py:currentmodule:: mod\n"
++            "\n"
++            ".. py:function:: f(a, b)\n"
++            "\n"
++            "   :param a: alpha\n"
++            "   :type a: A\n"
++            "   :param A b: beta\n"
++            "   :rtype: A\n"
++            "\n"
++            ".. py:currentmodule:: mod.submod\n"
++            "\n"
++            ".. py:function:: g(a, b)\n"
++            "\n"
++            "   :param a: alpha\n"
++            "   :type a: A\n"
++            "   :param A b: beta\n"
++            "   :rtype: A\n")
++    domain = app.env.get_domain('py')
++    doctree = restructuredtext.parse(app, text)
++    refnodes = list(doctree.traverse(pending_xref))
++
++    assert len(refnodes) == 6
++
++    expected = [
++        ('mod', 'mod.A'),
++        ('mod', 'mod.A'),
++        ('mod', 'mod.A'),
++        ('mod.submod', 'mod.submod.A'),
++        ('mod.submod', 'mod.submod.A'),
++        ('mod.submod', 'mod.submod.A'),
++    ]
++    for refnode, (modname, resolved) in zip(refnodes, expected):
++        assert_node(refnode, pending_xref, refdomain='py', reftype='class',
++                    reftarget='A', **{'py:module': modname})
++        assert refnode.hasattr('refspecific')
++        matches = domain.find_obj(app.env, refnode.get('py:module'),
++                                  refnode.get('py:class'),
++                                  refnode['reftarget'], refnode['reftype'], 1)
++        assert [name for name, obj in matches] == [resolved]
++
++
+ def test_pydecorator_signature(app):
+     text = ".. py:decorator:: deco"
+     domain = app.env.get_domain('py')

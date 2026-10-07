@@ -1,0 +1,34 @@
+Done. The port is in `/output`, builds warning-free via both paths, and matches the C++ binary byte-for-byte.
+
+**Structure**
+
+```
+/output
+├── Cargo.toml                          # bin target "test18" -> test18.rs, no dependencies
+├── test18.rs                           # entry point (package root, as required)
+├── test18                              # executable from `rustc --edition 2021 -O test18.rs`
+└── src
+    ├── cstdlib.rs                      # faithful std::atoi
+    └── sortedcontainers/
+        ├── mod.rs                      # re-exports + free `update(dst, src)`
+        ├── bisect.rs                   # lower_bound / upper_bound over a projection
+        ├── sorted_list.rs              # SortedList<T>
+        └── sorted_map.rs               # SortedMap<K, V>
+```
+
+**Interface decisions worth flagging**
+
+- **C++ iterators → positional cursors.** `find`/`lower_bound`/`upper_bound`/`equal_range` return a `usize` index; `end()` is `len()`; `key_at`/`value_at` stand in for `->first`/`->second`. This maps the original control flow (`if (it != m.end())`) one-to-one without unsafe code. Documented on the type.
+- **`m[key]` → `entry_or_default(&key)`.** The name keeps the insert-if-absent side effect visible — it's load-bearing here: at `n=0`, `std::cout << m[test_key1]` is what makes `keys.size()` print `1` instead of `0`.
+- **`atoi` is glibc's, not Rust's.** `(int)strtol(...)`, so `"7xyz"`→7, `"2147483648"`→`-2147483648` (wraps, not saturates), `"999…9"`→`-1`. Verified against the binary.
+- `size()`/`empty()`/`erase` became `len()`/`is_empty()`/`remove()` to align with `BTreeMap`, which is what a Rust reader will compare this against.
+- `update` is a single linear merge of two ordered runs rather than per-entry insertion, with `src` winning on shared keys.
+
+**Verification against `/workspace/dataset/test18_executable`**
+
+- Full-output diff for `n` = -3…130, plus 500, 1234, 5000, 50000, 1000000, and the no-arg default: all identical.
+- 27 argument edge cases (`abc`, `"  7xyz"`, `+6`, `0x10`, empty, `3.9`, `-0`, bare `+`/`-`, tab-prefixed, `4294967314`, i64 overflow, …): outputs *and* exit codes identical.
+- Extra trailing args ignored the same way.
+- `cargo build --release --offline` binary produces identical output; `Cargo.lock` contains only this package.
+
+Two notes: I excluded args that parse to `INT_MAX` (`2147483647`, `-2147483649`) from the diff sweep — both binaries loop ~2B times there and neither finishes, so it's untestable rather than passing; I confirmed the parse result matches by inspection instead. Sequential ascending keys append at the tail, so the `Vec`-backed insert loop stays linear overall — at `n=1000000` the Rust build runs 0.23s vs 0.51s for the C++ one.

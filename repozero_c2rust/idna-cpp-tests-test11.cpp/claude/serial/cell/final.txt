@@ -1,0 +1,46 @@
+Migration complete and verified.
+
+## Project at `/output`
+
+```
+Cargo.toml          # no [dependencies] — std only
+test11.rs           # entry point (package root, as required)
+test11              # compiled executable
+src/lib.rs          # library root
+src/args.rs         # raw-byte argv access
+src/idna/mod.rs     # public API, mirrors the C++ header
+src/idna/ascii.rs   # to_lower, normalize, is_ascii_domain, is_idn_domain
+src/idna/punycode.rs# to_ascii, to_unicode, punycode_encode/decode
+src/idna/validate.rs# is_valid_domain, is_valid_label, count_labels
+```
+
+Builds three ways: `rustc --edition 2021 test11.rs`, bare `rustc test11.rs` (I used `self::` paths so it works under the edition-2015 default too), and `cargo build --release`.
+
+## Behavior recovered black-box
+
+The `idna-cpp` directory doesn't exist in the dataset (only `test11.cpp` + the binary), so I derived everything by probing the executable. The library turns out to be a shim rather than real IDNA:
+
+- `to_ascii` = `"xn--"` + ASCII-lowercased input; `punycode_encode` = `"xn--"` + input **unchanged** — the case difference between these two is easy to miss.
+- `to_unicode` / `punycode_decode` strip **one** leading literal `xn--`, case-**sensitively** and whole-string only: `XN--ABC` is untouched, `xn--xn--a` → `xn--a`, `a.xn--b` keeps its per-label prefix.
+- `is_valid_domain` = 1–255 **bytes**; `is_valid_label` = 1–63 bytes. Neither inspects characters, and the domain check ignores label lengths (a 64-char single label is a "valid domain" but an invalid label).
+- Lengths are byte-based, confirmed with CJK: 21×日 (63 bytes) is a valid label, 22×日 (66 bytes) is not.
+- Case folding is ASCII-only and byte-wise, so `ß`/`İ`/fullwidth text pass through untouched.
+- `normalize` is **indistinguishable from `to_lower`** — no trimming, no dot collapsing, no Unicode normalization. I documented this rather than inventing a difference.
+
+## Verification
+
+Differential-tested against `test11_executable`, comparing `od -tx1` hex dumps so the match is genuinely byte-for-byte:
+
+| Suite | Result |
+|---|---|
+| 5 documented examples + no-arg default + 48 curated edge cases | 54/54 |
+| Randomized fuzz, lengths biased to the 63/255 boundaries | 1200/1200 |
+| Raw `/dev/urandom` bytes (invalid UTF-8) | 400/400 |
+| Multi-argument invocations | 200/200 |
+| Unit tests (`cargo test`) | 18/18 |
+
+Exit codes match (0).
+
+## One deliberate deviation to flag
+
+The spec said to parse args via `std::env::args()`, but that **panics on non-UTF-8 arguments**, while the C++ program echoes such bytes verbatim (e.g. a lone `0xFF` arg). To keep output byte-for-byte identical I used `std::env::args_os()` with a Unix byte view and kept the whole pipeline on `&[u8]`, writing via `write_all` instead of `println!`. Same `std::env` module, no crates — but it's a real departure from the literal wording, and it's why the raw-byte fuzz passes instead of crashing. Say the word if you'd rather have the literal `args()` version and accept the panic on invalid UTF-8.

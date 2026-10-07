@@ -1,0 +1,27 @@
+Fixed.
+
+## Root cause
+
+`call_command()` forwards a kwarg into `parse_args()` only when the action itself is `required`. Members of a `required=True` mutually exclusive group have `action.required == False` — the requirement lives on the *group*, not the action. So `shop_id=1` was never forwarded, `parse_args([])` ran with an unsatisfied group, and argparse raised `Error: one of the arguments --shop-id --shop is required`.
+
+## Change
+
+`django/core/management/__init__.py:133` — collect the actions belonging to required mutually exclusive groups, and forward a kwarg if its action is required **or** it belongs to such a group:
+
+```python
+mutually_exclusive_required_options = {
+    opt
+    for group in parser._mutually_exclusive_groups
+    for opt in group._group_actions if group.required
+}
+```
+
+Only one member is ever forwarded per call (the caller passes one kwarg), so argparse's exclusivity check still fires if a caller passes two, and omitting all of them still errors as before.
+
+## Verification
+
+- New test `user_commands.tests.CommandTests.test_mutually_exclusive_group_required_options` plus command `tests/user_commands/management/commands/mutually_exclusive_required.py`. It fails on the unpatched tree with exactly the reported `CommandError`, and passes with the fix.
+- Drove the reporter's exact parser (including `--shop` → `dest='shop_name'`) through `call_command`: `shop_id=1`, `'--shop-id=1'`, `shop_name='bakery'`, and `'--shop=bakery'` all work; calling with no argument still raises the required-group error.
+- `user_commands` (35 tests) OK. `admin_scripts` has 3 failures (`DiffSettings.test_all`, `test_unified_all`, `test_startapp_unicode_name`) — I confirmed these fail identically with my change stashed; they're environment issues (ascii locale, subprocess-based diffsettings), not regressions.
+
+One limitation I left alone as pre-existing: the forwarding check is `opt.dest in options`, so passing an option under its *flag* name when `dest` was renamed (e.g. `shop='bakery'` instead of `shop_name='bakery'`) still isn't forwarded — the same gap already exists for plain `required=True` options.

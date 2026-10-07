@@ -1,0 +1,128 @@
+diff --git a/sphinx/domains/cpp.py b/sphinx/domains/cpp.py
+index fe52d881d..59dfccc5e 100644
+--- a/sphinx/domains/cpp.py
++++ b/sphinx/domains/cpp.py
+@@ -298,6 +298,7 @@ T = TypeVar('T')
+ 
+ _string_re = re.compile(r"[LuU8]?('([^'\\]*(?:\\.[^'\\]*)*)'"
+                         r'|"([^"\\]*(?:\\.[^"\\]*)*)")', re.S)
++_udl_suffix_re = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+ _visibility_re = re.compile(r'\b(public|private|protected)\b')
+ _operator_re = re.compile(r'''(?x)
+         \[\s*\]
+@@ -882,6 +883,28 @@ class ASTCharLiteral(ASTLiteral):
+         signode.append(nodes.Text(txt, txt))
+ 
+ 
++class ASTUserDefinedLiteral(ASTLiteral):
++    def __init__(self, literal: ASTLiteral, suffix: str) -> None:
++        self.literal = literal
++        self.suffix = suffix
++
++    def _stringify(self, transform: StringifyTransform) -> str:
++        return transform(self.literal) + self.suffix
++
++    def get_id(self, version: int) -> str:
++        # the suffix is inserted before the trailing 'E', if any
++        litId = self.literal.get_id(version)
++        if litId.endswith('E'):
++            return litId[:-1] + self.suffix + 'E'
++        else:
++            return litId + self.suffix
++
++    def describe_signature(self, signode: TextElement, mode: str,
++                           env: "BuildEnvironment", symbol: "Symbol") -> None:
++        self.literal.describe_signature(signode, mode, env, symbol)
++        signode.append(nodes.Text(self.suffix))
++
++
+ class ASTThisLiteral(ASTExpression):
+     def _stringify(self, transform: StringifyTransform) -> str:
+         return "this"
+@@ -4658,32 +4681,40 @@ class DefinitionParser(BaseParser):
+             return ASTBooleanLiteral(True)
+         if self.skip_word('false'):
+             return ASTBooleanLiteral(False)
++
++        lit = None  # type: ASTLiteral
+         for regex in [float_literal_re, binary_literal_re, hex_literal_re,
+                       integer_literal_re, octal_literal_re]:
+             pos = self.pos
+             if self.match(regex):
+                 while self.current_char in 'uUlLfF':
+                     self.pos += 1
+-                return ASTNumberLiteral(self.definition[pos:self.pos])
++                lit = ASTNumberLiteral(self.definition[pos:self.pos])
++                break
+ 
+-        string = self._parse_string()
+-        if string is not None:
+-            return ASTStringLiteral(string)
++        if lit is None:
++            string = self._parse_string()
++            if string is not None:
++                lit = ASTStringLiteral(string)
+ 
+-        # character-literal
+-        if self.match(char_literal_re):
+-            prefix = self.last_match.group(1)  # may be None when no prefix
+-            data = self.last_match.group(2)
+-            try:
+-                return ASTCharLiteral(prefix, data)
+-            except UnicodeDecodeError as e:
+-                self.fail("Can not handle character literal. Internal error was: %s" % e)
+-            except UnsupportedMultiCharacterCharLiteral:
+-                self.fail("Can not handle character literal"
+-                          " resulting in multiple decoded characters.")
+-
+-        # TODO: user-defined lit
+-        return None
++        if lit is None:
++            # character-literal
++            if self.match(char_literal_re):
++                prefix = self.last_match.group(1)  # may be None when no prefix
++                data = self.last_match.group(2)
++                try:
++                    lit = ASTCharLiteral(prefix, data)
++                except UnicodeDecodeError as e:
++                    self.fail("Can not handle character literal. Internal error was: %s" % e)
++                except UnsupportedMultiCharacterCharLiteral:
++                    self.fail("Can not handle character literal"
++                              " resulting in multiple decoded characters.")
++
++        if lit is not None:
++            # user-defined-literal, the suffix must be directly adjacent
++            if self.match(_udl_suffix_re):
++                lit = ASTUserDefinedLiteral(lit, self.matched_text)
++        return lit
+ 
+     def _parse_fold_or_paren_expression(self) -> ASTExpression:
+         # "(" expression ")"
+diff --git a/tests/test_domain_cpp.py b/tests/test_domain_cpp.py
+index 9db741ae5..c842f0773 100644
+--- a/tests/test_domain_cpp.py
++++ b/tests/test_domain_cpp.py
+@@ -176,7 +176,12 @@ def test_expressions():
+         exprCheck(p + "'\\U0001f34c'", t + "127820")
+         exprCheck(p + "'\\U0001F34C'", t + "127820")
+ 
+-    # TODO: user-defined lit
++    # user-defined literals
++    exprCheck('1_x', 'L1_xE')
++    exprCheck('1u_x', 'L1u_xE')
++    exprCheck('6.62607015e-34q_J', 'L6.62607015e-34q_JE')
++    exprCheck('"abc"_x', 'LA3_Kc_xE')
++    exprCheck("'a'_x", 'c97_x')
+     exprCheck('(... + Ns)', '(... + Ns)', id4='flpl2Ns')
+     exprCheck('(Ns + ...)', '(Ns + ...)', id4='frpl2Ns')
+     exprCheck('(Ns + ... + 0)', '(Ns + ... + 0)', id4='fLpl2NsL0E')
+@@ -808,6 +813,9 @@ def test_initializers():
+     check('member', 'T v{42, 42, args...}', idsMember)
+     # other
+     check('member', 'T v = T{}', idsMember)
++    # with user-defined literals in the initializer
++    check('member', 'constexpr auto planck_constant = 6.62607015e-34q_J * 1q_s',
++          {1: 'planck_constant__auto', 2: '15planck_constant'})
+ 
+ 
+ def test_attributes():

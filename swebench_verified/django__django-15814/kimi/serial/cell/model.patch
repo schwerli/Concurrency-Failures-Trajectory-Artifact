@@ -1,0 +1,59 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 33cc636b22..5036335bec 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -748,7 +748,7 @@ class Query(BaseExpression):
+                     cur_model = source.related_model
+                 else:
+                     cur_model = source.remote_field.model
+-                opts = cur_model._meta
++                opts = cur_model._meta.concrete_model._meta
+                 # Even if we're "just passing through" this model, we must add
+                 # both the current model's pk and the related reference field
+                 # (if it's not a reverse relation) to the things we select.
+diff --git a/tests/proxy_models/tests.py b/tests/proxy_models/tests.py
+index f2f465678b..08eee69422 100644
+--- a/tests/proxy_models/tests.py
++++ b/tests/proxy_models/tests.py
+@@ -390,6 +390,41 @@ class ProxyModelTests(TestCase):
+             repr(resp), "<ProxyImprovement: ProxyImprovement:improve that>"
+         )
+ 
++    def test_select_related_only_proxy(self):
++        contributor = ProxyTrackerUser.objects.create(
++            name="Contributor", status="contrib"
++        )
++        someone = BaseUser.objects.create(name="Someone")
++        bug = Bug.objects.create(
++            summary="fix this",
++            version="1.1beta",
++            assignee=contributor,
++            reporter=someone,
++        )
++        Improvement.objects.create(
++            summary="improve that",
++            version="1.1beta",
++            assignee=contributor,
++            reporter=contributor,
++            associated_bug=bug,
++        )
++
++        # select_related() + only() on a relation to a proxy model.
++        resp = (
++            Improvement.objects.select_related("reporter")
++            .only("reporter__name")
++            .get()
++        )
++        self.assertEqual(resp.reporter.name, "Contributor")
++
++        # select_related() + only() on a relation to a proxy of proxy model.
++        resp = (
++            Improvement.objects.select_related("associated_bug")
++            .only("associated_bug__summary")
++            .get()
++        )
++        self.assertEqual(resp.associated_bug.summary, "fix this")
++
+     def test_proxy_load_from_fixture(self):
+         management.call_command("loaddata", "mypeople.json", verbosity=0)
+         p = MyPerson.objects.get(pk=100)

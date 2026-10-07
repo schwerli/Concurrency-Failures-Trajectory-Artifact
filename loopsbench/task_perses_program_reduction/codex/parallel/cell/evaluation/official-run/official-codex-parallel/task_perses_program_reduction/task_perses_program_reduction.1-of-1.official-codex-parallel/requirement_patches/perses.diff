@@ -1,0 +1,1123 @@
+diff --git a/agent_tests/test_perses.py b/agent_tests/test_perses.py
+new file mode 100644
+index 0000000..f5d6e02
+--- /dev/null
++++ b/agent_tests/test_perses.py
+@@ -0,0 +1,54 @@
++import unittest
++from pathlib import Path
++
++from reduction.config import Config
++from reduction.driver import ReductionDriver
++from reduction.grammar import Grammar, GrammarRule, RuleType
++from reduction.perses_reducer import PersesReducer
++from reduction.pnf import normalize_to_pnf
++from reduction.property_test import PropertyTester
++
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++class PNFNormalizerTests(unittest.TestCase):
++    def test_normalizes_aliases_recursion_and_quantifiers(self) -> None:
++        grammar = Grammar(start_symbol="expr")
++        grammar.add_rule(GrammarRule("expr", RuleType.ALTERNATION, ["expr_left", "term"]))
++        grammar.add_rule(GrammarRule("expr_left", RuleType.SEQUENCE, ["expr", "PLUS", "term"]))
++        grammar.add_rule(GrammarRule("term", RuleType.SEQUENCE, ["factor"]))
++        grammar.add_rule(GrammarRule("factor", RuleType.SEQUENCE, ["NUMBER"]))
++        grammar.add_rule(GrammarRule("list_tail", RuleType.KLEENE_STAR, ["COMMA", "factor"]))
++        grammar.add_rule(GrammarRule("dead", RuleType.SEQUENCE, ["UNUSED"]))
++
++        normalized = normalize_to_pnf(grammar)
++
++        self.assertTrue(normalized.is_pnf())
++        self.assertNotIn("dead", normalized.rules)
++        self.assertNotIn("term", normalized.rules)
++        self.assertNotIn("list_tail", normalized.rules)
++        self.assertEqual(normalized.rules["expr"].rule_type, RuleType.SEQUENCE)
++
++
++class PersesReducerTests(unittest.TestCase):
++    def test_reduces_bug1(self) -> None:
++        subject = ROOT / "test_subjects" / "bug1"
++        grammar = normalize_to_pnf(Grammar.python_simplified())
++        tester = PropertyTester(str(subject / "test.sh"), work_dir=str(subject))
++        source = (subject / "program.py").read_text(encoding="utf-8")
++
++        driver = ReductionDriver(
++            grammar=grammar,
++            tester=tester,
++            reducers=[PersesReducer(grammar)],
++            config=Config(fixpoint=True, max_iterations=20, timeout_per_test=10),
++        )
++        result = driver.reduce(source)
++
++        self.assertLess(result.reduced_tokens, result.original_tokens)
++        self.assertTrue(PropertyTester(str(subject / "test.sh"), work_dir=str(subject)).test(result.reduced_source))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/agent_tests/test_perses_core.py b/agent_tests/test_perses_core.py
+new file mode 100644
+index 0000000..3653200
+--- /dev/null
++++ b/agent_tests/test_perses_core.py
+@@ -0,0 +1,70 @@
++import unittest
++
++from reduction.driver import ReductionDriver
++from reduction.grammar import Grammar, GrammarRule, RuleType
++from reduction.perses_reducer import PersesReducer
++from reduction.pnf import normalize_to_pnf
++
++
++class ZeroDivisionTester:
++    def __init__(self) -> None:
++        self._test_count = 0
++
++    @property
++    def test_count(self) -> int:
++        return self._test_count
++
++    def test(self, source: str) -> bool:
++        self._test_count += 1
++        namespace: dict[str, object] = {}
++        try:
++            exec(source, namespace, namespace)
++        except ZeroDivisionError:
++            return True
++        except Exception:
++            return False
++        return False
++
++
++class PNFNormalizerTest(unittest.TestCase):
++    def test_normalizer_prunes_unreachable_and_rewrites_recursion(self) -> None:
++        grammar = Grammar(start_symbol="start")
++        grammar.add_rule(GrammarRule("start", RuleType.SEQUENCE, ["alias"]))
++        grammar.add_rule(GrammarRule("alias", RuleType.ALTERNATION, ["expr"]))
++        grammar.add_rule(GrammarRule("expr", RuleType.SEQUENCE, ["expr", "TERM"]))
++        grammar.add_rule(GrammarRule("dead", RuleType.SEQUENCE, ["GHOST"]))
++
++        normalized = normalize_to_pnf(grammar)
++
++        self.assertNotIn("dead", normalized.rules)
++        self.assertNotIn("alias", normalized.rules)
++        self.assertEqual(len(normalized.rules), 1)
++        self.assertEqual(normalized.rules[normalized.start_symbol].rule_type, RuleType.KLEENE_PLUS)
++        self.assertTrue(normalized.is_pnf())
++
++
++class PersesReducerTest(unittest.TestCase):
++    def test_reducer_removes_irrelevant_subtrees(self) -> None:
++        source = """\
++def helper():
++    return 1
++
++def trigger():
++    x = helper()
++    return 1 / 0
++
++trigger()
++"""
++        grammar = normalize_to_pnf(Grammar.python_simplified())
++        tester = ZeroDivisionTester()
++        driver = ReductionDriver(grammar, tester, [PersesReducer(grammar)])
++
++        result = driver.reduce(source)
++
++        self.assertLess(result.reduced_tokens, result.original_tokens)
++        self.assertIn("trigger", result.reduced_source)
++        self.assertTrue(ZeroDivisionTester().test(result.reduced_source))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/reduction/__init__.py b/reduction/__init__.py
+index f02ed1e..d109160 100644
+--- a/reduction/__init__.py
++++ b/reduction/__init__.py
+@@ -15,3 +15,5 @@ from reduction.dd import DeltaDebugging
+ from reduction.reducer import AbstractReducer
+ from reduction.driver import ReductionDriver, ReductionResult
+ from reduction.config import Config
++from reduction.pnf import PNFNormalizer, normalize_grammar, normalize_to_pnf
++from reduction.perses_reducer import PersesReducer
+diff --git a/reduction/dd.py b/reduction/dd.py
+index e625b97..342f726 100644
+--- a/reduction/dd.py
++++ b/reduction/dd.py
+@@ -10,6 +10,7 @@ from typing import List
+ 
+ from reduction.token import Token
+ from reduction.property_test import PropertyTester
++from reduction.tree import render_tokens
+ 
+ 
+ class DeltaDebugging:
+@@ -135,37 +136,4 @@ class DeltaDebugging:
+         Returns:
+             Reconstructed source string.
+         """
+-        if not tokens:
+-            return ""
+-
+-        # Group tokens by line
+-        lines_dict: dict[int, list[Token]] = {}
+-        for tok in tokens:
+-            if tok.type == 'NEWLINE':
+-                continue
+-            if tok.line not in lines_dict:
+-                lines_dict[tok.line] = []
+-            lines_dict[tok.line].append(tok)
+-
+-        if not lines_dict:
+-            return ""
+-
+-        result_lines = []
+-        for line_num in sorted(lines_dict.keys()):
+-            line_tokens = sorted(lines_dict[line_num], key=lambda t: t.col)
+-            line_str = ""
+-            current_col = 0
+-            for tok in line_tokens:
+-                if tok.type == 'INDENT':
+-                    line_str += tok.value
+-                    current_col = len(tok.value)
+-                else:
+-                    if tok.col > current_col:
+-                        line_str += " " * (tok.col - current_col)
+-                    elif current_col > 0 and line_str and not line_str.endswith(' '):
+-                        line_str += " "
+-                    line_str += tok.value
+-                    current_col = tok.col + len(tok.value)
+-            result_lines.append(line_str)
+-
+-        return "\n".join(result_lines) + "\n"
++        return render_tokens(tokens)
+diff --git a/reduction/perses_reducer.py b/reduction/perses_reducer.py
+new file mode 100644
+index 0000000..4239035
+--- /dev/null
++++ b/reduction/perses_reducer.py
+@@ -0,0 +1,266 @@
++"""Perses-style syntax-guided reducer."""
++
++from __future__ import annotations
++
++import heapq
++
++from reduction.grammar import Grammar, RuleType
++from reduction.parser import Parser
++from reduction.pnf import normalize_to_pnf
++from reduction.property_test import PropertyTester
++from reduction.reducer import AbstractReducer
++from reduction.tree import NodeType, SparTreeNode
++from reduction.tree_utils import iter_nodes, node_at, parent_at
++
++
++LIST_RULE_TYPES = {RuleType.KLEENE_STAR, RuleType.KLEENE_PLUS}
++
++
++class PersesReducer(AbstractReducer):
++    """Reduce a SparTree while preserving grammar-compatible structure."""
++
++    def __init__(self, grammar: Grammar):
++        self.grammar = normalize_to_pnf(grammar)
++        self.parser = Parser(self.grammar)
++
++    @property
++    def name(self) -> str:
++        return "perses"
++
++    def reduce(self, tree: SparTreeNode, tester: PropertyTester) -> SparTreeNode:
++        working = self.parser.parse(tree.to_source())
++
++        while True:
++            candidate = self._reduce_once(working, tester)
++            if candidate is None or candidate.token_count() >= working.token_count():
++                return working
++            working = candidate
++
++    def _reduce_once(
++        self,
++        tree: SparTreeNode,
++        tester: PropertyTester,
++    ) -> SparTreeNode | None:
++        queue: list[tuple[int, int, tuple[int, ...]]] = []
++        for order, (path, node) in enumerate(iter_nodes(tree)):
++            if node.deleted or node.node_type == NodeType.TOKEN or node.token_count() == 0:
++                continue
++            heapq.heappush(queue, (-node.token_count(), order, path))
++
++        while queue:
++            _, _, path = heapq.heappop(queue)
++            node = node_at(tree, path)
++            if node is None or node.deleted or node.token_count() == 0:
++                continue
++
++            if self._is_list_node(node):
++                candidate = self._reduce_list_children(tree, path, tester)
++            elif node.node_type == NodeType.OPTIONAL:
++                candidate = self._delete_whole_node(tree, path, tester)
++            elif node.node_type == NodeType.REGULAR:
++                candidate = self._replace_with_compatible_descendant(tree, path, tester)
++            else:
++                candidate = None
++
++            if candidate is not None and candidate.token_count() < tree.token_count():
++                return candidate
++
++        return None
++
++    def _is_list_node(self, node: SparTreeNode) -> bool:
++        rule = self.grammar.expected_rule(node.rule_name)
++        return rule is not None and rule.rule_type in LIST_RULE_TYPES
++
++    def _reduce_list_children(
++        self,
++        tree: SparTreeNode,
++        path: tuple[int, ...],
++        tester: PropertyTester,
++    ) -> SparTreeNode | None:
++        working = tree
++        rule = self.grammar.expected_rule(node_at(tree, path).rule_name) if node_at(tree, path) else None
++        if rule is None:
++            return None
++
++        minimum_children = 1 if rule.rule_type == RuleType.KLEENE_PLUS else 0
++        granularity = 2
++        changed = False
++
++        while True:
++            node = node_at(working, path)
++            if node is None or len(node.children) <= minimum_children:
++                break
++
++            partitions = self._split_indices(len(node.children), granularity)
++            progress = False
++
++            for partition in partitions:
++                keep = [index for index in range(len(node.children)) if index not in partition]
++                if len(keep) < minimum_children:
++                    continue
++                candidate = self._clone_with_child_subset(working, path, keep)
++                accepted = self._accept_tree(candidate, tester)
++                if accepted is not None:
++                    working = accepted
++                    granularity = max(2, granularity - 1)
++                    changed = True
++                    progress = True
++                    break
++
++            if progress:
++                continue
++
++            for partition in partitions:
++                if len(partition) < minimum_children or len(partition) == len(node.children):
++                    continue
++                candidate = self._clone_with_child_subset(working, path, partition)
++                accepted = self._accept_tree(candidate, tester)
++                if accepted is not None:
++                    working = accepted
++                    granularity = 2
++                    changed = True
++                    progress = True
++                    break
++
++            if progress:
++                continue
++
++            if granularity >= len(node.children):
++                break
++            granularity = min(len(node.children), granularity * 2)
++
++        if changed:
++            return working
++        return None
++
++    def _delete_whole_node(
++        self,
++        tree: SparTreeNode,
++        path: tuple[int, ...],
++        tester: PropertyTester,
++    ) -> SparTreeNode | None:
++        if not path:
++            return None
++        candidate = tree.clone()
++        parent, index = parent_at(candidate, path)
++        if parent is None or index is None:
++            return None
++        del parent.children[index]
++        return self._accept_tree(candidate, tester)
++
++    def _replace_with_compatible_descendant(
++        self,
++        tree: SparTreeNode,
++        path: tuple[int, ...],
++        tester: PropertyTester,
++    ) -> SparTreeNode | None:
++        if not path:
++            return None
++
++        target = node_at(tree, path)
++        if target is None or target.token_count() <= 1:
++            return None
++
++        seen_sources: set[str] = set()
++        for candidate_node in sorted(
++            self._compatible_descendants(target),
++            key=lambda item: item.token_count(),
++        ):
++            candidate_source = candidate_node.to_source()
++            if candidate_source in seen_sources:
++                continue
++            seen_sources.add(candidate_source)
++
++            candidate_tree = tree.clone()
++            parent, index = parent_at(candidate_tree, path)
++            if parent is None or index is None:
++                continue
++            parent.children[index] = candidate_node.clone()
++            accepted = self._accept_tree(candidate_tree, tester)
++            if accepted is not None:
++                return accepted
++
++        return None
++
++    def _compatible_descendants(self, node: SparTreeNode) -> list[SparTreeNode]:
++        target_indent = self._leading_indent(node)
++        target_source = node.to_source()
++        candidates: list[SparTreeNode] = []
++
++        for _, descendant in iter_nodes(node):
++            if descendant is node or descendant.deleted:
++                continue
++            if descendant.rule_name != node.rule_name:
++                continue
++            if descendant.token_count() >= node.token_count():
++                continue
++            if self._leading_indent(descendant) != target_indent:
++                continue
++            if descendant.to_source() == target_source:
++                continue
++            candidates.append(descendant)
++
++        return candidates
++
++    def _clone_with_child_subset(
++        self,
++        tree: SparTreeNode,
++        path: tuple[int, ...],
++        keep_indices: list[int],
++    ) -> SparTreeNode:
++        candidate = tree.clone()
++        node = node_at(candidate, path)
++        if node is None:
++            return candidate
++        keep = set(keep_indices)
++        node.children = [
++            child
++            for index, child in enumerate(node.children)
++            if index in keep
++        ]
++        return candidate
++
++    def _accept_tree(
++        self,
++        candidate: SparTreeNode,
++        tester: PropertyTester,
++    ) -> SparTreeNode | None:
++        source = candidate.to_source()
++        if not source.strip():
++            return None
++        if not tester.test(source):
++            return None
++        return self.parser.parse(source)
++
++    def _leading_indent(self, node: SparTreeNode) -> int:
++        tokens = node.tokens()
++        if not tokens:
++            return 0
++
++        first_line = None
++        for token in tokens:
++            if token.type == "NEWLINE":
++                continue
++            if first_line is None:
++                first_line = token.line
++            if token.line != first_line:
++                break
++            if token.type == "INDENT":
++                return len(token.value)
++        return 0
++
++    def _split_indices(self, length: int, partitions: int) -> list[list[int]]:
++        if length <= 0:
++            return []
++        if partitions > length:
++            partitions = length
++
++        result = []
++        base = length // partitions
++        remainder = length % partitions
++        start = 0
++        for index in range(partitions):
++            end = start + base + (1 if index < remainder else 0)
++            result.append(list(range(start, end)))
++            start = end
++        return [chunk for chunk in result if chunk]
+diff --git a/reduction/pnf.py b/reduction/pnf.py
+new file mode 100644
+index 0000000..9bba828
+--- /dev/null
++++ b/reduction/pnf.py
+@@ -0,0 +1,343 @@
++"""Grammar normalization into a Perses-friendly prioritized normal form."""
++
++from __future__ import annotations
++
++import copy
++from collections import deque
++
++from reduction.grammar import Grammar, GrammarRule, RuleType
++
++
++_QUANTIFIER_SUFFIXES = {
++    "*": RuleType.KLEENE_STAR,
++    "+": RuleType.KLEENE_PLUS,
++    "?": RuleType.OPTIONAL,
++}
++
++
++class PNFNormalizer:
++    """Normalize grammars into a reduced Perses-style normal form.
++
++    The grammar representation in this repository is intentionally small, so
++    normalization focuses on the transformations that the reducers actually
++    need: reachability pruning, alias inlining, direct recursion rewriting,
++    and factoring quantified helpers into named rules.
++    """
++
++    def __init__(self) -> None:
++        self._name_counter = 0
++
++    def normalize(self, grammar: Grammar) -> Grammar:
++        """Return a normalized copy of ``grammar``."""
++        normalized = copy.deepcopy(grammar)
++        self._hoist_nested_rules(normalized)
++        self._hoist_quantified_aliases(normalized)
++        self._inline_single_alternative_rules(normalized)
++        self._remove_direct_recursion(normalized)
++        self._hoist_nested_rules(normalized)
++        self._hoist_quantified_aliases(normalized)
++        self._inline_single_alternative_rules(normalized)
++        self._remove_unreachable_rules(normalized)
++        return normalized
++
++    def _hoist_nested_rules(self, grammar: Grammar) -> None:
++        """Replace inline ``GrammarRule`` symbols with named helper rules."""
++        queue = deque(grammar.rules.values())
++        while queue:
++            rule = queue.popleft()
++            new_symbols: list[str] = []
++            changed = False
++
++            for index, symbol in enumerate(rule.symbols, start=1):
++                if isinstance(symbol, GrammarRule):
++                    changed = True
++                    helper_name = symbol.name or f"{rule.name}__item_{index}"
++                    helper_name = self._unique_name(grammar, helper_name)
++                    helper_rule = GrammarRule(
++                        name=helper_name,
++                        rule_type=symbol.rule_type,
++                        symbols=list(symbol.symbols),
++                    )
++                    grammar.add_rule(helper_rule)
++                    queue.append(helper_rule)
++                    new_symbols.append(helper_name)
++                else:
++                    new_symbols.append(symbol)
++
++            if changed:
++                rule.symbols = new_symbols
++
++    def _hoist_quantified_aliases(self, grammar: Grammar) -> None:
++        """Turn ``foo*`` / ``foo+`` / ``foo?`` references into helper rules."""
++        for rule in list(grammar.rules.values()):
++            new_symbols: list[str] = []
++            changed = False
++            for symbol in rule.symbols:
++                if (
++                    isinstance(symbol, str)
++                    and len(symbol) > 1
++                    and symbol[-1] in _QUANTIFIER_SUFFIXES
++                ):
++                    helper_name = self._unique_name(
++                        grammar,
++                        f"{rule.name}__{symbol[:-1]}_{symbol[-1]}",
++                    )
++                    grammar.add_rule(
++                        GrammarRule(
++                            helper_name,
++                            _QUANTIFIER_SUFFIXES[symbol[-1]],
++                            [symbol[:-1]],
++                        )
++                    )
++                    new_symbols.append(helper_name)
++                    changed = True
++                else:
++                    new_symbols.append(symbol if isinstance(symbol, str) else symbol.name)
++            if changed:
++                rule.symbols = new_symbols
++
++    def _inline_single_alternative_rules(self, grammar: Grammar) -> None:
++        """Inline alias-like rules that simply forward to another symbol."""
++        alias_map: dict[str, str] = {}
++
++        for name, rule in list(grammar.rules.items()):
++            if rule.rule_type not in (RuleType.SEQUENCE, RuleType.ALTERNATION):
++                continue
++            if len(rule.symbols) != 1:
++                continue
++            target = rule.symbols[0]
++            if not isinstance(target, str) or target == name:
++                continue
++            alias_map[name] = target
++
++        if not alias_map:
++            return
++
++        def resolve(symbol: str) -> str:
++            seen = set()
++            current = symbol
++            while current in alias_map and current not in seen:
++                seen.add(current)
++                current = alias_map[current]
++            return current
++
++        for rule in grammar.rules.values():
++            rewritten: list[str] = []
++            for symbol in rule.symbols:
++                if isinstance(symbol, str):
++                    rewritten.append(resolve(symbol))
++                else:
++                    rewritten.append(symbol.name)
++            rule.symbols = rewritten
++
++        if grammar.start_symbol in alias_map:
++            grammar.start_symbol = resolve(grammar.start_symbol)
++
++        for alias in alias_map:
++            if alias != grammar.start_symbol:
++                grammar.rules.pop(alias, None)
++
++    def _remove_unreachable_rules(self, grammar: Grammar) -> None:
++        """Drop productions that cannot be reached from the start symbol."""
++        reachable: set[str] = set()
++        queue = deque([grammar.start_symbol])
++
++        while queue:
++            name = queue.popleft()
++            if name in reachable:
++                continue
++            reachable.add(name)
++            rule = grammar.rules.get(name)
++            if rule is None:
++                continue
++            for symbol in rule.symbols:
++                if isinstance(symbol, str) and symbol in grammar.rules and symbol not in reachable:
++                    queue.append(symbol)
++
++        grammar.rules = {
++            name: rule for name, rule in grammar.rules.items() if name in reachable
++        }
++
++    def _remove_direct_recursion(self, grammar: Grammar) -> None:
++        """Rewrite direct left/right recursion into quantified helpers."""
++        for rule_name in list(grammar.rules):
++            rule = grammar.rules.get(rule_name)
++            if rule is None:
++                continue
++
++            rewritten = self._rewrite_direct_recursive_rule(grammar, rule)
++            if rewritten is not None:
++                grammar.rules[rule_name] = rewritten
++
++    def _rewrite_direct_recursive_rule(
++        self,
++        grammar: Grammar,
++        rule: GrammarRule,
++    ) -> GrammarRule | None:
++        """Rewrite a direct recursive rule when it matches a supported shape."""
++        if rule.rule_type == RuleType.SEQUENCE:
++            return self._rewrite_recursive_sequence(grammar, rule)
++
++        if rule.rule_type != RuleType.ALTERNATION:
++            return None
++
++        left_recursive: list[list[str]] = []
++        right_recursive: list[list[str]] = []
++        base_rules: list[str] = []
++
++        for symbol in rule.symbols:
++            if not isinstance(symbol, str):
++                return None
++
++            alt_rule = grammar.rules.get(symbol)
++            if alt_rule is None:
++                base_rules.append(symbol)
++                continue
++
++            if alt_rule.rule_type == RuleType.SEQUENCE and alt_rule.symbols:
++                first = alt_rule.symbols[0]
++                last = alt_rule.symbols[-1]
++                if first == rule.name and len(alt_rule.symbols) > 1:
++                    left_recursive.append([str(part) for part in alt_rule.symbols[1:]])
++                    continue
++                if last == rule.name and len(alt_rule.symbols) > 1:
++                    right_recursive.append([str(part) for part in alt_rule.symbols[:-1]])
++                    continue
++
++            if symbol != rule.name:
++                base_rules.append(symbol)
++
++        if left_recursive and not right_recursive and base_rules:
++            return self._build_left_recursive_rewrite(grammar, rule, base_rules, left_recursive)
++
++        if right_recursive and not left_recursive and base_rules:
++            return self._build_right_recursive_rewrite(grammar, rule, base_rules, right_recursive)
++
++        return None
++
++    def _rewrite_recursive_sequence(
++        self,
++        grammar: Grammar,
++        rule: GrammarRule,
++    ) -> GrammarRule | None:
++        """Rewrite a trivial ``A -> A x`` or ``A -> x A`` sequence."""
++        if not rule.symbols:
++            return None
++
++        first = rule.symbols[0]
++        last = rule.symbols[-1]
++
++        if first == rule.name and len(rule.symbols) > 1:
++            item_name = self._sequence_helper(grammar, rule.name, "tail_item", list(rule.symbols[1:]))
++            plus_name = self._quantifier_helper(grammar, rule.name, "tail_plus", RuleType.KLEENE_PLUS, item_name)
++            return GrammarRule(rule.name, RuleType.SEQUENCE, [plus_name])
++
++        if last == rule.name and len(rule.symbols) > 1:
++            item_name = self._sequence_helper(grammar, rule.name, "head_item", list(rule.symbols[:-1]))
++            plus_name = self._quantifier_helper(grammar, rule.name, "head_plus", RuleType.KLEENE_PLUS, item_name)
++            return GrammarRule(rule.name, RuleType.SEQUENCE, [plus_name])
++
++        return None
++
++    def _build_left_recursive_rewrite(
++        self,
++        grammar: Grammar,
++        rule: GrammarRule,
++        base_rules: list[str],
++        recursive_suffixes: list[list[str]],
++    ) -> GrammarRule:
++        base_name = self._alternation_helper(grammar, rule.name, "base", base_rules)
++        tail_item_names = [
++            self._sequence_helper(grammar, rule.name, f"tail_item_{index}", suffix)
++            for index, suffix in enumerate(recursive_suffixes, start=1)
++        ]
++        tail_alt_name = self._alternation_helper(grammar, rule.name, "tail_alt", tail_item_names)
++        tail_star_name = self._quantifier_helper(
++            grammar,
++            rule.name,
++            "tail_star",
++            RuleType.KLEENE_STAR,
++            tail_alt_name,
++        )
++        return GrammarRule(rule.name, RuleType.SEQUENCE, [base_name, tail_star_name])
++
++    def _build_right_recursive_rewrite(
++        self,
++        grammar: Grammar,
++        rule: GrammarRule,
++        base_rules: list[str],
++        recursive_prefixes: list[list[str]],
++    ) -> GrammarRule:
++        base_name = self._alternation_helper(grammar, rule.name, "base", base_rules)
++        head_item_names = [
++            self._sequence_helper(grammar, rule.name, f"head_item_{index}", prefix)
++            for index, prefix in enumerate(recursive_prefixes, start=1)
++        ]
++        head_alt_name = self._alternation_helper(grammar, rule.name, "head_alt", head_item_names)
++        head_star_name = self._quantifier_helper(
++            grammar,
++            rule.name,
++            "head_star",
++            RuleType.KLEENE_STAR,
++            head_alt_name,
++        )
++        return GrammarRule(rule.name, RuleType.SEQUENCE, [head_star_name, base_name])
++
++    def _alternation_helper(
++        self,
++        grammar: Grammar,
++        base_name: str,
++        suffix: str,
++        symbols: list[str],
++    ) -> str:
++        if len(symbols) == 1:
++            return symbols[0]
++        helper_name = self._unique_name(grammar, f"{base_name}__{suffix}")
++        grammar.add_rule(GrammarRule(helper_name, RuleType.ALTERNATION, list(symbols)))
++        return helper_name
++
++    def _sequence_helper(
++        self,
++        grammar: Grammar,
++        base_name: str,
++        suffix: str,
++        symbols: list[str],
++    ) -> str:
++        if len(symbols) == 1:
++            return symbols[0]
++        helper_name = self._unique_name(grammar, f"{base_name}__{suffix}")
++        grammar.add_rule(GrammarRule(helper_name, RuleType.SEQUENCE, list(symbols)))
++        return helper_name
++
++    def _quantifier_helper(
++        self,
++        grammar: Grammar,
++        base_name: str,
++        suffix: str,
++        rule_type: RuleType,
++        symbol: str,
++    ) -> str:
++        helper_name = self._unique_name(grammar, f"{base_name}__{suffix}")
++        grammar.add_rule(GrammarRule(helper_name, rule_type, [symbol]))
++        return helper_name
++
++    def _unique_name(self, grammar: Grammar, base_name: str) -> str:
++        """Generate a rule name that does not collide with the current grammar."""
++        if base_name not in grammar.rules:
++            return base_name
++
++        while True:
++            self._name_counter += 1
++            candidate = f"{base_name}_{self._name_counter}"
++            if candidate not in grammar.rules:
++                return candidate
++
++
++def normalize_grammar(grammar: Grammar) -> Grammar:
++    """Normalize ``grammar`` into Perses Normal Form."""
++    return PNFNormalizer().normalize(grammar)
++
++
++def normalize_to_pnf(grammar: Grammar) -> Grammar:
++    """Normalize ``grammar`` into Perses Normal Form."""
++    return normalize_grammar(grammar)
+diff --git a/reduction/property_test.py b/reduction/property_test.py
+index a993b3c..c8a2116 100644
+--- a/reduction/property_test.py
++++ b/reduction/property_test.py
+@@ -25,7 +25,7 @@ class PropertyTester:
+             work_dir: Directory for temporary files. Uses system temp if None.
+         """
+         self.test_script = os.path.abspath(test_script)
+-        self.work_dir = work_dir or tempfile.gettempdir()
++        self.work_dir = os.path.abspath(work_dir or tempfile.gettempdir())
+         self._test_count = 0
+         self.timeout = 10  # seconds
+ 
+@@ -50,9 +50,13 @@ class PropertyTester:
+         self._test_count += 1
+ 
+         # Write source to temporary file
+-        tmp_path = os.path.join(self.work_dir, "_reduction_candidate.py")
++        tmp_fd, tmp_path = tempfile.mkstemp(
++            prefix="_reduction_candidate_",
++            suffix=".py",
++            dir=self.work_dir
++        )
+         try:
+-            with open(tmp_path, 'w') as f:
++            with os.fdopen(tmp_fd, 'w') as f:
+                 f.write(program_source)
+ 
+             # Run the test script
+diff --git a/reduction/tree.py b/reduction/tree.py
+index 3539c98..e9aa5c1 100644
+--- a/reduction/tree.py
++++ b/reduction/tree.py
+@@ -8,6 +8,61 @@ import copy
+ from reduction.token import Token
+ 
+ 
++def render_tokens(tokens: List[Token]) -> str:
++    """Render a token stream back into source code.
++
++    The parser keeps tokens in structural order, so rendering follows that order
++    and uses the stored line/column positions only as soft spacing hints. This
++    remains stable even after subtree replacement, where absolute line numbers
++    from the original source are no longer globally meaningful.
++    """
++    if not tokens:
++        return ""
++
++    pieces: list[str] = []
++    prev: Token | None = None
++    at_line_start = True
++
++    for tok in tokens:
++        if tok.type == 'NEWLINE':
++            continue
++
++        line_changed = prev is not None and tok.line != prev.line
++        if line_changed:
++            pieces.append("\n")
++            at_line_start = True
++
++        if tok.type == 'INDENT':
++            if at_line_start:
++                pieces.append(tok.value)
++            elif pieces and not pieces[-1].endswith((" ", "\n")):
++                pieces.append(" ")
++                pieces.append(tok.value)
++            else:
++                pieces.append(tok.value)
++            at_line_start = False
++            prev = tok
++            continue
++
++        if not at_line_start:
++            gap = 0
++            if prev is not None and not line_changed:
++                gap = max(0, tok.col - (prev.col + len(prev.value)))
++            if gap > 0:
++                pieces.append(" " * gap)
++            elif pieces and not pieces[-1].endswith((" ", "\n")):
++                pieces.append(" ")
++
++        pieces.append(tok.value)
++        at_line_start = False
++        prev = tok
++
++    if not pieces or pieces[-1] != "\n":
++        pieces.append("\n")
++
++    return "".join(pieces)
++
++
+ class NodeType(Enum):
+     """Types of nodes in the SparTree, corresponding to grammar quantifiers."""
+     KLEENE_STAR = "kleene_star"    # Zero or more repetitions
+@@ -64,42 +119,7 @@ class SparTreeNode:
+         Rebuilds the source text by placing tokens at their original
+         line/column positions where possible.
+         """
+-        tokens = self.tokens()
+-        if not tokens:
+-            return ""
+-
+-        # Group tokens by line
+-        lines_dict: dict[int, list[Token]] = {}
+-        for tok in tokens:
+-            if tok.type == 'NEWLINE':
+-                continue
+-            if tok.line not in lines_dict:
+-                lines_dict[tok.line] = []
+-            lines_dict[tok.line].append(tok)
+-
+-        if not lines_dict:
+-            return ""
+-
+-        # Reconstruct lines
+-        result_lines = []
+-        for line_num in sorted(lines_dict.keys()):
+-            line_tokens = sorted(lines_dict[line_num], key=lambda t: t.col)
+-            line_str = ""
+-            current_col = 0
+-            for tok in line_tokens:
+-                if tok.type == 'INDENT':
+-                    line_str += tok.value
+-                    current_col = len(tok.value)
+-                else:
+-                    if tok.col > current_col:
+-                        line_str += " " * (tok.col - current_col)
+-                    elif current_col > 0 and line_str and not line_str.endswith(' '):
+-                        line_str += " "
+-                    line_str += tok.value
+-                    current_col = tok.col + len(tok.value)
+-            result_lines.append(line_str)
+-
+-        return "\n".join(result_lines) + "\n"
++        return render_tokens(self.tokens())
+ 
+     def clone(self) -> 'SparTreeNode':
+         """Create a deep copy of this node and all descendants."""
+diff --git a/reduction/tree_utils.py b/reduction/tree_utils.py
+new file mode 100644
+index 0000000..d9fa74a
+--- /dev/null
++++ b/reduction/tree_utils.py
+@@ -0,0 +1,91 @@
++"""Shared SparTree utilities used by multiple reducers."""
++
++from __future__ import annotations
++
++from typing import Iterable, Iterator, Sequence
++
++from reduction.tree import SparTreeNode
++
++
++Path = tuple[int, ...]
++
++
++def iter_nodes(node: SparTreeNode, path: Path = ()) -> Iterator[tuple[Path, SparTreeNode]]:
++    """Yield nodes in pre-order together with their positional path."""
++    yield path, node
++    for index, child in enumerate(node.children):
++        yield from iter_nodes(child, path + (index,))
++
++
++def node_at(root: SparTreeNode, path: Sequence[int]) -> SparTreeNode | None:
++    """Return the node at ``path`` or ``None`` if the path is invalid."""
++    current = root
++    for index in path:
++        if index < 0 or index >= len(current.children):
++            return None
++        current = current.children[index]
++    return current
++
++
++def parent_at(root: SparTreeNode, path: Sequence[int]) -> tuple[SparTreeNode | None, int | None]:
++    """Return the parent node and child index for ``path``."""
++    if not path:
++        return None, None
++    parent = node_at(root, path[:-1])
++    if parent is None:
++        return None, None
++    return parent, path[-1]
++
++
++def line_span(node: SparTreeNode) -> tuple[int, int] | None:
++    """Return the inclusive source-line span covered by ``node``."""
++    tokens = node.tokens()
++    if not tokens:
++        return None
++    lines = [token.line for token in tokens]
++    return min(lines), max(lines)
++
++
++def replace_lines(
++    source: str,
++    start_line: int,
++    end_line: int,
++    replacement_lines: Iterable[str],
++) -> str:
++    """Replace an inclusive line span with the provided replacement lines."""
++    lines = source.splitlines()
++    prefix = lines[: max(start_line - 1, 0)]
++    suffix = lines[end_line:]
++    merged = prefix + list(replacement_lines) + suffix
++    if not merged:
++        return ""
++    return "\n".join(merged) + "\n"
++
++
++def reindent_lines(lines: Sequence[str], target_indent: int) -> list[str]:
++    """Shift a block of lines so its minimum indentation matches ``target_indent``."""
++    materialized = list(lines)
++    non_empty = [line for line in materialized if line.strip()]
++    if not non_empty:
++        return materialized
++    current_indent = min(len(line) - len(line.lstrip(" ")) for line in non_empty)
++    adjusted: list[str] = []
++    for line in materialized:
++        if not line.strip():
++            adjusted.append("")
++            continue
++        stripped = line[current_indent:] if len(line) >= current_indent else line.lstrip(" ")
++        adjusted.append((" " * target_indent) + stripped)
++    return adjusted
++
++
++def target_indent_for(node: SparTreeNode) -> int:
++    """Return the indentation of the first token line in ``node``."""
++    span = line_span(node)
++    if span is None:
++        return 0
++    first_line = span[0]
++    for token in node.tokens():
++        if token.line == first_line:
++            return token.col if token.type != "INDENT" else len(token.value)
++    return 0
+diff --git a/run.sh b/run.sh
+index 9dd589c..dd9edda 100755
+--- a/run.sh
++++ b/run.sh
+@@ -1,3 +1,62 @@
+ #!/bin/bash
+-# Experiment runner - extended by each paper's patch
+-echo "No experiments configured yet"
++set -euo pipefail
++
++cd "$(dirname "$0")"
++
++python3 -B - <<'PY'
++from pathlib import Path
++
++from reduction.config import Config
++from reduction.dd import DeltaDebugging
++from reduction.driver import ReductionDriver
++from reduction.grammar import Grammar
++from reduction.perses_reducer import PersesReducer
++from reduction.pnf import normalize_to_pnf
++from reduction.property_test import PropertyTester
++from reduction.token import Tokenizer
++
++
++ROOT = Path.cwd()
++SUBJECTS = ROOT / "test_subjects"
++GRAMMAR = normalize_to_pnf(Grammar.python_simplified())
++
++
++def read_text(path: Path) -> str:
++    return path.read_text(encoding="utf-8")
++
++
++def make_tester(script: Path, work_dir: Path) -> PropertyTester:
++    return PropertyTester(str(script), work_dir=str(work_dir))
++
++
++def run_dd_baseline(subject: str) -> None:
++    subject_dir = SUBJECTS / subject
++    source = read_text(subject_dir / "program.py")
++    tester = make_tester(subject_dir / "test.sh", subject_dir)
++    tokenizer = Tokenizer()
++    reduced = DeltaDebugging(tester).reduce(tokenizer.tokenize(source))
++    print(f"DD_{subject.upper()}_TOKENS={len(reduced)}")
++    print(f"DD_{subject.upper()}_TESTS={tester.test_count}")
++
++
++def run_perses(subject: str) -> None:
++    subject_dir = SUBJECTS / subject
++    source = read_text(subject_dir / "program.py")
++    tester = make_tester(subject_dir / "test.sh", subject_dir)
++    driver = ReductionDriver(
++        grammar=GRAMMAR,
++        tester=tester,
++        reducers=[PersesReducer(GRAMMAR)],
++        config=Config(fixpoint=True, max_iterations=100, timeout_per_test=10),
++    )
++    result = driver.reduce(source)
++    prefix = f"PERSES_{subject.upper()}"
++    print(f"{prefix}_TOKENS={result.reduced_tokens}")
++    print(f"{prefix}_TESTS={result.num_tests}")
++    print(f"{prefix}_RATIO={result.reduction_ratio:.3f}")
++
++
++run_dd_baseline("bug1")
++for bug in ("bug1", "bug2", "bug3"):
++    run_perses(bug)
++PY

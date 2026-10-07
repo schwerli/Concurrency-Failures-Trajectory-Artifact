@@ -1,0 +1,380 @@
+export const meta = {
+  name: 'furl-blackbox-probe',
+  description: 'Exhaustively reverse-engineer furl URL behavior from a compiled executable, across 12 dimensions, then critic + gap-fill',
+  phases: [
+    { title: 'Probe', detail: '12 parallel dimension probes against the executable' },
+    { title: 'Critic', detail: 'read all specs, find gaps, contradictions, unverified claims' },
+    { title: 'GapFill', detail: 'probe every gap the critic identified' },
+  ],
+}
+
+const PREAMBLE = `You are reverse-engineering the Python library \`furl\` purely as a BLACK BOX by running a precompiled executable. You may NOT read furl's source. You may NOT run \`python\` (it is not available). Work only from observed behavior.
+
+The executable is: /workspace/dataset/test2_executable
+It is exactly equivalent to this Python program:
+
+    import argparse
+    from furl import furl
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--a', type=str, required=True)
+    parser.add_argument('--b', type=str, required=True)
+    args = parser.parse_args()
+    f = furl(args.a)
+    print(f.set(host=args.b).url)
+
+So: --a is an arbitrary URL string parsed by furl(); --b is a host string assigned via .set(host=...); stdout is the resulting .url followed by a newline.
+
+GOAL: produce an implementation-grade spec so that someone can reimplement this from scratch in pure JavaScript with byte-identical stdout.
+
+RULES OF ENGAGEMENT
+- Run it directly, e.g.: /workspace/dataset/test2_executable --a 'http://x.com/p' --b 'n.com'
+- It is a PyInstaller binary; each run takes ~0.2-0.5s. Batch many cases per bash call, but keep each bash call to <= ~100 cases so you do not hit the 120s tool timeout. Prefix each run with \`timeout 20\`.
+- ALWAYS use this robust batching pattern (real TAB characters between the two fields):
+
+    cd /workspace/dataset
+    while IFS=$'\\t' read -r A B; do
+      printf '%s\\t%s\\t=> ' "$A" "$B"
+      timeout 20 ./test2_executable --a "$A" --b "$B" 2>&1 | head -1
+    done <<'EOF'
+    http://x.com/p	n.com
+    /rel/path	n.com
+    EOF
+
+  The quoted heredoc delimiter <<'EOF' prevents any shell expansion, so you can put backslashes, dollar signs, quotes and backticks in the data safely.
+- On success stdout has the URL and exit code 0. On failure stdout is EMPTY, a Python traceback goes to stderr, and exit code is 1. Redirect deliberately (2>/dev/null vs 2>&1) and check \`echo $?\` when the distinction matters.
+- When whitespace or invisible characters matter, pipe stdout through \`od -c\`.
+- To isolate --a parsing, hold --b fixed at a boring valid host like \`n.com\`. To isolate --b behavior, hold --a fixed at \`http://a.com/p\`.
+- IMPORTANT: because the host is always overwritten by --b, the original host text in --a only matters for (a) where the authority/netloc ends and the path begins, (b) whether an authority existed at all, (c) the port, (d) the userinfo. Do not waste runs on original-host spellings unless testing delimiting.
+- Useful already-established baseline facts (verify, do not blindly trust):
+  * scheme and host are lowercased; path/query/fragment case is preserved.
+  * The final assembly behaves like Python's urllib.parse.urlunsplit((scheme, netloc, path, query, fragment)): if netloc is truthy, OR (scheme is truthy AND scheme is in urllib's uses_netloc list AND path does not start with '//'), then a '/' is prepended to a non-empty path that does not start with '/', and '//'+netloc is prefixed; then 'scheme:' is prefixed if scheme; then '?'+query if query is truthy; then '#'+fragment if fragment is truthy.
+  * Default ports are elided: http://h:80/ -> http://h/ , https://h:443/ -> https://h/ , ftp://h:21/ -> ftp://h/ .
+  * Query values are decoded then re-encoded: '?a=1%202' -> '?a=1+2' ; '?a=1;b=2' -> '?a=1%3Bb%3D2' ; '?a=ü' -> '?a=%C3%BC'.
+  * Path segments are decoded then re-encoded: '/a b/c' -> '/a%20b/c' ; '/a%20b' stays '/a%20b' ; '/../a/./b' is NOT normalized.
+  * --b non-ASCII is IDNA/punycode encoded: 'ünïcode.com' -> 'xn--ncode-cta3g.com'.
+  * --b that is invalid raises: ValueError: Invalid host '<b>'. Host strings must have at least one non-period character, can't contain any of '!@#$%^&'"*()+=:;/', and can't have adjacent periods.
+  * --b = '' does NOT raise; 'http://a.com/p?x=1#f' + '' -> 'http:///p?x=1#f'.
+
+DELIVERABLES (all three are required)
+1. Write a thorough, exhaustive spec to /workspace/specs/NAME.md (substitute your dimension NAME below). Every rule you established, each with the concrete evidence (input -> output) that proves it. Include tables. Explicitly flag anything you could NOT determine. This file is the implementation spec.
+2. Append EVERY case you ran to /workspace/specs/cases/NAME.b64 — one case per line, format \`<base64 of the --a value>\\t<base64 of the --b value>\` (TAB separated). Use this helper so it is exact:
+
+    emit(){ printf '%s\\t%s\\n' "$(printf '%s' "$1" | base64 -w0)" "$(printf '%s' "$2" | base64 -w0)" >> /workspace/specs/cases/NAME.b64; }
+
+   Include boring cases too — this becomes a differential-test corpus. Aim for at least 120 cases. Do not include the expected output (a separate harness regenerates it).
+3. Return your structured findings.
+
+CONSTRAINTS
+- Do NOT write anything to /output. Do NOT create or modify any .mjs/.js files. You are a prober only.
+- Do not use jq (unavailable). Standard coreutils, bash, base64, od are available.
+
+YOUR ASSIGNED DIMENSION:
+`
+
+const SCHEMA = {
+  type: 'object',
+  properties: {
+    dimension: { type: 'string' },
+    specPath: { type: 'string' },
+    casesPath: { type: 'string' },
+    caseCount: { type: 'integer' },
+    rules: {
+      type: 'array',
+      description: 'Precise, implementable rules established by experiment. Each string must be specific enough to code from, and should cite an example.',
+      items: { type: 'string' },
+    },
+    surprises: {
+      type: 'array',
+      description: 'Counterintuitive behaviors a reimplementer would get wrong by default.',
+      items: { type: 'string' },
+    },
+    uncertainties: {
+      type: 'array',
+      description: 'Things you could not determine, or where behavior looked inconsistent.',
+      items: { type: 'string' },
+    },
+  },
+  required: ['dimension', 'specPath', 'casesPath', 'caseCount', 'rules', 'surprises', 'uncertainties'],
+  additionalProperties: false,
+}
+
+const DIMENSIONS = [
+  {
+    name: 'join-and-scheme',
+    task: `NAME = join-and-scheme. Determine (1) exactly how furl detects and parses the SCHEME of --a, and (2) the final URL assembly/join rules.
+
+Scheme detection: which characters may appear in a scheme; must it start with a letter; are digits/'+'/'-'/'.' allowed; what happens with a leading digit ('1http://x'); is the scheme lowercased; what about an empty scheme (':/x', ':x'); 'http:' alone; 'http:/x'; 'http:///x'; 'http:x'; 'a:b'; 'C:\\\\windows\\\\path'; 'HTTP://X'; 'ht tp://x'; 'http+s://x'; 'x-y.z+1://h/p'; a scheme with a trailing dot; '//x' (no scheme); a bare word 'foo'; 'foo:bar:baz'; strings with '?' or '#' before any ':' (e.g. 'a?b:c'); 'mailto:x@y.com'; 'tel:+1234'; 'data:text/plain;base64,AAA'; 'urn:isbn:1234'; 'file:///etc/passwd'; 'file://localhost/etc'; 'javascript:alert(1)'; 'about:blank'; a URL whose scheme is absent but whose path contains a colon ('foo/bar:baz', 'bar:baz/foo' — note a colon in the FIRST path segment is what makes it look like a scheme).
+
+Join rules: verify the urlunsplit model in the preamble precisely. Specifically nail down WHICH schemes cause '//' to be emitted when the netloc/host is EMPTY (--b ''). Test --b '' against many schemes: '', http, https, ftp, ftps, sftp, file, gopher, nntp, telnet, imap, wais, mms, shttp, snews, prospero, rtsp, rtspu, rsync, svn, svn+ssh, nfs, git, git+ssh, ws, wss, itms-services, mailto, news, tel, data, urn, about, javascript, sip, ldap, ssh, unknownscheme. For each, does 'SCHEME://a.com/p' with --b '' produce 'SCHEME:///p' or 'SCHEME:/p'? This reveals urllib's uses_netloc membership exactly — enumerate it as a definitive list. Also test with an EMPTY path ('SCHEME://a.com' + --b '') and with a path that already starts with '//' (e.g. --a 'http://a.com//p//q' + --b '').
+
+Also determine: when --b is '' and there IS userinfo or a port in --a, what does the netloc look like ('http://user:pass@a.com:8080/p' + --b '')? Does an empty host with a port still emit ':8080'?`,
+  },
+  {
+    name: 'default-ports',
+    task: `NAME = default-ports. Build the DEFINITIVE default-port table furl uses to decide when to elide a port from the output, and nail down all port parsing/validation edge cases.
+
+Method: for scheme S and candidate default port P, run --a 'S://a.com:P/p' --b 'n.com'. If output is 'S://n.com/p' the port was elided (P is S's default); if 'S://n.com:P/p' it was kept. Probe at least these schemes against their plausible IANA defaults, and also cross-check each scheme against a WRONG port to confirm the port is otherwise preserved: http 80, https 443, ftp 21, ftps 990, sftp 22, ssh 22, telnet 23, smtp 25, smtps 465, submission 587, imap 143, imaps 993, pop 110, pop3 110, pop3s 995, nntp 119, nntps 563, news 119, snews 563, ldap 389, ldaps 636, gopher 70, wais 210, dns 53, tftp 69, irc 194, ircs 6697, rsync 873, svn 3690, git 9418, ws 80, wss 443, rtsp 554, rtsps 322, rtspu 554, mms 1755, nfs 2049, prospero 1525, shttp 80, file (none), mailto (none), and an unknown scheme 'zzz' with port 80. Report the exact mapping, and note any scheme where a port is NEVER elided.
+
+Also determine, holding --b 'n.com':
+- Port with no scheme: '//a.com:80/p' and '//a.com:8080/p' — is 80 elided when there is no scheme?
+- Empty port: 'http://a.com:/p' — kept, dropped, or error?
+- Port 0: 'http://a.com:0/p'. Leading zeros: 'http://a.com:080/p', ':0080'. Very large: ':65535', ':65536', ':99999', ':4294967296'.
+- Non-numeric port: 'http://a.com:abc/p', ':8a', ':-1', ':+80', ':8.0', ':0x50', ': 80', ':80 '. Which raise ValueError and with WHAT exact message? Capture the exact final stderr line and the exit code for each.
+- Does the port survive when --b changes the host? Does --b ever affect the port (e.g. --b '' with a port)?
+- Uppercase scheme with default port: 'HTTP://a.com:80/p'.
+- Does an IPv6 host with a default port elide it: 'http://[::1]:80/p'?`,
+  },
+  {
+    name: 'path-encoding',
+    task: `NAME = path-encoding. Determine EXACTLY how the path of --a is decoded and re-encoded on output. Hold --b at 'n.com' throughout and use --a 'http://a.com/<PATH>'.
+
+Do a per-character sweep. For every ASCII character from 0x20 to 0x7E, put it RAW into a path segment and record whether it is preserved literally or percent-encoded (and to what). Then separately put its PERCENT-ENCODED form (e.g. %20, %2F, %3F, %23, %25, %2B, %3B, %2C, %3D, %26, %40, %3A, %24, %21, %27, %28, %29, %2A, %7E, %5F, %2D, %2E, %5B, %5D, %22, %3C, %3E, %5C, %5E, %60, %7B, %7C, %7D) into a path segment and record whether it stays encoded or is decoded to the raw character. Derive the exact "safe character" set for path output. Pay special attention to: '/', '?', '#', '%', '+', ' ', ';', ',', '=', '&', '@', ':', '~', '$', '!', "'", '(', ')', '*', '[', ']', '|', '\\\\', '^', '\`', '{', '}', '<', '>', '"'.
+
+Also determine:
+- Is '+' in a path left as '+' or turned into a space / %2B? Is '%2B' decoded to '+'?
+- Is ' ' (raw space) encoded as %20 or '+'?
+- Lowercase percent escapes: '/a%2fb', '/a%3fb', '/%c3%bc' — are hex digits uppercased on re-emit? Is the escape preserved or decoded?
+- Malformed escapes: '/a%', '/a%2', '/a%zz', '/a%2zb', '/%%20', '/a%20%', '/100%25', '/%', '/%00' (NUL byte!), '/%0a', '/%0d', '/%09'.
+- Non-UTF8 escapes: '/%ff', '/%c3', '/%e4%f6' (invalid UTF-8 sequences). Does it error, replace, or pass through?
+- Raw non-ASCII in the path: '/ü', '/日本', '/emoji😀', combining characters. What encoding is used?
+- Structure: empty path; '/'; '//'; '///'; '/a//b'; trailing '/'; trailing '//'; '/.'; '/..'; '/a/../b'; '/./'; dot-segment normalization (confirm NONE happens).
+- Path parameters with ';': '/p;a=1', '/p;a=1;b=2', '/a;x/b;y', ';leading', '/p;'. Is ';' preserved raw in the path? Does its position (first segment vs later) matter?
+- Where does the path END: does a '?' or '#' inside a percent-encoded form ('%3F', '%23') stay inside the path? Does a raw '?' or '#' terminate the path (start query/fragment)?
+- Relative/absolute: --a 'rel/path', --a './rel', --a '../up', --a 'a:b/c' (scheme ambiguity), --a '/abs'. Note how the join phase then adds a leading '/'.
+- A path containing '@' or ':' in the FIRST segment when there is no authority — does it get reinterpreted?`,
+  },
+  {
+    name: 'query-encoding',
+    task: `NAME = query-encoding. Determine EXACTLY how the query string of --a is parsed, then re-serialized. Hold --b at 'n.com' and use --a 'http://a.com/p?<QUERY>'.
+
+Structure first:
+- Pair separators: is '&' the only separator? Is ';' a separator or a literal (test '?a=1;b=2', '?a=1&b=2', '?a=1;&b=2')?
+- Key with no '=': '?a', '?a&b', '?a=&b'. Is 'a' emitted as 'a' or 'a='? Is 'a=' emitted as 'a=' or 'a'?
+- Empty key: '?=v', '?=', '?&', '?&&', '?a&&b', '?', '?=&=' — which pairs survive, which are dropped?
+- Multiple '=' in one pair: '?a=b=c' -> how is it split and re-encoded?
+- Duplicate keys: '?a=1&a=2&a=3' — order and multiplicity preserved?
+- Order: is the original pair order preserved, or sorted?
+- A completely empty query ('?') — is the '?' dropped?
+- Query containing '#': raw '#' terminates the query. What about '%23'?
+- Query containing '/' and '?': '?a=b/c', '?a=b?c', '?a?b=c'.
+
+Then the per-character encoding sweep, done SEPARATELY for the key position and the value position (they may differ!). For every ASCII char 0x20..0x7E placed raw in a key, and raw in a value, record preserved vs encoded. Then repeat with the percent-encoded form as input (%20 %21 %22 %23 %24 %25 %26 %27 %28 %29 %2A %2B %2C %2D %2E %2F %3A %3B %3C %3D %3E %3F %40 %5B %5C %5D %5E %5F %60 %7B %7C %7D %7E) and record whether it round-trips encoded or is decoded. Derive the exact safe set for keys and for values.
+
+Critical specifics:
+- '+' handling: raw '+' in a value ('?a=1+2'), '%2B' in a value, raw ' ' in a value, '%20' in a value. Same four in a KEY. Establish the full plus/space mapping in both directions.
+- Is space emitted as '+' or '%20'?
+- Are '/' and '?' left raw in query values? Is ':' ? Is '@' ? Is '~' ? Is ',' ? Is '$' ? Is '!' ? Is "'" ? Is '(' ')' '*' ?
+- Non-ASCII raw in key and value: 'ü', '日本', '😀'.
+- Malformed escapes in query: '?a=%', '?a=%2', '?a=%zz', '?a=%c3', '?a=%ff', '?a=100%25', '?a=%00'.
+- Lowercase hex: '?a=%c3%bc', '?a=%2f' — uppercased on output? decoded?
+- Very long / many pairs — any limit?`,
+  },
+  {
+    name: 'fragment-encoding',
+    task: `NAME = fragment-encoding. Determine EXACTLY how furl parses and re-serializes the FRAGMENT of --a. Hold --b at 'n.com'; use --a 'http://a.com/p#<FRAG>'.
+
+furl is known to model a fragment as having its own internal path AND query, split on the first '?'. Establish this precisely:
+- '#simple', '#/a/b', '#a?b', '#a?b=c', '#?q=1', '#a?', '#?', '#a?b?c' (two '?'), '#a=b' (no '?'), '#&a=b'.
+- When the fragment contains '?', is the part after it re-encoded using QUERY rules (i.e. does '#a?x=1;y=2' become '#a?x=1%3By%3D2', and does '#a?x=1 2' become '#a?x=1+2')? Compare with the part before the '?' which should follow PATH-like rules. Prove or disprove that the two halves use different encoders by finding a character that is treated differently on each side (';' '=' '&' '+' ' ' '/' '?' are good candidates).
+- Is there a 'separator' behavior where an empty fragment path plus a query still emits '?' (e.g. '#?a=1')? What about a fragment that is only '?'.
+- Empty fragment: '#' alone — is the '#' dropped? '#' with empty path and empty query.
+- Per-character sweep for the fragment (raw 0x20..0x7E, and the percent-encoded forms) in BOTH the pre-'?' part and the post-'?' part. Derive both safe sets.
+- Does a raw '#' after the first '#' stay in the fragment ('#a#b')? Does '%23' in the fragment survive?
+- Does the fragment ever contain a raw '?' unencoded?
+- Non-ASCII in the fragment; malformed escapes ('#%', '#%2', '#%zz'); '%00'.
+- Interaction: does a URL with a fragment but no query still emit correctly ('http://a.com#f' + n.com)? What about '?' and '#' both empty ('http://a.com/p?#')?
+- Also test a fragment on a URL with NO path and NO scheme ('#frag' alone as --a, '//h#frag').`,
+  },
+  {
+    name: 'userinfo',
+    task: `NAME = userinfo. Determine how furl parses and re-emits the USERNAME and PASSWORD (userinfo) of --a, since these survive the host replacement. Hold --b at 'n.com' unless stated; use --a 'http://<USERINFO>@a.com/p'.
+
+- Basic: 'user@', 'user:pass@', ':pass@', 'user:@', ':@', '@' (empty userinfo). Which produce what in the output netloc? Is a lone '@' emitted?
+- Multiple '@' in the authority: 'a@b@c.com/p' — where does the userinfo end (first or last '@')?
+- Multiple ':' in userinfo: 'u:p:q@a.com' — how is the password split?
+- Per-character sweep: for every ASCII char 0x20..0x7E placed raw in the username, and raw in the password, record preserved vs percent-encoded. Then the same with percent-encoded input forms (%40 %3A %2F %3F %23 %20 %2B %25 %5B %5D %3B %3D %26 %2C etc.) — decoded or preserved? Derive the exact safe sets for username and password (they are probably the same but verify).
+- Is '+' preserved? Is space encoded as %20 or '+'?
+- Non-ASCII in userinfo ('ü@a.com', 'u:pä@a.com') — what encoding?
+- Malformed escapes ('%','%2','%zz') in userinfo.
+- Case: is the username/password lowercased? (host is, but userinfo should NOT be) — test 'User:PaSS@a.com'.
+- Interaction with --b: 'http://user:pass@a.com/p' with --b '' — is 'user:pass@' still emitted with an empty host? With --b '' and a port too?
+- Interaction with IPv6: 'http://u:p@[::1]:8080/p'.
+- Does userinfo appear when there is NO scheme ('//u:p@a.com/p')?
+- What if the '@' appears in the PATH rather than the authority ('http://a.com/p@q', 'a@b.com/p' with no scheme)?`,
+  },
+  {
+    name: 'host-parse-netloc',
+    task: `NAME = host-parse-netloc. Determine exactly how furl DELIMITS the authority (netloc) of --a from the rest, and when it considers an authority to be present at all. The original host text is discarded (replaced by --b), so focus on delimiting and on side effects (port, userinfo, errors). Hold --b at 'n.com' unless stated.
+
+- Authority present vs absent: 'http://a.com/p', 'http:/p', 'http:p', '//a.com/p', '///p' (empty authority + /p), '////p', 'a.com/p' (no scheme), '/p', 'p', ''.
+- Where does the authority end: at the first '/', '?', or '#'? Test 'http://a.com?q=1', 'http://a.com#f', 'http://a.com\\\\p' (backslash), 'http://a.com:8080?q', 'http://a.com;p/q'.
+- Does furl VALIDATE the host parsed from --a? Try clearly invalid original hosts and see if it errors BEFORE the set(host=) call: 'http://a_b.com/p', 'http://a..com/p', 'http://a b.com/p', 'http://a!b/p', 'http://%41.com/p', 'http://ü.com/p' (does the original get IDNA'd? irrelevant to output but may error), 'http://.../p', 'http://./p'. Note which raise and which do not — the exact error text and exit code matter.
+- IPv6 literals in --a: 'http://[::1]/p', 'http://[::1]:8080/p', 'http://[2001:db8::1]/p', 'http://[v6::1]/p', 'http://[::1/p' (unclosed bracket), 'http://]::1[/p', 'http://[]/p', 'http://[::1]x/p', 'http://[fe80::1%25eth0]/p' (zone id, percent-encoded), 'http://[fe80::1%eth0]/p'. Which raise ValueError, with what exact message?
+- Empty authority with a port: 'http://:8080/p'. Empty authority with userinfo: 'http://u@/p'.
+- A trailing dot in the original host: 'http://a.com./p'.
+- Uppercase original host, mixed case: confirm irrelevant since replaced.
+- Whether the presence of an authority in --a changes anything in the OUTPUT given that --b always sets a host. Specifically compare --a 'a.com/p' (no authority) vs --a '//a.com/p' (authority) with --b 'n.com': the first should keep 'a.com' as a path segment.
+- Very long hosts, hosts with only dots, and a host that is only a port.`,
+  },
+  {
+    name: 'host-set-validation',
+    task: `NAME = host-set-validation. Determine the EXACT validation rules applied to the --b value by .set(host=b), and the exact error behavior. Hold --a at 'http://a.com/p'.
+
+The known error message is:
+ValueError: Invalid host '<b>'. Host strings must have at least one non-period character, can't contain any of '!@#$%^&'"*()+=:;/', and can't have adjacent periods.
+
+Verify each clause and find the true character blacklist EMPIRICALLY, character by character:
+- For every ASCII character from 0x00-ish (use printable 0x20..0x7E, plus tab if you can inject it) test --b 'aXb' where X is that character. Record ACCEPTED (and what appears in the output — is it percent-encoded or literal?) vs REJECTED. Produce a definitive accepted/rejected table for all 95 printable ASCII characters. The documented blacklist is !@#$%^&'"*()+=:;/ — check whether the real behavior matches exactly, and specifically whether these are accepted: space, '?', '#', '%', '~', '\`', '[', ']', '{', '}', '|', '\\\\', '<', '>', ',', '-', '_', '.', and the digits/letters.
+- '%' is in the blacklist, so '%20' should be rejected — confirm. But is '%' rejected even in an otherwise-valid host?
+- Period rules: '', '.', '..', '...', 'a.', '.a', 'a..b', 'a.b', 'a.b.', '.a.b', 'a...b'. Which are accepted? Confirm "at least one non-period character" and "no adjacent periods". What does the OUTPUT look like for accepted ones (e.g. is a trailing dot kept)?
+- Empty string --b '': confirm it does NOT raise and what it produces.
+- Case: is --b lowercased? 'EXAMPLE.COM', 'ExAmPlE.CoM', and non-ASCII uppercase 'ÜNICODE.com', 'İ' (dotted capital I), 'ẛ', 'ß', 'SS'.
+- IPv6 in --b: '[::1]', '[2001:db8::1]', '::1' (no brackets — contains ':' which is blacklisted!), '[::1]:80', '[]', '[::1', '::1]', '[fe80::1%25eth0]'. Which are accepted, and what is emitted? Determine whether brackets bypass the blacklist check entirely.
+- IPv4 in --b: '127.0.0.1', '1.2.3', '999.999.999.999', '0x7f.1', '1.2.3.4.5'.
+- Trailing/leading whitespace in --b: ' a.com', 'a.com ', ' ' (single space), '\\t' if injectable.
+- Digits-only --b: '123', '0'.
+- Very long --b: a single label of 63 chars, 64 chars, 100 chars, 300 chars; a host with many labels totaling >253 chars. Any length validation?
+- Exact error output format: capture the FULL stderr for one failing case verbatim (including the traceback lines and any [PYI-...] line) and the exit code, plus confirm stdout is empty. Note whether the [PYI-...:ERROR] number varies between runs.`,
+  },
+  {
+    name: 'idna',
+    task: `NAME = idna. Determine EXACTLY how non-ASCII --b values are converted to ASCII (IDNA/punycode), since this must be reimplemented from scratch in JS. Hold --a at 'http://a.com/p'. Output shows the encoded host.
+
+Baseline: --b 'ünïcode.com' -> host 'xn--ncode-cta3g.com'.
+
+Establish:
+- Is encoding applied per dot-separated LABEL (each label independently prefixed 'xn--') or to the whole string? Test 'ü.ö.com', 'ü.com', 'a.ü', 'ü.ö'.
+- Are pure-ASCII labels left completely untouched (not punycoded)? Test mixed 'abc.ü.def'.
+- Case folding / normalization: does it lowercase non-ASCII before encoding? Test 'Ü.com' vs 'ü.com' (same output?), 'ÄÖÜ.com' vs 'äöü.com'. Test 'ß.com' (IDNA2003 maps ß->ss; IDNA2008/UTS46 keeps it as xn--zca) — REPORT THE EXACT OUTPUT, this distinguishes the algorithm. Test 'ẛ.com', 'İ.com' (U+0130), 'ı.com' (U+0131 dotless i), 'Σ.com'/'σ.com'/'ς.com' (final sigma), 'ΑΒΓ.com'.
+- Unicode normalization: test a precomposed character vs its decomposed form, e.g. 'é.com' as U+00E9 vs 'e' + U+0301. Do they produce the SAME punycode? (That reveals NFKC/nameprep.) Use printf with UTF-8 bytes: printf '\\xc3\\xa9' and printf 'e\\xcc\\x81'.
+- Prohibited characters: does it reject or accept 'ü ü.com' (space + non-ascii), a soft hyphen U+00AD, a zero-width joiner U+200D, U+3002 IDEOGRAPHIC FULL STOP (is it treated as a label separator?), U+FF0E FULLWIDTH FULL STOP, U+FF61. Test whether these alternative full stops split labels (UTS46 does; IDNA2003 nameprep maps U+3002 to '.'? report actual).
+- Test a full-width digit '１２３.com' and a full-width letter 'ａ.com' (U+FF41) — does NFKC fold them to ASCII?
+- Test CJK: '日本.com', '中国', 'テスト.com' -> exact xn-- output. Test emoji '😀.com' (does it error or encode?). Test Cyrillic 'пример.рф'. Test Arabic 'مثال.com' (RTL). Test Hebrew. Test Devanagari 'उदाहरण.com'.
+- Label length: a non-ASCII label whose punycode exceeds 63 chars — does it raise, and with what error?
+- Empty label with non-ASCII elsewhere: 'ü..com' (adjacent periods should be rejected first by furl's own validator — confirm which error wins), 'ü.' (trailing dot with non-ASCII).
+- Does the blacklist check happen BEFORE or AFTER idna encoding? Test 'ü_x.com' (underscore allowed?), 'ü/x' (slash blacklisted).
+- Report at least 25 exact (input -> output) unicode pairs so a from-scratch punycode implementation can be verified. Give the input as an explicit sequence of Unicode codepoints (e.g. U+00FC) AND the exact output string, so the pairs are unambiguous. Generate inputs with printf and UTF-8 escapes to avoid any editor mangling.`,
+  },
+  {
+    name: 'argparse-cli',
+    task: `NAME = argparse-cli. Determine the EXACT command-line parsing behavior so it can be replicated byte-for-byte in Node. The program uses Python argparse with prog name 'test2_executable', two required string options --a and --b, and the default -h/--help.
+
+Establish exactly (capture stdout, stderr, and exit code separately for each — use \`2>/dev/null\`, \`2>&1 >/dev/null\`, and \`echo $?\`):
+- Success baseline: '--a X --b Y' and '--b Y --a X' (order irrelevant?).
+- '--a=X --b=Y' form. Mixed: '--a=X --b Y'.
+- No args at all; only --a; only --b. Exact usage+error text.
+- Unknown option: '--c 1 --a X --b Y'. Exact 'unrecognized arguments' text.
+- Positional/extra args: '--a X --b Y extra', 'extra --a X --b Y'.
+- Missing value: '--a' alone at the end; '--a --b Y' (does --b become the value of --a, or is it an error 'expected one argument'?).
+- Values that look like options: '--a -x --b Y', '--a --b' , '--a -1 --b Y' (negative-number-looking), '--a -- --b Y', '--a=-x --b Y'. Also the '--' separator: '--a X --b Y --', '-- --a X --b Y'.
+- Empty values: '--a "" --b n.com' and '--a= --b=n.com'.
+- Abbreviations: is '--a' unambiguous? Try '-a X -b Y' (single dash), '---a X', '--A X' (case sensitivity).
+- Repeated options: '--a 1 --a 2 --b Y' (last wins?).
+- Help: '-h' and '--help' exact stdout (byte-for-byte, get it with od -c if needed) and exit code. Also '--help' combined with missing required args, and '--a X --help'.
+- '--h' (abbreviation of --help)?
+- Values containing '=' ('--a=http://x.com/?a=1'), leading/trailing spaces, newlines, tabs, and unicode.
+- Whether argparse writes the usage line to stdout or stderr in the error case.
+Record the EXACT text of every message, including capitalization, punctuation, indentation and blank lines. Reproduce the help output verbatim in your spec inside a fenced code block.
+For the cases file, still emit base64 pairs for the SUCCESS cases you tried (the differential harness only runs the two-arg form); document the error cases in the spec instead.`,
+  },
+  {
+    name: 'component-interaction',
+    task: `NAME = component-interaction. Probe how the components interact and how full realistic URLs round-trip, hunting for behavior the single-component probes would miss. Vary BOTH --a and --b.
+
+- Full kitchen-sink URLs: 'https://user:pa%73s@www.EXAMPLE.com:8443/a/b%20c/d;p=1?x=1&y=a b&z=%C3%BC#frag/path?fq=1;2' with several different --b values ('n.com', '', '[::1]', 'ünï.com', 'A.B.C').
+- Real-world URLs: google search URLs with many params, S3 URLs, URLs with base64 in the query (containing '+', '/', '='), JWTs in the query, data URIs, URLs with encoded slashes in the path, URLs with a query but no path, a fragment but no query, a port but no path, etc.
+- Idempotence: take the OUTPUT of a run and feed it back in as --a with the same --b. Does it produce the same string (fixed point) or keep changing? Find any case where furl is NOT idempotent — those are the most interesting cases. Test at least 30 outputs for idempotence, including ones with '+', '%', ';', '=' and non-ASCII.
+- Order of operations: does an error in host validation happen before or after other parsing? Give --a something that itself would raise (e.g. a bad port 'http://a.com:xx/p') together with a --b that would also raise (e.g. 'x:y'). WHICH error message wins? That reveals evaluation order. Test several combinations (bad port + bad host, unclosed IPv6 in a + bad b, etc.).
+- Does furl ever raise on --a alone (with a perfectly valid --b)? Enumerate every --a you can find that raises, with the exact error line.
+- Empty-ish inputs: --a '' --b ''; --a '/' --b ''; --a '#' --b ''; --a '?' --b ''; --a ':' --b 'n.com'; --a '//' --b 'n.com'; --a '?#' --b 'n.com'.
+- Whitespace: --a with leading/trailing spaces, embedded tab, embedded newline, embedded CR, a NUL-ish '%00'. Does furl strip surrounding whitespace from the URL like some parsers do? Test --a '  http://a.com/p  '.
+- Control characters in --a: raw tab/newline/CR inside the URL (inject with printf into a variable). Are they stripped, preserved, or encoded?
+- Very long URLs (10k chars) — any truncation?
+Aim high on case count here (200+) since this is the broadest safety net.`,
+  },
+  {
+    name: 'adversarial-corpus',
+    task: `NAME = adversarial-corpus. Your job is primarily to BUILD A LARGE, DIVERSE, ADVERSARIAL CORPUS of (--a, --b) pairs, and to report only the rules that surprise you. Think like a fuzzer with taste: what would break a hand-written reimplementation?
+
+Generate and RUN at least 350 cases, drawn from all of these families (mix them):
+- Every printable ASCII character injected, one at a time, into each of: scheme, path segment, query key, query value, fragment, username, password. (You can generate these programmatically in bash with a loop over a character list.)
+- The same for the percent-encoded form of each character.
+- Percent-encoding pathologies: '%', '%2', '%zz', '%%', '%25', '%2525', double-encoded values, over-long UTF-8, lone surrogate escapes '%ED%A0%80', '%C0%80', '%FE', '%FF'.
+- Structural pathologies: many consecutive '/', '?', '#', '&', '=', ';', '@', ':' characters; a URL that is only punctuation ('://', '?#', '#?', '//?#', ':///'); '?' before '#' vs '#' before '?' ('http://a.com#f?q' — the '?' is INSIDE the fragment).
+- Scheme confusion: 'http:/\\\\a.com/p', 'http:\\\\\\\\a.com', 'HtTpS://A.com', '  http://a.com', 'http ://a.com', 'http:// a.com'.
+- --b values: valid hosts, invalid hosts (expected to raise), '', single characters, IPv6 forms, unicode, very long, digits, hyphens/underscores, trailing dots.
+- Realistic URLs from the wild (at least 40): CDN URLs, API endpoints with tokens, URLs with matrix params, sitemap URLs, mailto/tel/data/file/git+ssh/ws URLs, punycode-already-encoded hosts, localhost with ports, IP-literal URLs.
+- Unicode across many scripts in path/query/fragment (not just --b).
+
+For each case record the exact single-line stdout, or 'ERROR:<exact final stderr line>' if it exits non-zero. Put the notable ones in your spec grouped by family with a short comment on what a naive reimplementation would get wrong. It is fine for most cases to be unremarkable — the CORPUS is the deliverable, so the cases file must contain every single case you ran (target 350+ lines).`,
+  },
+]
+
+phase('Probe')
+log(`Probing ${DIMENSIONS.length} dimensions of furl behavior against the compiled executable`)
+
+const probes = await parallel(DIMENSIONS.map((d) => () =>
+  agent(PREAMBLE + d.task, {
+    label: `probe:${d.name}`,
+    phase: 'Probe',
+    schema: SCHEMA,
+  })
+))
+
+const good = probes.filter(Boolean)
+log(`${good.length}/${DIMENSIONS.length} probes returned. Total cases: ${good.reduce((n, p) => n + (p.caseCount || 0), 0)}`)
+
+phase('Critic')
+const allRules = good.map((p) => `## ${p.dimension}\nspec: ${p.specPath}\nRULES:\n- ${(p.rules || []).join('\n- ')}\nSURPRISES:\n- ${(p.surprises || []).join('\n- ')}\nUNCERTAINTIES:\n- ${(p.uncertainties || []).join('\n- ')}`).join('\n\n')
+
+const CRITIC_SCHEMA = {
+  type: 'object',
+  properties: {
+    contradictions: { type: 'array', items: { type: 'string' } },
+    gaps: {
+      type: 'array',
+      description: 'Specific, independently-probeable gaps. Each must be phrased as a concrete experiment plan.',
+      items: { type: 'string' },
+    },
+  },
+  required: ['contradictions', 'gaps'],
+  additionalProperties: false,
+}
+
+const critique = await agent(
+  `You are a completeness critic for a black-box reverse-engineering effort. The target is Python's \`furl\` library, observed through /workspace/dataset/test2_executable (equivalent to: f = furl(args.a); print(f.set(host=args.b).url)). Twelve prober agents each wrote a spec into /workspace/specs/*.md and reported rules.
+
+Here are their reported rules, surprises and uncertainties:
+
+${allRules}
+
+Read the spec files in /workspace/specs/ (list the directory first) to see the full detail and the supporting evidence.
+
+Your job: find what is MISSING or WRONG, specifically the things that would make a from-scratch JavaScript reimplementation produce different output. Ask: which claims rest on a single example? Which characters or components were never tested in some position? Are any two specs contradictory? Is any rule stated so vaguely it cannot be coded (e.g. "some characters are encoded")? Is the exact safe-character set pinned down for EVERY component (path, query key, query value, fragment path, fragment query, username, password)? Is the port/default-port table complete? Is the IDNA algorithm pinned down enough to reimplement (which of IDNA2003-nameprep vs UTS46, exact case-folding and normalization)? Is the assembly/join rule airtight, including the uses_netloc scheme list?
+
+You MAY run the executable yourself (same rules: batch cases, prefix with \`timeout 20\`, no python) to check any claim you doubt — and you should, for anything load-bearing.
+
+Return: (1) contradictions between specs or between a spec and reality you verified, (2) a list of concrete remaining gaps, each phrased as a self-contained experiment plan that one agent can execute with the executable. Aim for 6-14 high-value gaps; do not pad with trivia.`,
+  { label: 'critic:completeness', phase: 'Critic', schema: CRITIC_SCHEMA, effort: 'high' }
+)
+
+const gaps = (critique && critique.gaps) || []
+log(`Critic found ${gaps.length} gaps and ${((critique && critique.contradictions) || []).length} contradictions`)
+
+phase('GapFill')
+const fills = await parallel(gaps.slice(0, 16).map((g, i) => () =>
+  agent(PREAMBLE + `NAME = gapfill-${i + 1}. You are closing ONE specific gap left by earlier probers. Be surgical and exhaustive about exactly this question, and do not stop until the answer is precise enough to code from without guessing.
+
+THE GAP:
+${g}
+
+Write your findings to /workspace/specs/gapfill-${i + 1}.md and your cases to /workspace/specs/cases/gapfill-${i + 1}.b64.`,
+    { label: `gapfill:${i + 1}`, phase: 'GapFill', schema: SCHEMA }
+  )
+))
+
+return {
+  probes: good.map((p) => ({ dimension: p.dimension, specPath: p.specPath, caseCount: p.caseCount, rules: p.rules, surprises: p.surprises, uncertainties: p.uncertainties })),
+  contradictions: (critique && critique.contradictions) || [],
+  gapFills: fills.filter(Boolean).map((f) => ({ dimension: f.dimension, specPath: f.specPath, caseCount: f.caseCount, rules: f.rules, surprises: f.surprises, uncertainties: f.uncertainties })),
+}

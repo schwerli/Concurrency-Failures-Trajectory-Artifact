@@ -1,0 +1,40 @@
+You're right, it's a bug — and there were actually two of them stacked.
+
+## Root cause
+
+**Bug 1 — `Identity._entry` used Python's `==` instead of symbolic equality** (`sympy/matrices/expressions/matexpr.py:480`):
+
+```python
+def _entry(self, i, j):
+    if i == j:          # structural comparison!
+        return S.One
+    else:
+        return S.Zero   # <-- wrong for symbolic i, j
+```
+
+For distinct symbols `i` and `j`, `i == j` is `False` structurally, so `Identity(n)[i, j]` returned a hard **`0`**. That's why the total sum was `0`: every summand was literally zero. Your other checks passed because they never hit the off-diagonal symbolic case — `e[i, i]` has `i == i` → `1`, and `e[0, 1]` has concrete indices.
+
+Fixed to fall back to a `KroneckerDelta` when equality is undecidable:
+
+```python
+def _entry(self, i, j):
+    eq = Eq(i, j)
+    if eq is S.true:
+        return S.One
+    elif eq is S.false:
+        return S.Zero
+    return KroneckerDelta(i, j)
+```
+
+**Bug 2 — `eval_sum` gave up on `Piecewise` whose conditions involve the summation index.** With bug 1 fixed, the inner sum correctly became `Piecewise((1, (0 <= j) & (j <= n-1)), (0, True))`, but the outer sum over `j ∈ [0, n-1]` returned `None` (unevaluated) — even though the condition is *exactly* the summation range. Added a helper that discharges branch conditions against the index's known range: a branch inconsistent with `[a, b]` is dropped, and one implied by `[a, b]` shadows the rest. Here the Piecewise collapses to `1`, and `Sum(1, (j, 0, n-1))` → `n`.
+
+## Verification
+
+Your script now prints `n` for the total sum. Also checked that undecidable cases still stay unevaluated rather than guessing (`Sum(Piecewise((1, i < k), (0, True)), (i, 0, n))` is untouched), and that the empty-range and concrete-size cases agree.
+
+Two things worth flagging:
+
+- **I had to change an existing test.** `test_Sum_doit` asserted `Sum(pw, (n, 1, nmax)).doit() == Sum(pw, (n, 1, nmax))` — i.e. it pinned the old "stays unevaluated" behavior. It now evaluates to `nmax`, which I brute-force confirmed correct for `nmax` = 1, 2, 5. I updated the assertion and added a companion case (`(n, 1, nmax+1)`) that still must stay unevaluated, since the range is no longer covered by the condition.
+- **`simplify_logic` builds an unguarded `2**n` truth table**, so I capped the helper at 8 relational atoms. Without that, a Piecewise with many conditions inside a `Sum` would hang; with it, a 15-branch/28-atom case completes in 1.6 s.
+
+Full suite over `concrete`, `matrices`, `functions`, `assumptions`, `printing`, `simplify`, `physics/quantum`, `tensor`: **1657 passed vs. 1656 at baseline**, with a byte-identical list of failures/exceptions. The one pre-existing failure (`test_polarify`) and the 266 exceptions are unrelated environment noise — the exceptions are all Python 3.9 `DeprecationWarning`s from `collections` ABC imports in `sathandlers.py`, and they occur identically before and after.

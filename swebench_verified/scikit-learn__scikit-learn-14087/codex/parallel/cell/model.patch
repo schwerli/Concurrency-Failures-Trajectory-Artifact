@@ -1,0 +1,63 @@
+diff --git a/sklearn/linear_model/logistic.py b/sklearn/linear_model/logistic.py
+index 1999f1dae..890761444 100644
+--- a/sklearn/linear_model/logistic.py
++++ b/sklearn/linear_model/logistic.py
+@@ -2170,7 +2170,7 @@ class LogisticRegressionCV(LogisticRegression, BaseEstimator,
+                 # Take the best scores across every fold and the average of
+                 # all coefficients corresponding to the best scores.
+                 best_indices = np.argmax(scores, axis=1)
+-                if self.multi_class == 'ovr':
++                if multi_class == 'ovr':
+                     w = np.mean([coefs_paths[i, best_indices[i], :]
+                                  for i in range(len(folds))], axis=0)
+                 else:
+@@ -2181,7 +2181,11 @@ class LogisticRegressionCV(LogisticRegression, BaseEstimator,
+                 self.C_.append(np.mean(self.Cs_[best_indices_C]))
+ 
+                 best_indices_l1 = best_indices // len(self.Cs_)
+-                self.l1_ratio_.append(np.mean(l1_ratios_[best_indices_l1]))
++                if l1_ratios_[0] is None:
++                    self.l1_ratio_.append(None)
++                else:
++                    self.l1_ratio_.append(
++                        np.mean(np.asarray(l1_ratios_)[best_indices_l1]))
+ 
+             if multi_class == 'multinomial':
+                 self.C_ = np.tile(self.C_, n_classes)
+diff --git a/sklearn/linear_model/tests/test_logistic.py b/sklearn/linear_model/tests/test_logistic.py
+index 6ad9a4ec9..c386ffd8b 100644
+--- a/sklearn/linear_model/tests/test_logistic.py
++++ b/sklearn/linear_model/tests/test_logistic.py
+@@ -1543,7 +1543,7 @@ def test_LogisticRegressionCV_no_refit(multi_class):
+                                random_state=0)
+ 
+     Cs = np.logspace(-4, 4, 3)
+-    l1_ratios = np.linspace(0, 1, 2)
++    l1_ratios = [0, 1]
+ 
+     lrcv = LogisticRegressionCV(penalty='elasticnet', Cs=Cs, solver='saga',
+                                 l1_ratios=l1_ratios, random_state=0,
+@@ -1554,6 +1554,23 @@ def test_LogisticRegressionCV_no_refit(multi_class):
+     assert lrcv.coef_.shape == (n_classes, n_features)
+ 
+ 
++@pytest.mark.parametrize('solver', ('liblinear', 'saga'))
++def test_LogisticRegressionCV_no_refit_binary_auto(solver):
++    # Test that refit=False works when the effective multi_class mode is OvR
++    # but the estimator parameter remains set to "auto".
++    X, y = make_classification(n_samples=200, n_classes=2, n_informative=3,
++                               n_redundant=0, random_state=0)
++
++    lrcv = LogisticRegressionCV(cv=3, solver=solver, tol=1e-2,
++                                random_state=0, refit=False)
++    lrcv.fit(X, y)
++
++    assert lrcv.C_.shape == (1,)
++    assert lrcv.coef_.shape == (1, X.shape[1])
++    assert lrcv.intercept_.shape == (1,)
++    assert_array_equal(lrcv.l1_ratio_, [None])
++
++
+ def test_LogisticRegressionCV_elasticnet_attribute_shapes():
+     # Make sure the shapes of scores_ and coefs_paths_ attributes are correct
+     # when using elasticnet (added one dimension for l1_ratios)

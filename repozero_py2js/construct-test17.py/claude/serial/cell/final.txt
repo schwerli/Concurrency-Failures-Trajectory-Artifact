@@ -1,0 +1,44 @@
+Migration complete and verified against the reference binary.
+
+## Structure
+
+```
+/output/
+├── lib/
+│   ├── python/          # Python-runtime primitives
+│   │   ├── utf8.mjs         str.encode() → byte array
+│   │   ├── repr.mjs         repr(bytes) and repr(str)
+│   │   ├── int.mjs          int(str) semantics + floor-mod
+│   │   └── traceback.mjs    PythonException / SystemExit / traceback printing
+│   ├── construct/       # the `construct` subset
+│   │   ├── errors.mjs       ConstructError → StreamError, FormatFieldError, StructError
+│   │   ├── stream.mjs       stream_write length guard
+│   │   ├── formatfield.mjs  Int8ul/Int16ul/… (struct.pack)
+│   │   ├── bytes.mjs        Bytes(n)
+│   │   └── index.mjs        namespace barrel
+│   └── cli/argparse.mjs # ArgumentParser work-alike
+└── test17.mjs           # entry point
+```
+
+## Behaviors I pinned down by probing the executable
+
+- **`repr(bytes)` quoting** — `'` by default, `"` when the payload has `'` but no `"`, and `\'` escaping when it has both. Escapes are `\\ \t \n \r` plus `\xNN` for anything outside `0x20–0x7e`.
+- **Big integers matter.** `--f 99999999999999999999` must round-trip into the error text verbatim, so every numeric arg is a `BigInt`. `parseInt` would have corrupted it.
+- **`int()` is broader than JS number parsing** — accepts surrounding whitespace, `+5`, digit-separating underscores (`1_0` → 10), and Unicode decimal digits (`٣` → 3), while rejecting `0x10`, `5.0`, `_10`, `10_`, `1__0`.
+- **Build order fixes which error wins.** All seven fields are built before anything prints, so `--a 256 --b 65536 --d 9` reports only the `--a` failure, at `test17.py` line 16.
+- **Two distinct length errors** — negative width is checked before the payload comparison, giving `length must be non-negative` rather than `wrong length`.
+
+## Constraint notes
+
+- Bytes are plain `Array`s of numbers with shift/mask arithmetic — **no `DataView`, `ArrayBuffer`, `Uint8Array`, `Buffer`, or `TextEncoder` anywhere** (UTF-8 encoding is hand-rolled, including surrogate pairs). Verified by grep.
+- Zero imports outside relative `.mjs` files; no `require`/`module.exports`.
+- `prog` is hardcoded to `test17_executable` and traceback frames to `test17.py`, so usage/error text matches the reference character for character rather than leaking `test17.mjs`. Flagged because it's a deliberate fidelity choice, not an oversight — say the word if you'd rather it report its own filename.
+
+## Verification
+
+- 58 hand-built differential cases: stdout, stderr, and exit code all match (`pass=58 fail=0`).
+- 600 randomized fuzz cases comparing **raw stdout bytes**: `pass=600 fail=0`.
+- `--help` output is byte-identical under `od -c`.
+- Exit codes align: `0` success, `1` uncaught build error, `2` argparse error.
+
+One inherent gap: the trailing `[PYI-<pid>:ERROR]` line embeds the process ID, so that single line can never match between two runs — even the reference against itself. Everything else in the traceback reproduces exactly.

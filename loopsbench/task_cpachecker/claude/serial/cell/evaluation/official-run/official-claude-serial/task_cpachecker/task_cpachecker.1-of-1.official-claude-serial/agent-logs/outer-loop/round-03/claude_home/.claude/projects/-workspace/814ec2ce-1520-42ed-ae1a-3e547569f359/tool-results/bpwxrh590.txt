@@ -1,0 +1,828 @@
+"""Linear integer arithmetic: affine expressions, constraints and a solver.
+
+The module provides the building blocks used by the symbolic analyses:
+
+* :class:`LinExpr`    -- affine expression ``c0 + sum(ci * symbol_i)``
+* :class:`Constraint` -- ``expr == 0``, ``expr >= 0`` or ``expr = 0 (mod m)``
+* :class:`Clause`     -- a disjunction of conjunctions of constraints
+* :func:`is_satisfiable` -- decision procedure for a conjunction of the above
+
+The decision procedure is deliberately lightweight (no external SMT solver).
+It combines four sound refutation techniques:
+
+1. integer normalisation of (in)equalities (gcd tightening),
+2. exact elimination of equalities that have a unit coefficient,
+3. interval (bound) propagation,
+4. Fourier-Motzkin elimination for the remaining inequalities, and
+5. Gaussian elimination modulo *m* for congruences.
+
+Every step is *sound for refutation*: whenever the solver answers ``UNSAT`` the
+constraint system really has no integer solution.  When the techniques above
+cannot refute a system the solver answers ``SAT``; the answer may then be an
+over-approximation (the usual direction for a verifier that must not discard
+feasible program paths).
+"""
+
+from __future__ import annotations
+
+from math import gcd
+from typing import Iterable, Optional, Sequence, Union
+
+
+class NonLinearError(Exception):
+    """Raised when a term cannot be represented as an affine expression."""
+
+
+def _ceil_div(numerator: int, denominator: int) -> int:
+    """Integer ceiling division that works for negative operands."""
+    quotient, remainder = divmod(numerator, denominator)
+    if remainder:
+        quotient += 1
+    return quotient
+
+
+def _floor_div(numerator: int, denominator: int) -> int:
+    # Python's // already rounds towards negative infinity for both signs.
+    return numerator // denominator
+
+
+# ---------------------------------------------------------------------------
+# Affine expressions
+# ---------------------------------------------------------------------------
+
+
+class LinExpr:
+    """Affine integer expression over symbolic variables."""
+
+    __slots__ = ("terms", "constant", "_hash")
+
+    def __init__(self, terms: Optional[dict[str, int]] = None, constant: int = 0):
+        cleaned: dict[str, int] = {}
+        if terms:
+            for symbol, coefficient in terms.items():
+                coefficient = int(coefficient)
+                if coefficient:
+                    cleaned[symbol] = coefficient
+        self.terms = cleaned
+        self.constant = int(constant)
+        self._hash = hash((frozenset(self.terms.items()), self.constant))
+
+    # -- constructors ---------------------------------------------------
+    @staticmethod
+    def symbol(name: str) -> "LinExpr":
+        return LinExpr({name: 1})
+
+    @staticmethod
+    def value(constant: int) -> "LinExpr":
+        return LinExpr({}, constant)
+
+    # -- queries --------------------------------------------------------
+    @property
+    def is_constant(self) -> bool:
+        return not self.terms
+
+    def coefficient(self, symbol: str) -> int:
+        return self.terms.get(symbol, 0)
+
+    def symbols(self) -> Iterable[str]:
+        return self.terms.keys()
+
+    def content_gcd(self) -> int:
+        """gcd of the absolute values of all coefficients (0 if constant)."""
+        result = 0
+        for coefficient in self.terms.values():
+            result = gcd(result, abs(coefficient))
+        return result
+
+    # -- arithmetic -----------------------------------------------------
+    def __add__(self, other: "LinExpr") -> "LinExpr":
+        terms = dict(self.terms)
+        for symbol, coefficient in other.terms.items():
+            terms[symbol] = terms.get(symbol, 0) + coefficient
+        return LinExpr(terms, self.constant + other.constant)
+
+    def __sub__(self, other: "LinExpr") -> "LinExpr":
+        return self + (-other)
+
+    def __neg__(self) -> "LinExpr":
+        return LinExpr({s: -c for s, c in self.terms.items()}, -self.constant)
+
+    def scaled(self, factor: int) -> "LinExpr":
+        if factor == 0:
+            return LinExpr()
+        return LinExpr({s: c * factor for s, c in self.terms.items()},
+                       self.constant * factor)
+
+    def multiply(self, other: "LinExpr") -> "LinExpr":
+        if other.is_constant:
+            return self.scaled(other.constant)
+        if self.is_constant:
+            return other.scaled(self.constant)
+        raise NonLinearError(f"non-linear product: ({self}) * ({other})")
+
+    def divide(self, other: "LinExpr") -> "LinExpr":
+        if self.is_constant and other.is_constant and other.constant != 0:
+            # C truncates towards zero.
+            quotient = abs(self.constant) // abs(other.constant)
+            if (self.constant < 0) != (other.constant < 0):
+                quotient = -quotient
+            return LinExpr.value(quotient)
+        raise NonLinearError(f"non-linear division: ({self}) / ({other})")
+
+    def remove(self, symbol: str) -> "LinExpr":
+        """Return a copy without the term of ``symbol``."""
+        if symbol not in self.terms:
+            return self
+        terms = dict(self.terms)
+        del terms[symbol]
+        return LinExpr(terms, self.constant)
+
+    def substitute(self, mapping: dict[str, "LinExpr"]) -> "LinExpr":
+        if not mapping or not any(s in mapping for s in self.terms):
+            return self
+        result = LinExpr({}, self.constant)
+        for symbol, coefficient in self.terms.items():
+            replacement = mapping.get(symbol)
+            if replacement is None:
+                result = result + LinExpr({symbol: coefficient})
+            else:
+                result = result + replacement.scaled(coefficient)
+        return result
+
+    def rename(self, mapping: dict[str, str]) -> "LinExpr":
+        if not mapping:
+            return self
+        terms: dict[str, int] = {}
+        for symbol, coefficient in self.terms.items():
+            name = mapping.get(symbol, symbol)
+            terms[name] = terms.get(name, 0) + coefficient
+        return LinExpr(terms, self.constant)
+
+    # -- protocol -------------------------------------------------------
+    def __eq__(self, other) -> bool:
+        return (isinstance(other, LinExpr) and other.constant == self.constant
+                and other.terms == self.terms)
+
+    def __hash__(self) -> int:
+        return self._hash
+
+    def __repr__(self) -> str:
+        if not self.terms:
+            return str(self.constant)
+        parts = []
+        for symbol in sorted(self.terms):
+            coefficient = self.terms[symbol]
+            if coefficient == 1:
+                parts.append(f"+{symbol}")
+            elif coefficient == -1:
+                parts.append(f"-{symbol}")
+            elif coefficient < 0:
+                parts.append(f"{coefficient}*{symbol}")
+            else:
+                parts.append(f"+{coefficient}*{symbol}")
+        if self.constant:
+            parts.append(f"{self.constant:+d}")
+        text = "".join(parts)
+        return text[1:] if text.startswith("+") else text
+
+
+ZERO = LinExpr()
+ONE = LinExpr.value(1)
+
+
+# ---------------------------------------------------------------------------
+# Constraints
+# ---------------------------------------------------------------------------
+
+
+class Constraint:
+    """An atomic linear constraint.
+
+    ``EQ``:  ``expr == 0``
+    ``GEQ``: ``expr >= 0``
+    ``MOD``: ``expr = 0 (mod modulus)``
+    """
+
+    EQ = "=="
+    GEQ = ">="
+    MOD = "mod"
+
+    __slots__ = ("kind", "expr", "modulus", "_hash")
+
+    def __init__(self, kind: str, expr: LinExpr, modulus: int = 0):
+        self.kind = kind
+        self.expr = expr
+        self.modulus = modulus
+        self._hash = hash((kind, expr, modulus))
+
+    # -- constructors ---------------------------------------------------
+    @staticmethod
+    def equal(expr: LinExpr) -> "Constraint":
+        return Constraint(Constraint.EQ, expr)
+
+    @staticmethod
+    def at_least_zero(expr: LinExpr) -> "Constraint":
+        return Constraint(Constraint.GEQ, expr)
+
+    @staticmethod
+    def greater_zero(expr: LinExpr) -> "Constraint":
+        """``expr > 0`` which over the integers is ``expr - 1 >= 0``."""
+        return Constraint(Constraint.GEQ, expr - ONE)
+
+    @staticmethod
+    def congruent(expr: LinExpr, modulus: int) -> "Constraint":
+        return Constraint(Constraint.MOD, expr, abs(modulus))
+
+    # -- operations -----------------------------------------------------
+    def substitute(self, mapping: dict[str, LinExpr]) -> "Constraint":
+        return Constraint(self.kind, self.expr.substitute(mapping), self.modulus)
+
+    def rename(self, mapping: dict[str, str]) -> "Constraint":
+        return Constraint(self.kind, self.expr.rename(mapping), self.modulus)
+
+    def negate(self) -> "Clause":
+        """Logical negation, expressed as a disjunction."""
+        if self.kind == Constraint.EQ:
+            return Clause([[Constraint.greater_zero(self.expr)],
+                           [Constraint.greater_zero(-self.expr)]])
+        if self.kind == Constraint.GEQ:
+            # not (e >= 0)  <=>  -e - 1 >= 0
+            return Clause([[Constraint.at_least_zero(-self.expr - ONE)]])
+        if self.kind == Constraint.MOD:
+            modulus = self.modulus
+            if modulus <= 1:
+                return Clause([])          # e = 0 (mod 1) is always true
+            return Clause([[Constraint.congruent(self.expr - LinExpr.value(r), modulus)]
+                           for r in range(1, modulus)])
+        raise ValueError(f"unknown constraint kind {self.kind}")
+
+    def symbols(self) -> Iterable[str]:
+        return self.expr.symbols()
+
+    def __eq__(self, other) -> bool:
+        return (isinstance(other, Constraint) and other.kind == self.kind
+                and other.modulus == self.modulus and other.expr == self.expr)
+
+    def __hash__(self) -> int:
+        return self._hash
+
+    def __repr__(self) -> str:
+        if self.kind == Constraint.MOD:
+            return f"({self.expr}) = 0 mod {self.modulus}"
+        return f"({self.expr}) {self.kind} 0"
+
+
+class Clause:
+    """Disjunction of conjunctions of constraints (a small DNF formula)."""
+
+    __slots__ = ("alternatives", "_hash")
+
+    def __init__(self, alternatives: Iterable[Sequence[Constraint]]):
+        self.alternatives = tuple(tuple(alt) for alt in alternatives)
+        self._hash = hash(("clause", self.alternatives))
+
+    @property
+    def is_false(self) -> bool:
+        return len(self.alternatives) == 0
+
+    @property
+    def is_unit(self) -> bool:
+        return len(self.alternatives) == 1
+
+    def substitute(self, mapping: dict[str, LinExpr]) -> "Clause":
+        return Clause([[c.substitute(mapping) for c in alt] for alt in self.alternatives])
+
+    def rename(self, mapping: dict[str, str]) -> "Clause":
+        return Clause([[c.rename(mapping) for c in alt] for alt in self.alternatives])
+
+    def negate(self) -> "Clause":
+        """Negate a DNF formula, producing another DNF formula."""
+        result: list[list[Constraint]] = [[]]
+        for alternative in self.alternatives:
+            extended: list[list[Constraint]] = []
+            for conjunction in result:
+                for constraint in alternative:
+                    for negated in constraint.negate().alternatives:
+                        extended.append(conjunction + list(negated))
+            result = extended
+            if not result:
+                break
+        return Clause(result)
+
+    def symbols(self) -> set[str]:
+        found: set[str] = set()
+        for alternative in self.alternatives:
+            for constraint in alternative:
+                found.update(constraint.symbols())
+        return found
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, Clause) and other.alternatives == self.alternatives
+
+    def __hash__(self) -> int:
+        return self._hash
+
+    def __repr__(self) -> str:
+        if self.is_false:
+            return "false"
+        return " | ".join(
+            "&".join(repr(c) for c in alt) if len(alt) > 1 else repr(alt[0])
+            for alt in self.alternatives
+        )
+
+
+FormulaItem = Union[Constraint, Clause]
+
+
+def negate_items(items: Sequence[FormulaItem]) -> Clause:
+    """Negate a conjunction of formula items, yielding a DNF clause."""
+    alternatives: list[list[Constraint]] = []
+    for item in items:
+        for alternative in item.negate().alternatives:
+            alternatives.append(list(alternative))
+    return Clause(alternatives)
+
+
+# ---------------------------------------------------------------------------
+# Decision procedure
+# ---------------------------------------------------------------------------
+
+
+class SolverLimits:
+    """Resource limits that keep the (exponential) procedures bounded."""
+
+    __slots__ = ("max_branches", "max_inequalities", "max_fm_variables")
+
+    def __init__(self, max_branches: int = 8192, max_inequalities: int = 600,
+                 max_fm_variables: int = 16):
+        self.max_branches = max_branches
+        self.max_inequalities = max_inequalities
+        self.max_fm_variables = max_fm_variables
+
+
+DEFAULT_LIMITS = SolverLimits()
+
+
+def is_satisfiable(items: Iterable[FormulaItem],
+                   limits: Optional[SolverLimits] = None) -> bool:
+    """Check whether the conjunction of ``items`` has an integer solution."""
+    limits = limits or DEFAULT_LIMITS
+    units: list[Constraint] = []
+    clauses: list[Clause] = []
+    for item in items:
+        if isinstance(item, Constraint):
+            units.append(item)
+        elif isinstance(item, Clause):
+            if item.is_false:
+                return False
+            if item.is_unit:
+                units.extend(item.alternatives[0])
+            else:
+                clauses.append(item)
+        else:
+            raise TypeError(f"not a formula item: {item!r}")
+
+    # Solve the clause with the fewest alternatives first: cheaper branching.
+    clauses.sort(key=lambda c: len(c.alternatives))
+    budget = [limits.max_branches]
+    return _solve(units, clauses, 0, budget, limits)
+
+
+def is_unsatisfiable(items: Iterable[FormulaItem],
+                     limits: Optional[SolverLimits] = None) -> bool:
+    return not is_satisfiable(items, limits)
+
+
+def _solve(units: list[Constraint], clauses: Sequence[Clause], index: int,
+           budget: list[int], limits: SolverLimits) -> bool:
+    """DPLL-style case split over the disjunctions in ``clauses``.
+
+    ``units`` is the conjunction of atomic constraints decided so far; the
+    clauses from ``index`` on still have to be satisfied by picking one of
+    their alternatives.  The unit part is refuted eagerly, so an inconsistent
+    prefix prunes the whole subtree of remaining case splits.
+
+    When the branching budget is exhausted the search gives up and answers
+    ``True``: that is the conservative direction, a verifier may explore
+    infeasible paths but must never discard feasible ones.
+    """
+    if not _core_satisfiable(units, limits):
+        return False
+    if index >= len(clauses):
+        return True
+
+    for alternative in clauses[index].alternatives:
+        if budget[0] <= 0:
+            return True                 # out of budget: assume satisfiable
+        budget[0] -= 1
+        if _solve(units + list(alternative), clauses, index + 1, budget, limits):
+            return True
+    return False
+
+
+def entails(items: Sequence[FormulaItem], consequence: Sequence[FormulaItem],
+            limits: Optional[SolverLimits] = None) -> bool:
+    """Check ``items => consequence`` by refuting ``items and not consequence``."""
+    negated = negate_items(list(consequence))
+    if negated.is_false:            # the consequence is trivially true
+        return True
+    return is_unsatisfiable(list(items) + [negated], limits)
+
+
+def collect_symbols(items: Iterable[FormulaItem]) -> list[str]:
+    """All symbols occurring in a formula, in deterministic order."""
+    symbols: list[str] = []
+    for item in items:
+        found = item.symbols() if isinstance(item, Clause) else item.expr.symbols()
+        for symbol in sorted(found):
+            if symbol not in symbols:
+                symbols.append(symbol)
+    return symbols
+
+
+def find_model(items: Iterable[FormulaItem], symbols: Optional[Sequence[str]] = None,
+               limits: Optional[SolverLimits] = None) -> Optional[dict[str, int]]:
+    """Best-effort search for a satisfying assignment (used for witnesses).
+
+    Symbols are pinned one after another to a candidate value taken from the
+    propagated bounds; every choice is validated with the decision procedure.
+    Returns ``None`` when no full assignment could be constructed.
+    """
+    limits = limits or DEFAULT_LIMITS
+    current = list(items)
+    if not is_satisfiable(current, limits):
+        return None
+    order = list(symbols) if symbols is not None else collect_symbols(current)
+    for symbol in collect_symbols(current):
+        if symbol not in order:
+            order.append(symbol)
+
+    model: dict[str, int] = {}
+    for symbol in order:
+        for candidate in _candidate_values(current, symbol):
+            trial = current + [Constraint.equal(LinExpr.symbol(symbol)
+                                                - LinExpr.value(candidate))]
+            if is_satisfiable(trial, limits):
+                current = trial
+                model[symbol] = candidate
+                break
+        else:
+            return None
+    return model
+
+
+def _candidate_values(items: Sequence[FormulaItem], symbol: str) -> list[int]:
+    """Plausible values for ``symbol`` derived from interval propagation."""
+    equalities: list[LinExpr] = []
+    inequalities: list[LinExpr] = []
+    for item in items:
+        if isinstance(item, Constraint):
+            if item.kind == Constraint.EQ:
+                equalities.append(item.expr)
+            elif item.kind == Constraint.GEQ:
+                inequalities.append(item.expr)
+    bounds = _propagate_bounds(equalities, inequalities)
+    low, high = (bounds or {}).get(symbol, (None, None))
+    candidates: list[int] = []
+
+    def offer(value: Optional[int]) -> None:
+        if value is None:
+            return
+        if low is not None and value < low:
+            return
+        if high is not None and value > high:
+            return
+        if value not in candidates:
+            candidates.append(value)
+
+    offer(0)
+    offer(low)
+    offer(high)
+    if low is not None:
+        offer(low + 1)
+        offer(low + 2)
+    if high is not None:
+        offer(high - 1)
+    offer(1)
+    offer(-1)
+    return candidates[:8]
+
+
+def _core_satisfiable(units: Sequence[Constraint], limits: SolverLimits) -> bool:
+    equalities: list[LinExpr] = []
+    inequalities: list[LinExpr] = []
+    congruences: list[tuple[LinExpr, int]] = []
+    for constraint in units:
+        if constraint.kind == Constraint.EQ:
+            equalities.append(constraint.expr)
+        elif constraint.kind == Constraint.GEQ:
+            inequalities.append(constraint.expr)
+        elif constraint.kind == Constraint.MOD:
+            if constraint.modulus > 1:
+                congruences.append((constraint.expr, constraint.modulus))
+
+    state = _eliminate_equalities(equalities, inequalities, congruences)
+    if state is None:
+        return False
+    equalities, inequalities, congruences = state
+
+    # Interval propagation; variables pinned to a single value become
+    # equalities, which enables further exact elimination.
+    for _ in range(len(_all_symbols(equalities, inequalities, congruences)) + 1):
+        bounds = _propagate_bounds(equalities, inequalities)
+        if bounds is None:
+            return False
+        fixed = {symbol: LinExpr.value(low)
+                 for symbol, (low, high) in bounds.items()
+                 if low is not None and low == high}
+        if not fixed:
+            break
+        equalities = [e.substitute(fixed) for e in equalities]
+        inequalities = [e.substitute(fixed) for e in inequalities]
+        congruences = [(e.substitute(fixed), m) for e, m in congruences]
+        for symbol, value in fixed.items():
+            equalities.append(LinExpr.symbol(symbol) - value)
+        state = _eliminate_equalities(equalities, inequalities, congruences)
+        if state is None:
+            return False
+        equalities, inequalities, congruences = state
+
+    if not _fourier_motzkin(equalities, inequalities, limits):
+        return False
+    return _congruences_satisfiable(equalities, congruences)
+
+
+def _all_symbols(equalities, inequalities, congruences) -> set[str]:
+    symbols: set[str] = set()
+    for expr in equalities:
+        symbols.update(expr.symbols())
+    for expr in inequalities:
+        symbols.update(expr.symbols())
+    for expr, _ in congruences:
+        symbols.update(expr.symbols())
+    return symbols
+
+
+def _normalize_equality(expr: LinExpr) -> tuple[bool, Optional[LinExpr]]:
+    """gcd-normalise ``expr == 0``; ``(False, None)`` means unsatisfiable."""
+    if expr.is_constant:
+        return expr.constant == 0, None
+    divisor = expr.content_gcd()
+    if divisor > 1:
+        if expr.constant % divisor != 0:
+            return False, None      # no integer solution
+        expr = LinExpr({s: c // divisor for s, c in expr.terms.items()},
+                       expr.constant // divisor)
+    return True, expr
+
+
+def _normalize_inequality(expr: LinExpr) -> tuple[bool, Optional[LinExpr]]:
+    """gcd-tighten ``expr >= 0``; ``(False, None)`` means unsatisfiable."""
+    if expr.is_constant:
+        return expr.constant >= 0, None
+    divisor = expr.content_gcd()
+    if divisor > 1:
+        expr = LinExpr({s: c // divisor for s, c in expr.terms.items()},
+                       expr.constant // divisor)
+    return True, expr
+
+
+def _eliminate_equalities(equalities: list[LinExpr], inequalities: list[LinExpr],
+                          congruences: list[tuple[LinExpr, int]]):
+    """Substitute away every equality that has a coefficient of +-1.
+
+    Such substitutions are exact over the integers (unimodular), so no
+    precision is lost.  Returns ``None`` if the system is unsatisfiable.
+    """
+    pending = list(equalities)
+    remaining: list[LinExpr] = []
+    inequalities = list(inequalities)
+    congruences = list(congruences)
+
+    while pending:
+        expr = pending.pop()
+        ok, expr = _normalize_equality(expr)
+        if not ok:
+            return None
+        if expr is None:
+            continue
+        pivot = next((s for s, c in expr.terms.items() if abs(c) == 1), None)
+        if pivot is None:
+            remaining.append(expr)
+            continue
+        coefficient = expr.coefficient(pivot)
+        rest = expr.remove(pivot)
+        # coefficient * pivot + rest == 0  =>  pivot = -rest / coefficient
+        replacement = rest.scaled(-1) if coefficient == 1 else rest
+        mapping = {pivot: replacement}
+        pending = [e.substitute(mapping) for e in pending]
+        remaining = [e.substitute(mapping) for e in remaining]
+        # A previously irreducible equality may become reducible again.
+        pending.extend(remaining)
+        remaining = []
+        inequalities = [e.substitute(mapping) for e in inequalities]
+        congruences = [(e.substitute(mapping), m) for e, m in congruences]
+
+    normalized: list[LinExpr] = []
+    for expr in inequalities:
+        ok, expr = _normalize_inequality(expr)
+        if not ok:
+            return None
+        if expr is not None:
+            normalized.append(expr)
+    return remaining, normalized, congruences
+
+
+def _interval_of(expr: LinExpr, bounds: dict[str, tuple[Optional[int], Optional[int]]]):
+    """Evaluate ``expr`` over the given variable intervals."""
+    low: Optional[int] = expr.constant
+    high: Optional[int] = expr.constant
+    for symbol, coefficient in expr.terms.items():
+        var_low, var_high = bounds.get(symbol, (None, None))
+        if coefficient > 0:
+            term_low = None if var_low is None else coefficient * var_low
+            term_high = None if var_high is None else coefficient * var_high
+        else:
+            term_low = None if var_high is None else coefficient * var_high
+            term_high = None if var_low is None else coefficient * var_low
+        low = None if (low is None or term_low is None) else low + term_low
+        high = None if (high is None or term_high is None) else high + term_high
+    return low, high
+
+
+def _propagate_bounds(equalities: list[LinExpr], inequalities: list[LinExpr]):
+    """Interval propagation.  Returns bounds, or ``None`` if unsatisfiable."""
+    bounds: dict[str, tuple[Optional[int], Optional[int]]] = {
+        symbol: (None, None)
+        for symbol in _all_symbols(equalities, inequalities, [])
+    }
+    if not bounds:
+        return bounds
+
+    for _ in range(16):
+        changed = False
+        for expr, is_equality in ([(e, True) for e in equalities]
+                                  + [(e, False) for e in inequalities]):
+            for symbol, coefficient in expr.terms.items():
+                rest = expr.remove(symbol)
+                rest_low, rest_high = _interval_of(rest, bounds)
+                low, high = bounds[symbol]
+                new_low, new_high = low, high
+                # coefficient * symbol + rest >= 0  =>  coefficient*symbol >= -rest_high
+                if rest_high is not None:
+                    if coefficient > 0:
+                        candidate = _ceil_div(-rest_high, coefficient)
+                        if new_low is None or candidate > new_low:
+                            new_low = candidate
+                    else:
+                        candidate = _floor_div(-rest_high, coefficient)
+                        if new_high is None or candidate < new_high:
+                            new_high = candidate
+                if is_equality and rest_low is not None:
+                    # coefficient * symbol = -rest  =>  bound from the other side
+                    if coefficient > 0:
+                        candidate = _floor_div(-rest_low, coefficient)
+                        if new_high is None or candidate < new_high:
+                            new_high = candidate
+                    else:
+                        candidate = _ceil_div(-rest_low, coefficient)
+                        if new_low is None or candidate > new_low:
+                            new_low = candidate
+                if (new_low, new_high) != (low, high):
+                    if new_low is not None and new_high is not None and new_low > new_high:
+                        return None
+                    bounds[symbol] = (new_low, new_high)
+                    changed = True
+        if not changed:
+            break
+    return bounds
+
+
+def _fourier_motzkin(equalities: list[LinExpr], inequalities: list[LinExpr],
+                     limits: SolverLimits) -> bool:
+    """Rational feasibility test for the inequality system."""
+    system: list[LinExpr] = list(inequalities)
+    for expr in equalities:
+        system.append(expr)
+        system.append(-expr)
+
+    cleaned: list[LinExpr] = []
+    for expr in system:
+        ok, expr = _normalize_inequality(expr)
+        if not ok:
+            return False
+        if expr is not None:
+            cleaned.append(expr)
+    system = list(dict.fromkeys(cleaned))
+
+    variables = set()
+    for expr in system:
+        variables.update(expr.symbols())
+    if len(system) > limits.max_inequalities or len(variables) > limits.max_fm_variables:
+        return True                 # too large: give up (conservative)
+
+    while variables:
+        # Eliminate the variable that produces the fewest resolvents.
+        def cost(symbol: str) -> int:
+            positive = sum(1 for e in system if e.coefficient(symbol) > 0)
+            negative = sum(1 for e in system if e.coefficient(symbol) < 0)
+            return positive * negative
+
+        victim = min(variables, key=cost)
+        variables.discard(victim)
+
+        lower = [e for e in system if e.coefficient(victim) > 0]
+        upper = [e for e in system if e.coefficient(victim) < 0]
+        rest = [e for e in system if e.coefficient(victim) == 0]
+
+        for low_expr in lower:
+            a = low_expr.coefficient(victim)
+            e1 = low_expr.remove(victim)
+            for high_expr in upper:
+                b = -high_expr.coefficient(victim)
+                e2 = high_expr.remove(victim)
+                resolvent = e2.scaled(a) + e1.scaled(b)
+                ok, resolvent = _normalize_inequality(resolvent)
+                if not ok:
+                    return False
+                if resolvent is not None:
+                    rest.append(resolvent)
+        system = list(dict.fromkeys(rest))
+        if len(system) > limits.max_inequalities:
+            return True             # too large: give up (conservative)
+    return True
+
+
+def _congruences_satisfiable(equalities: list[LinExpr],
+                             congruences: list[tuple[LinExpr, int]]) -> bool:
+    """Gaussian elimination modulo ``m`` for every modulus in use."""
+    if not congruences:
+        return True
+    for modulus in sorted({m for _, m in congruences}):
+        rows: list[tuple[dict[str, int], int]] = []
+        for expr in equalities:
+            rows.append(_row_mod(expr, modulus))
+        for expr, other in congruences:
+            if other % modulus == 0:
+                rows.append(_row_mod(expr, modulus))
+        if not _mod_system_satisfiable(rows, modulus):
+            return False
+    return True
+
+
+def _row_mod(expr: LinExpr, modulus: int) -> tuple[dict[str, int], int]:
+    terms = {}
+    for symbol, coefficient in expr.terms.items():
+        reduced = coefficient % modulus
+        if reduced:
+            terms[symbol] = reduced
+    return terms, expr.constant % modulus
+
+
+def _mod_system_satisfiable(rows: list[tuple[dict[str, int], int]], modulus: int) -> bool:
+    rows = [(dict(terms), constant) for terms, constant in rows]
+    while True:
+        pivot_row = None
+        pivot_symbol = None
+        for index, (terms, _) in enumerate(rows):
+            for symbol, coefficient in terms.items():
+                if gcd(coefficient, modulus) == 1:
+                    pivot_row, pivot_symbol = index, symbol
+                    break
+            if pivot_row is not None:
+                break
+        if pivot_row is None:
+            break
+
+        terms, constant = rows.pop(pivot_row)
+        inverse = pow(terms[pivot_symbol], -1, modulus)
+        rest = {s: c for s, c in terms.items() if s != pivot_symbol}
+        # pivot_symbol = -inverse * (rest + constant)
+        substitution = {s: (-inverse * c) % modulus for s, c in rest.items()}
+        substitution_constant = (-inverse * constant) % modulus
+
+        updated: list[tuple[dict[str, int], int]] = []
+        for other_terms, other_constant in rows:
+            factor = other_terms.pop(pivot_symbol, 0)
+            if factor:
+                for symbol, coefficient in substitution.items():
+                    value = (other_terms.get(symbol, 0) + factor * coefficient) % modulus
+                    if value:
+                        other_terms[symbol] = value
+                    else:
+                        other_terms.pop(symbol, None)
+                other_constant = (other_constant + factor * substitution_constant) % modulus
+            updated.append((other_terms, other_constant))
+        rows = updated
+
+    for terms, constant in rows:
+        if not terms:
+            if constant % modulus != 0:
+                return False
+        else:
+            divisor = modulus
+            for coefficient in terms.values():
+                divisor = gcd(divisor, coefficient)
+            if constant % divisor != 0:
+                return False
+    return True

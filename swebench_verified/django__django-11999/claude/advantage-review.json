@@ -1,0 +1,118 @@
+{
+  "schema_version": 2,
+  "phase": "fixed",
+  "pair_id": "swebench_verified/django__django-11999/claude",
+  "task": {
+    "plain_summary_zh": "修复 Django 2.2+ 中带 choices 字段的模型无法覆盖 get_FOO_display() 的回归。",
+    "acceptance_target_zh": "用户在同一模型类中定义的 get_foo_bar_display() 应优先于字段自动生成的显示方法，同时不能破坏继承 choices 的正常显示。"
+  },
+  "modes": {
+    "parallel": {
+      "solution_passed": true,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 1715.229
+    },
+    "serial": {
+      "solution_passed": false,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 1863.667
+    }
+  },
+  "reconstruction": {
+    "parallel_strategy_zh": "并行主线程先自行定位 Field.contribute_to_class 的无条件 setattr，复现问题并实现 cls.__dict__ 防护；后台 workflow 同时让多个子代理做根因、候选防护差异、测试覆盖和反驳审查，主线程随后参考这些结果并恢复被子代理清理误删的补丁。",
+    "serial_strategy_zh": "串行单线程也定位到同一源码位置，先实现了 cls.__dict__ 防护并添加回归测试；测试通过后它为了验证 hasattr 备选方案而 checkout 源文件，导致源码修复被回滚，最后超时提交了只有测试文件的补丁。",
+    "realized_parallelism_zh": "并行确有真实重叠：主线程从 09:53 后继续复现、编辑和测试，同时 workflow 在多个子代理中并发执行根因分析、候选方案比较、测试影响扫描和反驳验证；但这些并发检查主要验证了主线程已做出的选择，而不是清楚地产生了最终质量差。",
+    "parallel_workers": 10,
+    "peak_overlapping_useful_workers": 8
+  },
+  "baseline_audit": {
+    "same_task_and_prompt": true,
+    "serial_run_valid": false,
+    "parallel_run_valid": true,
+    "external_or_harness_issues_zh": [
+      "串行代理进程以 agent_timeout 结束，returncode 为 143，最终响应为空。",
+      "串行最终提交的补丁只包含测试新增内容，缺少自己先前写过的字段源码修复；这是未完成运行问题，不是可干净归因于并发缺失的正常串行基线。"
+    ]
+  },
+  "decision": "exclude",
+  "exclusion_code": "serial_external_failure",
+  "decision_reason_zh": "排除。并行确实有重叠子代理并且官方通过，串行官方未通过；但串行失败发生在它已经找到并临时实现正确修复之后，又在验证备选方案时回滚源码修复并最终超时，形成不完整运行基线。质量差不能可靠归因于并发机制本身。",
+  "advantage": null,
+  "new_pattern_candidate": {
+    "is_candidate": false,
+    "name_zh": null,
+    "mechanism_zh": null,
+    "why_existing_dimensions_fail_zh": null
+  },
+  "evidence": {
+    "parallel": [
+      {
+        "path": "parallel/cell/model.patch",
+        "line": 8,
+        "summary_zh": "并行最终补丁在 choices 分支下修改 get_FOO_display 的生成逻辑。"
+      },
+      {
+        "path": "parallel/cell/model.patch",
+        "line": 15,
+        "summary_zh": "并行采用 cls.__dict__ 防护，避免覆盖同类中显式定义的方法。"
+      },
+      {
+        "path": "parallel/agent/claude/.claude/projects/-testbed/487dfd9b-4862-4223-9a5f-9346b68a295c/workflows/wf_ccda2be7-4a3.json",
+        "line": 1,
+        "summary_zh": "workflow 记录显示 9 个子代理参与根因、方案比较和反驳验证等并发工作。"
+      },
+      {
+        "path": "parallel/cell/status.json",
+        "line": 307,
+        "summary_zh": "并行官方评测记录 solution_passed 为 true。"
+      }
+    ],
+    "serial": [
+      {
+        "path": "serial/agent/claude/.claude/projects/-testbed/970ed63b-2270-43f0-8f54-34a488c4160f.jsonl",
+        "line": 58,
+        "summary_zh": "串行验证 hasattr 备选方案失败，说明它知道 cls.__dict__ 的必要性。"
+      },
+      {
+        "path": "serial/agent/claude/.claude/projects/-testbed/970ed63b-2270-43f0-8f54-34a488c4160f.jsonl",
+        "line": 62,
+        "summary_zh": "串行最后可见状态显示源码修复已被 checkout 回滚，只剩测试文件改动。"
+      },
+      {
+        "path": "serial/cell/model.patch",
+        "line": 1,
+        "summary_zh": "串行最终 model.patch 从第一行开始就是测试文件 diff，没有源码文件 diff。"
+      },
+      {
+        "path": "serial/cell/status.json",
+        "line": 102,
+        "summary_zh": "串行代理进程 returncode 为 143，表示超时终止。"
+      }
+    ],
+    "evaluator": [
+      {
+        "path": "parallel/cell/evaluation/summary.json",
+        "line": 70,
+        "summary_zh": "并行官方评测 solution_passed 为 true。"
+      },
+      {
+        "path": "serial/cell/evaluation/summary.json",
+        "line": 70,
+        "summary_zh": "串行官方评测 solution_passed 为 false。"
+      },
+      {
+        "path": "serial/cell/evaluation/official-run/logs/run_evaluation/formal-claude-serial-django__django-11999/uiuc-claude-serial/django__django-11999/test_output.txt",
+        "line": 376,
+        "summary_zh": "官方测试输出显示串行提交后 fail-to-pass 测试失败。"
+      }
+    ]
+  },
+  "case_narrative_zh": "该任务要求修复 Django 中 choices 字段自动生成的 get_FOO_display() 覆盖用户自定义同名方法的问题。并行主线程和多个子代理确实重叠工作：主线程实现并测试 cls.__dict__ 防护，子代理并发做根因、候选方案、测试影响和反驳验证，最终并行补丁包含源码修复并通过官方评测。串行运行也独立找到了同一修复并让目标测试通过，但在验证 hasattr 备选方案时把源码修复 checkout 掉，最后超时且提交了只有测试的补丁。因此官方质量差是真实的，但串行基线是不完整运行，不能把优势稳健归因于并发本身；也不存在不能归入既有三类的新增机制候选。",
+  "confidence": "high"
+}

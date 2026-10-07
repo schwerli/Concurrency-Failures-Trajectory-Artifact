@@ -1,0 +1,65 @@
+diff --git a/django/contrib/sessions/backends/base.py b/django/contrib/sessions/backends/base.py
+index b5453160a5..c3c31d604b 100644
+--- a/django/contrib/sessions/backends/base.py
++++ b/django/contrib/sessions/backends/base.py
+@@ -108,11 +108,20 @@ class SessionBase:
+ 
+     def encode(self, session_dict):
+         "Return the given session dictionary serialized and encoded as a string."
++        # RemovedInDjango40Warning: DEFAULT_HASHING_ALGORITHM will be removed.
++        if settings.DEFAULT_HASHING_ALGORITHM == 'sha1':
++            return self._legacy_encode(session_dict)
+         return signing.dumps(
+             session_dict, salt=self.key_salt, serializer=self.serializer,
+             compress=True,
+         )
+ 
++    def _legacy_encode(self, session_dict):
++        # RemovedInDjango40Warning: pre-Django 3.1 format will be invalid.
++        serialized = self.serializer().dumps(session_dict)
++        hash = self._hash(serialized)
++        return base64.b64encode(hash.encode() + b':' + serialized).decode('ascii')
++
+     def decode(self, session_data):
+         try:
+             return signing.loads(session_data, salt=self.key_salt, serializer=self.serializer)
+diff --git a/docs/releases/3.1.1.txt b/docs/releases/3.1.1.txt
+index 516d47cd03..d23a409f23 100644
+--- a/docs/releases/3.1.1.txt
++++ b/docs/releases/3.1.1.txt
+@@ -14,3 +14,7 @@ Bugfixes
+ 
+ * Fixed wrapping of long model names in the admin's navigation sidebar
+   (:ticket:`31854`).
++
++* Fixed encoding session data during the transition to Django 3.1 when the
++  ``DEFAULT_HASHING_ALGORITHM`` setting is set to ``'sha1'``
++  (:ticket:`31883`).
+diff --git a/tests/sessions_tests/tests.py b/tests/sessions_tests/tests.py
+index 248dae82aa..ed5ec3bf98 100644
+--- a/tests/sessions_tests/tests.py
++++ b/tests/sessions_tests/tests.py
+@@ -34,6 +34,7 @@ from django.test import (
+     RequestFactory, TestCase, ignore_warnings, override_settings,
+ )
+ from django.utils import timezone
++from django.utils.deprecation import RemovedInDjango40Warning
+ 
+ from .models import SessionStore as CustomDatabaseSession
+ 
+@@ -323,6 +324,15 @@ class SessionTestsMixin:
+             {'a test key': 'a test value'},
+         )
+ 
++    @ignore_warnings(category=RemovedInDjango40Warning)
++    @override_settings(DEFAULT_HASHING_ALGORITHM='sha1')
++    def test_encode_legacy_decode(self):
++        # RemovedInDjango40Warning: pre-Django 3.1 sessions will be invalid.
++        data = {'a test key': 'a test value'}
++        encoded = self.session.encode(data)
++        self.assertEqual(self.session._legacy_decode(encoded), data)
++        self.assertEqual(self.session.decode(encoded), data)
++
+     def test_decode_failure_logged_to_security(self):
+         bad_encode = base64.b64encode(b'flaskdj:alkdjf').decode('ascii')
+         with self.assertLogs('django.security.SuspiciousSession', 'WARNING') as cm:

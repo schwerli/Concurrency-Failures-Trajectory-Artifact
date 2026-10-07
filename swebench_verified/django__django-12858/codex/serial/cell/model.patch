@@ -1,0 +1,156 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 6c9e9d3707..6a0d27d6cd 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -1731,31 +1731,40 @@ class Model(metaclass=ModelBase):
+                 _fields.append(f)
+         fields = _fields
+ 
++        def _is_valid_ordering_reference(ordering):
++            from django.db.models.sql.query import Query
++
++            query = Query(cls)
++            try:
++                _, _, targets, rest = query.names_to_path(
++                    ordering.split(LOOKUP_SEP), cls._meta,
++                )
++            except FieldError:
++                return False
++            if not rest:
++                return True
++            expression = Value(None, output_field=targets[-1])
++            *transforms, lookup = rest
++            try:
++                for name in transforms:
++                    expression = query.try_transform(expression, name)
++            except FieldError:
++                return False
++            if lookup == 'isnull' and expression.get_lookup(lookup) is not None:
++                return True
++            return expression.get_transform(lookup) is not None
++
+         # Check related fields.
+         for field in related_fields:
+-            _cls = cls
+-            fld = None
+-            for part in field.split(LOOKUP_SEP):
+-                try:
+-                    # pk is an alias that won't be found by opts.get_field.
+-                    if part == 'pk':
+-                        fld = _cls._meta.pk
+-                    else:
+-                        fld = _cls._meta.get_field(part)
+-                    if fld.is_relation:
+-                        _cls = fld.get_path_info()[-1].to_opts.model
+-                    else:
+-                        _cls = None
+-                except (FieldDoesNotExist, AttributeError):
+-                    if fld is None or fld.get_transform(part) is None:
+-                        errors.append(
+-                            checks.Error(
+-                                "'ordering' refers to the nonexistent field, "
+-                                "related field, or lookup '%s'." % field,
+-                                obj=cls,
+-                                id='models.E015',
+-                            )
+-                        )
++            if not _is_valid_ordering_reference(field):
++                errors.append(
++                    checks.Error(
++                        "'ordering' refers to the nonexistent field, "
++                        "related field, or lookup '%s'." % field,
++                        obj=cls,
++                        id='models.E015',
++                    )
++                )
+ 
+         # Skip ordering on pk. This is always a valid order_by field
+         # but is an alias and therefore won't be found by opts.get_field.
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 05597173ee..658e27aae6 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -5,8 +5,11 @@ from itertools import chain
+ 
+ from django.core.exceptions import EmptyResultSet, FieldError
+ from django.db import DatabaseError, NotSupportedError
++from django.db.models import BooleanField
+ from django.db.models.constants import LOOKUP_SEP
+-from django.db.models.expressions import OrderBy, Random, RawSQL, Ref, Value
++from django.db.models.expressions import (
++    Case, OrderBy, Random, RawSQL, Ref, Value, When,
++)
+ from django.db.models.functions import Cast
+ from django.db.models.query_utils import Q, select_related_descend
+ from django.db.models.sql.constants import (
+@@ -711,6 +714,13 @@ class SQLCompiler:
+         name, order = get_order_dir(name, default_order)
+         descending = order == 'DESC'
+         pieces = name.split(LOOKUP_SEP)
++        if pieces[-1] == 'isnull':
++            expression = Case(
++                When(Q(**{name: True}), then=True),
++                default=False,
++                output_field=BooleanField(),
++            )
++            return [(OrderBy(expression, descending=descending), False)]
+         field, targets, alias, joins, path, opts, transform_function = self._setup_joins(pieces, opts, alias)
+ 
+         # If we get to this point and the field is a relation to another model,
+diff --git a/tests/invalid_models_tests/test_models.py b/tests/invalid_models_tests/test_models.py
+index 6bfdf2e736..5b92b207ee 100644
+--- a/tests/invalid_models_tests/test_models.py
++++ b/tests/invalid_models_tests/test_models.py
+@@ -893,6 +893,27 @@ class OtherModelTests(SimpleTestCase):
+         with register_lookup(models.CharField, Lower):
+             self.assertEqual(Model.check(), [])
+ 
++    def test_ordering_allows_isnull_lookup(self):
++        class Model(models.Model):
++            test = models.IntegerField(null=True)
++
++            class Meta:
++                ordering = ('test__isnull',)
++
++        self.assertEqual(Model.check(), [])
++
++    def test_ordering_allows_related_isnull_lookup(self):
++        class Parent(models.Model):
++            parent = models.ForeignKey('self', models.CASCADE, null=True)
++
++        class Child(models.Model):
++            parent = models.ForeignKey(Parent, models.CASCADE)
++
++            class Meta:
++                ordering = ('parent__parent__isnull',)
++
++        self.assertEqual(Child.check(), [])
++
+     def test_ordering_pointing_to_related_model_pk(self):
+         class Parent(models.Model):
+             pass
+diff --git a/tests/ordering/tests.py b/tests/ordering/tests.py
+index a9cc729c45..d0326651a1 100644
+--- a/tests/ordering/tests.py
++++ b/tests/ordering/tests.py
+@@ -95,6 +95,20 @@ class OrderingTests(TestCase):
+         with self.assertRaisesMessage(ValueError, msg):
+             Article.objects.order_by(F("author").desc(nulls_last=True, nulls_first=True))
+ 
++    def test_order_by_isnull_lookup(self):
++        Article.objects.filter(headline="Article 3").update(author=self.author_1)
++        Article.objects.filter(headline="Article 4").update(author=self.author_2)
++        self.assertQuerysetEqual(
++            Article.objects.order_by("author__isnull", "headline"),
++            ["Article 3", "Article 4", "Article 1", "Article 2"],
++            attrgetter("headline"),
++        )
++        self.assertQuerysetEqual(
++            Article.objects.order_by("-author__isnull", "headline"),
++            ["Article 1", "Article 2", "Article 3", "Article 4"],
++            attrgetter("headline"),
++        )
++
+     def assertQuerysetEqualReversible(self, queryset, sequence):
+         self.assertSequenceEqual(queryset, sequence)
+         self.assertSequenceEqual(queryset.reverse(), list(reversed(sequence)))

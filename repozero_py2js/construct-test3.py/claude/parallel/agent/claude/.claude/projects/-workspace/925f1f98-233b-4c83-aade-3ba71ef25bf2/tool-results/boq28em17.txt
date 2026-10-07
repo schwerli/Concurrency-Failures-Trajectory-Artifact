@@ -1,0 +1,744 @@
+=== /tmp/cand_c2/lib/cli/argument_parser.mjs ===
+     1	// lib/cli/argument_parser.mjs
+     2	//
+     3	// A hand-rolled argparse clone, built by hand from process.argv. Every user-visible
+     4	// string comes from the ARGPARSE_MESSAGES catalogue below, and every branching
+     5	// decision comes from one of the explicit tables/predicates, so each behaviour can
+     6	// be checked against the measured ground truth line by line.
+     7	//
+     8	// Reproduced behaviours (all measured against the reference build):
+     9	//   usage/help layout and the "options:" heading
+    10	//   required-argument errors, and that they fire BEFORE unrecognized-argument errors
+    11	//   type-conversion errors at consume time (left to right, before required checks)
+    12	//   -h/--help anywhere wins immediately, unless an earlier token already failed
+    13	//   long-option abbreviation (--h, --he, --hel all mean --help)
+    14	//   "--opt=value", last-occurrence-wins, negative numbers accepted as values
+    15	//   a bare "--" and everything after it becomes unrecognized input
+    16	//   "-hx" fires -h then rejects the tail; "--help=x" is an explicit-argument error
+    17	
+    18	import { pyStrRepr } from '../python/bytes_repr.mjs';
+    19	import { pyIntFromString } from '../python/int_parse.mjs';
+    20	import { SystemExit, progName, writeStdout, writeStderr } from '../python/errors.mjs';
+    21	
+    22	// ---------------------------------------------------------------------------
+    23	// Message catalogue (MEASURED, verbatim)
+    24	// ---------------------------------------------------------------------------
+    25	export const ARGPARSE_MESSAGES = {
+    26	  /** "the following arguments are required: --a, --b" */
+    27	  requiredArguments: (names) =>
+    28	    `the following arguments are required: ${names.join(', ')}`,
+    29	  /** "invalid int value: 'abc'" (Python's %r of the raw string) */
+    30	  invalidValue: (typeName, raw) =>
+    31	    `invalid ${typeName} value: ${pyStrRepr(raw)}`,
+    32	  /** "expected one argument" */
+    33	  expectedOneArgument: () => 'expected one argument',
+    34	  /** "unrecognized arguments: --c 3" */
+    35	  unrecognizedArguments: (tokens) =>
+    36	    `unrecognized arguments: ${tokens.join(' ')}`,
+    37	  /** "ambiguous option: --x could match --help, --a" */
+    38	  ambiguousOption: (token, optionStrings) =>
+    39	    `ambiguous option: ${token} could match ${optionStrings.join(', ')}`,
+    40	  /** "ignored explicit argument 'x'" */
+    41	  ignoredExplicitArgument: (explicitArg) =>
+    42	    `ignored explicit argument ${pyStrRepr(explicitArg)}`,
+    43	  /** wrapper argparse puts around per-action errors */
+    44	  argumentError: (actionName, message) => `argument ${actionName}: ${message}`,
+    45	};
+    46	
+    47	/** Exit codes, per the spec. */
+    48	export const EXIT_CODES = { ok: 0, argparseError: 2 };
+    49	
+    50	// ---------------------------------------------------------------------------
+    51	// Type registry ("type=int" in the Python source)
+    52	// ---------------------------------------------------------------------------
+    53	export const TYPE_REGISTRY = {
+    54	  int: { name: 'int', convert: pyIntFromString },
+    55	};
+    56	
+    57	// ---------------------------------------------------------------------------
+    58	// Token classification tables
+    59	// ---------------------------------------------------------------------------
+    60	// argparse's `_negative_number_matcher`. Python's `\d` is Unicode-aware, hence
+    61	// \p{Nd} here rather than [0-9]. A token matching this is treated as a value (not
+    62	// an option) as long as the parser declares no negative-number-like options --
+    63	// which is why `--a -5` reaches construct with -5.
+    64	export const NEGATIVE_NUMBER_RE = /^-[\p{Nd}]+$|^-[\p{Nd}]*\.[\p{Nd}]+$/u;
+    65	
+    66	/** The token that ends option processing outright. */
+    67	export const OPTION_TERMINATOR = '--';
+    68	
+    69	/** Help-layout constants, matching argparse's HelpFormatter. */
+    70	export const HELP_LAYOUT = { indent: 2, gap: 2, maxHelpPosition: 24 };
+    71	
+    72	/**
+    73	 * argparse's `_get_action_name` for options: all option strings joined by "/".
+    74	 * "--a" for --a, "-h/--help" for the help action.
+    75	 * @param {object} action
+    76	 * @returns {string}
+    77	 */
+    78	export function actionName(action) {
+    79	  return action.optionStrings.join('/');
+    80	}
+    81	
+    82	/**
+    83	 * Internal signal for a per-action failure. parseArgs() converts it into the
+    84	 * "argument <name>: <message>" wrapper and then into a usage error.
+    85	 */
+    86	class ArgumentError extends Error {
+    87	  constructor(action, message) {
+    88	    super(ARGPARSE_MESSAGES.argumentError(actionName(action), message));
+    89	    this.name = 'ArgumentError';
+    90	  }
+    91	}
+    92	
+    93	export class ArgumentParser {
+    94	  /**
+    95	   * @param {{prog?: string, addHelp?: boolean}} [options]
+    96	   */
+    97	  constructor(options = {}) {
+    98	    this.prog = options.prog ?? progName();
+    99	    this.prefixChars = '-';
+   100	    this.allowAbbrev = true;
+   101	    /** @type {object[]} declaration order drives usage, help and build order */
+   102	    this.actions = [];
+   103	    /** @type {Map<string, object>} insertion order drives ambiguity reporting */
+   104	    this.optionStringActions = new Map();
+   105	
+   106	    if (options.addHelp !== false) {
+   107	      this.addArgument(['-h', '--help'], {
+   108	        action: 'help',
+   109	        help: 'show this help message and exit',
+   110	      });
+   111	    }
+   112	  }
+   113	
+   114	  /**
+   115	   * parser.add_argument(...)
+   116	   * @param {string|string[]} flags e.g. '--a' or ['-h', '--help']
+   117	   * @param {{action?: 'store'|'help', type?: string, required?: boolean, metavar?: string, help?: string}} [spec]
+   118	   */
+   119	  addArgument(flags, spec = {}) {
+   120	    const optionStrings = Array.isArray(flags) ? flags.slice() : [flags];
+   121	    const longest = optionStrings.find((s) => s.startsWith('--')) ?? optionStrings[0];
+   122	    const dest = longest.replace(/^-+/, '').replace(/-/g, '_');
+   123	    const kind = spec.action ?? 'store';
+   124	    const action = {
+   125	      optionStrings,
+   126	      dest,
+   127	      kind,
+   128	      // nargs is 0 for flags (help) and 1 for value-taking options.
+   129	      nargs: kind === 'help' ? 0 : 1,
+   130	      metavar: spec.metavar ?? dest.toUpperCase(),
+   131	      typeName: spec.type ?? null,
+   132	      required: spec.required ?? false,
+   133	      help: spec.help ?? '',
+   134	    };
+   135	    this.actions.push(action);
+   136	    for (const optionString of optionStrings) {
+   137	      this.optionStringActions.set(optionString, action);
+   138	    }
+   139	    return action;
+   140	  }
+   141	
+   142	  // -------------------------------------------------------------------------
+   143	  // Usage / help
+   144	  // -------------------------------------------------------------------------
+   145	
+   146	  /** @returns {string} newline-terminated "usage: ..." line */
+   147	  formatUsage() {
+   148	    const parts = this.actions.map((action) => {
+   149	      const head = action.optionStrings[0];
+   150	      const core = action.nargs === 0 ? head : `${head} ${action.metavar}`;
+   151	      return action.required ? core : `[${core}]`;
+   152	    });
+   153	    const tail = parts.length > 0 ? ' ' + parts.join(' ') : '';
+   154	    return `usage: ${this.prog}${tail}\n`;
+   155	  }
+   156	
+   157	  /**
+   158	   * The invocation column of the help table: "-h, --help", "--a A".
+   159	   * @param {object} action
+   160	   * @returns {string}
+   161	   */
+   162	  formatInvocation(action) {
+   163	    if (action.nargs === 0) return action.optionStrings.join(', ');
+   164	    return action.optionStrings.map((s) => `${s} ${action.metavar}`).join(', ');
+   165	  }
+   166	
+   167	  /** @returns {string} newline-terminated full help text */
+   168	  formatHelp() {
+   169	    const { indent, gap, maxHelpPosition } = HELP_LAYOUT;
+   170	    const invocations = this.actions.map((a) => this.formatInvocation(a));
+   171	    const widest = invocations.reduce((m, s) => Math.max(m, s.length), 0);
+   172	    // argparse: help_position = min(action_max_length + 2, max_help_position),
+   173	    // where action_max_length already includes the current indent.
+   174	    const helpPosition = Math.min(widest + indent + gap, maxHelpPosition);
+   175	
+   176	    const lines = [this.formatUsage().replace(/\n$/, ''), '', 'options:'];
+   177	    this.actions.forEach((action, index) => {
+   178	      const invocation = invocations[index];
+   179	      const prefix = ' '.repeat(indent) + invocation;
+   180	      if (!action.help) {
+   181	        lines.push(prefix);
+   182	        return;
+   183	      }
+   184	      const pad = helpPosition - indent - invocation.length;
+   185	      if (pad > 0) {
+   186	        lines.push(prefix + ' '.repeat(pad) + action.help);
+   187	      } else {
+   188	        lines.push(prefix);
+   189	        lines.push(' '.repeat(helpPosition) + action.help);
+   190	      }
+   191	    });
+   192	    return lines.join('\n') + '\n';
+   193	  }
+   194	
+   195	  // -------------------------------------------------------------------------
+   196	  // Exit paths
+   197	  // -------------------------------------------------------------------------
+   198	
+   199	  /**
+   200	   * parser.error(): usage plus "<prog>: error: <message>" on stderr, exit 2.
+   201	   * @param {string} message
+   202	   * @returns {never}
+   203	   */
+   204	  error(message) {
+   205	    writeStderr(this.formatUsage());
+   206	    writeStderr(`${this.prog}: error: ${message}\n`);
+   207	    throw new SystemExit(EXIT_CODES.argparseError);
+   208	  }
+   209	
+   210	  /**
+   211	   * The help action: full help on stdout, exit 0.
+   212	   * @returns {never}
+   213	   */
+   214	  printHelpAndExit() {
+   215	    writeStdout(this.formatHelp());
+   216	    throw new SystemExit(EXIT_CODES.ok);
+   217	  }
+   218	
+   219	  // -------------------------------------------------------------------------
+   220	  // Token classification (argparse's _parse_optional / _get_option_tuples)
+   221	  // -------------------------------------------------------------------------
+   222	
+   223	  /**
+   224	   * @param {string} token
+   225	   * @returns {Array<{action: object, optionString: string, explicitArg: string|null}>}
+   226	   */
+   227	  getOptionTuples(token) {
+   228	    const chars = this.prefixChars;
+   229	    const result = [];
+   230	    const isPrefix = (ch) => ch !== undefined && chars.includes(ch);
+   231	
+   232	    if (isPrefix(token[0]) && isPrefix(token[1])) {
+   233	      // Long option: match by prefix when abbreviation is allowed.
+   234	      if (!this.allowAbbrev) return result;
+   235	      let optionPrefix = token;
+   236	      let explicitArg = null;
+   237	      const eq = token.indexOf('=');
+   238	      if (eq !== -1) {
+   239	        optionPrefix = token.slice(0, eq);
+   240	        explicitArg = token.slice(eq + 1);
+   241	      }
+   242	      for (const [optionString, action] of this.optionStringActions) {
+   243	        if (optionString.startsWith(optionPrefix)) {
+   244	          result.push({ action, optionString, explicitArg });
+   245	        }
+   246	      }
+   247	    } else if (isPrefix(token[0]) && !isPrefix(token[1])) {
+   248	      // Short option, possibly with its argument glued on: "-hx".
+   249	      const shortPrefix = token.slice(0, 2);
+   250	      const shortExplicitArg = token.slice(2);
+   251	      for (const [optionString, action] of this.optionStringActions) {
+   252	        if (optionString === shortPrefix) {
+   253	          result.push({ action, optionString, explicitArg: shortExplicitArg });
+   254	        } else if (optionString.startsWith(token)) {
+   255	          result.push({ action, optionString, explicitArg: null });
+   256	        }
+   257	      }
+   258	    }
+   259	    return result;
+   260	  }
+   261	
+   262	  /**
+   263	   * argparse's _parse_optional. Returns null when the token is meant to be
+   264	   * positional input, otherwise a tuple whose `action` is null for an option that
+   265	   * looks like one but is not declared.
+   266	   * @param {string} token
+   267	   * @returns {{action: object|null, optionString: string, explicitArg: string|null}|null}
+   268	   */
+   269	  parseOptional(token) {
+   270	    if (token === '') return null; // empty string -> positional
+   271	    if (!this.prefixChars.includes(token[0])) return null; // no prefix -> positional
+   272	
+   273	    const exact = this.optionStringActions.get(token);
+   274	    if (exact) return { action: exact, optionString: token, explicitArg: null };
+   275	
+   276	    if (token.length === 1) return null; // a bare "-" is positional
+   277	
+   278	    const eq = token.indexOf('=');
+   279	    if (eq !== -1) {
+   280	      const head = token.slice(0, eq);
+   281	      const known = this.optionStringActions.get(head);
+   282	      if (known) {
+   283	        return { action: known, optionString: head, explicitArg: token.slice(eq + 1) };
+   284	      }
+   285	    }
+   286	
+   287	    const tuples = this.getOptionTuples(token);
+   288	    if (tuples.length > 1) {
+   289	      this.error(
+   290	        ARGPARSE_MESSAGES.ambiguousOption(
+   291	          token,
+   292	          tuples.map((t) => t.optionString),
+   293	        ),
+   294	      );
+   295	    }
+   296	    if (tuples.length === 1) return tuples[0];
+   297	
+   298	    // Looks like a negative number and we have no such options -> positional.
+   299	    if (NEGATIVE_NUMBER_RE.test(token)) return null;
+   300	    // Contains a space -> positional (this is what accepts "- 5" as a value).
+   301	    if (token.includes(' ')) return null;
+   302	
+   303	    return { action: null, optionString: token, explicitArg: null };
+   304	  }
+   305	
+   306	  /**
+   307	   * True when a token can NOT serve as an option's value. That is any token
+   308	   * argparse classifies as an option ('O') or as the "--" separator ('-'); only
+   309	   * plain positional tokens ('A') are eligible, because for optionals argparse
+   310	   * strips the "-*" wildcards out of the nargs pattern.
+   311	   * @param {string|undefined} token
+   312	   * @returns {boolean}
+   313	   */
+   314	  looksLikeOption(token) {
+   315	    if (token === undefined) return true;
+   316	    if (token === OPTION_TERMINATOR) return true;
+   317	    return this.parseOptional(token) !== null;
+   318	  }
+   319	
+   320	  // -------------------------------------------------------------------------
+   321	  // Value conversion and action dispatch
+   322	  // -------------------------------------------------------------------------
+   323	
+   324	  /**
+   325	   * @param {object} action
+   326	   * @param {string} raw
+   327	   * @returns {bigint|string}
+   328	   */
+   329	  convertValue(action, raw) {
+   330	    if (!action.typeName) return raw;
+   331	    const type = TYPE_REGISTRY[action.typeName];
+   332	    const converted = type.convert(raw);
+   333	    if (!converted.ok) {
+   334	      throw new ArgumentError(
+   335	        action,
+   336	        ARGPARSE_MESSAGES.invalidValue(type.name, raw),
+   337	      );
+   338	    }
+   339	    return converted.value;
+   340	  }
+   341	
+   342	  /**
+   343	   * @param {object} action
+   344	   * @param {string[]} values
+   345	   * @param {Record<string, unknown>} namespace
+   346	   * @param {Set<object>} seen
+   347	   */
+   348	  takeAction(action, values, namespace, seen) {
+   349	    seen.add(action);
+   350	    if (action.kind === 'help') {
+   351	      this.printHelpAndExit();
+   352	    }
+   353	    // 'store': the last occurrence wins, matching "--a 1 --b 1 --a 5" -> 5.
+   354	    namespace[action.dest] = this.convertValue(action, values[0]);
+   355	  }
+   356	
+   357	  // -------------------------------------------------------------------------
+   358	  // Main loop
+   359	  // -------------------------------------------------------------------------
+   360	
+   361	  /**
+   362	   * @param {string[]} argv
+   363	   * @returns {{namespace: Record<string, unknown>, extras: string[]}}
+   364	   */
+   365	  parseKnownArgs(argv) {
+   366	    /** @type {Record<string, unknown>} */
+   367	    const namespace = {};
+   368	    for (const action of this.actions) {
+   369	      if (action.kind === 'store') namespace[action.dest] = null;
+   370	    }
+   371	    /** @type {Set<object>} */
+   372	    const seen = new Set();
+   373	    /** @type {string[]} */
+   374	    const extras = [];
+   375	
+   376	    let index = 0;
+   377	    while (index < argv.length) {
+   378	      const token = argv[index];
+   379	
+   380	      // MEASURED: the "--" itself is NOT swallowed. It and every following token
+   381	      // become positional input, and since this parser declares no positionals
+   382	      // they all end up in the unrecognized list.
+   383	      if (token === OPTION_TERMINATOR) {
+   384	        for (let k = index; k < argv.length; k += 1) extras.push(argv[k]);
+   385	        break;
+   386	      }
+   387	
+   388	      const optional = this.parseOptional(token);
+   389	      if (optional === null || optional.action === null) {
+   390	        extras.push(token); // positional input, or an undeclared option
+   391	        index += 1;
+   392	        continue;
+   393	      }
+   394	
+   395	      index = this.consumeOptional(optional, argv, index, namespace, seen, extras);
+   396	    }
+   397	
+   398	    return { namespace, extras, seen };
+   399	  }
+   400	
+   401	  /**
+   402	   * Consume one option (and any glued-on short options), returning the next index.
+   403	   * @returns {number}
+   404	   */
+   405	  consumeOptional(optional, argv, index, namespace, seen, extras) {
+   406	    let action = optional.action;
+   407	    let optionString = optional.optionString;
+   408	    let explicitArg = optional.explicitArg;
+   409	
+   410	    for (;;) {
+   411	      if (explicitArg !== null) {
+   412	        const isShort = !this.prefixChars.includes(optionString[1]);
+   413	        if (action.nargs === 0 && isShort && explicitArg !== '') {
+   414	          // "-hx": fire -h now, then re-interpret "-x" as the next short option.
+   415	          this.takeAction(action, [], namespace, seen);
+   416	          const prefixChar = optionString[0];
+   417	          const nextOptionString = prefixChar + explicitArg[0];
+   418	          const nextAction = this.optionStringActions.get(nextOptionString);
+   419	          if (nextAction) {
+   420	            action = nextAction;
+   421	            optionString = nextOptionString;
+   422	            explicitArg = explicitArg.slice(1);
+   423	            continue;
+   424	          }
+   425	          extras.push(prefixChar + explicitArg);
+   426	          return index + 1;
+   427	        }
+   428	        if (action.nargs === 1) {
+   429	          // "--a=16", and "--a=" which yields the empty string.
+   430	          this.takeAction(action, [explicitArg], namespace, seen);
+   431	          return index + 1;
+   432	        }
+   433	        // "--help=x": a flag cannot take a value.
+   434	        throw new ArgumentError(
+   435	          action,
+   436	          ARGPARSE_MESSAGES.ignoredExplicitArgument(explicitArg),
+   437	        );
+   438	      }
+   439	
+   440	      if (action.nargs === 0) {
+   441	        this.takeAction(action, [], namespace, seen);
+   442	        return index + 1;
+   443	      }
+   444	
+   445	      const next = argv[index + 1];
+   446	      if (this.looksLikeOption(next)) {
+   447	        throw new ArgumentError(action, ARGPARSE_MESSAGES.expectedOneArgument());
+   448	      }
+   449	      this.takeAction(action, [next], namespace, seen);
+   450	      return index + 2;
+   451	    }
+   452	  }
+   453	
+   454	  /**
+   455	   * parser.parse_args(). Throws SystemExit for help and for every error path.
+   456	   * @param {string[]} [argv] defaults to process.argv.slice(2)
+   457	   * @returns {Record<string, unknown>}
+   458	   */
+   459	  parseArgs(argv = process.argv.slice(2)) {
+   460	    let result;
+   461	    try {
+   462	      result = this.parseKnownArgs(argv);
+   463	    } catch (err) {
+   464	      if (err instanceof ArgumentError) this.error(err.message);
+   465	      throw err;
+   466	    }
+   467	
+   468	    // MEASURED ordering: required-argument errors come first, which is why
+   469	    // "-- --a 1 --b 1" reports missing --a/--b rather than unrecognized input.
+   470	    const missing = this.actions
+   471	      .filter((action) => action.required && !result.seen.has(action))
+   472	      .map((action) => actionName(action));
+   473	    if (missing.length > 0) {
+   474	      this.error(ARGPARSE_MESSAGES.requiredArguments(missing));
+   475	    }
+   476	
+   477	    if (result.extras.length > 0) {
+   478	      this.error(ARGPARSE_MESSAGES.unrecognizedArguments(result.extras));
+   479	    }
+   480	
+   481	    return result.namespace;
+   482	  }
+   483	}
+=== /tmp/cand_c2/lib/python/errors.mjs ===
+     1	// lib/python/errors.mjs
+     2	//
+     3	// Python-side runtime services:
+     4	//   * process I/O shims for sys.stdout / sys.stderr
+     5	//   * SystemExit semantics (argparse's exit path)
+     6	//   * exception base class carrying a Python-style dotted type name
+     7	//   * traceback rendering, driven by an explicit frame table
+     8	//   * the MEASURED traceback template for this program's construct failure
+     9	//
+    10	// The process is never torn down abruptly: we only ever set process.exitCode and
+    11	// return, so pending stdout/stderr writes are always flushed by Node.
+    12	
+    13	// ---------------------------------------------------------------------------
+    14	// sys.stdout / sys.stderr
+    15	// ---------------------------------------------------------------------------
+    16	
+    17	/** @param {string} text */
+    18	export function writeStdout(text) {
+    19	  process.stdout.write(text);
+    20	}
+    21	
+    22	/** @param {string} text */
+    23	export function writeStderr(text) {
+    24	  process.stderr.write(text);
+    25	}
+    26	
+    27	/**
+    28	 * Python's print() for a single string argument.
+    29	 * @param {string} text
+    30	 */
+    31	export function print(text) {
+    32	  writeStdout(text + '\n');
+    33	}
+    34	
+    35	// ---------------------------------------------------------------------------
+    36	// Script naming (argparse derives prog from basename(sys.argv[0]))
+    37	// ---------------------------------------------------------------------------
+    38	
+    39	/**
+    40	 * basename() without importing node:path -- split on both separators.
+    41	 * @param {string} filePath
+    42	 * @returns {string}
+    43	 */
+    44	export function basename(filePath) {
+    45	  const parts = String(filePath).split(/[/\\]/);
+    46	  return parts[parts.length - 1] || String(filePath);
+    47	}
+    48	
+    49	/**
+    50	 * The argparse `prog`: basename(process.argv[1]) -> "test3.mjs".
+    51	 * @param {string[]} [argv]
+    52	 * @returns {string}
+    53	 */
+    54	export function progName(argv = process.argv) {
+    55	  return basename(argv[1] ?? '');
+    56	}
+    57	
+    58	/**
+    59	 * The script stem, i.e. prog with its final extension removed -> "test3".
+    60	 * Used for the traceback filename ("test3.py") and the PyInstaller error line
+    61	 * ("Failed to execute script 'test3'").
+    62	 * @param {string} [prog]
+    63	 * @returns {string}
+    64	 */
+    65	export function scriptStem(prog = progName()) {
+    66	  const dot = prog.lastIndexOf('.');
+    67	  return dot > 0 ? prog.slice(0, dot) : prog;
+    68	}
+    69	
+    70	// ---------------------------------------------------------------------------
+    71	// SystemExit
+    72	// ---------------------------------------------------------------------------
+    73	
+    74	/**
+    75	 * Python's SystemExit. Thrown by the parser's exit()/error() paths and caught by
+    76	 * the entry point, which turns it into process.exitCode.
+    77	 */
+    78	export class SystemExit extends Error {
+    79	  /** @param {number} code */
+    80	  constructor(code = 0) {
+    81	    super(`SystemExit: ${code}`);
+    82	    this.name = 'SystemExit';
+    83	    this.pyType = 'SystemExit';
+    84	    this.code = code;
+    85	  }
+    86	}
+    87	
+    88	// ---------------------------------------------------------------------------
+    89	// Python-style exceptions
+    90	// ---------------------------------------------------------------------------
+    91	
+    92	/**
+    93	 * Base for exceptions that must render as "<dotted.type>: <message>" inside a
+    94	 * traceback. `pyType` is the fully qualified name Python would print.
+    95	 */
+    96	export class PythonException extends Error {
+    97	  /**
+    98	   * @param {string} pyType e.g. 'construct.core.FormatFieldError'
+    99	   * @param {string} message may contain newlines
+   100	   */
+   101	  constructor(pyType, message) {
+   102	    super(message);
+   103	    this.name = pyType;
+   104	    this.pyType = pyType;
+   105	    this.pyMessage = message;
+   106	    /** @type {PythonException|null} the "during handling" predecessor */
+   107	    this.pyContext = null;
+   108	  }
+   109	}
+   110	
+   111	/**
+   112	 * The header line Python prints for an exception: "<type>: <message>".
+   113	 * @param {{pyType: string, pyMessage: string}} exc
+   114	 * @returns {string}
+   115	 */
+   116	export function formatExceptionLine(exc) {
+   117	  return exc.pyMessage === '' ? exc.pyType : `${exc.pyType}: ${exc.pyMessage}`;
+   118	}
+   119	
+   120	// ---------------------------------------------------------------------------
+   121	// Traceback rendering
+   122	// ---------------------------------------------------------------------------
+   123	
+   124	export const TRACEBACK_HEADER = 'Traceback (most recent call last):';
+   125	export const CHAINED_CONTEXT_NOTE =
+   126	  'During handling of the above exception, another exception occurred:';
+   127	
+   128	/**
+   129	 * One stack frame line: `  File "<file>", line <line>, in <func>`.
+   130	 *
+   131	 * Note: no source-text line is emitted. That matches the ground truth for the
+   132	 * frozen executable, whose linecache cannot find test3.py (it only prints source
+   133	 * text when a same-named .py file happens to sit in the current directory).
+   134	 *
+   135	 * @param {{file: string, line: number, func: string}} frame
+   136	 * @returns {string}
+   137	 */
+   138	export function formatFrame(frame) {
+   139	  return `  File "${frame.file}", line ${frame.line}, in ${frame.func}`;
+   140	}
+   141	
+   142	/**
+   143	 * One traceback section: header, frames, then the exception line(s).
+   144	 * @param {{frames: Array<{file: string, line: number, func: string}>, exception: {pyType: string, pyMessage: string}}} section
+   145	 * @returns {string[]} lines
+   146	 */
+   147	export function formatTracebackSection(section) {
+   148	  return [
+   149	    TRACEBACK_HEADER,
+   150	    ...section.frames.map(formatFrame),
+   151	    ...formatExceptionLine(section.exception).split('\n'),
+   152	  ];
+   153	}
+   154	
+   155	/**
+   156	 * A chained traceback. Sections are rendered oldest-first, separated by a blank
+   157	 * line, the "During handling ..." note, and another blank line -- exactly the
+   158	 * measured layout.
+   159	 * @param {Array<{frames: Array<object>, exception: object}>} sections
+   160	 * @returns {string} newline-terminated text
+   161	 */
+   162	export function formatTraceback(sections) {
+   163	  const lines = [];
+   164	  sections.forEach((section, index) => {
+   165	    if (index > 0) {
+   166	      lines.push('', CHAINED_CONTEXT_NOTE, '');
+   167	    }
+   168	    lines.push(...formatTracebackSection(section));
+   169	  });
+   170	  return lines.join('\n') + '\n';
+   171	}
+   172	
+   173	// ---------------------------------------------------------------------------
+   174	// PyInstaller bootloader failure line
+   175	// ---------------------------------------------------------------------------
+   176	// MEASURED: "[PYI-338:ERROR] Failed to execute script 'test3' due to unhandled
+   177	// exception!" -- the number is the live process id, so it is taken from
+   178	// process.pid rather than hardcoded.
+   179	
+   180	/**
+   181	 * @param {string} stem script stem, e.g. 'test3'
+   182	 * @param {number} [pid]
+   183	 * @returns {string}
+   184	 */
+   185	export function pyiFailureLine(stem, pid = process.pid) {
+   186	  return `[PYI-${pid}:ERROR] Failed to execute script '${stem}' due to unhandled exception!`;
+   187	}
+   188	
+   189	// ---------------------------------------------------------------------------
+   190	// MEASURED traceback template for the construct build failure
+   191	// ---------------------------------------------------------------------------
+   192	// Reading top to bottom, this reproduces the ground-truth stderr for
+   193	// `--a 256 --b 0` verbatim (only the PYI process id varies):
+   194	//
+   195	//   Traceback (most recent call last):
+   196	//     File "construct/core.py", line 1165, in _build
+   197	//   struct.error: 'B' format requires 0 <= number <= 255
+   198	//
+   199	//   During handling of the above exception, another exception occurred:
+   200	//
+   201	//   Traceback (most recent call last):
+   202	//     File "test3.py", line 19, in <module>
+   203	//     File "test3.py", line 15, in main
+   204	//     File "construct/core.py", line 452, in build
+   205	//     File "construct/core.py", line 464, in build_stream
+   206	//     File "construct/core.py", line 2260, in _build
+   207	//     File "construct/core.py", line 2774, in _build
+   208	//     File "construct/core.py", line 1167, in _build
+   209	//   construct.core.FormatFieldError: Error in path (building) -> field1
+   210	//   struct '<B' error during building, given value 256
+   211	//   [PYI-<pid>:ERROR] Failed to execute script 'test3' due to unhandled exception!
+   212	
+   213	/** Frames of the inner struct.error section. */
+   214	export const STRUCT_ERROR_FRAMES = [
+   215	  { file: 'construct/core.py', line: 1165, func: '_build' },
+   216	];
+   217	
+   218	/**
+   219	 * Frames of the outer FormatFieldError section. The two test3.py frames use the
+   220	 * script stem so the filename tracks the real entry point instead of being
+   221	 * hardcoded; their line numbers come from the Python source
+   222	 * (line 19 = `main()`, line 15 = the `struct_format.build(...)` call).
+   223	 * @param {string} stem
+   224	 * @returns {Array<{file: string, line: number, func: string}>}
+   225	 */
+   226	export function formatFieldErrorFrames(stem) {
+   227	  const scriptPy = `${stem}.py`;
+   228	  return [
+   229	    { file: scriptPy, line: 19, func: '<module>' },
+   230	    { file: scriptPy, line: 15, func: 'main' },
+   231	    { file: 'construct/core.py', line: 452, func: 'build' },
+   232	    { file: 'construct/core.py', line: 464, func: 'build_stream' },
+   233	    { file: 'construct/core.py', line: 2260, func: '_build' },
+   234	    { file: 'construct/core.py', line: 2774, func: '_build' },
+   235	    { file: 'construct/core.py', line: 1167, func: '_build' },
+   236	  ];
+   237	}
+   238	
+   239	/**
+   240	 * Render the full unhandled-exception report for a construct build failure:
+   241	 * chained traceback plus the PyInstaller bootloader line.
+   242	 * @param {{pyType: string, pyMessage: string, pyContext: object|null}} exception the FormatFieldError
+   243	 * @param {string} stem script stem, e.g. 'test3'
+   244	 * @returns {string} newline-terminated text destined for stderr
+   245	 */
+   246	export function formatUnhandledBuildException(exception, stem) {
+   247	  const sections = [];
+   248	  if (exception.pyContext) {
+   249	    sections.push({
+   250	      frames: STRUCT_ERROR_FRAMES,
+   251	      exception: exception.pyContext,
+   252	    });
+   253	  }
+   254	  sections.push({
+   255	    frames: formatFieldErrorFrames(stem),
+   256	    exception,
+   257	  });
+   258	  return formatTraceback(sections) + pyiFailureLine(stem) + '\n';
+   259	}

@@ -1,0 +1,85 @@
+Library files in `/output`:
+
+- [program_name.mjs](/output/lib/cli/program_name.mjs:1)
+- [numbers.mjs](/output/lib/cli/numbers.mjs:1)
+- [arg_parser.mjs](/output/lib/cli/arg_parser.mjs:1)
+- [scheduled_job.mjs](/output/lib/schedule/scheduled_job.mjs:1)
+- [pending_job.mjs](/output/lib/schedule/pending_job.mjs:1)
+- [scheduler.mjs](/output/lib/schedule/scheduler.mjs:1)
+- [index.mjs](/output/lib/schedule/index.mjs:1)
+
+I verified `node /output/test11.mjs` against `/workspace/dataset/test11_executable` for the main run and key CLI cases: `--help`, missing required args, missing values, invalid ints, unknown args, repeated args, `--a=...`/`--b=...`, and Python-style underscore ints like `1_0`. Usage/error text intentionally shows `test11.mjs`, which matches `argparse` basename behavior for the invoked script.
+
+Entry file: [test11.mjs](/output/test11.mjs:1)
+
+```js
+import { getProgramName } from './lib/cli/program_name.mjs';
+import { parseTest11Args } from './lib/cli/arg_parser.mjs';
+import { clear, every, getJobs } from './lib/schedule/index.mjs';
+
+function writeLine(value) {
+  process.stdout.write(`${String(value)}\n`);
+}
+
+export function main(argv = process.argv.slice(2), scriptPath = process.argv[1]) {
+  const parseResult = parseTest11Args(argv, scriptPath);
+
+  if (parseResult.kind === 'exit') {
+    if (parseResult.stdout !== '') {
+      process.stdout.write(parseResult.stdout);
+    }
+
+    if (parseResult.stderr !== '') {
+      process.stderr.write(parseResult.stderr);
+    }
+
+    return parseResult.code;
+  }
+
+  const args = parseResult.args;
+  clear();
+  let jobsCreated = 0;
+
+  for (let index = 0; index < args.a; index += 1) {
+    every(1).seconds.tag('group1').do(() => undefined);
+    jobsCreated += 1;
+  }
+
+  writeLine(jobsCreated);
+
+  for (let index = 0; index < args.b; index += 1) {
+    every(1).minutes.tag('group2').do(() => undefined);
+    jobsCreated += 1;
+  }
+
+  writeLine(jobsCreated);
+
+  const group1Jobs = getJobs('group1');
+  writeLine(group1Jobs.length);
+
+  const group2Jobs = getJobs('group2');
+  writeLine(group2Jobs.length);
+
+  const allJobs = getJobs();
+  writeLine(allJobs.length);
+
+  clear('group1');
+  writeLine(getJobs().length);
+
+  clear('group2');
+  writeLine(getJobs().length);
+
+  for (let index = 0; index < args.a + args.b; index += 1) {
+    every(1).seconds.do(() => undefined);
+  }
+
+  writeLine(getJobs().length);
+  return 0;
+}
+
+const isDirectRun = process.argv[1] && import.meta.url.endsWith(`/${getProgramName(process.argv[1])}`);
+
+if (isDirectRun) {
+  process.exitCode = main();
+}
+```

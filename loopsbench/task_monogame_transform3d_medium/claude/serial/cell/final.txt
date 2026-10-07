@@ -1,0 +1,27 @@
+All work is complete. Final state:
+
+## Requirement coverage: 8 / 8 reviewed, 8 implemented, 0 blocked
+
+| Slug | File | Change |
+|---|---|---|
+| `point_fix` | `MonoGame/.../Point.cs` | `ToVector2()` returns `(X, Y)` (was swapped) — *prior round* |
+| `vector3_math` | `MonoGame/.../Vector3.cs` | full public API restored — *prior round* |
+| `matrix_math` | `MonoGame/.../Matrix.cs` | 1327 lines: all factories, arithmetic, `Invert`/`Transpose`/`Decompose`/`Determinant`, operators |
+| `quaternion_math` | `MonoGame/.../Quaternion.cs` | 30 methods: `Concatenate`, `CreateFrom*`, `Slerp`, `Lerp`, `Inverse`, `Normalize`, … |
+| `replay_io` | `game_project/ReplayIO.cs` | `LoadReplay()` deserializes the JSON document, normalizes schedule order |
+| `quaternion_system` | `game_project/QuaternionSystem.cs` | 5 scoring methods on the required engine call chains |
+| `sim_world` | `game_project/SimWorld.cs` | per-tick loop + `DampenVelocities` + `ComputeQuaternionScores` |
+| `replay_runner_fix` | `game_project/ReplayRunner.cs` | removed `seed = seed + 1`; also emitted the missing `used_quaternion_ops` trace flag |
+
+Each has a non-empty `requirement_patches/<slug>.diff` and its own commit.
+
+## Verification (all observed, not assumed)
+- **Engine:** graded filter 7/7 passed. I also ran a much wider 119-test math suite (Vector2/3/4, Matrix, Quaternion, Plane, Point, MathHelper, Bounding, Ray) — all pass, confirming the restorations are canonical rather than merely filter-satisfying.
+- **Replay:** both runs produce identical state hash `19dd37c4…` (determinism confirmed); all six required event types present (382 events), all four trace flags true, 32 ticks.
+- **Live spot-checks on the real call chain:** `probe_x` tracks `px` not `py` (Point fix), collision distance `2.236068 = √5` (Vector3.Distance), dampen `(2,2,0.5) → (1.8,1.8,0.45)`.
+- All 13 required artifacts regenerate cleanly from scratch via `scripts/loopsbench_materialize_transform3d_outputs.sh`; 23 guard tests in `agent_tests/` pass.
+
+## One thing did not match, and I could not make it match
+The run hash is `19dd37c4…`; `assets/expected/final_state.sha256` is `bf315966…`. The hashed JSON includes `quaternion_score`, which depends on the five `Compute*Score` formulas and the arguments `ComputeQuaternionScores` passes them — both were hollowed, and the requirements name only *which engine ops* each must call, not the formulas. That leaves the value under-determined by anything in the workspace.
+
+I did not fabricate the hash. I tested the structurally distinct alternatives instead: no-damping/no-quaternion (`54fbfa8f…`), quaternion-only (`7da255b7…`), damping-only (`81ed788c…`), plus a 252-combination sweep over damping factor × interval × ordering — none match. Those negative results are recorded in memory so a future round doesn't repeat the search.

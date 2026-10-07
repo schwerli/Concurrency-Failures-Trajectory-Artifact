@@ -1,0 +1,138 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index aaf35ee37c..18e6bdc776 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -840,14 +840,7 @@ class Query(BaseExpression):
+             unref_amount = cur_refcount - to_counts.get(alias, 0)
+             self.unref_alias(alias, unref_amount)
+ 
+-    def change_aliases(self, change_map):
+-        """
+-        Change the aliases in change_map (which maps old-alias -> new-alias),
+-        relabelling any references to them in select columns and the where
+-        clause.
+-        """
+-        assert set(change_map).isdisjoint(change_map.values())
+-
++    def _change_aliases(self, change_map):
+         # 1. Update references in "select" (normal columns plus aliases),
+         # "group by" and "where".
+         self.where.relabel_aliases(change_map)
+@@ -879,6 +872,40 @@ class Query(BaseExpression):
+             for alias, aliased in self.external_aliases.items()
+         }
+ 
++    def change_aliases(self, change_map):
++        """
++        Change the aliases in change_map (which maps old-alias -> new-alias),
++        relabelling any references to them in select columns and the where
++        clause.
++        """
++        if not change_map:
++            return
++
++        # When an alias is both a source and a destination (e.g. T4 -> T5 and
++        # T5 -> T6), move the source aliases aside first so each original alias
++        # is still relabeled exactly once.
++        conflicting_aliases = set(change_map).intersection(change_map.values())
++        if conflicting_aliases:
++            changed_aliases = (
++                set(self.alias_map).union(change_map).union(change_map.values())
++            )
++            prefix = '%s%d' % (self.alias_prefix, len(changed_aliases) + 1)
++            temp_aliases = {}
++            for pos, alias in enumerate(sorted(conflicting_aliases), start=1):
++                temp_alias = '%s_%s' % (prefix, pos)
++                while temp_alias in changed_aliases:
++                    pos += 1
++                    temp_alias = '%s_%s' % (prefix, pos)
++                temp_aliases[alias] = temp_alias
++                changed_aliases.add(temp_alias)
++            self._change_aliases(temp_aliases)
++            change_map = {
++                temp_aliases.get(alias, alias): new_alias
++                for alias, new_alias in change_map.items()
++            }
++
++        self._change_aliases(change_map)
++
+     def bump_prefix(self, outer_query):
+         """
+         Change the alias prefix to the next letter in the alphabet in a way
+diff --git a/tests/queries/models.py b/tests/queries/models.py
+index c3322c224e..df85fe7fa8 100644
+--- a/tests/queries/models.py
++++ b/tests/queries/models.py
+@@ -625,6 +625,35 @@ class Task(models.Model):
+         return self.title
+ 
+ 
++# Models for queryset alias relabel regression tests.
++
++
++class QueryChangeAliasesBaz(models.Model):
++    pass
++
++
++class QueryChangeAliasesQux(models.Model):
++    bazes = models.ManyToManyField(QueryChangeAliasesBaz, related_name='quxes')
++
++
++class QueryChangeAliasesFoo(models.Model):
++    qux = models.ForeignKey(
++        QueryChangeAliasesQux, models.CASCADE, related_name='foos',
++    )
++
++
++class QueryChangeAliasesBar(models.Model):
++    foo = models.ForeignKey(
++        QueryChangeAliasesFoo, models.CASCADE, related_name='bars',
++    )
++    other_foo = models.ForeignKey(
++        QueryChangeAliasesFoo, models.CASCADE, related_name='other_bars',
++    )
++    baz = models.ForeignKey(
++        QueryChangeAliasesBaz, models.CASCADE, related_name='bars',
++    )
++
++
+ class Staff(models.Model):
+     name = models.CharField(max_length=10)
+ 
+diff --git a/tests/queries/tests.py b/tests/queries/tests.py
+index ca982b9c6a..18d41a63f6 100644
+--- a/tests/queries/tests.py
++++ b/tests/queries/tests.py
+@@ -25,7 +25,8 @@ from .models import (
+     ModelB, ModelC, ModelD, MyObject, NamedCategory, Node, Note, NullableName,
+     Number, ObjectA, ObjectB, ObjectC, OneToOneCategory, Order, OrderItem,
+     Page, Paragraph, Person, Plaything, PointerA, Program, ProxyCategory,
+-    ProxyObjectA, ProxyObjectB, Ranking, Related, RelatedIndividual,
++    ProxyObjectA, ProxyObjectB, QueryChangeAliasesBar, QueryChangeAliasesBaz,
++    QueryChangeAliasesFoo, QueryChangeAliasesQux, Ranking, Related, RelatedIndividual,
+     RelatedObject, Report, ReportComment, ReservedName, Responsibility, School,
+     SharedConnection, SimpleCategory, SingleObject, SpecialCategory, Staff,
+     StaffUser, Student, Tag, Task, Teacher, Ticket21203Child,
+@@ -2130,6 +2131,22 @@ class QuerySetBitwiseOperationTests(TestCase):
+         nested_combined = School.objects.filter(pk__in=combined.values('pk'))
+         self.assertSequenceEqual(nested_combined, [self.school])
+ 
++    def test_or_with_rhs_aliases_chained_to_new_lhs_aliases(self):
++        qux = QueryChangeAliasesQux.objects.create()
++        baz = QueryChangeAliasesBaz.objects.create()
++        qux.bazes.add(baz)
++        foo = QueryChangeAliasesFoo.objects.create(qux=qux)
++        QueryChangeAliasesBar.objects.create(foo=foo, other_foo=foo, baz=baz)
++
++        qs1 = qux.foos.all()
++        qs2 = QueryChangeAliasesFoo.objects.filter(
++            Q(bars__baz__in=qux.bazes.all()) |
++            Q(other_bars__baz__in=qux.bazes.all())
++        )
++
++        self.assertCountEqual(qs2 | qs1, [foo])
++        self.assertCountEqual(qs1 | qs2, [foo])
++
+ 
+ class CloneTests(TestCase):
+ 

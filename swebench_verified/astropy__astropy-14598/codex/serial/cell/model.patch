@@ -1,0 +1,53 @@
+diff --git a/astropy/io/fits/card.py b/astropy/io/fits/card.py
+index 1b3285ddc..ed9fb0515 100644
+--- a/astropy/io/fits/card.py
++++ b/astropy/io/fits/card.py
+@@ -858,8 +858,7 @@ class Card(_Verify):
+                 if not m:
+                     return kw, vc
+ 
+-                value = m.group("strg") or ""
+-                value = value.rstrip().replace("''", "'")
++                value = (m.group("strg") or "").rstrip()
+                 if value and value[-1] == "&":
+                     value = value[:-1]
+                 values.append(value)
+@@ -870,7 +869,8 @@ class Card(_Verify):
+             if keyword in self._commentary_keywords:
+                 valuecomment = "".join(values)
+             else:
+-                # CONTINUE card
++                # Keep the joined string in escaped FITS form so _parse_value
++                # can unescape it once after rebuilding the full payload.
+                 valuecomment = f"'{''.join(values)}' / {' '.join(comments)}"
+             return keyword, valuecomment
+ 
+diff --git a/astropy/io/fits/tests/test_header.py b/astropy/io/fits/tests/test_header.py
+index c573100c9..db91dee37 100644
+--- a/astropy/io/fits/tests/test_header.py
++++ b/astropy/io/fits/tests/test_header.py
+@@ -559,6 +559,24 @@ class TestHeaderFunctions(FitsTestCase):
+             "CONTINUE  '' / ntlongcommentlongcommentlongcommentlongcomment                   "
+         )
+ 
++    @pytest.mark.parametrize("prefix_len", range(60, 70))
++    def test_long_string_roundtrip_preserves_trailing_double_quotes(self, prefix_len):
++        value = "x" * prefix_len + "''"
++
++        card = fits.Card("CONFIG", value)
++        round_tripped = fits.Card.fromstring(str(card))
++
++        assert round_tripped.value == value
++
++    @pytest.mark.parametrize("prefix_len", range(50, 70))
++    def test_long_string_roundtrip_preserves_embedded_double_quotes(self, prefix_len):
++        value = "x" * prefix_len + "''" + "x" * 10
++
++        card = fits.Card("CONFIG", value)
++        round_tripped = fits.Card.fromstring(str(card))
++
++        assert round_tripped.value == value
++
+     def test_long_string_value_via_fromstring(self, capsys):
+         # long string value via fromstring() method
+         c = fits.Card.fromstring(

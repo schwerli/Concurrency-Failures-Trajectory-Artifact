@@ -1,0 +1,78 @@
+diff --git a/django/db/models/sql/datastructures.py b/django/db/models/sql/datastructures.py
+index 1edf040e82..332fd3890e 100644
+--- a/django/db/models/sql/datastructures.py
++++ b/django/db/models/sql/datastructures.py
+@@ -161,7 +161,9 @@ class Join:
+     def __hash__(self):
+         return hash(self.identity)
+ 
+-    def equals(self, other):
++    def equals(self, other, with_filtered_relation=True):
++        if with_filtered_relation:
++            return self.identity == other.identity
+         # Ignore filtered_relation in equality check.
+         return self.identity[:-1] == other.identity[:-1]
+ 
+@@ -216,5 +218,5 @@ class BaseTable:
+     def __hash__(self):
+         return hash(self.identity)
+ 
+-    def equals(self, other):
++    def equals(self, other, with_filtered_relation=True):
+         return self.identity == other.identity
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 54f3258eac..57e3a153e5 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1027,7 +1027,10 @@ class Query(BaseExpression):
+         reuse_aliases = [
+             a
+             for a, j in self.alias_map.items()
+-            if (reuse is None or a in reuse) and j.equals(join)
++            if (reuse is None or a in reuse)
++            and j.equals(
++                join, with_filtered_relation=join.filtered_relation is not None
++            )
+         ]
+         if reuse_aliases:
+             if join.table_alias in reuse_aliases:
+diff --git a/tests/filtered_relation/tests.py b/tests/filtered_relation/tests.py
+index 790a90d9e2..dc203922cc 100644
+--- a/tests/filtered_relation/tests.py
++++ b/tests/filtered_relation/tests.py
+@@ -101,6 +101,35 @@ class FilteredRelationTests(TestCase):
+             lambda x: (x, x.author_join, x.editor_join),
+         )
+ 
++    def test_multiple_filtered_relation_same_relation(self):
++        qs = (
++            Author.objects.alias(
++                book_alice=FilteredRelation(
++                    "book", condition=Q(book__title__contains="Alice")
++                ),
++                book_jane=FilteredRelation(
++                    "book", condition=Q(book__title__contains="Jane")
++                ),
++            )
++            .annotate(
++                book_alice_title=F("book_alice__title"),
++                book_jane_title=F("book_jane__title"),
++            )
++            .order_by("pk", "book_alice__pk", "book_jane__pk")
++        )
++        # Both filtered relations must generate their own join.
++        self.assertEqual(str(qs.query).count("LEFT OUTER JOIN"), 2)
++        self.assertQuerysetEqual(
++            qs,
++            [
++                (self.author1, "Poem by Alice", None),
++                (self.author1, "The book by Alice", None),
++                (self.author2, None, "The book by Jane A"),
++                (self.author2, None, "The book by Jane B"),
++            ],
++            lambda x: (x, x.book_alice_title, x.book_jane_title),
++        )
++
+     def test_select_related_with_empty_relation(self):
+         qs = (
+             Author.objects.annotate(

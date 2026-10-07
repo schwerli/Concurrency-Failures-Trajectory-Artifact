@@ -1,0 +1,91 @@
+diff --git a/django/db/backends/sqlite3/base.py b/django/db/backends/sqlite3/base.py
+index a64190f0d0..7f0e4f3c2d 100644
+--- a/django/db/backends/sqlite3/base.py
++++ b/django/db/backends/sqlite3/base.py
+@@ -438,9 +438,13 @@ def _sqlite_datetime_parse(dt, tzname=None, conn_tzname=None):
+             sign = tzname[sign_index]
+             tzname, offset = tzname.split(sign)
+             if offset:
+-                hours, minutes = offset.split(':')
++                hours, minutes = offset.split(':') if ':' in offset else (offset[:2], offset[2:])
+                 offset_delta = datetime.timedelta(hours=int(hours), minutes=int(minutes))
+                 dt += offset_delta if sign == '+' else -offset_delta
++            if not tzname:
++                # The time zone name is a fixed offset (e.g. '+0300'), the
++                # offset was already applied to the datetime.
++                return dt
+         dt = timezone.localtime(dt, pytz.timezone(tzname))
+     return dt
+ 
+diff --git a/django/utils/timezone.py b/django/utils/timezone.py
+index bb2b6b9594..1ca150f3e7 100644
+--- a/django/utils/timezone.py
++++ b/django/utils/timezone.py
+@@ -72,7 +72,16 @@ def get_current_timezone_name():
+ 
+ 
+ def _get_timezone_name(timezone):
+-    """Return the name of ``timezone``."""
++    """
++    Return the offset for fixed offset timezones, or the name of timezone if
++    not set.
++    """
++    try:
++        offset = timezone.utcoffset(None)
++    except Exception:
++        offset = None
++    if offset is not None:
++        timezone = get_fixed_timezone(offset)
+     return str(timezone)
+ 
+ # Timezone selection functions.
+diff --git a/tests/timezones/tests.py b/tests/timezones/tests.py
+index 7b54ec3bfc..088ebeb2d4 100644
+--- a/tests/timezones/tests.py
++++ b/tests/timezones/tests.py
+@@ -1001,7 +1001,7 @@ class TemplateTests(SimpleTestCase):
+ 
+         self.assertEqual(tpl.render(Context()), "Africa/Nairobi")
+         with timezone.override(UTC):
+-            self.assertEqual(tpl.render(Context()), "UTC")
++            self.assertEqual(tpl.render(Context()), "+0000")
+ 
+         tpl = Template(
+             "{% load tz %}{% timezone tz %}{% get_current_timezone as time_zone %}"
+diff --git a/tests/utils_tests/test_timezone.py b/tests/utils_tests/test_timezone.py
+index 2e28d3a9a5..4232075918 100644
+--- a/tests/utils_tests/test_timezone.py
++++ b/tests/utils_tests/test_timezone.py
+@@ -121,7 +121,7 @@ class TimezoneTests(SimpleTestCase):
+ 
+     def test_override_fixed_offset(self):
+         with timezone.override(datetime.timezone(datetime.timedelta(), 'tzname')):
+-            self.assertEqual(timezone.get_current_timezone_name(), 'tzname')
++            self.assertEqual(timezone.get_current_timezone_name(), '+0000')
+ 
+     def test_activate_invalid_timezone(self):
+         with self.assertRaisesMessage(ValueError, 'Invalid timezone: None'):
+@@ -274,3 +274,23 @@ class TimezoneTests(SimpleTestCase):
+     def test_fixedoffset_negative_timedelta(self):
+         delta = datetime.timedelta(hours=-2)
+         self.assertEqual(timezone.get_fixed_timezone(delta).utcoffset(None), delta)
++
++    def test_get_timezone_name(self):
++        # The offset must be returned for fixed offset timezones because
++        # the Etc/GMT zone names use the opposite sign convention, which
++        # reversed the offset in database queries.
++        for tz, expected in [
++            (pytz.timezone('Etc/GMT-10'), '+1000'),
++            (pytz.timezone('Etc/GMT+10'), '-1000'),
++        ]:
++            with self.subTest(tz=tz):
++                self.assertEqual(timezone._get_timezone_name(tz), expected)
++
++    @needs_zoneinfo
++    def test_get_timezone_name_zoneinfo(self):
++        for tz, expected in [
++            (zoneinfo.ZoneInfo('Etc/GMT-10'), '+1000'),
++            (zoneinfo.ZoneInfo('Etc/GMT+10'), '-1000'),
++        ]:
++            with self.subTest(tz=tz):
++                self.assertEqual(timezone._get_timezone_name(tz), expected)

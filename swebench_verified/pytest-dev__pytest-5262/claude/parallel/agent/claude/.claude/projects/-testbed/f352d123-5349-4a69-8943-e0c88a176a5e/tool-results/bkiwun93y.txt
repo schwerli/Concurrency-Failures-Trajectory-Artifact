@@ -1,0 +1,399 @@
+================================================================================
+SUMMARY: pytest fragments are `changelog/<ISSUE>.<TYPE>.rst` — one-paragraph, user-facing, full-sentence RST with no inline issue link (towncrier adds it). For issue 5257 add `/testbed/changelog/5257.bugfix.rst` containing: `Ensure that ``sys.stdout.mode`` does not include ``'b'`` as it is a text stream.` CONTRIBUTING requires the fragment plus an AUTHORS entry (alphabetical by first name) for any non-trivial/non-doc change, so a bugfix does need AUTHORS updating.
+----------------------------------------
+# 1. Current changelog/ contents
+
+Only two files — no pending fragments (4.5.0 was just released, so towncrier consumed them):
+
+- `/testbed/changelog/README.rst`
+- `/testbed/changelog/_template.rst`
+
+Representative fragments therefore had to come from git history (`git log --diff-filter=A --name-only -- 'changelog/*.bugfix.rst'`).
+
+# 2. Filename convention
+
+Pattern: `<ISSUE>.<TYPE>.rst` where `<TYPE>` is one of `feature`, `bugfix`, `doc`, `deprecation`, `removal`, `vendor`, `trivial`.
+
+The `.rst` extension is **mandatory and CI-enforced**, not optional. `/testbed/.pre-commit-config.yaml` lines 51-56 define a `language: fail` hook:
+
+```yaml
+    -   id: changelogs-rst
+        name: changelog filenames
+        language: fail
+        entry: 'changelog files must be named ####.(feature|bugfix|doc|deprecation|removal|vendor|trivial).rst'
+        exclude: changelog/(\d+\.(feature|bugfix|doc|deprecation|removal|vendor|trivial).rst|README.rst|_template.rst)
+        files: ^changelog/
+```
+
+Anything in `changelog/` not matching that regex fails the `linting` tox env. Note `/testbed/CONTRIBUTING.rst` line 176 is **out of date** — it shows `changelog/2574.bugfix` with no extension. Extensionless fragments (e.g. `changelog/3745.bugfix`, `changelog/4248.trivial.txt`) were last added 2018-08-01; all 386 fragments added since use `.rst`.
+
+Issue number: use the GitHub issue id if one exists, else the PR number (README.rst lines 24-26).
+
+# 3. Content convention (from changelog/README.rst + observed fragments)
+
+- Aimed at **pytest users**, not developers describing internals.
+- "Make sure to use full sentences with correct case and punctuation" — README's own example: `Fix issue with non-ascii messages from the ``warnings`` module.`
+- **Ends with a period.** Nearly all sampled fragments do (`5089`, `5098`, `5092`, `5039`, `5031`, `5139`, `4928`, `4898`); `4903` is the rare exception.
+- **Single paragraph** for non-`feature` types ("it is usually better to stick to a single paragraph to keep it concise"). Only `5229` in my sample used two lines.
+- **No inline issue number or link.** I dumped ~120 historical fragment bodies and grepped for `#[0-9]{3,}` / `issues/[0-9]` — zero hits. `/testbed/changelog/_template.rst` line 17 prepends the reference automatically:
+  `- {% for value in values|sort %}...`{{ value }} <https://github.com/pytest-dev/pytest/issues/{{ value[1:] }}>`_{% endfor %}: {{ text }}`
+  so the rendered line becomes `- `#5257 <...>`_: <your text>`. Adding your own link duplicates it.
+- **Double backticks only** for literals/code — the `rst-backticks` pygrep hook (line 42) rejects single backticks, and the `rst` hook (lines 45-50, `rst-lint --encoding utf-8`) lints `changelog/.*`, so the fragment must be valid standalone RST.
+- Voice is mixed: imperative present ("Fix …", "Require …", "Invalidate …", "Produce …", "Eliminate …") or descriptive present ("Environment variables are properly restored when using pytester's ``testdir`` fixture."). Imperative "Fix …" / "Ensure …" is the most common for bugfixes.
+
+Verbatim samples:
+- `5089.bugfix.rst`: `Fix crash caused by error in ``__repr__`` function with both ``showlocals`` and verbose output enabled.`
+- `5098.bugfix.rst`: `Invalidate import caches with ``monkeypatch.syspath_prepend``, which is required with namespace packages being used.`
+- `5092.bugfix.rst`: `Produce a warning when unknown keywords are passed to ``pytest.param(...)``.`
+- `5039.bugfix.rst`: `Fix regression with ``--pdbcls``, which stopped working with local modules in 4.0.0.`
+- `4898.bugfix.rst`: `Fix ``AttributeError: FixtureRequest has no 'confg' attribute`` bug in ``testdir.copy_example``.`
+
+# 4. What to add for issue 5257
+
+Exact literal filename (absolute): `/testbed/changelog/5257.bugfix.rst`
+
+Exact body (one line, trailing newline, no heading, no issue link):
+
+```rst
+Ensure that ``sys.stdout.mode`` does not include ``'b'`` as it is a text stream.
+```
+
+Equally house-style alternatives if you prefer to name the class:
+- `Fix ``EncodedFile.mode`` to not include ``'b'``, since it is a text stream and only accepts text.`
+- ```EncodedFile.mode`` no longer includes ``'b'``, which caused libraries checking for binary mode to write bytes to captured output.`
+
+I recommend the first form: it describes the user-visible symptom (code doing `if "b" in sys.stdout.mode:` then writing bytes broke under capture) rather than the internal class, matching the README's "aimed at pytest users" rule.
+
+This matches the fix already present in the working tree — `/testbed/src/_pytest/capture.py` lines 450-452 add:
+
+```python
+    @property
+    def mode(self):
+        return self.buffer.mode.replace("b", "")
+```
+
+# 5. CONTRIBUTING.rst requirements
+
+Two places state the requirement:
+- Lines 176-178 (Short version): "Write a ``changelog`` entry: ``changelog/2574.bugfix``, use issue id number and one of ``bugfix``, ``removal``, ``feature``, ``vendor``, ``doc`` or ``trivial`` for the issue type." (extension omitted — stale, see above; also omits `deprecation`, which pyproject.toml and the pre-commit regex both accept)
+- Lines 267-269 (Long version): same, "The file should be named ``<issueid>.<type>``".
+
+Target branch: line 279 — `base: master` for a bugfix (`features` is only for new features).
+
+# 6. AUTHORS — yes, update it
+
+- Line 179-180: "Unless your change is a trivial or a documentation fix (e.g., a typo or reword of a small section) please add yourself to the ``AUTHORS`` file, in alphabetical order."
+- Line 271: "Add yourself to ``AUTHORS`` file if not there yet, in alphabetical order."
+
+A `bugfix` is neither trivial nor doc-only, so the author should be added to `/testbed/AUTHORS` if not already listed. Format: one plain name per line under `Contributors include::`, sorted alphabetically by **given name** as written (e.g. `Daniel Grana`, `Daniel Hahler`, `Daniel Nuri`, `Danielle Jenkins`, `Dave Hunt`). File is 258 lines. No email, no issue/PR reference. Skip if the name is already present.
+
+I did not create or modify any files — this is a report only.
+RISKS: ['CONTRIBUTING.rst lines 176 and 267 document the filename without the `.rst` extension; following them literally fails the `changelogs-rst` pre-commit hook (`language: fail`) in the `linting` tox env. Always use `5257.bugfix.rst`.', 'Do not put `#5257` or a GitHub URL in the fragment body — changelog/_template.rst line 17 prepends the issue link, so an inline reference renders twice. No historical fragment does this.', 'Single backticks will be rejected by the `rst-backticks` pygrep hook, and the fragment is run through `rst-lint`, so it must be valid standalone RST (no headings, no undefined roles).', 'changelog/ has no pending fragments right now, so there is no in-tree example to copy; all style precedent came from git history and is reproduced verbatim above.', "The `deprecation` type is valid (pyproject.toml lines 23-26, pre-commit regex) even though CONTRIBUTING's list omits it — not relevant here, but the CONTRIBUTING list is incomplete.", 'AUTHORS ordering is by given name as written, not surname; inserting by surname would be inconsistent with the existing file.']
+================================================================================
+SUMMARY: Exhaustive sweep of src/ and testing/ found exactly one file-object ".mode" read in pytest itself (src/_pytest/capture.py:414 in safe_text_dupfile) plus one indirect read via py.io.dupfile (src/_pytest/config/__init__.py:238 -> py/_io/capture.py:102). All other ".mode" / "b in" hits are unrelated (assertion-rewrite mode strings, os.stat permission bits, dict-diff text). An EncodedFile can never reach safe_text_dupfile from any current pytest code path (its only call site passes a fresh TemporaryFile), and even if one were passed in, the mode check at line 414 is only evaluated when fileno() raises: for fd-backed EncodedFiles it is skipped entirely, and for BytesIO/StringIO-backed ones getattr(f,"mode","") is "" both before and after stripping "b". The only behavioral divergence is a closed fd-backed EncodedFile, which today gets double-wrapped in a second EncodedFile and after the change would be returned unchanged. Verified empirically with the candidate patch applied: testing/test_capture.py 107 passed / 7 skipped / 1 xfailed, unchanged; sys.stdout.mode under default fd capture goes 'rb+' -> 'r+'.
+----------------------------------------
+## Grep methodology
+
+Patterns run over src/ and testing/ (all file types, not just .py):
+- `\.mode\b`
+- `["']mode["']`, `getattr\([^,]+,\s*["']mode`, `hasattr\([^,]+,\s*["']mode`
+- `"b" in` / `'b' in` / `"b" not in` / `'b' not in`
+- `in .*\.mode`, `binary`
+- `\bmode\b` (broad, to catch mode-as-parameter uses)
+
+Note that `getattr(f, "mode", "")` does not match `\.mode\b`, which is why the alternation grep was necessary. Also cross-checked the installed `py` library (the only third-party code pytest hands captured streams to) and git history for former call sites.
+
+## A. Real file-object mode reads
+
+### A1. src/_pytest/capture.py:414 — THE hit
+```
+406: def safe_text_dupfile(f, mode, default_encoding="UTF8"):
+410:     encoding = getattr(f, "encoding", None)
+411:     try:
+412:         fd = f.fileno()
+413:     except Exception:
+414:         if "b" not in getattr(f, "mode", "") and hasattr(f, "encoding"):
+415:             # we seem to have a text stream, let's just use it
+416:             return f
+417:     else:
+418:         newfd = os.dup(fd)
+419:         if "b" not in mode:
+420:             mode += "b"
+421:         f = os.fdopen(newfd, mode, 0)  # no buffering
+422:     return EncodedFile(f, encoding or default_encoding)
+```
+This is the only place in pytest that reads a file-like object's `.mode`. Critically, it lives inside the `except` branch, so it is evaluated ONLY when `f.fileno()` raises. EncodedFile reachability: see section D.
+
+### A2. src/_pytest/config/__init__.py:238 — indirect read (external callee)
+```
+233:  if os.environ.get("PYTEST_DEBUG"):
+234:      err = sys.stderr
+235:      encoding = getattr(err, "encoding", "utf8")
+236:      try:
+238:          err = py.io.dupfile(err, encoding=encoding)
+```
+`py.io.dupfile` (site-packages/py/_io/capture.py:102) does `mode = mode or f.mode`, then (line 110) `mode = mode.replace("b", "")` because `encoding is not None`.
+
+Reachable with an EncodedFile: YES. `err = sys.stderr`, and under the default `--capture=fd` sys.stderr IS an EncodedFile (verified: `TYPE EncodedFile MODE 'rb+'`). The path needs PYTEST_DEBUG set plus a `PytestPluginManager` constructed while an outer fd capture is active — i.e. a nested/in-process run (`testdir.inline_run`, `runpytest_inprocess`), or any plugin building a Config mid-run.
+
+Effect of stripping "b": none. Today `f.mode` -> 'rb+' and py strips the "b" itself -> 'r+'. After the change `f.mode` is already 'r+' -> identical `os.fdopen(newfd, 'r+', True, encoding)`. (Dup'ing an EncodedFile's fd as a text stream is pre-existing weirdness, unchanged either way.)
+
+## B. Mode-string hits that are NOT file-attribute reads
+
+- src/_pytest/capture.py:419-421 — `if "b" not in mode: mode += "b"`. `mode` is the *string parameter*, always the literal `"wb+"` from line 566. Unaffected by EncodedFile.mode.
+- src/_pytest/capture.py:817-830 — `_reopen_stdio(f, mode)` / `if not buffered and mode[0] == "w":`. `mode` is a hardcoded literal at the call sites (`_reopen_stdio(sys.stdin, "rb")`, `(sys.stdout, "wb")`, `(sys.stderr, "wb")`); the stream's own `.mode` is never read. An EncodedFile does reach `_py36_windowsconsoleio_workaround` (it passes `hasattr(stream, "buffer")`), but it bails at the `isinstance(raw_stdout, io._WindowsConsoleIO)` check because `EncodedFile.buffer` is a plain FileIO with no `.raw`. Unaffected.
+- src/_pytest/assertion/__init__.py:69 — `self.mode = mode` — assertion-rewrite mode ("plain"/"rewrite"). Not a file. Unreachable for EncodedFile.
+- src/_pytest/config/__init__.py:774 — `mode = getattr(ns, "assertmode", "plain")` — argparse Namespace. Not a file.
+- src/_pytest/logging.py:414,480 — `open(..., mode="w", ...)` literals. Not reads.
+
+## C. testing/ hits
+
+Relevant (exercise safe_text_dupfile / EncodedFile attributes):
+- testing/test_capture.py:913-936 `test_dupfile` — `capture.safe_text_dupfile(tmpfile, "wb")` where tmpfile is a real file opened "wb+". `fileno()` succeeds -> `else` branch; line 414 never evaluated. Asserts `flist[0].name == repr(flist[0].buffer)`.
+- testing/test_capture.py:939-944 `test_dupfile_on_bytesio` — BytesIO: `fileno()` raises, `getattr(f,"mode","")` -> `""`, but `hasattr(bio,"encoding")` is False, so line 414's condition is False and it falls through to `EncodedFile(bio, "UTF8")`.
+- testing/test_capture.py:947-951 `test_dupfile_on_textio` — `py.io.TextIO` (== `io.StringIO`): `fileno()` raises, no `.mode` -> `""`, `hasattr(f,"encoding")` True (TextIOBase defines `encoding = None`) -> line 414 returns `f` unchanged; asserts `not hasattr(f, "name")`. This is the ONLY test that exercises the 414 early-return branch.
+- testing/test_capture.py:1454-1461 `test_pickling_and_unpickling_encoded_file` — `capture.EncodedFile(None, None)`. Matters for a `mode` property implemented as `self.buffer.mode...`: accessing `.mode` on that instance would raise `AttributeError: 'NoneType' object has no attribute 'mode'`. Pickle never touches `.mode`, so the test still passes (verified with the patch applied).
+- testing/test_capture.py:1375-1385 `test_error_attribute_issue555` and 1406-1418 `test_dontreadfrominput_has_encoding` — assert on `sys.stdout.errors` / `sys.stdout.encoding` under `inline_run()`. These are the sibling attributes of `mode` and are direct evidence that user test code sees an EncodedFile as sys.stdout/sys.stderr.
+
+Unrelated (false positives):
+- testing/test_assertrewrite.py:687 `old_mode = cache.stat().mode` and :727 `old_mode = sub.stat().mode` — `os.stat` permission bits.
+- testing/test_assertion.py:433 `assert "b" not in line` — dict-diff omission text.
+- testing/python/fixtures.py:2248 `assert "b" in values` — fixture param list.
+- Various `@pytest.mark.parametrize("mode", [...])` in test_recwarn.py, test_assertion.py, code/test_excinfo.py, python/setup_only.py, test_doctest.py — test parametrization labels.
+
+## D. Does an EncodedFile ever reach safe_text_dupfile?
+
+No, not from any current pytest code path.
+
+1. Sole call site in src is capture.py:566, inside `FDCaptureBinary.__init__` when `tmpfile is None`:
+   `f = TemporaryFile(); tmpfile = safe_text_dupfile(f, mode="wb+")` — always a fresh raw binary temp file.
+2. capfd / capfdbinary: `CaptureFixture._start` (capture.py:360) -> `MultiCapture(out=True, err=True, in_=False, Capture=FDCapture)` -> `FDCaptureBinary.__init__(tmpfile=None)` -> fresh TemporaryFile. Never an EncodedFile.
+3. capsys / capsysbinary: use `SysCapture`/`CaptureIO`, which never call safe_text_dupfile at all. Verified empirically: under capsys `sys.stdout` is `CaptureIO` and has NO `.mode` attribute.
+4. Nested capture: outer fd capture + inner in-process run. Verified empirically — inner `sys.stdout` is `EncodedFile` with mode `'rb+'` and `.buffer` of type `FileIO`, i.e. a fresh TemporaryFile dup, never EncodedFile-inside-EncodedFile.
+5. Passing a pre-made tmpfile (`FDCaptureBinary(targetfd, tmpfile=X)`) bypasses safe_text_dupfile entirely, so even a plugin/test handing in an EncodedFile never reaches line 414.
+6. History: the one call that ever passed a live stream, `dupped_stdout = safe_text_dupfile(sys.stdout, "wb")` (commit 9d716a39), was removed in commit 3b8935c5. So the "EncodedFile back into safe_text_dupfile" scenario was possible historically but is dead today.
+7. Only remaining route: third-party code calling `_pytest.capture.safe_text_dupfile(sys.stdout, ...)` while fd capture is active. No installed package in this env imports it (grepped site-packages).
+
+## E. If an EncodedFile WERE passed in, does stripping "b" change behavior?
+
+Three sub-cases, all verified empirically with and without a candidate `mode` property (`return self.buffer.mode.replace("b", "")`):
+
+(a) EncodedFile over an fd-backed file (the normal capture object): `f.fileno()` succeeds -> `else` branch (`os.dup`, mode arg already has "b", `os.fdopen(newfd, "wb+", 0)`) -> returns a NEW EncodedFile reusing `f.encoding`. Line 414 is never evaluated. Before and after: `EncodedFile`, new fd, `is same? False`. NO CHANGE.
+
+(b) EncodedFile over a non-fd buffer (BytesIO / StringIO): `fileno()` raises. `getattr(f, "mode", "")` -> `""` both before (delegated `__getattr__` raises AttributeError) and after (the property raises AttributeError because the buffer has no `.mode`; `getattr` with a default swallows it). `hasattr(f,"encoding")` is always True (set in `__init__`). Both -> `return f` unchanged. NO CHANGE.
+
+(c) The only divergence — EncodedFile whose buffer is fd-backed but whose `fileno()` raises, in practice a CLOSED file (`ValueError: I/O operation on closed file`) where `.mode` is still readable:
+- Today: `"b" not in "rb+"` is False -> the `except` block does not return -> control falls through to line 422 and the object is DOUBLE-WRAPPED: `EncodedFile(EncodedFile(FileIO))` (verified: result `.buffer` type is `EncodedFile`).
+- With stripping: mode is `'r+'` -> the "text stream" branch returns the same object unchanged.
+This is a real behavior change but only for already-closed streams, and the new behavior is strictly less broken (the double-wrapped object would encode twice; `EncodedFile.write` raises TypeError for bytes on PY3, and both variants raise ValueError on any actual I/O since the fd is closed).
+
+Semantically the change makes the line-414 heuristic correct for EncodedFile for the first time: EncodedFile IS a text stream from the writer's side (`write()` requires `six.text_type` and raises `TypeError` for bytes on PY3, capture.py:432-439), so a mode without "b" is the honest answer.
+
+## F. Empirical verification performed
+
+- Default `--capture=fd`: `sys.stdout` -> `EncodedFile`, `mode == 'rb+'` (buffer is `<_io.FileIO name=4 mode='rb+'>`). With capsys: `CaptureIO`, no `.mode`.
+- Applied the candidate patch (a `mode` property on `EncodedFile` returning `self.buffer.mode.replace("b", "")`), re-ran: `sys.stdout.mode` -> `'r+'`; `testing/test_capture.py` = 107 passed, 7 skipped, 1 xfailed (identical to baseline); `testing/test_pytester.py testing/test_terminal.py testing/test_pastebin.py testing/logging` = 209 passed, 7 skipped, 1 xfailed. Patch then reverted; tracked tree is clean.
+- Confirmed `changelog/` has no existing fragment mentioning mode (only README.rst and _template.rst).
+RISKS: ['A `mode` property implemented as `self.buffer.mode.replace("b", "")` raises AttributeError when the buffer has no `.mode` (io.BytesIO, io.StringIO, or `None` as in testing/test_capture.py:1459 `EncodedFile(None, None)`). Callers using `getattr(f, "mode", default)` / `hasattr` are unaffected (the delegated `__getattr__` raised AttributeError before too), but any consumer doing a bare `f.mode` on a non-fd-backed EncodedFile still crashes - equally before and after, only the exception message changes. If robustness is wanted, guard with `getattr(self.buffer, "mode", "")`.', 'Behavior change confined to one edge case: safe_text_dupfile receiving an EncodedFile whose fileno() raises but whose buffer still reports a binary mode (a closed capture file). Today that path double-wraps into EncodedFile(EncodedFile(...)); after the change it returns the object unchanged. No pytest code path reaches this today, but an out-of-tree plugin calling `_pytest.capture.safe_text_dupfile` could.', 'Defining `mode` as a property shadows the `__getattr__` delegation to `self.buffer`, so anything that previously relied on getting the buffer\'s exact mode string (including the "b") from an EncodedFile now gets the stripped value. The only in-repo consumer of that is py.io.dupfile via src/_pytest/config/__init__.py:238, which already strips "b" itself when an encoding is passed - same result either way.', 'src/_pytest/capture.py:419 (`if "b" not in mode: mode += "b"`) looks like the same check but operates on the string parameter; do not "fix" it in the same pass - it must keep adding "b" or os.fdopen(..., 0) with unbuffered text mode would fail.', 'An untracked file /testbed/probe.py exists in the working tree (not created by this analysis; tracked files are clean). Worth checking before committing anything so it is not swept into a commit.']
+================================================================================
+SUMMARY: Reconnaissance of /testbed/testing/test_capture.py: EncodedFile unit tests are plain module-level functions; a module-level `tmpfile` yield_fixture (lines 904-909) hands out a real binary temp file via testdir; the repo still supports py2.7 (six + _PY3 + sys.version_info skipifs), so a bytes-write TypeError test must be py3-gated. Best insertion point is line 1462 (right after test_pickling_and_unpickling_encoded_file, before test_global_capture_with_live_logging). Verified with a scratch probe that EncodedFile over a buffer opened "rb+" currently reports mode 'rb+' (assertion fails today) and that write(b"...") already raises TypeError on py3.
+----------------------------------------
+# 1. Existing style for EncodedFile-level unit tests
+
+They are **plain module-level functions** (not methods on a class), and the EncodedFile-specific ones currently use **no fixtures at all**:
+
+/testbed/testing/test_capture.py:1455-1461
+```python
+def test_pickling_and_unpickling_encoded_file():
+    # See https://bitbucket.org/pytest-dev/pytest/pull-request/194
+    # pickle.loads() raises infinite recursion if
+    # EncodedFile.__getattr__ is not implemented properly
+    ef = capture.EncodedFile(None, None)
+    ef_as_str = pickle.dumps(ef)
+    pickle.loads(ef_as_str)
+```
+
+The other EncodedFile test is integration-style via `testdir` (subprocess-less runpytest), /testbed/testing/test_capture.py:1556-1576:
+```python
+def test_typeerror_encodedfile_write(testdir):
+    """It should behave the same with and without output capturing (#4861)."""
+    p = testdir.makepyfile(
+        """
+        def test_fails():
+            import sys
+            sys.stdout.write(b"foo")
+    """
+    )
+    ...
+    if _PY3:
+        result_with_capture.stdout.fnmatch_lines(
+            ["E           TypeError: write() argument must be str, not bytes"]
+        )
+    else:
+        assert result_with_capture.ret == 0
+```
+
+Yes, there IS a `tmpfile` fixture, defined at module level (so it is visible to every test in the file, including ones added at line 1462) — /testbed/testing/test_capture.py:904-909:
+```python
+@pytest.yield_fixture
+def tmpfile(testdir):
+    f = testdir.makepyfile("").open("wb+")
+    yield f
+    if not f.closed:
+        f.close()
+```
+Notes: it is `@pytest.yield_fixture` (old style, still used in this file), it depends on `testdir`, it opens **"wb+"** (not "rb+"), and it closes the file for you. Imports available at top of file (lines 6-22): `io`, `os`, `pickle`, `sys`, `py`, `from six import text_type`, `import pytest`, `from _pytest import capture`, `from _pytest.compat import _PY3`. So a new test refers to `capture.EncodedFile`, matching existing style.
+
+# 2. How other tests build a real EncodedFile over a real binary temp file
+
+There is no existing test that constructs `EncodedFile` directly over a real file — they go through `capture.safe_text_dupfile()`, which returns an `EncodedFile` (src/_pytest/capture.py:422). Working snippets copied from the file:
+
+/testbed/testing/test_capture.py:1441-1454 (uses the `tmpfile` fixture; `nf` is an EncodedFile):
+```python
+@needsosdup
+def test_dupfile(tmpfile):
+    flist = []
+    for i in range(5):
+        nf = capture.safe_text_dupfile(tmpfile, "wb")
+        assert nf != tmpfile
+        assert nf.fileno() != tmpfile.fileno()
+        assert nf not in flist
+        print(i, end="", file=nf)
+        flist.append(nf)
+
+    fname_open = flist[0].name
+    assert fname_open == repr(flist[0].buffer)
+    ...
+    tmpfile.seek(0)
+    s = tmpfile.read()
+    assert "01234" in repr(s)
+    tmpfile.close()
+```
+
+/testbed/testing/test_capture.py:939-945 (no temp file at all — BytesIO):
+```python
+def test_dupfile_on_bytesio():
+    bio = io.BytesIO()
+    f = capture.safe_text_dupfile(bio, "wb")
+    f.write("hello")
+    assert bio.getvalue() == b"hello"
+    assert "BytesIO object" in f.name
+```
+
+Pattern for making a binary temp file inline without the fixture (used by TestFDCapture, line 993-995):
+```python
+        with testdir.makepyfile("").open("wb+") as tmpfile:
+            self.test_simple_many(tmpfile)
+```
+and reading the raw bytes back (test_writeorg, lines 1015-1027): `with open(tmpfile.name, "rb") as stmp_file: stmp = stmp_file.read()`.
+
+Relevant source under test, /testbed/src/_pytest/capture.py:425-451 — `EncodedFile` has `buffer`, `encoding`, `write`, `writelines`, a `name` property, and `__getattr__` delegating everything else to `self.buffer`. There is **no `mode` property**, so `mode` is delegated and keeps the `b`:
+```python
+    def write(self, obj):
+        if isinstance(obj, six.text_type):
+            obj = obj.encode(self.encoding, "replace")
+        elif _PY3:
+            raise TypeError(
+                "write() argument must be str, not {}".format(type(obj).__name__)
+            )
+        self.buffer.write(obj)
+    ...
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "buffer"), name)
+```
+
+Verified empirically in the testbed env (scratch files, since deleted): buffer opened `"rb+"` → `EncodedFile.mode == 'rb+'` (so `assert "b" not in ef.mode` fails today), and `ef.write(b"foo")` → `TypeError: write() argument must be str, not bytes`.
+
+# 3. py2/py3 compat matters — yes
+
+- setup.cfg:46 → `python_requires = >=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*`; setup.cfg classifiers list Python 2.7 and 3.4-3.7.
+- setup.py:7 → `"six>=1.10.0"` is a hard install requirement.
+- tox.ini envlist (lines 7-20) includes `py27`, `py34`…`py38`, `pypy`, `pypy3`, `{py27,py37}-{pexpect,xdist,...}`, `py27-nobyte-xdist`.
+- test_capture.py:16 `from six import text_type`; :21 `from _pytest.compat import _PY3`.
+- Guard styles already in the file (pick any):
+  - string-condition decorator, :879 / :894 / :1119 — `@pytest.mark.skipif("sys.version_info < (3,)", reason="python2 has no buffer")`
+  - expression decorator, :856 — `@pytest.mark.skipif(sys.version_info[0] == 2, reason="python 3 only behaviour")`
+  - in-body branch, :846 — `if sys.version_info >= (3, 0): f.write("ö"); pytest.raises(TypeError, f.write, b"hello") else: ...`
+  - in-body `_PY3`, :1571 — `if _PY3: ... else: ...`
+- Consequence for the two new tests:
+  - bytes-write TypeError is **py3-only** by construction (`elif _PY3` in capture.py:435). Gate it with `@pytest.mark.skipif(sys.version_info[0] == 2, reason="python 3 only behaviour")` (or an in-body `if _PY3:`), otherwise it fails on py27.
+  - mode test: exact string assertions are version-sensitive. On py3 `open(path, "wb+")` (what the `tmpfile` fixture does) reports `.mode == 'rb+'`, but a py2 `file` object reports the literal `'wb+'` it was given → a `== "r+"` assert would pass on py3 and fail on py2. Two portable options: open the buffer yourself with `"rb+"` (reports `'rb+'` on both, so `== "r+"` is safe), or assert `"b" not in ef.mode`. The task's phrasing ("buffer opened 'rb+'") matches the first option, e.g. `with testdir.makepyfile("").open("rb+") as f: assert capture.EncodedFile(f, encoding=None).mode == "r+"` — verified this fails today with `assert 'b' not in 'rb+'`.
+
+# 4. Best place to add the two tests
+
+**Insert at line 1462** of /testbed/testing/test_capture.py — i.e. immediately after `test_pickling_and_unpickling_encoded_file` (which ends at line 1461) and before `test_global_capture_with_live_logging` (line 1464), keeping two blank lines above and below (black/pre-commit style enforced by the `linting` tox env). That keeps all direct `capture.EncodedFile(...)` unit tests together; the `tmpfile`/`testdir` fixtures are module-level and resolve fine there.
+
+Secondary acceptable spot: append after `test_typeerror_encodedfile_write` at end of file (file is 1576 lines, so start at line 1577 with two preceding blank lines) — that groups with the existing write/TypeError test, but that neighbour is a `testdir.runpytest` integration test rather than an EncodedFile-level unit test, so 1462 is the better fit.
+
+Suggested naming consistent with the file: `test_encodedfile_mode(testdir)` (or `(tmpfile)` if you accept the "wb+" caveat above) and `test_encodedfile_write_bytes_raises_typeerror(tmpfile)` / reuse the `if _PY3` idiom.
+
+# 5. Command to run just those tests
+
+The repo's `pytest` lives in the conda env `testbed` (the default `python` on PATH has no pytest):
+
+```
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest testing/test_capture.py -k "encodedfile or encoded_file" -p no:cacheprovider -v
+```
+
+Verified output today: `2 passed, 113 deselected` (rootdir /testbed, inifile tox.ini, addopts `-ra -p pytester --strict-markers` from tox.ini:141, so `testdir` is available automatically). If both new tests are named `test_encodedfile_*`, `-k encodedfile` alone suffices:
+
+```
+cd /testbed && /opt/miniconda3/envs/testbed/bin/python -m pytest testing/test_capture.py -k encodedfile -p no:cacheprovider -v
+```
+Or target them exactly: `... testing/test_capture.py::test_encodedfile_mode testing/test_capture.py::test_encodedfile_write_bytes_raises_typeerror`. Drop `-p no:cacheprovider` if you don't mind a `.pytest_cache` directory being written.
+
+# Housekeeping
+
+I modified nothing. `git status` reports one untracked file I did **not** create: /testbed/probe.py (a scratch script exercising `EncodedFile.mode` / `write(b"...")`, timestamped during this session — presumably from a sibling agent). It was clean at session start, so someone may want to remove it before committing.
+RISKS: ['A mode assertion using the shared `tmpfile` fixture (opened "wb+") is not py2/py3 portable: py3 reports \'rb+\' -> \'r+\', py2 reports \'wb+\' -> \'w+\'. Open the buffer explicitly with "rb+" or assert `"b" not in ef.mode`.', 'The bytes-write TypeError only exists on py3 (`elif _PY3` in src/_pytest/capture.py:435); this repo still tests py27/pypy via tox, so the test must be skipif-gated or branch on _PY3 or it will fail on py27.', 'tox.ini sets `filterwarnings = error` and `xfail_strict=true`; any DeprecationWarning raised by a new test (e.g. unclosed file / deprecated fixture use) becomes a failure.', '`@pytest.yield_fixture` is used in this file for `tmpfile`; do not introduce a second competing tmpfile-style fixture — reuse the existing one or open a file inline like TestFDCapture does at line 993.', "An untracked /testbed/probe.py exists that I did not create (likely a sibling agent's scratch file); it would be picked up by a naive `git add -A`."]
+================================================================================
+SUMMARY: EncodedFile.mode is delegated via __getattr__ to a raw _io.FileIO. In the only production path (FDCaptureBinary/FDCapture on fds 1/2, i.e. --capture=fd global capture plus capfd/capfdbinary) it reports 'rb+', while EncodedFile.write() accepts only str — verified empirically: sys.stdout during capfd is EncodedFile(buffer=_io.FileIO, mode='rb+', encoding='UTF8') and ef.write(b"...") raises TypeError. buffer.mode does NOT always exist (BytesIO path, EncodedFile(None, None) pickling test), so a strip-'b' property must degrade to AttributeError; because a property getter raising AttributeError falls through to __getattr__, that happens automatically. No internal pytest/py consumer reads .mode off an EncodedFile, so an explicit mode property is safe — prototyped it and 107 passed/7 skipped/1 xfail in testing/test_capture.py plus 223 passed in test_pdb/test_terminal/test_pytester/logging, then reverted.
+----------------------------------------
+# 1. Concrete underlying-buffer modes per construction path
+
+All modes below measured on the testbed interpreter (/opt/miniconda3/envs/testbed/bin/python, 3.9.20). Note `os.fdopen(fd, mode, 0)` with buffering=0 returns a raw `_io.FileIO`, and `FileIO.mode` normalizes: `'wb+'->'rb+'`, `'rb+'->'rb+'`, `'wb'->'wb'`, `'rb'->'rb'`, `'ab+'->'ab+'`.
+
+Path A — the ONLY production construction. `src/_pytest/capture.py:564-566` (`FDCaptureBinary.__init__`): `f = TemporaryFile()` (its own `.mode` is `'rb+'`, a BufferedRandom) -> `safe_text_dupfile(f, mode="wb+")` -> line 418 `newfd = os.dup(fd)` -> lines 419-420 leave mode as `"wb+"` ('b' already present) -> line 421 `os.fdopen(newfd, "wb+", 0)` -> `_io.FileIO` with **`.mode == 'rb+'`** -> line 422 `EncodedFile(FileIO, 'UTF8')`.
+  - Reached for targetfd 1 and 2, for both global `--capture=fd` and the `capfd`/`capfdbinary` fixtures. Line 568 then does `SysCapture(targetfd, tmpfile)`, so this EncodedFile is installed as `sys.stdout`/`sys.stderr` (line 666). Empirically, inside a `capfd` test: `('EncodedFile', 'FileIO', 'rb+', "'UTF8'")`. `'b' in sys.stdout.mode` is True, yet `sys.stdout.write(b"x")` raises `TypeError: write() argument must be str, not bytes` (lines 435-438). That is exactly the reported youtube-dl failure.
+  - Note the `TemporaryFile` is closed by `with f:` at line 565; the EncodedFile owns only the duped fd.
+
+Path B — tests only, `testing/test_capture.py:916` `capture.safe_text_dupfile(tmpfile, "wb")` where `tmpfile` (fixture at test_capture.py:904-909) is `py.path.local.open("wb+")` -> `os.fdopen(newfd, "wb", 0)` -> `FileIO` with **`.mode == 'wb'`**.
+
+Path C — `testing/test_capture.py:941` `safe_text_dupfile(io.BytesIO(), "wb")`. `BytesIO.fileno()` raises `UnsupportedOperation`, so line 414 runs: `getattr(f, "mode", "")` -> `""`, `"b" not in ""` -> True, but `hasattr(f, "encoding")` -> False, so the early return is skipped and line 422 wraps the **BytesIO itself**. That buffer has **no `.mode` at all**.
+
+Path D — `testing/test_capture.py:949` `safe_text_dupfile(py.io.TextIO(), "wb")`. `py.io.TextIO` is `io.StringIO`; no `fileno`, no `.mode` (-> `""`), but `TextIOBase.encoding` exists (value `None`), so line 414-416 returns `f` unchanged. **No EncodedFile is created** (this is what `assert not hasattr(f, "name")` at test_capture.py:951 is asserting).
+
+Path E — `FDCaptureBinary(0)` (stdin, line 558-561) uses `open(os.devnull, "r")`, a TextIOWrapper with `.mode == 'r'`. Not an EncodedFile. `SysCapture` (line 641) uses `CaptureIO()`/`DontReadFromInput()` (lines 651-654) — never an EncodedFile. `FDCaptureBinary(targetfd, tmpfile=...)` with a caller-supplied tmpfile bypasses `safe_text_dupfile` entirely (only used by tests).
+
+Hypothetical: if a caller ever passed a mode without 'b', lines 419-420 append it, so the fdopen mode is always binary and `FileIO.mode` always ends up in {'rb','wb','ab','rb+','ab+','xb','xb+'} — i.e. always contains 'b'.
+
+# 2. Does buffer.mode always exist?
+
+- Path A (production): yes. `_io.FileIO` always exposes `.mode`.
+- Path B: yes (`FileIO`).
+- Path C (BytesIO): **no** — today `ef.mode` raises `AttributeError: '_io.BytesIO' object has no attribute 'mode'` via the `__getattr__` delegation at capture.py:450-451.
+- `EncodedFile(None, None)` (`testing/test_capture.py:1459`, test_pickling_and_unpickling_encoded_file): **no** — `ef.mode` raises `AttributeError: 'NoneType' object has no attribute 'mode'`. Pickling itself never touches `.mode`; it probes dunders (`__reduce_ex__`, `__getstate__`), which fall into `__getattr__` -> `getattr(None, ...)` -> AttributeError, which is why the recursion guard `object.__getattribute__(self, "buffer")` at line 451 matters.
+- Consequence for a fix: a `mode` property must not assume the attribute exists. Verified behavior: when a property getter raises `AttributeError`, Python falls back to `__getattr__`, which re-raises `AttributeError` from the buffer. So `@property def mode: return self.buffer.mode.replace("b", "")` preserves today's `AttributeError` for both None and BytesIO buffers with no extra guard, and pickling still round-trips (verified).
+
+# 3. Can an explicit strip-'b' mode property break an internal consumer?
+
+No internal consumer reads `.mode` on an EncodedFile.
+- `grep '\.mode\b'` over `src/`: only `src/_pytest/capture.py:414` and `src/_pytest/assertion/__init__.py:69` (unrelated `AssertionState.mode` string). Line 414 reads `.mode` off the *input* `f`, which in every production call is a `TemporaryFile`, never an EncodedFile; and for a real file `fileno()` succeeds so line 414 is not even reached.
+- `py` library: `py/_io/capture.py:102` (`mode = mode or f.mode`) is inside `py.io.dupfile`, which pytest no longer uses (`safe_text_dupfile` replaced it); `py/_path/local.py:500` (`if 'b' in mode`) inspects `LocalPath.open`'s own argument. `py._io.terminalwriter` keys off `isatty()`/`encoding`, not `mode`.
+- The capture machinery itself keys off `encoding`, not `mode`: `FDCapture.snap` at capture.py:633-638 (`enc = getattr(self.tmpfile, "encoding", None)`), `FDCaptureBinary.snap` 591-596, `writeorg` 618-622 (raw `os.write` on the saved fd).
+- Empirical: with the property applied, `testing/test_capture.py` = 107 passed / 7 skipped / 1 xfailed; `test_pdb.py + test_terminal.py + test_pytester.py + testing/logging` = 223 passed / 42 skipped / 1 xfailed. `sys.stdout.mode` inside `capfd` becomes `'r+'` (was `'rb+'`).
+
+Residual risks (none blocking, all pre-existing asymmetries):
+- `'rb+'` -> `'r+'` advertises a *readable text* stream, but EncodedFile has no `read()`, so reads delegate to the binary buffer and return bytes. A third party that sniffed `.mode` to decide how to *read* would now be misled in the opposite direction. Only pytest reads the tmpfile (capture.py:594) and it decodes explicitly, so internal behavior is unaffected.
+- Anything doing `open(x, mode=out.mode)` would switch from binary to text; no such call exists in pytest/py.
+- Precedent for shadowing a delegated attribute already exists in this class: `errors = "strict"` (line 426, issue 555) and the `name` property (lines 445-448, changelog #2555 "capture: ensure that EncodedFile.name is a string").
+
+# 4. Exact lines to touch (pristine /testbed/src/_pytest/capture.py)
+
+- Insert a `mode` property immediately after the `name` property, i.e. after line 448 and before `__getattr__` at line 450 (new lines 450-453):
+  `@property` / `def mode(self):` / docstring / `return self.buffer.mode.replace("b", "")`
+  Keep `__getattr__` (now lines ~454-455) untouched — it is the AttributeError fallback for None/BytesIO buffers.
+- No change needed at `safe_text_dupfile` lines 406-422 (the mode-sniff at 414 and the `mode += "b"` at 419-420 stay as-is), none at `FDCaptureBinary.__init__` 550-572, none at `FDCapture.snap` 633-638, none in `SysCapture`/`SysCaptureBinary` 641-701.
+- Test: add a case in `testing/test_capture.py` next to the existing dupfile tests — after `test_dupfile` (ends line 936) / around `test_dupfile_on_bytesio` (939-945) — asserting `capture.safe_text_dupfile(tmpfile, "wb").mode == "w"` and that the fd-capture stream's mode has no `'b'`; existing lines 941/949/1459 already pin the AttributeError/early-return/pickling paths and must keep passing.
+- Changelog newsfragment required by `changelog/README.rst`: `changelog/<ISSUE>.bugfix.rst` (the referenced GitHub issue for the youtube-dl `'b' in out.mode` report is #4224; `changelog/` currently holds no pending fragments).
+RISKS: ["Stripping 'b' makes .mode advertise a readable *text* stream ('rb+' -> 'r+') although EncodedFile has no read() and delegates reads to the binary buffer, so reads still return bytes; the lie is merely inverted for readers. No pytest code reads based on .mode (FDCapture.snap decodes via .encoding at capture.py:633-638), so internal behavior is unchanged.", 'buffer.mode does not exist in two exercised paths (io.BytesIO buffer from safe_text_dupfile, and EncodedFile(None, None) in test_pickling_and_unpickling_encoded_file). A plain property is safe only because a property raising AttributeError falls through to __getattr__; do not add a try/except that returns a fabricated string, and do not implement it as an instance attribute set in __init__ (that would raise at construction time for those buffers).', 'Third-party code doing open(path, mode=stream.mode) or otherwise reusing the mode string would switch from binary to text. No such consumer exists in pytest, py, or pluggy.', 'An untracked /testbed/probe.py exists in the working tree (not created by this analysis, present before my edits); I executed it read-only. My prototype patch to src/_pytest/capture.py was reverted from a backup and git diff is empty.']

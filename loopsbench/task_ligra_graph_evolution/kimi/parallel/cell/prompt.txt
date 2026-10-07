@@ -1,0 +1,238 @@
+Implement the Ligra graph processing framework evolution,
+following the Ligra / Ligra+ research sequence. Ligra (PPoPP 2013) introduced a lightweight shared-memory
+parallel graph processing framework based on edgeMap/vertexMap abstractions. Ligra+ (IEEE TOPC 2015)
+extended it with compressed graph representations that reduce memory footprint while preserving
+the same algorithmic interface. Both papers share the same C++ codebase.
+
+Use the existing workspace layout:
+`/workspace/` -- base framework code is already present here. All papers build on top
+  of these files in place. Keep the implementation in the existing layout instead of creating per-paper subdirectories.
+`/workspace/ligra/` -- framework header files (parallel.h, utils.h, graph.h, vertex.h, etc.)
+`/workspace/apps/` -- application directory with Makefile (applications must be implemented here)
+`/workspace/inputs/` -- test graphs (rMatGraph_J_5_100, rMatGraph_WJ_5_100)
+`/workspace/run.sh` -- existing experiment runner that must be replaced with the final implementation
+
+Build notes: The apps/Makefile uses `make` with g++. Applications are compiled as
+`g++ -std=c++14 -O3 -DBYTERLE -o <app> <app>.C`. Each .C file in apps/ is symlinked to
+header files from ../ligra/. Run `make` from the apps/ directory to build all targets.
+
+Use the matching requirement files under `requirements/` for stage-local scope:
+`ligra` and `ligra_plus`.
+
+Follow this implementation order:
+Step 1: Implement the Ligra baseline inside `/workspace/`.
+Step 2: Extend the same `/workspace/` codebase with the Ligra+ additions.
+
+Keep this constraint in mind: The workspace must contain a working implementation after each paper.
+Implement every mechanism described in each paper in full. Do not skip any algorithm,
+data structure, or component mentioned in the paper.
+
+Paper 1: ligra -- Ligra: A Lightweight Graph Processing Framework for Shared Memory:
+
+Work in `/workspace/`.
+
+Implement the following mechanisms:
+vertexSubset data structure: A set of active vertices represented in two modes:
+  sparse (a list of vertex IDs) and dense (a boolean array of length n). The data structure
+  must support converting between representations via toSparse() and toDense(), and provide
+  size queries (numRows, numNonzeros, isEmpty). Use a threshold (default: n/20) to decide
+  when to switch between sparse and dense processing.
+
+edgeMap function: The core traversal primitive. Given a graph G, a vertexSubset U of
+  active vertices, and user-defined functions (update, updateAtomic, cond), iterate over all
+  edges (u,v) where u is in U. Must support two modes:
+  Sparse mode: iterate over out-neighbors of each vertex in U. Used when the frontier is small.
+  Dense mode: iterate over all vertices v and check if any in-neighbor is in U. Used when
+    frontier is large (m + outDegrees > threshold).
+  edgeMap should dispatch between sparse and dense based on frontier size vs. the threshold.
+  Sparse mode must support both filtered and no-filter variants. Dense mode must support
+  both backward (iterate in-neighbors) and forward (iterate out-neighbors) variants.
+  All modes must handle the output flag (whether to produce a new vertexSubset) and the
+  remove_duplicates flag (dedup output vertices).
+
+vertexMap function: Apply a user function f to every vertex in a vertexSubset.
+  Must handle both sparse and dense representations, and both data and no-data variants.
+
+vertexFilter function: Return a new vertexSubset containing only vertices that satisfy
+  a predicate. Must support both dense-based filtering (vertexFilter) and sparse-based
+  filtering (vertexFilter2).
+
+BFS application: Breadth-first search from a source vertex. Use edgeMap with an update
+  function that sets parent[d] = s when d is unvisited (parent[d] == UINT_E_MAX), and a cond
+  function that checks if d is unvisited. Loop until the frontier is empty. Count and report
+  the number of BFS levels (rounds) and the number of visited vertices.
+
+Triangle counting application: Count the exact number of triangles in a symmetric graph.
+  For each vertex u, for each neighbor v > u, count the intersection of N(u) and N(v) where
+  the third vertex w > v. Use the countOutNgh primitive for efficient counting.
+  Report the total triangle count.
+
+PageRank application: Iterative PageRank with damping factor 0.85. Initialize all
+  vertices with rank 1/n. In each iteration: (a) spread rank along edges using edgeMap
+  (each vertex distributes its rank equally to all out-neighbors), (b) apply the damping
+  formula: p_next[i] = damping * p_next[i] + (1-damping)/n. Converge when L1-norm of
+  the difference is below epsilon=0.0000001, or after maxiters iterations. Report the sum
+  of all final PageRank values.
+
+Other applications: Also implement BellmanFord (single-source shortest paths),
+  Components (connected components via label propagation), Components-Shortcut (with
+  pointer jumping), KCore (k-core decomposition), MIS (maximal independent set),
+  BC (betweenness centrality), Radii (graph radii estimation), and PageRankDelta.
+  These share the edgeMap/vertexMap interface.
+
+Run the following experiments (run from `/workspace/`):
+`bfs_level_count`: Run BFS from vertex 0 on the symmetric graph rMatGraph_J_5_100.
+  Build and run: `cd apps && make BFS && ./BFS -r 0 -s -rounds 1 ../inputs/rMatGraph_J_5_100`.
+  Parse "BFS levels: <N>" from stdout. Report N as an integer.
+`triangle_count`: Count triangles on the symmetric graph rMatGraph_J_5_100.
+  Build and run: `cd apps && make Triangle && ./Triangle -s -rounds 1 ../inputs/rMatGraph_J_5_100`.
+  Parse "triangle count = <N>" from stdout. Report N as an integer.
+
+Paper 2: ligra_plus -- Smaller and Faster: Parallel Processing of Compressed Graphs with Ligra+:
+
+Work in `/workspace/` (same directory, building on Paper 1's implementation)
+
+Implement the following mechanisms:
+Byte encoding (variable-length delta encoding): Encode sorted neighbor lists using
+  delta encoding with variable-length byte representation. For a sorted neighbor list
+  [v0, v1, v2, ...], store [v0, v1-v0, v2-v1, ...] where each delta is encoded in 1-5 bytes
+  using a continuation-bit scheme: low 7 bits = data, bit 7 = continuation flag (1 = more
+  bytes follow). Must support both sequential and parallel decoding.
+
+Byte-RLE encoding: Extend byte encoding with run-length encoding. When the same delta
+  value repeats k times consecutively, store (delta, count) instead of k separate copies.
+  This benefits graphs with regular degree distributions.
+
+compressedVertex interface: A replacement for the standard vertex struct that provides
+  the same interface (getOutNeighbors, getOutDegree, decodeOutNgh, decodeInNghBreakEarly,
+  decodeOutNghSparse, decodeOutNghSparseSeq, countOutNgh, packOutNgh, copyOutNgh) but
+  reads from compressed byte streams instead of raw arrays. Must work with both
+  compressedSymmetricVertex and compressedAsymmetricVertex types.
+
+Encoder tool: A standalone program that reads an uncompressed Ligra graph file and
+  writes a compressed version. The compressed file format has: (1) a header with vertex count,
+  edge count, and total compressed space, (2) per-vertex byte offsets, (3) per-vertex degrees,
+  (4) compressed neighbor data. Must handle both symmetric and asymmetric graphs.
+
+Decoder tool: A standalone program that reads a compressed graph and writes an
+  uncompressed version (inverse of the encoder).
+
+Integration with existing framework: The existing edgeMap, vertexMap, and parallel_main
+  functions must work with compressed graph types. When the -c flag is passed, parallel_main
+  should read a compressed graph and pass it to Compute. All existing applications (BFS,
+  PageRank, Triangle, etc.) must work unchanged on compressed graphs.
+
+Update the Makefile: Add encoder and decoder to the build targets, and add the
+  compression header files (byte.h, byteRLE.h, byte-pd.h, byteRLE-pd.h, nibble.h,
+  nibble-pd.h, encoder.C, decoder.C) to the COMMON dependencies list.
+
+Run the following experiments (run from `/workspace/`):
+`bfs_compressed_matches_uncompressed`: Compress rMatGraph_J_5_100 using the encoder,
+  then run BFS from vertex 0 on the compressed graph. Verify visited count matches
+  uncompressed BFS.
+  Steps: `cd apps && make encoder BFS && ./encoder ../inputs/rMatGraph_J_5_100 ../inputs/rMatGraph_J_5_100.compressed && ./BFS -r 0 -c -s -rounds 1 ../inputs/rMatGraph_J_5_100.compressed`.
+  Parse "BFS visited: <N>" from stdout. Report N as an integer.
+`pagerank_sum_compressed`: Run PageRank with 10 iterations on the compressed graph.
+  Steps: `cd apps && make PageRank && ./PageRank -maxiters 10 -c -s -rounds 1 ../inputs/rMatGraph_J_5_100.compressed`.
+  Parse "PageRank sum: <F>" from stdout. Report F as a float.
+
+After implementing both stages, update `/workspace/run.sh` so it runs all required
+experiments and writes `/workspace/results.json` with:
+   {
+     "ligra": {
+       "bfs_level_count": <integer>,
+       "triangle_count": <integer>
+     },
+     "ligra_plus": {
+       "bfs_compressed_matches_uncompressed": <integer>,
+       "pagerank_sum_compressed": <float>
+     }
+   }
+Run every experiment from `cd /workspace/`. The results file should contain
+exactly 4 numeric values.
+
+
+
+You are running as a long-horizon autonomous engineering agent at
+`/workspace`. This task spans many files and requirements, and is expected
+to take many iterations.
+
+Read every requirement under `/workspace/requirements/` (and any other
+explicit requirement list referenced by the task) and only finish once
+every single one is addressed. Cherry-picking or partial fixes will lead
+to failure.
+
+
+
+## Optional planning artifact
+
+If you believe the task is complex enough to benefit from a plan, you may
+write `/workspace/agent_plans/plan.json` before making changes. This is
+optional. If you create it, it must be a JSON object with `nodes` and
+`edges`. Each node must have string `id` equal to a requirement slug from
+`/workspace/requirements/`, may include `label` and `layer`, and each edge
+must use string `from` and `to` that reference those ids.
+
+
+
+## Git workflow (required)
+
+`/workspace` is initialized as a git repo. After finishing the
+implementation for ONE requirement:
+
+  1. `cd /workspace`
+  2. `git add -A`
+  3. `git diff --cached > requirement_patches/<slug>.diff`
+  4. `git commit -m "impl: <slug>"`
+
+Where `<slug>` is the requirement filename without the `.yaml` extension.
+The patch file MUST be non-empty for the requirement to count as complete.
+Never write or `touch` an empty `.diff` file.
+
+You may run `git log`, `git diff`, `git show` at any time to inspect what
+prior work has done — only your own commits will be there; no reference
+solution is accessible.
+
+## Recommended workflow
+
+1. Read the task carefully and survey `/workspace` so you understand the
+   code you are changing.
+2. As a development agent, when implementing a requirement you may write
+   tests under `/workspace/agent_tests/` to safeguard correctness and
+   future stability — write them if you think they help, otherwise skip.
+3. Keep iterating until every requirement is implemented. Do not stop at a
+   partial fix, a first passing check, or one successful edit.
+4. Do not narrow the scope on your own. Missing a requirement is a task
+   failure even if the changed tests pass.
+5. You may revise the same files and rerun focused checks as many times as
+   needed before finishing.
+6. Your final summary must report requirement coverage counts, including at
+   least the total number of requirements reviewed and how many were
+   implemented and blocked.
+
+Harness progress update:
+- Requirement coverage: 0/2 (0.0%)
+- Completed requirement slugs: none
+- Remaining requirement slugs: ligra, ligra_plus
+- Your previous run ended naturally. Continue from the current workspace state.
+- You may estimate progress yourself by comparing `/workspace/requirement_patches/*.diff` against `/workspace/requirements/*.yaml`.
+- You are only allowed to end when the whole task is complete, not when one part is complete.
+- The full task prompt is repeated above; keep working until every remaining requirement is implemented or you are truly blocked.
+
+## Git workflow (required)
+
+`/workspace` is initialized as a git repo at the start of round 1. After
+finishing the implementation for ONE requirement:
+
+  1. `cd /workspace`
+  2. `git add -A`
+  3. `git diff --cached > requirement_patches/<slug>.diff`
+  4. `git commit -m "impl: <slug>"`
+
+Where `<slug>` is the requirement filename without the `.yaml` extension.
+The patch file MUST be non-empty for the requirement to count as complete.
+Never write or `touch` an empty `.diff` file.
+
+You may run `git log`, `git diff`, `git show` at any time to inspect what
+prior rounds have done — only your own commits will be there; no reference
+solution is accessible.

@@ -1,0 +1,37 @@
+Done. The port is complete and verified against the reference binary.
+
+## What's in `/output`
+
+```
+Cargo.toml            no [dependencies] — std only
+test11.rs             entry file (package root), also the [[bin]] target
+test11                executable (rustc -O test11.rs)
+src/lib.rs            library root
+src/tsl/              container
+  growth_policy.rs      power-of-two bucket counts, doubling growth
+  hopscotch_hash.rs     open-addressing table w/ neighborhood bitmaps + displacement
+  hopscotch_map.rs      HopscotchMap: insert/load_factor/max_load_factor/rehash/…
+  identity_hash.rs      std::hash<int> equivalent (identity)
+src/cxx/              C++ runtime behaviour
+  decimal.rs            exact decimal expansion of an f64
+  ostream.rs            operator<<(float) == printf("%.6g")
+  stoi.rs               std::stoi parsing rules
+  terminate.rs          verbose terminate message + SIGABRT
+```
+
+## Behaviour recovered black-box
+
+Probing the binary rather than the library source pinned three things that a naive port gets wrong:
+
+- **`max_load_factor` defaults to `0.9f`, not `0.95`** — growth points are `trunc(bucket_count × 0.9f)`: 7, 14, 28, 57, 115, 230, 460, 921… (the non-constant ratio at 64+ buckets is the `float` truncation, confirmed up to 4096 buckets).
+- **A default-constructed map has zero buckets**; the first insert grows to 2, and `load_factor()` returns `0` rather than NaN when there are none.
+- **Output formatting needs exact-decimal round-half-to-even.** `33/128 = 0.2578125` is an exact tie at 6 significant digits and must print `0.257812`, while `0.2734375` must print `0.273438`. Rust's `{}`/`{:.6}` can't do this, so `cxx::decimal` expands the float exactly via `m·2⁻ᵏ = (m·5ᵏ)/10ᵏ` on a decimal bignum.
+
+## Verification
+
+- **810 differential cases** vs `test11_executable` comparing stdout, stderr **and** exit status: counts −3…300 exhaustively, every growth boundary through 117964, 400 random counts up to 200k, non-`--a` first args, and the error paths. **0 mismatches.** Byte-exact including trailing newline (`cmp` on raw bytes).
+- The three abort paths reproduce libstdc++ exactly — message text and SIGABRT/exit 134: missing `argv[2]` → `std::logic_error` / `basic_string::_S_construct null not valid`; `--a abc` → `std::invalid_argument` / `stoi`; `--a 99999999999` → `std::out_of_range` / `stoi`.
+- The `%g` formatter was cross-checked against glibc `printf` on **453,929 values** (every reachable `n/2ᵏ` load factor plus 400k random f32 patterns, incl. subnormals and scientific-notation ranges): all match.
+- 31 unit tests pass on both targets; `cargo build --release` and `rustc -O test11.rs` are both warning-free.
+
+Two notes: requirement 7 asks for "an executable at `/output/test11.rs`" — since that path is the source, the executables are `/output/test11` and `/output/target/release/test11`. And my scratch differential harness is at `/workspace/difftest.sh` (outside `/output`); say the word and I'll remove it.

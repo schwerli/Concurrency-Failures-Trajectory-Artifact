@@ -1,0 +1,934 @@
+     1	/*
+     2	* Licensed to the Apache Software Foundation (ASF) under one
+     3	* or more contributor license agreements.  See the NOTICE file
+     4	* distributed with this work for additional information
+     5	* regarding copyright ownership.  The ASF licenses this file
+     6	* to you under the Apache License, Version 2.0 (the
+     7	* "License"); you may not use this file except in compliance
+     8	* with the License.  You may obtain a copy of the License at
+     9	*
+    10	*   http://www.apache.org/licenses/LICENSE-2.0
+    11	*
+    12	* Unless required by applicable law or agreed to in writing,
+    13	* software distributed under the License is distributed on an
+    14	* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    15	* KIND, either express or implied.  See the License for the
+    16	* specific language governing permissions and limitations
+    17	* under the License.
+    18	*/
+    19	
+    20	import * as zrUtil from 'zrender/src/core/util';
+    21	import RoamController from './RoamController';
+    22	import * as roamHelper from '../../component/helper/roamHelper';
+    23	import {onIrrelevantElement} from '../../component/helper/cursorHelper';
+    24	import * as graphic from '../../util/graphic';
+    25	import {
+    26	    toggleHoverEmphasis,
+    27	    enableComponentHighDownFeatures,
+    28	    setDefaultStateProxy
+    29	} from '../../util/states';
+    30	import geoSourceManager from '../../coord/geo/geoSourceManager';
+    31	import {getUID} from '../../util/component';
+    32	import ExtensionAPI from '../../core/ExtensionAPI';
+    33	import GeoModel, { GeoCommonOptionMixin, GeoItemStyleOption, RegoinOption } from '../../coord/geo/GeoModel';
+    34	import MapSeries, { MapDataItemOption } from '../../chart/map/MapSeries';
+    35	import GlobalModel from '../../model/Global';
+    36	import { Payload, ECElement, LineStyleOption, InnerFocus, DisplayState } from '../../util/types';
+    37	import GeoView from '../geo/GeoView';
+    38	import MapView from '../../chart/map/MapView';
+    39	import Geo from '../../coord/geo/Geo';
+    40	import Model from '../../model/Model';
+    41	import { setLabelStyle, getLabelStatesModels } from '../../label/labelStyle';
+    42	import { getECData } from '../../util/innerStore';
+    43	import { createOrUpdatePatternFromDecal } from '../../util/decal';
+    44	import ZRText, {TextStyleProps} from 'zrender/src/graphic/Text';
+    45	import { ViewCoordSysTransformInfoPart } from '../../coord/View';
+    46	import { GeoSVGGraphicRecord, GeoSVGResource } from '../../coord/geo/GeoSVGResource';
+    47	import Displayable from 'zrender/src/graphic/Displayable';
+    48	import Element from 'zrender/src/Element';
+    49	import SeriesData from '../../data/SeriesData';
+    50	import { GeoJSONRegion } from '../../coord/geo/Region';
+    51	import { SVGNodeTagLower } from 'zrender/src/tool/parseSVG';
+    52	import { makeInner } from '../../util/model';
+    53	import { GeoProjection, ProjectionStream } from '../../coord/geo/geoTypes';
+    54	
+    55	interface RegionsGroup extends graphic.Group {
+    56	}
+    57	
+    58	type RegionModel = ReturnType<GeoModel['getRegionModel']> | ReturnType<MapSeries['getRegionModel']>;
+    59	
+    60	type MapOrGeoModel = GeoModel | MapSeries;
+    61	
+    62	interface ViewBuildContext {
+    63	    api: ExtensionAPI;
+    64	    geo: Geo;
+    65	    mapOrGeoModel: GeoModel | MapSeries;
+    66	    data: SeriesData;
+    67	    isVisualEncodedByVisualMap: boolean;
+    68	    isGeo: boolean;
+    69	    transformInfoRaw: ViewCoordSysTransformInfoPart;
+    70	}
+    71	
+    72	interface GeoStyleableOption {
+    73	    itemStyle?: GeoItemStyleOption;
+    74	    lineStyle?: LineStyleOption;
+    75	}
+    76	type RegionName = string;
+    77	
+    78	/**
+    79	 * Only these tags enable use `itemStyle` if they are named in SVG.
+    80	 * Other tags like <text> <tspan> <image> might not suitable for `itemStyle`.
+    81	 * They will not be considered to be styled until some requirements come.
+    82	 */
+    83	const OPTION_STYLE_ENABLED_TAGS: SVGNodeTagLower[] = [
+    84	    'rect', 'circle', 'line', 'ellipse', 'polygon', 'polyline', 'path'
+    85	];
+    86	const OPTION_STYLE_ENABLED_TAG_MAP = zrUtil.createHashMap<number, SVGNodeTagLower>(
+    87	    OPTION_STYLE_ENABLED_TAGS
+    88	);
+    89	const STATE_TRIGGER_TAG_MAP = zrUtil.createHashMap<number, SVGNodeTagLower>(
+    90	    OPTION_STYLE_ENABLED_TAGS.concat(['g']) as SVGNodeTagLower[]
+    91	);
+    92	const LABEL_HOST_MAP = zrUtil.createHashMap<number, SVGNodeTagLower>(
+    93	    OPTION_STYLE_ENABLED_TAGS.concat(['g']) as SVGNodeTagLower[]
+    94	);
+    95	const mapLabelRaw = makeInner<{
+    96	    ignore: boolean
+    97	}, ZRText>();
+    98	
+    99	
+   100	function getFixedItemStyle(model: Model<GeoItemStyleOption>) {
+   101	    const itemStyle = model.getItemStyle();
+   102	    const areaColor = model.get('areaColor');
+   103	
+   104	    // If user want the color not to be changed when hover,
+   105	    // they should both set areaColor and color to be null.
+   106	    if (areaColor != null) {
+   107	        itemStyle.fill = areaColor;
+   108	    }
+   109	
+   110	    return itemStyle;
+   111	}
+   112	// Only stroke can be used for line.
+   113	// Using fill in style if stroke not exits.
+   114	// TODO Not sure yet. Perhaps a separate `lineStyle`?
+   115	function fixLineStyle(styleHost: { style: graphic.Path['style'] }) {
+   116	    const style = styleHost.style;
+   117	    if (style) {
+   118	        style.stroke = (style.stroke || style.fill);
+   119	        style.fill = null;
+   120	    }
+   121	}
+   122	
+   123	class MapDraw {
+   124	
+   125	    private uid: string;
+   126	
+   127	    private _controller: RoamController;
+   128	
+   129	    private _controllerHost: {
+   130	        target: graphic.Group;
+   131	        zoom?: number;
+   132	        zoomLimit?: GeoCommonOptionMixin['scaleLimit'];
+   133	    };
+   134	
+   135	    readonly group: graphic.Group;
+   136	
+   137	
+   138	    /**
+   139	     * This flag is used to make sure that only one among
+   140	     * `pan`, `zoom`, `click` can occurs, otherwise 'selected'
+   141	     * action may be triggered when `pan`, which is unexpected.
+   142	     */
+   143	    private _mouseDownFlag: boolean;
+   144	
+   145	    private _regionsGroup: RegionsGroup;
+   146	
+   147	    private _regionsGroupByName: zrUtil.HashMap<RegionsGroup>;
+   148	
+   149	    private _svgMapName: string;
+   150	
+   151	    private _svgGroup: graphic.Group;
+   152	
+   153	    private _svgGraphicRecord: GeoSVGGraphicRecord;
+   154	
+   155	    // A name may correspond to multiple graphics.
+   156	    // Used as event dispatcher.
+   157	    private _svgDispatcherMap: zrUtil.HashMap<Element[], RegionName>;
+   158	
+   159	
+   160	    constructor(api: ExtensionAPI) {
+   161	        const group = new graphic.Group();
+   162	        this.uid = getUID('ec_map_draw');
+   163	        this._controller = new RoamController(api.getZr());
+   164	        this._controllerHost = { target: group };
+   165	        this.group = group;
+   166	
+   167	        group.add(this._regionsGroup = new graphic.Group() as RegionsGroup);
+   168	        group.add(this._svgGroup = new graphic.Group());
+   169	    }
+   170	
+   171	    draw(
+   172	        mapOrGeoModel: GeoModel | MapSeries,
+   173	        ecModel: GlobalModel,
+   174	        api: ExtensionAPI,
+   175	        fromView: MapView | GeoView,
+   176	        payload: Payload
+   177	    ): void {
+   178	
+   179	        const isGeo = mapOrGeoModel.mainType === 'geo';
+   180	
+   181	        // Map series has data. GEO model that controlled by map series
+   182	        // will be assigned with map data. Other GEO model has no data.
+   183	        let data = (mapOrGeoModel as MapSeries).getData && (mapOrGeoModel as MapSeries).getData();
+   184	        isGeo && ecModel.eachComponent({mainType: 'series', subType: 'map'}, function (mapSeries: MapSeries) {
+   185	            if (!data && mapSeries.getHostGeoModel() === mapOrGeoModel) {
+   186	                data = mapSeries.getData();
+   187	            }
+   188	        });
+   189	
+   190	        const geo = mapOrGeoModel.coordinateSystem;
+   191	
+   192	        const regionsGroup = this._regionsGroup;
+   193	        const group = this.group;
+   194	
+   195	        const transformInfo = geo.getTransformInfo();
+   196	        const transformInfoRaw = transformInfo.raw;
+   197	        const transformInfoRoam = transformInfo.roam;
+   198	
+   199	        // No animation when first draw or in action
+   200	        const isFirstDraw = !regionsGroup.childAt(0) || payload;
+   201	
+   202	        if (isFirstDraw) {
+   203	            group.x = transformInfoRoam.x;
+   204	            group.y = transformInfoRoam.y;
+   205	            group.scaleX = transformInfoRoam.scaleX;
+   206	            group.scaleY = transformInfoRoam.scaleY;
+   207	            group.dirty();
+   208	        }
+   209	        else {
+   210	            graphic.updateProps(group, transformInfoRoam, mapOrGeoModel);
+   211	        }
+   212	
+   213	        const isVisualEncodedByVisualMap = data
+   214	            && data.getVisual('visualMeta')
+   215	            && data.getVisual('visualMeta').length > 0;
+   216	
+   217	        const viewBuildCtx = {
+   218	            api,
+   219	            geo,
+   220	            mapOrGeoModel,
+   221	            data,
+   222	            isVisualEncodedByVisualMap,
+   223	            isGeo,
+   224	            transformInfoRaw
+   225	        };
+   226	
+   227	        if (geo.resourceType === 'geoJSON') {
+   228	            this._buildGeoJSON(viewBuildCtx);
+   229	        }
+   230	        else if (geo.resourceType === 'geoSVG') {
+   231	            this._buildSVG(viewBuildCtx);
+   232	        }
+   233	
+   234	        this._updateController(mapOrGeoModel, ecModel, api);
+   235	
+   236	        this._updateMapSelectHandler(mapOrGeoModel, regionsGroup, api, fromView);
+   237	    }
+   238	
+   239	    private _buildGeoJSON(viewBuildCtx: ViewBuildContext): void {
+   240	        const regionsGroupByName = this._regionsGroupByName = zrUtil.createHashMap<RegionsGroup, string>();
+   241	        const regionsInfoByName = zrUtil.createHashMap<{
+   242	            dataIdx: number;
+   243	            regionModel: Model<RegoinOption> | Model<MapDataItemOption>;
+   244	        }, string>();
+   245	        const regionsGroup = this._regionsGroup;
+   246	        const transformInfoRaw = viewBuildCtx.transformInfoRaw;
+   247	        const mapOrGeoModel = viewBuildCtx.mapOrGeoModel;
+   248	        const data = viewBuildCtx.data;
+   249	        const projection = viewBuildCtx.geo.projection;
+   250	        const projectionStream = projection && projection.stream;
+   251	
+   252	        function transformPoint(point: number[], project: GeoProjection['project']): number[] {
+   253	            if (project) {
+   254	                // projection may return null point.
+   255	                point = project(point);
+   256	            }
+   257	            return point && [
+   258	                point[0] * transformInfoRaw.scaleX + transformInfoRaw.x,
+   259	                point[1] * transformInfoRaw.scaleY + transformInfoRaw.y
+   260	            ];
+   261	        };
+   262	
+   263	        function transformPolygonPoints(inPoints: number[][]): number[][] {
+   264	            const outPoints = [];
+   265	            // If projectionStream is provided. Use it instead of single point project.
+   266	            const project = !projectionStream && projection && projection.project;
+   267	            for (let i = 0; i < inPoints.length; ++i) {
+   268	                const newPt = transformPoint(inPoints[i], project);
+   269	                newPt && outPoints.push(newPt);
+   270	            }
+   271	            return outPoints;
+   272	        }
+   273	
+   274	        function getPolyShape(points: number[][]) {
+   275	            return {
+   276	                shape: {
+   277	                    points: transformPolygonPoints(points)
+   278	                }
+   279	            };
+   280	        }
+   281	
+   282	        regionsGroup.removeAll();
+   283	
+   284	        // Only when the resource is GeoJSON, there is `geo.regions`.
+   285	        zrUtil.each(viewBuildCtx.geo.regions, function (region: GeoJSONRegion) {
+   286	            const regionName = region.name;
+   287	
+   288	            // Consider in GeoJson properties.name may be duplicated, for example,
+   289	            // there is multiple region named "United Kindom" or "France" (so many
+   290	            // colonies). And it is not appropriate to merge them in geo, which
+   291	            // will make them share the same label and bring trouble in label
+   292	            // location calculation.
+   293	            let regionGroup = regionsGroupByName.get(regionName);
+   294	            let { dataIdx, regionModel } = regionsInfoByName.get(regionName) || {};
+   295	
+   296	            if (!regionGroup) {
+   297	                regionGroup = regionsGroupByName.set(regionName, new graphic.Group() as RegionsGroup);
+   298	                regionsGroup.add(regionGroup);
+   299	
+   300	                dataIdx = data ? data.indexOfName(regionName) : null;
+   301	                regionModel = viewBuildCtx.isGeo
+   302	                    ? mapOrGeoModel.getRegionModel(regionName)
+   303	                    : (data ? data.getItemModel(dataIdx) as Model<MapDataItemOption> : null);
+   304	
+   305	                regionsInfoByName.set(regionName, { dataIdx, regionModel });
+   306	            }
+   307	
+   308	            const polygonSubpaths: graphic.Polygon[] = [];
+   309	            const polylineSubpaths: graphic.Polyline[] = [];
+   310	
+   311	            zrUtil.each(region.geometries, function (geometry) {
+   312	                // Polygon and MultiPolygon
+   313	                if (geometry.type === 'polygon') {
+   314	                    let polys = [geometry.exterior].concat(geometry.interiors || []);
+   315	                    if (projectionStream) {
+   316	                        polys = projectPolys(polys, projectionStream);
+   317	                    }
+   318	                    zrUtil.each(polys, (poly) => {
+   319	                        polygonSubpaths.push(new graphic.Polygon(getPolyShape(poly)));
+   320	                    });
+   321	                }
+   322	                // LineString and MultiLineString
+   323	                else {
+   324	                    let points = geometry.points;
+   325	                    if (projectionStream) {
+   326	                        points = projectPolys(points, projectionStream, true);
+   327	                    }
+   328	                    zrUtil.each(points, points => {
+   329	                        polylineSubpaths.push(new graphic.Polyline(getPolyShape(points)));
+   330	                    });
+   331	                }
+   332	            });
+   333	
+   334	            const centerPt = transformPoint(region.getCenter(), projection && projection.project);
+   335	
+   336	            function createCompoundPath(subpaths: graphic.Path[], isLine?: boolean) {
+   337	                if (!subpaths.length) {
+   338	                    return;
+   339	                }
+   340	                const compoundPath = new graphic.CompoundPath({
+   341	                    culling: true,
+   342	                    segmentIgnoreThreshold: 1,
+   343	                    shape: {
+   344	                        paths: subpaths
+   345	                    }
+   346	                });
+   347	                regionGroup.add(compoundPath);
+   348	                applyOptionStyleForRegion(
+   349	                    viewBuildCtx, compoundPath, dataIdx, regionModel
+   350	                );
+   351	                resetLabelForRegion(
+   352	                    viewBuildCtx, compoundPath, regionName, regionModel, mapOrGeoModel, dataIdx, centerPt
+   353	                );
+   354	
+   355	                if (isLine) {
+   356	                    fixLineStyle(compoundPath);
+   357	                    zrUtil.each(compoundPath.states, fixLineStyle);
+   358	                }
+   359	            }
+   360	
+   361	            createCompoundPath(polygonSubpaths);
+   362	            createCompoundPath(polylineSubpaths, true);
+   363	        });
+   364	
+   365	        // Ensure children have been added to `regionGroup` before calling them.
+   366	        regionsGroupByName.each(function (regionGroup, regionName) {
+   367	            const { dataIdx, regionModel } = regionsInfoByName.get(regionName);
+   368	
+   369	            resetEventTriggerForRegion(
+   370	                viewBuildCtx, regionGroup, regionName, regionModel, mapOrGeoModel, dataIdx
+   371	            );
+   372	            resetTooltipForRegion(
+   373	                viewBuildCtx, regionGroup, regionName, regionModel, mapOrGeoModel
+   374	            );
+   375	            resetStateTriggerForRegion(
+   376	                viewBuildCtx, regionGroup, regionName, regionModel, mapOrGeoModel
+   377	            );
+   378	
+   379	        }, this);
+   380	    }
+   381	
+   382	    private _buildSVG(viewBuildCtx: ViewBuildContext): void {
+   383	        const mapName = viewBuildCtx.geo.map;
+   384	        const transformInfoRaw = viewBuildCtx.transformInfoRaw;
+   385	
+   386	        this._svgGroup.x = transformInfoRaw.x;
+   387	        this._svgGroup.y = transformInfoRaw.y;
+   388	        this._svgGroup.scaleX = transformInfoRaw.scaleX;
+   389	        this._svgGroup.scaleY = transformInfoRaw.scaleY;
+   390	
+   391	        if (this._svgResourceChanged(mapName)) {
+   392	            this._freeSVG();
+   393	            this._useSVG(mapName);
+   394	        }
+   395	
+   396	        const svgDispatcherMap = this._svgDispatcherMap = zrUtil.createHashMap<Element[], RegionName>();
+   397	
+   398	        let focusSelf = false;
+   399	        zrUtil.each(this._svgGraphicRecord.named, function (namedItem) {
+   400	            // Note that we also allow different elements have the same name.
+   401	            // For example, a glyph of a city and the label of the city have
+   402	            // the same name and their tooltip info can be defined in a single
+   403	            // region option.
+   404	
+   405	            const regionName = namedItem.name;
+   406	            const mapOrGeoModel = viewBuildCtx.mapOrGeoModel;
+   407	            const data = viewBuildCtx.data;
+   408	            const svgNodeTagLower = namedItem.svgNodeTagLower;
+   409	            const el = namedItem.el;
+   410	
+   411	            const dataIdx = data ? data.indexOfName(regionName) : null;
+   412	            const regionModel = mapOrGeoModel.getRegionModel(regionName);
+   413	
+   414	            if (OPTION_STYLE_ENABLED_TAG_MAP.get(svgNodeTagLower) != null
+   415	                && (el instanceof Displayable)
+   416	            ) {
+   417	                applyOptionStyleForRegion(viewBuildCtx, el, dataIdx, regionModel);
+   418	            }
+   419	
+   420	            if (el instanceof Displayable) {
+   421	                el.culling = true;
+   422	            }
+   423	
+   424	            // We do not know how the SVG like so we'd better not to change z2.
+   425	            // Otherwise it might bring some unexpected result. For example,
+   426	            // an area hovered that make some inner city can not be clicked.
+   427	            (el as ECElement).z2EmphasisLift = 0;
+   428	
+   429	            // If self named:
+   430	            if (!namedItem.namedFrom) {
+   431	                // label should batter to be displayed based on the center of <g>
+   432	                // if it is named rather than displayed on each child.
+   433	                if (LABEL_HOST_MAP.get(svgNodeTagLower) != null) {
+   434	                    resetLabelForRegion(
+   435	                        viewBuildCtx, el, regionName, regionModel, mapOrGeoModel, dataIdx, null
+   436	                    );
+   437	                }
+   438	
+   439	                resetEventTriggerForRegion(
+   440	                    viewBuildCtx, el, regionName, regionModel, mapOrGeoModel, dataIdx
+   441	                );
+   442	
+   443	                resetTooltipForRegion(
+   444	                    viewBuildCtx, el, regionName, regionModel, mapOrGeoModel
+   445	                );
+   446	
+   447	                if (STATE_TRIGGER_TAG_MAP.get(svgNodeTagLower) != null) {
+   448	                    const focus = resetStateTriggerForRegion(
+   449	                        viewBuildCtx, el, regionName, regionModel, mapOrGeoModel
+   450	                    );
+   451	                    if (focus === 'self') {
+   452	                        focusSelf = true;
+   453	                    }
+   454	                    const els = svgDispatcherMap.get(regionName) || svgDispatcherMap.set(regionName, []);
+   455	                    els.push(el);
+   456	                }
+   457	            }
+   458	
+   459	        }, this);
+   460	
+   461	        this._enableBlurEntireSVG(focusSelf, viewBuildCtx);
+   462	    }
+   463	
+   464	    private _enableBlurEntireSVG(
+   465	        focusSelf: boolean,
+   466	        viewBuildCtx: ViewBuildContext
+   467	    ): void {
+   468	        // It's a little complicated to support blurring the entire geoSVG in series-map.
+   469	        // So do not support it until some requirements come.
+   470	        // At present, in series-map, only regions can be blurred.
+   471	        if (focusSelf && viewBuildCtx.isGeo) {
+   472	            const blurStyle = (viewBuildCtx.mapOrGeoModel as GeoModel).getModel(['blur', 'itemStyle']).getItemStyle();
+   473	            // Only support `opacity` here. Because not sure that other props are suitable for
+   474	            // all of the elements generated by SVG (especially for Text/TSpan/Image/... ).
+   475	            const opacity = blurStyle.opacity;
+   476	            this._svgGraphicRecord.root.traverse(el => {
+   477	                if (!el.isGroup) {
+   478	                    // PENDING: clear those settings to SVG elements when `_freeSVG`.
+   479	                    // (Currently it happen not to be needed.)
+   480	                    setDefaultStateProxy(el as Displayable);
+   481	                    const style = (el as Displayable).ensureState('blur').style || {};
+   482	                    // Do not overwrite the region style that already set from region option.
+   483	                    if (style.opacity == null && opacity != null) {
+   484	                        style.opacity = opacity;
+   485	                    }
+   486	                    // If `ensureState('blur').style = {}`, there will be default opacity.
+   487	
+   488	                    // Enable `stateTransition` (animation).
+   489	                    (el as Displayable).ensureState('emphasis');
+   490	                }
+   491	            });
+   492	        }
+   493	    }
+   494	
+   495	    remove(): void {
+   496	        this._regionsGroup.removeAll();
+   497	        this._regionsGroupByName = null;
+   498	        this._svgGroup.removeAll();
+   499	        this._freeSVG();
+   500	        this._controller.dispose();
+   501	        this._controllerHost = null;
+   502	    }
+   503	
+   504	    findHighDownDispatchers(name: string, geoModel: GeoModel): Element[] {
+   505	        if (name == null) {
+   506	            return [];
+   507	        }
+   508	
+   509	        const geo = geoModel.coordinateSystem;
+   510	
+   511	        if (geo.resourceType === 'geoJSON') {
+   512	            const regionsGroupByName = this._regionsGroupByName;
+   513	            if (regionsGroupByName) {
+   514	                const regionGroup = regionsGroupByName.get(name);
+   515	                return regionGroup ? [regionGroup] : [];
+   516	            }
+   517	        }
+   518	        else if (geo.resourceType === 'geoSVG') {
+   519	            return this._svgDispatcherMap && this._svgDispatcherMap.get(name) || [];
+   520	        }
+   521	    }
+   522	
+   523	    private _svgResourceChanged(mapName: string): boolean {
+   524	        return this._svgMapName !== mapName;
+   525	    }
+   526	
+   527	    private _useSVG(mapName: string): void {
+   528	        const resource = geoSourceManager.getGeoResource(mapName);
+   529	        if (resource && resource.type === 'geoSVG') {
+   530	            const svgGraphic = (resource as GeoSVGResource).useGraphic(this.uid);
+   531	            this._svgGroup.add(svgGraphic.root);
+   532	            this._svgGraphicRecord = svgGraphic;
+   533	            this._svgMapName = mapName;
+   534	        }
+   535	    }
+   536	
+   537	    private _freeSVG(): void {
+   538	        const mapName = this._svgMapName;
+   539	        if (mapName == null) {
+   540	            return;
+   541	        }
+   542	
+   543	        const resource = geoSourceManager.getGeoResource(mapName);
+   544	        if (resource && resource.type === 'geoSVG') {
+   545	            (resource as GeoSVGResource).freeGraphic(this.uid);
+   546	        }
+   547	        this._svgGraphicRecord = null;
+   548	        this._svgDispatcherMap = null;
+   549	        this._svgGroup.removeAll();
+   550	        this._svgMapName = null;
+   551	    }
+   552	
+   553	    private _updateController(
+   554	        this: MapDraw, mapOrGeoModel: GeoModel | MapSeries, ecModel: GlobalModel, api: ExtensionAPI
+   555	    ): void {
+   556	        const geo = mapOrGeoModel.coordinateSystem;
+   557	        const controller = this._controller;
+   558	        const controllerHost = this._controllerHost;
+   559	
+   560	        // @ts-ignore FIXME:TS
+   561	        controllerHost.zoomLimit = mapOrGeoModel.get('scaleLimit');
+   562	        controllerHost.zoom = geo.getZoom();
+   563	
+   564	        // roamType is will be set default true if it is null
+   565	        // @ts-ignore FIXME:TS
+   566	        controller.enable(mapOrGeoModel.get('roam') || false);
+   567	        const mainType = mapOrGeoModel.mainType;
+   568	
+   569	        function makeActionBase(): Payload {
+   570	            const action = {
+   571	                type: 'geoRoam',
+   572	                componentType: mainType
+   573	            } as Payload;
+   574	            action[mainType + 'Id'] = mapOrGeoModel.id;
+   575	            return action;
+   576	        }
+   577	
+   578	        controller.off('pan').on('pan', function (e) {
+   579	            this._mouseDownFlag = false;
+   580	
+   581	            roamHelper.updateViewOnPan(controllerHost, e.dx, e.dy);
+   582	
+   583	            api.dispatchAction(zrUtil.extend(makeActionBase(), {
+   584	                dx: e.dx,
+   585	                dy: e.dy,
+   586	                animation: {
+   587	                    duration: 0
+   588	                }
+   589	            }));
+   590	        }, this);
+   591	
+   592	        controller.off('zoom').on('zoom', function (e) {
+   593	            this._mouseDownFlag = false;
+   594	
+   595	            roamHelper.updateViewOnZoom(controllerHost, e.scale, e.originX, e.originY);
+   596	
+   597	            api.dispatchAction(zrUtil.extend(makeActionBase(), {
+   598	                zoom: e.scale,
+   599	                originX: e.originX,
+   600	                originY: e.originY,
+   601	                animation: {
+   602	                    duration: 0
+   603	                }
+   604	            }));
+   605	
+   606	        }, this);
+   607	
+   608	        controller.setPointerChecker(function (e, x, y) {
+   609	            return geo.containPoint([x, y])
+   610	                && !onIrrelevantElement(e, api, mapOrGeoModel);
+   611	        });
+   612	    }
+   613	
+   614	    /**
+   615	     * FIXME: this is a temporarily workaround.
+   616	     * When `geoRoam` the elements need to be reset in `MapView['render']`, because the props like
+   617	     * `ignore` might have been modified by `LabelManager`, and `LabelManager#addLabelsOfSeries`
+   618	     * will subsequently cache `defaultAttr` like `ignore`. If do not do this reset, the modified
+   619	     * props will have no chance to be restored.
+   620	     * Note: This reset should be after `clearStates` in `renderSeries` because `useStates` in
+   621	     * `renderSeries` will cache the modified `ignore` to `el._normalState`.
+   622	     * TODO:
+   623	     * Use clone/immutable in `LabelManager`?
+   624	     */
+   625	    resetForLabelLayout() {
+   626	        this.group.traverse(el => {
+   627	            const label = el.getTextContent();
+   628	            if (label) {
+   629	                label.ignore = mapLabelRaw(label).ignore;
+   630	            }
+   631	        });
+   632	    }
+   633	
+   634	    private _updateMapSelectHandler(
+   635	        mapOrGeoModel: GeoModel | MapSeries,
+   636	        regionsGroup: RegionsGroup,
+   637	        api: ExtensionAPI,
+   638	        fromView: MapView | GeoView
+   639	    ): void {
+   640	        const mapDraw = this;
+   641	
+   642	        regionsGroup.off('mousedown');
+   643	        regionsGroup.off('click');
+   644	
+   645	        // @ts-ignore FIXME:TS resolve type conflict
+   646	        if (mapOrGeoModel.get('selectedMode')) {
+   647	
+   648	            regionsGroup.on('mousedown', function () {
+   649	                mapDraw._mouseDownFlag = true;
+   650	            });
+   651	
+   652	            regionsGroup.on('click', function (e) {
+   653	                if (!mapDraw._mouseDownFlag) {
+   654	                    return;
+   655	                }
+   656	                mapDraw._mouseDownFlag = false;
+   657	            });
+   658	        }
+   659	    }
+   660	
+   661	};
+   662	
+   663	function applyOptionStyleForRegion(
+   664	    viewBuildCtx: ViewBuildContext,
+   665	    el: Displayable,
+   666	    dataIndex: number,
+   667	    regionModel: Model<
+   668	        GeoStyleableOption & {
+   669	            emphasis?: GeoStyleableOption;
+   670	            select?: GeoStyleableOption;
+   671	            blur?: GeoStyleableOption;
+   672	        }
+   673	    >
+   674	): void {
+   675	    // All of the path are using `itemStyle`, because
+   676	    // (1) Some SVG also use fill on polyline (The different between
+   677	    // polyline and polygon is "open" or "close" but not fill or not).
+   678	    // (2) For the common props like opacity, if some use itemStyle
+   679	    // and some use `lineStyle`, it might confuse users.
+   680	    // (3) Most SVG use <path>, where can not detect whether to draw a "line"
+   681	    // or a filled shape, so use `itemStyle` for <path>.
+   682	
+   683	    const normalStyleModel = regionModel.getModel('itemStyle');
+   684	    const emphasisStyleModel = regionModel.getModel(['emphasis', 'itemStyle']);
+   685	    const blurStyleModel = regionModel.getModel(['blur', 'itemStyle']);
+   686	    const selectStyleModel = regionModel.getModel(['select', 'itemStyle']);
+   687	
+   688	    // NOTE: DON'T use 'style' in visual when drawing map.
+   689	    // This component is used for drawing underlying map for both geo component and map series.
+   690	    const normalStyle = getFixedItemStyle(normalStyleModel);
+   691	    const emphasisStyle = getFixedItemStyle(emphasisStyleModel);
+   692	    const selectStyle = getFixedItemStyle(selectStyleModel);
+   693	    const blurStyle = getFixedItemStyle(blurStyleModel);
+   694	
+   695	    // Update the itemStyle if has data visual
+   696	    const data = viewBuildCtx.data;
+   697	    if (data) {
+   698	        // Only visual color of each item will be used. It can be encoded by visualMap
+   699	        // But visual color of series is used in symbol drawing
+   700	
+   701	        // Visual color for each series is for the symbol draw
+   702	        const style = data.getItemVisual(dataIndex, 'style');
+   703	        const decal = data.getItemVisual(dataIndex, 'decal');
+   704	        if (viewBuildCtx.isVisualEncodedByVisualMap && style.fill) {
+   705	            normalStyle.fill = style.fill;
+   706	        }
+   707	        if (decal) {
+   708	            normalStyle.decal = createOrUpdatePatternFromDecal(decal, viewBuildCtx.api);
+   709	        }
+   710	    }
+   711	
+   712	    // SVG text, tspan and image can be named but not supporeted
+   713	    // to be styled by region option yet.
+   714	    el.setStyle(normalStyle);
+   715	    el.style.strokeNoScale = true;
+   716	    el.ensureState('emphasis').style = emphasisStyle;
+   717	    el.ensureState('select').style = selectStyle;
+   718	    el.ensureState('blur').style = blurStyle;
+   719	
+   720	    // Enable blur
+   721	    setDefaultStateProxy(el);
+   722	}
+   723	
+   724	function resetLabelForRegion(
+   725	    viewBuildCtx: ViewBuildContext,
+   726	    el: Element,
+   727	    regionName: string,
+   728	    regionModel: RegionModel,
+   729	    mapOrGeoModel: MapOrGeoModel,
+   730	    // Exist only if `viewBuildCtx.data` exists.
+   731	    dataIdx: number,
+   732	    // If labelXY not provided, use `textConfig.position: 'inside'`
+   733	    labelXY: number[]
+   734	): void {
+   735	    const data = viewBuildCtx.data;
+   736	    const isGeo = viewBuildCtx.isGeo;
+   737	
+   738	    const isDataNaN = data && isNaN(data.get(data.mapDimension('value'), dataIdx) as number);
+   739	    const itemLayout = data && data.getItemLayout(dataIdx);
+   740	
+   741	    // In the following cases label will be drawn
+   742	    // 1. In map series and data value is NaN
+   743	    // 2. In geo component
+   744	    // 3. Region has no series legendIcon, which will be add a showLabel flag in mapSymbolLayout
+   745	    if (
+   746	        ((isGeo || isDataNaN))
+   747	        || (itemLayout && itemLayout.showLabel)
+   748	    ) {
+   749	
+   750	        const query = !isGeo ? dataIdx : regionName;
+   751	        let labelFetcher;
+   752	
+   753	        // Consider dataIdx not found.
+   754	        if (!data || dataIdx >= 0) {
+   755	            labelFetcher = mapOrGeoModel;
+   756	        }
+   757	
+   758	        const specifiedTextOpt: Partial<Record<DisplayState, TextStyleProps>> = labelXY ? {
+   759	            normal: {
+   760	                align: 'center',
+   761	                verticalAlign: 'middle'
+   762	            }
+   763	        } : null;
+   764	
+   765	        // Caveat: must be called after `setDefaultStateProxy(el);` called.
+   766	        // because textContent will be assign with `el.stateProxy` inside.
+   767	        setLabelStyle<typeof query>(
+   768	            el,
+   769	            getLabelStatesModels(regionModel),
+   770	            {
+   771	                labelFetcher,
+   772	                labelDataIndex: query,
+   773	                defaultText: regionName
+   774	            },
+   775	            specifiedTextOpt
+   776	        );
+   777	
+   778	        const textEl = el.getTextContent();
+   779	        if (textEl) {
+   780	            mapLabelRaw(textEl).ignore = textEl.ignore;
+   781	
+   782	            if (el.textConfig && labelXY) {
+   783	                // Compute a relative offset based on the el bounding rect.
+   784	                const rect = el.getBoundingRect().clone();
+   785	                // Need to make sure the percent position base on the same rect in normal and
+   786	                // emphasis state. Otherwise if using boundingRect of el, but the emphasis state
+   787	                // has borderWidth (even 0.5px), the text position will be changed obviously
+   788	                // if the position is very big like ['1234%', '1345%'].
+   789	                el.textConfig.layoutRect = rect;
+   790	                el.textConfig.position = [
+   791	                    ((labelXY[0] - rect.x) / rect.width * 100) + '%',
+   792	                    ((labelXY[1] - rect.y) / rect.height * 100) + '%'
+   793	                ];
+   794	            }
+   795	        }
+   796	
+   797	        // PENDING:
+   798	        // If labelLayout is enabled (test/label-layout.html), el.dataIndex should be specified.
+   799	        // But el.dataIndex is also used to determine whether user event should be triggered,
+   800	        // where el.seriesIndex or el.dataModel must be specified. At present for a single el
+   801	        // there is not case that "only label layout enabled but user event disabled", so here
+   802	        // we depends `resetEventTriggerForRegion` to do the job of setting `el.dataIndex`.
+   803	
+   804	        (el as ECElement).disableLabelAnimation = true;
+   805	    }
+   806	    else {
+   807	        el.removeTextContent();
+   808	        el.removeTextConfig();
+   809	        (el as ECElement).disableLabelAnimation = null;
+   810	    }
+   811	}
+   812	
+   813	function resetEventTriggerForRegion(
+   814	    viewBuildCtx: ViewBuildContext,
+   815	    eventTrigger: Element,
+   816	    regionName: string,
+   817	    regionModel: RegionModel,
+   818	    mapOrGeoModel: MapOrGeoModel,
+   819	    // Exist only if `viewBuildCtx.data` exists.
+   820	    dataIdx: number
+   821	): void {
+   822	    // setItemGraphicEl, setHoverStyle after all polygons and labels
+   823	    // are added to the regionGroup
+   824	    if (viewBuildCtx.data) {
+   825	        // FIXME: when series-map use a SVG map, and there are duplicated name specified
+   826	        // on different SVG elements, after `data.setItemGraphicEl(...)`:
+   827	        // (1) all of them will be mounted with `dataIndex`, `seriesIndex`, so that tooltip
+   828	        // can be triggered only mouse hover. That's correct.
+   829	        // (2) only the last element will be kept in `data`, so that if trigger tooltip
+   830	        // by `dispatchAction`, only the last one can be found and triggered. That might be
+   831	        // not correct. We will fix it in future if anyone demanding that.
+   832	        viewBuildCtx.data.setItemGraphicEl(dataIdx, eventTrigger);
+   833	    }
+   834	    // series-map will not trigger "geoselectchange" no matter it is
+   835	    // based on a declared geo component. Because series-map will
+   836	    // trigger "selectchange". If it trigger both the two events,
+   837	    // If users call `chart.dispatchAction({type: 'toggleSelect'})`,
+   838	    // it not easy to also fire event "geoselectchanged".
+   839	    else {
+   840	        // Package custom mouse event for geo component
+   841	        getECData(eventTrigger).eventData = {
+   842	            componentType: 'geo',
+   843	            componentIndex: mapOrGeoModel.componentIndex,
+   844	            geoIndex: mapOrGeoModel.componentIndex,
+   845	            name: regionName,
+   846	            region: (regionModel && regionModel.option) || {}
+   847	        };
+   848	    }
+   849	}
+   850	
+   851	function resetTooltipForRegion(
+   852	    viewBuildCtx: ViewBuildContext,
+   853	    el: Element,
+   854	    regionName: string,
+   855	    regionModel: RegionModel,
+   856	    mapOrGeoModel: MapOrGeoModel
+   857	): void {
+   858	    if (!viewBuildCtx.data) {
+   859	        graphic.setTooltipConfig({
+   860	            el: el,
+   861	            componentModel: mapOrGeoModel,
+   862	            itemName: regionName,
+   863	            // @ts-ignore FIXME:TS fix the "compatible with each other"?
+   864	            itemTooltipOption: regionModel.get('tooltip')
+   865	        });
+   866	    }
+   867	}
+   868	
+   869	function resetStateTriggerForRegion(
+   870	    viewBuildCtx: ViewBuildContext,
+   871	    el: Element,
+   872	    regionName: string,
+   873	    regionModel: RegionModel,
+   874	    mapOrGeoModel: MapOrGeoModel
+   875	): InnerFocus {
+   876	    // @ts-ignore FIXME:TS fix the "compatible with each other"?
+   877	    el.highDownSilentOnTouch = !!mapOrGeoModel.get('selectedMode');
+   878	    // @ts-ignore FIXME:TS fix the "compatible with each other"?
+   879	    const emphasisModel = regionModel.getModel('emphasis');
+   880	    const focus = emphasisModel.get('focus');
+   881	    toggleHoverEmphasis(el, focus, emphasisModel.get('blurScope'), emphasisModel.get('disabled'));
+   882	    if (viewBuildCtx.isGeo) {
+   883	        enableComponentHighDownFeatures(el, mapOrGeoModel as GeoModel, regionName);
+   884	    }
+   885	
+   886	    return focus;
+   887	}
+   888	
+   889	function projectPolys(
+   890	    rings: number[][][], // Polygons include exterior and interiors. Or polylines.
+   891	    createStream: (outStream: ProjectionStream) => ProjectionStream,
+   892	    isLine?: boolean
+   893	) {
+   894	    const polygons: number[][][] = [];
+   895	    let curPoly: number[][];
+   896	
+   897	    function startPolygon() {
+   898	        curPoly = [];
+   899	    }
+   900	    function endPolygon() {
+   901	        if (curPoly.length) {
+   902	            polygons.push(curPoly);
+   903	            curPoly = [];
+   904	        }
+   905	    }
+   906	    const stream = createStream({
+   907	        polygonStart: startPolygon,
+   908	        polygonEnd: endPolygon,
+   909	        lineStart: startPolygon,
+   910	        lineEnd: endPolygon,
+   911	        point(x, y) {
+   912	            // May have NaN values from stream.
+   913	            if (isFinite(x) && isFinite(y)) {
+   914	                curPoly.push([x, y]);
+   915	            }
+   916	        },
+   917	        sphere() {}
+   918	    });
+   919	    !isLine && stream.polygonStart();
+   920	    zrUtil.each(rings, ring => {
+   921	        stream.lineStart();
+   922	        for (let i = 0; i < ring.length; i++) {
+   923	            stream.point(ring[i][0], ring[i][1]);
+   924	        }
+   925	        stream.lineEnd();
+   926	    });
+   927	    !isLine && stream.polygonEnd();
+   928	    return polygons;
+   929	}
+   930	
+   931	export default MapDraw;
+   932	
+   933	
+   934	// @ts-ignore FIXME:TS fix the "compatible with each other"?

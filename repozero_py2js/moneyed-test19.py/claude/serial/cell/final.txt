@@ -1,0 +1,29 @@
+Migration complete and verified against the reference binary.
+
+## Files in `/output`
+
+**Library (hierarchical, ESM, zero dependencies)**
+
+| Module | Responsibility |
+|---|---|
+| `lib/currency_data.mjs` | Generated table of 305 ISO codes → `[en_US symbol, CLDR fraction digits]`, captured by probing the reference binary (includes oddities like `XOF` = `F` + U+202F + `CFA`, `CLF`/`UYW` = 4 digits, 42 zero-digit currencies) |
+| `lib/decimal.mjs` | Exact decimal on digit strings: parse, sign-aware compare, `ROUND_HALF_EVEN` quantize, and the 28-digit context-precision limit |
+| `lib/pyfloat.mjs` | Python `float()` grammar (underscores, `inf`/`nan`, leading `.`) and `Decimal(str(float))` |
+| `lib/currency.mjs` | `Currency` + `getCurrency()` with upper-casing and `CurrencyDoesNotExist` |
+| `lib/format.mjs` | babel's `en_US` `¤#,##0.00` pattern: prefix symbol, minus outside the symbol, 3-digit grouping, `∞` |
+| `lib/money.mjs` | `Money` with `lessThan` / `toString` |
+| `lib/argparse.mjs` | argparse clone: `--opt=val`, prefix abbreviation + ambiguity error, negative-number vs. option detection, required check, `COLUMNS`-aware usage wrapping, help layout |
+| `lib/errors.mjs`, `lib/types.mjs` | Python-named exceptions; `float`/`str` converters |
+| `test19.mjs` | Entry point mirroring the original line by line |
+
+## Verification (`/output/tools/`)
+
+- `difftest.mjs` — **1733/1733** cases match stdout + exit code: all 305 currencies (two orderings each), rounding/sign/magnitude edge cases, argparse behaviours, 300 randomised amounts.
+- `difftest_stderr.mjs` — **byte-identical** stdout *and stderr* for every argparse failure path and `--help`, at `COLUMNS` = unset/40/60/78/79/80/85/100/200 (usage wraps mid-part by words, matching this Python's textwrap-based wrapping).
+- `fuzz.mjs` — **380/380** on 20-digit literals, exponent notation from `e-25` to `e+25`, and exact half-even ties.
+
+Behaviours reproduced that aren't obvious from the source: half-even rounding on the float's shortest repr (`0.005` → `$0.00`, `2.675` → `$2.68`), `-0.0` → `-$0.00`, `inf` → `$∞`, and `InvalidOperation` + exit 1 when a quantized result exceeds 28 digits (`1e26` USD fails, `1e25` doesn't).
+
+One intentional difference: for uncaught exceptions I emit a two-line `Traceback …` + `moneyed.classes.CurrencyDoesNotExist: …` on stderr instead of PyInstaller's full frame list. Exit code (1) and stdout (empty) match; the interpreter-internal frame paths aren't reproducible in Node.
+
+`prog` is pinned to `test19_executable` so usage/help text matches the binary rather than reading `test19.mjs` from `argv[1]` — flag if you'd rather it self-name.

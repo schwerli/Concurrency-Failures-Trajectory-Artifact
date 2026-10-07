@@ -1,0 +1,47 @@
+diff --git a/lib/matplotlib/dates.py b/lib/matplotlib/dates.py
+index 4d8ddf3ee5..c43e566242 100644
+--- a/lib/matplotlib/dates.py
++++ b/lib/matplotlib/dates.py
+@@ -796,8 +796,10 @@ class ConciseDateFormatter(ticker.Formatter):
+         # mostly 0: years,  1: months,  2: days,
+         # 3: hours, 4: minutes, 5: seconds, 6: microseconds
+         for level in range(5, -1, -1):
+-            if len(np.unique(tickdate[:, level])) > 1:
+-                if level < 2:
++            unique = np.unique(tickdate[:, level])
++            if len(unique) > 1:
++                # if 1 is included in unique, the year is shown in ticks
++                if level < 2 and np.any(unique == 1):
+                     show_offset = False
+                 break
+             elif level == 0:
+diff --git a/lib/matplotlib/tests/test_dates.py b/lib/matplotlib/tests/test_dates.py
+index a78c39c560..29a33b7218 100644
+--- a/lib/matplotlib/tests/test_dates.py
++++ b/lib/matplotlib/tests/test_dates.py
+@@ -613,6 +613,25 @@ def test_concise_formatter_show_offset(t_delta, expected):
+     assert formatter.get_offset() == expected
+ 
+ 
++def test_concise_formatter_show_offset_no_january():
++    # If the ticks are months but January is not among them, the year is not
++    # in any of the tick labels, so it must be shown in the offset.
++    d1 = datetime.datetime(1997, 2, 1)
++    d2 = d1 + datetime.timedelta(weeks=26)
++
++    fig, ax = plt.subplots()
++    locator = mdates.AutoDateLocator()
++    formatter = mdates.ConciseDateFormatter(locator)
++    ax.xaxis.set_major_locator(locator)
++    ax.xaxis.set_major_formatter(formatter)
++
++    ax.plot([d1, d2], [0, 0])
++    fig.canvas.draw()
++    assert [st.get_text() for st in ax.get_xticklabels()] == [
++        'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug']
++    assert formatter.get_offset() == '1997'
++
++
+ def test_offset_changes():
+     fig, ax = plt.subplots()
+ 

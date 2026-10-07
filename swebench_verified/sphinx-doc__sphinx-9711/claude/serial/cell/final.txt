@@ -1,0 +1,21 @@
+`needs_extensions` now compares versions numerically instead of lexicographically.
+
+**Fix** (`sphinx/extension.py:56-68`): parse both the required and loaded version with `packaging.version.Version` (already a Sphinx install dependency) and compare those. If either string isn't PEP 440-parseable, `InvalidVersion` is caught and the old string comparison is used as a fallback, so no previously-accepted setup starts erroring on an exception.
+
+**Verified end-to-end**, not just via unit tests — built a minimal project with `needs_extensions = {'myext': '0.6'}` and an extension reporting varying versions:
+
+| loaded version | before | after |
+|---|---|---|
+| `0.10.0` | ✗ version error | ✓ builds |
+| `0.6` / `0.6.0` | ✓ | ✓ |
+| `0.5.0` | ✗ | ✗ (correctly rejected) |
+| `0.4.dev0` | ✗ | ✗ |
+| `unknown version` | ✗ | ✗ |
+
+The reported case (min `0.6`, sphinx-gallery `0.10.0`) failed on the unmodified tree with exactly the error from the issue and now succeeds.
+
+**Tests**: added `tests/test_extension.py` (13 cases) covering fulfilled/unfulfilled requirements, `unknown version`, the not-loaded warning, and a parametrized comparison table including the `0.6` vs `0.10.0` regression and the non-PEP-440 fallback. All pass.
+
+**Full suite**: 1696 passed, 6 failed — the identical 6 failures occur on the unmodified tree (imagemagick/latex/locale/network dependent), plus `test_build_linkcheck.py::test_defaults` which needs network. No new failures.
+
+One judgment call worth flagging: for unparseable versions the fallback keeps the old lexicographic behavior rather than raising or accepting unconditionally. That preserves today's semantics for non-standard versioning schemes, but it means such extensions can still be misjudged — the same class of bug, just now confined to versions PEP 440 can't describe.

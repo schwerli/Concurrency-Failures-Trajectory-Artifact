@@ -1,0 +1,110 @@
+diff --git a/doc/whats_new/v0.21.rst b/doc/whats_new/v0.21.rst
+index 7bc4389e5..a5f828bf1 100644
+--- a/doc/whats_new/v0.21.rst
++++ b/doc/whats_new/v0.21.rst
+@@ -208,6 +208,12 @@ Support for Python 3.4 and below has been officially dropped.
+   :func:`~model_selection.validation_curve` only the latter is required.
+   :issue:`12613` and :issue:`12669` by :user:`Marc Torrellas <marctorrellas>`.
+ 
++- |Fix| Fixed a bug in :class:`model_selection.StratifiedKFold` where the
++  ``shuffle=True`` option only shuffled the order of the folds instead of
++  shuffling the samples within each class before splitting them into
++  batches, so that different ``random_state`` values produced the same
++  folds. :issue:`13124` by :user:`Hanmin Qin <qinhanmin2014>`.
++
+ :mod:`sklearn.neighbors`
+ ........................
+ 
+diff --git a/sklearn/model_selection/_split.py b/sklearn/model_selection/_split.py
+index 24394f869..c5476d251 100644
+--- a/sklearn/model_selection/_split.py
++++ b/sklearn/model_selection/_split.py
+@@ -576,8 +576,9 @@ class StratifiedKFold(_BaseKFold):
+             ``n_splits`` default value will change from 3 to 5 in v0.22.
+ 
+     shuffle : boolean, optional
+-        Whether to shuffle each stratification of the data before splitting
+-        into batches.
++        Whether to shuffle each class's samples before splitting into
++        batches. Note that the samples within each split will not be
++        shuffled.
+ 
+     random_state : int, RandomState instance or None, optional, default=None
+         If int, random_state is the seed used by the random number generator;
+@@ -620,7 +621,7 @@ class StratifiedKFold(_BaseKFold):
+         super().__init__(n_splits, shuffle, random_state)
+ 
+     def _make_test_folds(self, X, y=None):
+-        rng = self.random_state
++        rng = check_random_state(self.random_state)
+         y = np.asarray(y)
+         type_of_target_y = type_of_target(y)
+         allowed_target_types = ('binary', 'multiclass')
+@@ -630,9 +631,15 @@ class StratifiedKFold(_BaseKFold):
+                     allowed_target_types, type_of_target_y))
+ 
+         y = column_or_1d(y)
+-        n_samples = y.shape[0]
+-        unique_y, y_inversed = np.unique(y, return_inverse=True)
+-        y_counts = np.bincount(y_inversed)
++
++        _, y_idx, y_inv = np.unique(y, return_index=True, return_inverse=True)
++        # y_inv encodes y according to lexicographic order. We invert y_idx to
++        # map the classes so that they are encoded by order of appearance:
++        # 0 represents the first label appearing in y, 1 the second, etc.
++        _, class_perm = np.unique(y_idx, return_inverse=True)
++        y_encoded = class_perm[y_inv]
++
++        y_counts = np.bincount(y_encoded)
+         min_groups = np.min(y_counts)
+         if np.all(self.n_splits > y_counts):
+             raise ValueError("n_splits=%d cannot be greater than the"
+@@ -656,10 +663,10 @@ class StratifiedKFold(_BaseKFold):
+                   random_state=rng).split(np.zeros(max(count, self.n_splits)))
+             for count in y_counts]
+ 
+-        test_folds = np.zeros(n_samples, dtype=np.int)
++        test_folds = np.zeros(len(y), dtype=np.int)
+         for test_fold_indices, per_cls_splits in enumerate(zip(*per_cls_cvs)):
+-            for cls, (_, test_split) in zip(unique_y, per_cls_splits):
+-                cls_test_folds = test_folds[y == cls]
++            for cls, (_, test_split) in enumerate(per_cls_splits):
++                cls_test_folds = test_folds[y_encoded == cls]
+                 # the test split can be too big because we used
+                 # KFold(...).split(X[:max(c, n_splits)]) when data is not 100%
+                 # stratifiable for all the classes
+@@ -667,7 +674,7 @@ class StratifiedKFold(_BaseKFold):
+                 # If this is the case, let's trim it:
+                 test_split = test_split[test_split < len(cls_test_folds)]
+                 cls_test_folds[test_split] = test_fold_indices
+-                test_folds[y == cls] = cls_test_folds
++                test_folds[y_encoded == cls] = cls_test_folds
+ 
+         return test_folds
+ 
+diff --git a/sklearn/model_selection/tests/test_split.py b/sklearn/model_selection/tests/test_split.py
+index 5981df285..3adb3bd72 100644
+--- a/sklearn/model_selection/tests/test_split.py
++++ b/sklearn/model_selection/tests/test_split.py
+@@ -494,6 +494,21 @@ def test_shuffle_stratifiedkfold():
+     check_cv_coverage(kf0, X_40, y, groups=None, expected_n_splits=5)
+ 
+ 
++def test_shuffle_stratifiedkfold_regression():
++    # Check that shuffle=True actually shuffles the samples within each
++    # class (and not only the order of the batches) so that different
++    # random states produce different folds.
++    # Regression test for issue #13124.
++    X = np.arange(20)
++    y = np.concatenate((np.ones(10), np.zeros(10)))
++
++    folds = {}
++    for seed in (1, 2):
++        skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=seed)
++        folds[seed] = sorted(tuple(test) for _, test in skf.split(X, y))
++    assert folds[1] != folds[2]
++
++
+ def test_kfold_can_detect_dependent_samples_on_digits():  # see #2372
+     # The digits samples are dependent: they are apparently grouped by authors
+     # although we don't have any information on the groups segment locations

@@ -1,0 +1,172 @@
+2026-08-14 22:15:04,933 - INFO - Creating container for django__django-14792...
+2026-08-14 22:15:05,039 - INFO - Container for django__django-14792 created: d4566e86fb4b44dade94051201c55dddf84f3fd9dce429ee46c4fe47e735d051
+2026-08-14 22:15:05,389 - INFO - Container for django__django-14792 started: d4566e86fb4b44dade94051201c55dddf84f3fd9dce429ee46c4fe47e735d051
+2026-08-14 22:15:05,390 - INFO - Intermediate patch for django__django-14792 written to logs/run_evaluation/formal-kimi-serial-django__django-14792/uiuc-kimi-serial/django__django-14792/patch.diff, now applying to container...
+2026-08-14 22:15:05,528 - INFO - >>>>> Applied Patch:
+Checking patch django/db/backends/sqlite3/base.py...
+Checking patch django/utils/timezone.py...
+Checking patch tests/timezones/tests.py...
+Checking patch tests/utils_tests/test_timezone.py...
+Applied patch django/db/backends/sqlite3/base.py cleanly.
+Applied patch django/utils/timezone.py cleanly.
+Applied patch tests/timezones/tests.py cleanly.
+Applied patch tests/utils_tests/test_timezone.py cleanly.
+
+2026-08-14 22:15:06,936 - INFO - Git diff before:
+diff --git a/django/db/backends/sqlite3/base.py b/django/db/backends/sqlite3/base.py
+index a64190f0d0..7f0e4f3c2d 100644
+--- a/django/db/backends/sqlite3/base.py
++++ b/django/db/backends/sqlite3/base.py
+@@ -438,9 +438,13 @@ def _sqlite_datetime_parse(dt, tzname=None, conn_tzname=None):
+             sign = tzname[sign_index]
+             tzname, offset = tzname.split(sign)
+             if offset:
+-                hours, minutes = offset.split(':')
++                hours, minutes = offset.split(':') if ':' in offset else (offset[:2], offset[2:])
+                 offset_delta = datetime.timedelta(hours=int(hours), minutes=int(minutes))
+                 dt += offset_delta if sign == '+' else -offset_delta
++            if not tzname:
++                # The time zone name is a fixed offset (e.g. '+0300'), the
++                # offset was already applied to the datetime.
++                return dt
+         dt = timezone.localtime(dt, pytz.timezone(tzname))
+     return dt
+ 
+diff --git a/django/utils/timezone.py b/django/utils/timezone.py
+index bb2b6b9594..1ca150f3e7 100644
+--- a/django/utils/timezone.py
++++ b/django/utils/timezone.py
+@@ -72,7 +72,16 @@ def get_current_timezone_name():
+ 
+ 
+ def _get_timezone_name(timezone):
+-    """Return the name of ``timezone``."""
++    """
++    Return the offset for fixed offset timezones, or the name of timezone if
++    not set.
++    """
++    try:
++        offset = timezone.utcoffset(None)
++    except Exception:
++        offset = None
++    if offset is not None:
++        timezone = get_fixed_timezone(offset)
+     return str(timezone)
+ 
+ # Timezone selection functions.
+diff --git a/tests/timezones/tests.py b/tests/timezones/tests.py
+index 7b54ec3bfc..088ebeb2d4 100644
+--- a/tests/timezones/tests.py
++++ b/tests/timezones/tests.py
+@@ -1001,7 +1001,7 @@ class TemplateTests(SimpleTestCase):
+ 
+         self.assertEqual(tpl.render(Context()), "Africa/Nairobi")
+         with timezone.override(UTC):
+-            self.assertEqual(tpl.render(Context()), "UTC")
++            self.assertEqual(tpl.render(Context()), "+0000")
+ 
+         tpl = Template(
+             "{% load tz %}{% timezone tz %}{% get_current_timezone as time_zone %}"
+diff --git a/tests/utils_tests/test_timezone.py b/tests/utils_tests/test_timezone.py
+index 2e28d3a9a5..4232075918 100644
+--- a/tests/utils_tests/test_timezone.py
++++ b/tests/utils_tests/test_timezone.py
+@@ -121,7 +121,7 @@ class TimezoneTests(SimpleTestCase):
+ 
+     def test_override_fixed_offset(self):
+         with timezone.override(datetime.timezone(datetime.timedelta(), 'tzname')):
+-            self.assertEqual(timezone.get_current_timezone_name(), 'tzname')
++            self.assertEqual(timezone.get_current_timezone_name(), '+0000')
+ 
+     def test_activate_invalid_timezone(self):
+         with self.assertRaisesMessage(ValueError, 'Invalid timezone: None'):
+@@ -274,3 +274,23 @@ class TimezoneTests(SimpleTestCase):
+     def test_fixedoffset_negative_timedelta(self):
+         delta = datetime.timedelta(hours=-2)
+         self.assertEqual(timezone.get_fixed_timezone(delta).utcoffset(None), delta)
++
++    def test_get_timezone_name(self):
++        # The offset must be returned for fixed offset timezones because
++        # the Etc/GMT zone names use the opposite sign convention, which
++        # reversed the offset in database queries.
++        for tz, expected in [
++            (pytz.timezone('Etc/GMT-10'), '+1000'),
++            (pytz.timezone('Etc/GMT+10'), '-1000'),
++        ]:
++            with self.subTest(tz=tz):
++                self.assertEqual(timezone._get_timezone_name(tz), expected)
++
++    @needs_zoneinfo
++    def test_get_timezone_name_zoneinfo(self):
++        for tz, expected in [
++            (zoneinfo.ZoneInfo('Etc/GMT-10'), '+1000'),
++            (zoneinfo.ZoneInfo('Etc/GMT+10'), '-1000'),
++        ]:
++            with self.subTest(tz=tz):
++                self.assertEqual(timezone._get_timezone_name(tz), expected)
+2026-08-14 22:15:06,936 - INFO - Eval script for django__django-14792 written to logs/run_evaluation/formal-kimi-serial-django__django-14792/uiuc-kimi-serial/django__django-14792/eval.sh; copying to container...
+2026-08-14 22:15:12,057 - INFO - Test runtime: 5.06 seconds
+2026-08-14 22:15:12,057 - INFO - Test output for django__django-14792 written to logs/run_evaluation/formal-kimi-serial-django__django-14792/uiuc-kimi-serial/django__django-14792/test_output.txt
+2026-08-14 22:15:12,121 - INFO - Git diff after:
+diff --git a/django/db/backends/sqlite3/base.py b/django/db/backends/sqlite3/base.py
+index a64190f0d0..7f0e4f3c2d 100644
+--- a/django/db/backends/sqlite3/base.py
++++ b/django/db/backends/sqlite3/base.py
+@@ -438,9 +438,13 @@ def _sqlite_datetime_parse(dt, tzname=None, conn_tzname=None):
+             sign = tzname[sign_index]
+             tzname, offset = tzname.split(sign)
+             if offset:
+-                hours, minutes = offset.split(':')
++                hours, minutes = offset.split(':') if ':' in offset else (offset[:2], offset[2:])
+                 offset_delta = datetime.timedelta(hours=int(hours), minutes=int(minutes))
+                 dt += offset_delta if sign == '+' else -offset_delta
++            if not tzname:
++                # The time zone name is a fixed offset (e.g. '+0300'), the
++                # offset was already applied to the datetime.
++                return dt
+         dt = timezone.localtime(dt, pytz.timezone(tzname))
+     return dt
+ 
+diff --git a/django/utils/timezone.py b/django/utils/timezone.py
+index bb2b6b9594..1ca150f3e7 100644
+--- a/django/utils/timezone.py
++++ b/django/utils/timezone.py
+@@ -72,7 +72,16 @@ def get_current_timezone_name():
+ 
+ 
+ def _get_timezone_name(timezone):
+-    """Return the name of ``timezone``."""
++    """
++    Return the offset for fixed offset timezones, or the name of timezone if
++    not set.
++    """
++    try:
++        offset = timezone.utcoffset(None)
++    except Exception:
++        offset = None
++    if offset is not None:
++        timezone = get_fixed_timezone(offset)
+     return str(timezone)
+ 
+ # Timezone selection functions.
+diff --git a/tests/timezones/tests.py b/tests/timezones/tests.py
+index 7b54ec3bfc..088ebeb2d4 100644
+--- a/tests/timezones/tests.py
++++ b/tests/timezones/tests.py
+@@ -1001,7 +1001,7 @@ class TemplateTests(SimpleTestCase):
+ 
+         self.assertEqual(tpl.render(Context()), "Africa/Nairobi")
+         with timezone.override(UTC):
+-            self.assertEqual(tpl.render(Context()), "UTC")
++            self.assertEqual(tpl.render(Context()), "+0000")
+ 
+         tpl = Template(
+             "{% load tz %}{% timezone tz %}{% get_current_timezone as time_zone %}"
+2026-08-14 22:15:12,121 - INFO - Git diff changed after running eval script
+2026-08-14 22:15:12,121 - INFO - Grading answer for django__django-14792...
+2026-08-14 22:15:12,122 - INFO - report: {'django__django-14792': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': False, 'tests_status': {'FAIL_TO_PASS': {'success': [], 'failure': ['The _get_timezone_name() helper must return the offset for fixed offset', 'test_is_aware (utils_tests.test_timezone.TimezoneTests)']}, 'PASS_TO_PASS': {'success': ['test_activate_invalid_timezone (utils_tests.test_timezone.TimezoneTests)', 'test_fixedoffset_negative_timedelta (utils_tests.test_timezone.TimezoneTests)', 'test_fixedoffset_timedelta (utils_tests.test_timezone.TimezoneTests)', 'test_get_default_timezone (utils_tests.test_timezone.TimezoneTests)', 'test_get_default_timezone_utc (utils_tests.test_timezone.TimezoneTests)', 'test_is_naive (utils_tests.test_timezone.TimezoneTests)', 'test_localdate (utils_tests.test_timezone.TimezoneTests)', 'test_make_aware (utils_tests.test_timezone.TimezoneTests)', 'test_make_aware2 (utils_tests.test_timezone.TimezoneTests)', 'test_make_aware_no_tz (utils_tests.test_timezone.TimezoneTests)', 'test_make_aware_pytz_ambiguous (utils_tests.test_timezone.TimezoneTests)', 'test_make_aware_pytz_non_existent (utils_tests.test_timezone.TimezoneTests)', 'test_make_aware_zoneinfo_ambiguous (utils_tests.test_timezone.TimezoneTests)', 'test_make_aware_zoneinfo_non_existent (utils_tests.test_timezone.TimezoneTests)', 'test_make_naive (utils_tests.test_timezone.TimezoneTests)', 'test_make_naive_no_tz (utils_tests.test_timezone.TimezoneTests)', 'test_make_naive_pytz (utils_tests.test_timezone.TimezoneTests)', 'test_make_naive_zoneinfo (utils_tests.test_timezone.TimezoneTests)', 'test_now (utils_tests.test_timezone.TimezoneTests)', 'test_override (utils_tests.test_timezone.TimezoneTests)', 'test_override_decorator (utils_tests.test_timezone.TimezoneTests)', 'test_override_string_tz (utils_tests.test_timezone.TimezoneTests)'], 'failure': ['test_override_fixed_offset (utils_tests.test_timezone.TimezoneTests)']}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for django__django-14792: resolved: False
+2026-08-14 22:15:12,122 - INFO - Attempting to stop container sweb.eval.django__django-14792.formal-kimi-serial-django__django-14792...
+2026-08-14 22:15:27,560 - INFO - Container sweb.eval.django__django-14792.formal-kimi-serial-django__django-14792 stopped successfully.
+2026-08-14 22:15:27,561 - INFO - Attempting to remove container sweb.eval.django__django-14792.formal-kimi-serial-django__django-14792...
+2026-08-14 22:15:30,350 - INFO - Container sweb.eval.django__django-14792.formal-kimi-serial-django__django-14792 removed successfully.

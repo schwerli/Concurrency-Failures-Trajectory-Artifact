@@ -1,0 +1,95 @@
+diff --git a/ChangeLog b/ChangeLog
+index 97af302a..59a2aecb 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -15,6 +15,11 @@ Release date: TBA
+ 
+ * ``raising-bad-type`` is now properly emitted when  raising a string
+ 
++* The ``similarities`` checker (``duplicate-code``) is now deactivated when
++  ``min-similarity-lines`` is set to ``0``.
++
++  Closes #4900
++
+ * Added new extension ``SetMembershipChecker`` with ``use-set-for-membership`` check:
+   Emitted when using an in-place defined ``list`` or ``tuple`` to do a membership test. ``sets`` are better optimized for that.
+ 
+diff --git a/doc/whatsnew/2.11.rst b/doc/whatsnew/2.11.rst
+index 72dc75e7..e06e75be 100644
+--- a/doc/whatsnew/2.11.rst
++++ b/doc/whatsnew/2.11.rst
+@@ -55,6 +55,11 @@ Other Changes
+ 
+   Closes #4936
+ 
++* The ``similarities`` checker (``duplicate-code``) is now deactivated when
++  ``min-similarity-lines`` is set to ``0``.
++
++  Closes #4900
++
+ * Fix false positive for ``protected-access`` if a protected member is used in type hints of function definitions
+ 
+ * Fix false positive ``dict-iter-missing-items`` for dictionaries only using tuples as keys
+diff --git a/pylint/checkers/similar.py b/pylint/checkers/similar.py
+index c65b1c89..bc324c07 100644
+--- a/pylint/checkers/similar.py
++++ b/pylint/checkers/similar.py
+@@ -739,7 +739,8 @@ class SimilarChecker(BaseChecker, Similar, MapReduceMixin):
+                 "default": DEFAULT_MIN_SIMILARITY_LINE,
+                 "type": "int",
+                 "metavar": "<int>",
+-                "help": "Minimum lines number of a similarity.",
++                "help": "Minimum lines number of a similarity. "
++                "If set to 0, the similarities checker is disabled.",
+             },
+         ),
+         (
+@@ -825,11 +826,16 @@ class SimilarChecker(BaseChecker, Similar, MapReduceMixin):
+ 
+         stream must implement the readlines method
+         """
+-        with node.stream() as stream:
+-            self.append_stream(self.linter.current_name, stream, node.file_encoding)
++        if self.config.min_similarity_lines > 0:
++            with node.stream() as stream:
++                self.append_stream(
++                    self.linter.current_name, stream, node.file_encoding
++                )
+ 
+     def close(self):
+         """compute and display similarities on closing (i.e. end of parsing)"""
++        if self.config.min_similarity_lines <= 0:
++            return
+         total = sum(len(lineset) for lineset in self.linesets)
+         duplicated = 0
+         stats = self.stats
+diff --git a/tests/checkers/unittest_similar.py b/tests/checkers/unittest_similar.py
+index 4ddf2029..2da61ca2 100644
+--- a/tests/checkers/unittest_similar.py
++++ b/tests/checkers/unittest_similar.py
+@@ -393,6 +393,25 @@ def test_no_args() -> None:
+             pytest.fail("not system exit")
+ 
+ 
++def test_no_duplicate_code_with_min_similarity_lines_zero() -> None:
++    """Tests that the similarities checker is disabled with min-similarity-lines=0"""
++    linter = PyLinter(reporter=Reporter())
++    linter.register_checker(similar.SimilarChecker(linter))
++    linter.global_set_option("min-similarity-lines", 0)
++    linter.check([SIMILAR1, SIMILAR2])
++    assert "duplicate-code" not in linter.stats["by_msg"]
++
++
++def test_duplicate_code_with_default_min_similarity_lines() -> None:
++    """Tests that duplicate code is still reported with the default value"""
++    linter = PyLinter(reporter=Reporter())
++    checker = similar.SimilarChecker(linter)
++    linter.register_checker(checker)
++    assert checker.config.min_similarity_lines == 4
++    linter.check([SIMILAR1, SIMILAR2])
++    assert "duplicate-code" in linter.stats["by_msg"]
++
++
+ def test_get_map_data() -> None:
+     """Tests that a SimilarChecker respects the MapReduceMixin interface"""
+     linter = PyLinter(reporter=Reporter())

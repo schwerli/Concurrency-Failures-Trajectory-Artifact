@@ -1,0 +1,200 @@
+diff --git a/seaborn/_core/plot.py b/seaborn/_core/plot.py
+index 4f0290a4..d8956149 100644
+--- a/seaborn/_core/plot.py
++++ b/seaborn/_core/plot.py
+@@ -25,7 +25,7 @@ from seaborn._marks.base import Mark
+ from seaborn._stats.base import Stat
+ from seaborn._core.data import PlotData
+ from seaborn._core.moves import Move
+-from seaborn._core.scales import Scale
++from seaborn._core.scales import Nominal, Scale
+ from seaborn._core.subplots import Subplots
+ from seaborn._core.groupby import GroupBy
+ from seaborn._core.properties import PROPERTIES, Property
+@@ -1625,24 +1625,90 @@ class Plotter:
+                 base_legend = legend
+                 self._figure.legends.append(legend)
+ 
++    def _nominal_axis_extent(
++        self, ax: Axes, axis: str,
++    ) -> tuple[float, float] | None:
++        """Return the categorical span for a nominal coordinate axis."""
++        axis_obj = getattr(ax, f"{axis}axis")
++        # Use the realized axis mapping so shared/unshared facets and overlays
++        # reflect the categories actually attached to this subplot.
++        units = getattr(axis_obj, "units", None)
++        mapping = getattr(units, "_mapping", None)
++        n = len(mapping) if mapping is not None else len(getattr(ax, f"get_{axis}ticks")())
++        if not n:
++            return None
++        return -.5, n - .5
++
++    def _resolve_axis_limits(
++        self,
++        ax: Axes,
++        axis: str,
++        axis_key: str,
++        limits: dict[str, tuple[Any, Any]],
++        default: tuple[float, float] | None = None,
++        *,
++        nominal: bool = False,
++    ) -> tuple[Any, Any] | None:
++        """Convert user-provided limits, optionally filling from defaults."""
++        if axis_key not in limits:
++            return default
++
++        def convert(value, fallback, upper):
++            if value is None:
++                return fallback
++            axis_obj = getattr(ax, f"{axis}axis")
++            if nominal:
++                value = format(value)
++            value = axis_obj.convert_units(value)
++            if nominal:
++                value = cast(float, value) + (.5 if upper else -.5)
++            return value
++
++        lo_default, hi_default = (default if default is not None else (None, None))
++        lo, hi = limits[axis_key]
++        return (
++            convert(lo, lo_default, upper=False),
++            convert(hi, hi_default, upper=True),
++        )
++
++    def _theme_overrides_nominal_grid(self, p: Plot) -> bool:
++        """Return whether the user explicitly configured grid visibility."""
++        return any(k in p._theme for k in ["axes.grid", "axes.grid.axis"])
++
++    @staticmethod
++    def _invert_axis(ax: Axes, axis: str) -> None:
++        """Invert an axis while preserving compatibility with older matplotlib."""
++        axis_obj = getattr(ax, f"{axis}axis")
++        try:
++            axis_obj.set_inverted(True)
++        except AttributeError:
++            if axis == "x":
++                if not ax.xaxis_inverted():
++                    ax.invert_xaxis()
++            else:
++                if not ax.yaxis_inverted():
++                    ax.invert_yaxis()
++
+     def _finalize_figure(self, p: Plot) -> None:
+ 
+         for sub in self._subplots:
+             ax = sub["ax"]
+             for axis in "xy":
+                 axis_key = sub[axis]
++                nominal = isinstance(self._scales.get(axis_key), Nominal)
++                nominal_extent = self._nominal_axis_extent(ax, axis) if nominal else None
++
++                if nominal and not self._theme_overrides_nominal_grid(p):
++                    getattr(ax, f"{axis}axis").grid(False)
++
++                limits = self._resolve_axis_limits(
++                    ax, axis, axis_key, p._limits, nominal_extent, nominal=nominal,
++                )
++                if limits is not None:
++                    getattr(ax, f"set_{axis}lim")(*limits, auto=None)
+ 
+-                # Axis limits
+-                if axis_key in p._limits:
+-                    convert_units = getattr(ax, f"{axis}axis").convert_units
+-                    a, b = p._limits[axis_key]
+-                    lo = a if a is None else convert_units(a)
+-                    hi = b if b is None else convert_units(b)
+-                    if isinstance(a, str):
+-                        lo = cast(float, lo) - 0.5
+-                    if isinstance(b, str):
+-                        hi = cast(float, hi) + 0.5
+-                    ax.set(**{f"{axis}lim": (lo, hi)})
++                if nominal and axis == "y" and limits is not None:
++                    self._invert_axis(ax, axis)
+ 
+         engine_default = None if p._target is not None else "tight"
+         layout_engine = p._layout_spec.get("engine", engine_default)
+diff --git a/tests/_core/test_plot.py b/tests/_core/test_plot.py
+index 03a64917..5818dae3 100644
+--- a/tests/_core/test_plot.py
++++ b/tests/_core/test_plot.py
+@@ -365,6 +365,62 @@ class TestScaling:
+         ax = p._figure.axes[0]
+         assert ax.yaxis.convert_units("3") == 2
+ 
++    def test_inferred_nominal_axis_defaults(self):
++
++        p = Plot(x=["a", "b", "c"], y=[1, 2, 3]).add(MockMark()).plot()
++        ax = p._figure.axes[0]
++
++        assert ax.get_xlim() == (-0.5, 2.5)
++        assert not any(line.get_visible() for line in ax.xaxis.get_gridlines())
++        assert any(line.get_visible() for line in ax.yaxis.get_gridlines())
++
++    def test_explicit_nominal_y_axis_defaults(self):
++
++        p = Plot(x=[1, 2, 3], y=[2, 1, 3]).scale(y=Nominal()).add(MockMark()).plot()
++        ax = p._figure.axes[0]
++
++        assert ax.get_ylim() == (2.5, -0.5)
++        assert ax.yaxis_inverted()
++        assert not any(line.get_visible() for line in ax.yaxis.get_gridlines())
++        assert any(line.get_visible() for line in ax.xaxis.get_gridlines())
++
++    def test_nominal_axis_limits_fill_defaults(self):
++
++        p = (
++            Plot(x=["a", "b", "c"], y=[1, 2, 3])
++            .limit(x=(None, "b"))
++            .add(MockMark())
++            .plot()
++        )
++        ax = p._figure.axes[0]
++
++        assert ax.get_xlim() == (-0.5, 1.5)
++
++    def test_explicit_nominal_numeric_limits(self):
++
++        p = (
++            Plot(x=[1, 2, 3], y=[1, 2, 3])
++            .scale(x=Nominal())
++            .limit(x=(1, 3))
++            .add(MockMark())
++            .plot()
++        )
++        ax = p._figure.axes[0]
++
++        assert ax.get_xlim() == (-0.5, 2.5)
++
++    def test_nominal_axis_grid_can_follow_theme(self):
++
++        p = (
++            Plot(x=["a", "b", "c"], y=[1, 2, 3])
++            .theme({"axes.grid": True})
++            .add(MockMark())
++            .plot()
++        )
++        ax = p._figure.axes[0]
++
++        assert any(line.get_visible() for line in ax.xaxis.get_gridlines())
++
+     @pytest.mark.xfail(reason="Temporal auto-conversion not implemented")
+     def test_categorical_as_datetime(self):
+ 
+@@ -506,6 +562,8 @@ class TestScaling:
+         ax1, ax2 = p._figure.axes
+         assert len(ax1.get_xticks()) == 3
+         assert len(ax2.get_xticks()) == 3
++        assert ax1.get_xlim() == (-0.5, 2.5)
++        assert ax2.get_xlim() == (-0.5, 2.5)
+         assert_vector_equal(m.passed_data[0]["x"], pd.Series([0., 1.], [0, 1]))
+         assert_vector_equal(m.passed_data[1]["x"], pd.Series([0., 2.], [2, 3]))
+ 
+@@ -522,6 +580,8 @@ class TestScaling:
+         ax1, ax2 = p._figure.axes
+         assert len(ax1.get_xticks()) == 2
+         assert len(ax2.get_xticks()) == 2
++        assert ax1.get_xlim() == (-0.5, 1.5)
++        assert ax2.get_xlim() == (-0.5, 1.5)
+         assert_vector_equal(m.passed_data[0]["x"], pd.Series([0., 1.], [0, 1]))
+         assert_vector_equal(m.passed_data[1]["x"], pd.Series([0., 1.], [2, 3]))
+ 

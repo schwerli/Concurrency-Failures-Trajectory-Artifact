@@ -1,0 +1,30 @@
+All four sample cases plus 360+ differential/fuzz cases match the reference executable byte-for-byte on stdout, stderr, and exit code.
+
+## Structure (`/output`)
+
+```
+test10.mjs                  entry point — mirrors main()
+lib/bech32/polymod.mjs      generator polynomial + bech32Polymod
+lib/bech32/checksum.mjs     bech32HrpExpand / CreateChecksum / VerifyChecksum
+lib/bech32/index.mjs        public library surface (re-exports)
+lib/python/argparse.mjs     ArgumentParser subset
+lib/python/pyint.mjs        int(text) with base 10
+lib/python/text.mjs         str.strip / repr / code-point iteration
+lib/python/format.mjs       print() and str/repr of lists, bools, ints
+lib/python/errors.mjs       ValueError / SystemExit mirrors
+lib/python/traceback.mjs    uncaught-exception traceback
+```
+
+### Behaviors I probed on the executable and reproduced
+
+**Numerics — BigInt throughout** (`lib/bech32/polymod.mjs:20`). The CLI accepts data values well outside 5 bits: `--b 1000000000000`, `--b=-1`, `--b=9999…` (41 digits). Python ints are unbounded, so `chk = (chk & 0x1ffffff) << 5 ^ value` transiently exceeds 32 bits and negative values use infinite-width two's complement. Number-based `&`/`^`/`>>` would truncate and diverge; BigInt matches Python exactly, including arithmetic right-shift on negatives.
+
+**`int()` parsing** (`lib/python/pyint.mjs`). Verified against the binary: whitespace stripping (incl. `\xa0`), `+`/`-` signs, `1_0` underscore separators, and *any* Unicode decimal digit — `--b=٣,4` and `--b=１２` both succeed. Non-NFKC-foldable digit sets are resolved by scanning their code-point run.
+
+**argparse** (`lib/python/argparse.mjs`). Confirmed and matched: `--h` resolves as an unambiguous abbreviation of `--help`; `--b -1` takes `-1` as a *value* (negative-number matcher); `--b " -1"` likewise (contains a space); repeated `--a` — last wins; a trailing `--` surfaces as `unrecognized arguments: --`; and error precedence is *expected-one-argument* → *required-missing* → *unrecognized* (`-a bc --b 1,2` reports only `required: --a`).
+
+**Failure paths.** Bad ints emit the CPython traceback with the original `test10.py` line numbers and caret run, plus the PyInstaller footer, exit 1; usage errors exit 2; `--help` exits 0 with byte-identical text (column layout derived from argparse's `min(longest+2, 24)` rule).
+
+**Non-BMP HRP** (`lib/bech32/checksum.mjs:15`). `Array.from(hrp)` + `codePointAt` matches `ord(x) for x in hrp` — `--a 😀` is one value (128512), not two surrogate halves.
+
+Two deliberate judgement calls worth your review: `PROG` in `test10.mjs:11` is hardcoded to `test10_executable` so usage/help match the reference binary rather than saying `test10.mjs`; and the traceback footer uses `process.pid` in place of PyInstaller's `[PYI-<pid>:ERROR]` counter, which varies per run and cannot be matched exactly.

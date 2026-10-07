@@ -1,0 +1,244 @@
+diff --git a/ChangeLog b/ChangeLog
+index 97af302a..9a59d82f 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -65,6 +65,11 @@ Release date: TBA
+ 
+ * Extended ``consider-using-in`` check to work for attribute access.
+ 
++* Setting ``min-similarity-lines`` to ``0`` now makes the similarity checker
++  stop checking for duplicate code
++
++  Closes #4901
++
+ 
+ What's New in Pylint 2.10.3?
+ ============================
+diff --git a/cmp/failrun.txt b/cmp/failrun.txt
+new file mode 100644
+index 00000000..ba931292
+--- /dev/null
++++ b/cmp/failrun.txt
+@@ -0,0 +1,33 @@
++..............F......................................................... [ 57%]
++.....................................................                    [100%]
++=================================== FAILURES ===================================
++_______________________ test_set_duplicate_lines_to_zero _______________________
++
++    def test_set_duplicate_lines_to_zero() -> None:
++        output = StringIO()
++        with redirect_stdout(output), pytest.raises(SystemExit) as ex:
++            similar.Run(["--duplicates=0", SIMILAR1, SIMILAR2])
++        assert ex.value.code == 0
++>       assert output.getvalue() == ""
++E       AssertionError: assert 'TOTAL lines=...cent=0.00\n\n' == ''
++E         + TOTAL lines=62 duplicates=0 percent=0.00
++E         +
++
++tests/checkers/unittest_similar.py:379: AssertionError
++=============================== warnings summary ===============================
++../opt/miniconda3/envs/testbed/lib/python3.9/site-packages/astroid/interpreter/_import/util.py:6
++  /opt/miniconda3/envs/testbed/lib/python3.9/site-packages/astroid/interpreter/_import/util.py:6: DeprecationWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html
++    import pkg_resources
++
++../opt/miniconda3/envs/testbed/lib/python3.9/site-packages/astroid/node_classes.py:90
++  /opt/miniconda3/envs/testbed/lib/python3.9/site-packages/astroid/node_classes.py:90: DeprecationWarning: The 'astroid.node_classes' module is deprecated and will be replaced by 'astroid.nodes' in astroid 3.0.0
++    warnings.warn(
++
++../opt/miniconda3/envs/testbed/lib/python3.9/site-packages/astroid/scoped_nodes.py:26
++  /opt/miniconda3/envs/testbed/lib/python3.9/site-packages/astroid/scoped_nodes.py:26: DeprecationWarning: The 'astroid.scoped_nodes' module is deprecated and will be replaced by 'astroid.nodes' in astroid 3.0.0
++    warnings.warn(
++
++-- Docs: https://docs.pytest.org/en/stable/warnings.html
++=========================== short test summary info ============================
++FAILED tests/checkers/unittest_similar.py::test_set_duplicate_lines_to_zero
++1 failed, 124 passed, 3 warnings in 2.37s
+diff --git a/doc/whatsnew/2.11.rst b/doc/whatsnew/2.11.rst
+index 72dc75e7..1ee04176 100644
+--- a/doc/whatsnew/2.11.rst
++++ b/doc/whatsnew/2.11.rst
+@@ -71,3 +71,8 @@ Other Changes
+   Closes #4907
+ 
+ * Extended ``consider-using-in`` check to work for attribute access.
++
++* Setting ``min-similarity-lines`` to ``0`` now makes the similarity checker
++  stop checking for duplicate code
++
++  Closes #4901
+diff --git a/examples/pylintrc b/examples/pylintrc
+index 0bfe9593..d779e1c5 100644
+--- a/examples/pylintrc
++++ b/examples/pylintrc
+@@ -297,7 +297,7 @@ ignore-docstrings=yes
+ # Ignore imports when computing similarities.
+ ignore-imports=no
+ 
+-# Minimum lines number of a similarity.
++# Minimum lines number of a similarity. Set to 0 to disable the check.
+ min-similarity-lines=4
+ 
+ 
+diff --git a/pylint/checkers/similar.py b/pylint/checkers/similar.py
+index c65b1c89..5e6191d2 100644
+--- a/pylint/checkers/similar.py
++++ b/pylint/checkers/similar.py
+@@ -390,6 +390,8 @@ class Similar:
+ 
+     def run(self) -> None:
+         """start looking for similarities and display results on stdout"""
++        if self.min_lines == 0:
++            return
+         self._display_sims(self._compute_sims())
+ 
+     def _compute_sims(self) -> List[Tuple[int, Set[LinesChunkLimits_T]]]:
+@@ -739,7 +741,8 @@ class SimilarChecker(BaseChecker, Similar, MapReduceMixin):
+                 "default": DEFAULT_MIN_SIMILARITY_LINE,
+                 "type": "int",
+                 "metavar": "<int>",
+-                "help": "Minimum lines number of a similarity.",
++                "help": "Minimum lines number of a similarity. Set to 0 to disable "
++                "the check.",
+             },
+         ),
+         (
+@@ -825,11 +828,15 @@ class SimilarChecker(BaseChecker, Similar, MapReduceMixin):
+ 
+         stream must implement the readlines method
+         """
++        if self.min_lines == 0:
++            return
+         with node.stream() as stream:
+             self.append_stream(self.linter.current_name, stream, node.file_encoding)
+ 
+     def close(self):
+         """compute and display similarities on closing (i.e. end of parsing)"""
++        if self.min_lines == 0:
++            return
+         total = sum(len(lineset) for lineset in self.linesets)
+         duplicated = 0
+         stats = self.stats
+diff --git a/pylintrc b/pylintrc
+index 6acebfbf..005ddd22 100644
+--- a/pylintrc
++++ b/pylintrc
+@@ -117,7 +117,7 @@ notes=FIXME,XXX,TODO
+ 
+ [SIMILARITIES]
+ 
+-# Minimum lines number of a similarity.
++# Minimum lines number of a similarity. Set to 0 to disable the check.
+ min-similarity-lines=4
+ 
+ # Ignore comments when computing similarities.
+diff --git a/tests/checkers/scratch_similar_test.py b/tests/checkers/scratch_similar_test.py
+new file mode 100644
+index 00000000..9a24a95b
+--- /dev/null
++++ b/tests/checkers/scratch_similar_test.py
+@@ -0,0 +1,41 @@
++from pathlib import Path
++
++from _pytest.monkeypatch import MonkeyPatch
++
++from pylint.checkers import similar
++from pylint.lint import PyLinter
++from pylint.testutils import GenericTestReporter as Reporter
++
++INPUT = Path(__file__).parent / ".." / "input"
++
++
++def test_set_duplicate_lines_to_zero_does_not_read_the_modules() -> None:
++    """Setting min-similarity-lines to 0 stops the checker from collecting linesets"""
++    linter = PyLinter(reporter=Reporter())
++    linter.register_checker(similar.SimilarChecker(linter))
++    checker = linter.get_checkers()[-1]
++    checker.set_option("min-similarity-lines", 0)
++    linter.check(
++        [str(INPUT / "similar_lines_a.py"), str(INPUT / "similar_lines_b.py")]
++    )
++    assert checker.linesets == []
++    assert linter.stats["nb_duplicated_lines"] == 0
++    assert linter.reporter.messages == []
++
++
++def test_set_duplicate_lines_to_zero_does_not_compute_similarities(
++    monkeypatch: MonkeyPatch,
++) -> None:
++    """Setting min-similarity-lines to 0 short circuits SimilarChecker.close()"""
++    linter = PyLinter(reporter=Reporter())
++    checker = similar.SimilarChecker(linter)
++    linter.register_checker(checker)
++    checker.set_option("min-similarity-lines", 0)
++    linter.open()
++    checker.open()
++    computed = []
++    monkeypatch.setattr(
++        similar.Similar, "_compute_sims", lambda self: computed.append(1) or []
++    )
++    checker.close()
++    assert computed == []
+diff --git a/tests/checkers/unittest_similar.py b/tests/checkers/unittest_similar.py
+index 4ddf2029..7477316a 100644
+--- a/tests/checkers/unittest_similar.py
++++ b/tests/checkers/unittest_similar.py
+@@ -371,6 +371,14 @@ TOTAL lines=50 duplicates=14 percent=28.00
+     )
+ 
+ 
++def test_set_duplicate_lines_to_zero() -> None:
++    output = StringIO()
++    with redirect_stdout(output), pytest.raises(SystemExit) as ex:
++        similar.Run(["--duplicates=0", SIMILAR1, SIMILAR2])
++    assert ex.value.code == 0
++    assert output.getvalue() == ""
++
++
+ def test_help() -> None:
+     output = StringIO()
+     with redirect_stdout(output):
+diff --git a/tests/test_self.py b/tests/test_self.py
+index 9c044415..d9e0590a 100644
+--- a/tests/test_self.py
++++ b/tests/test_self.py
+@@ -1112,6 +1112,40 @@ class TestRunTC:
+             expected_output=expected_output,
+         )
+ 
++    def test_duplicate_code_disabled_with_min_similarity_lines_zero(self) -> None:
++        """Setting min-similarity-lines to 0 disables the duplicate code check."""
++        path = join(HERE, "regrtest_data", "duplicate_data_raw_strings")
++        out = StringIO()
++        self._run_pylint(
++            [
++                path,
++                "--disable=all",
++                "--enable=duplicate-code",
++                "--min-similarity-lines=0",
++            ],
++            out=out,
++        )
++        assert "Similar lines in 2 files" not in out.getvalue()
++
++    def test_duplicate_code_disabled_with_min_similarity_lines_zero_parallel(
++        self,
++    ) -> None:
++        """The check is also disabled when the linter runs with several jobs."""
++        path = join(HERE, "regrtest_data", "duplicate_data_raw_strings")
++        out = StringIO()
++        self._runtest(
++            [
++                path,
++                "--disable=all",
++                "--enable=duplicate-code",
++                "--min-similarity-lines=0",
++                "--jobs=2",
++            ],
++            out=out,
++            code=0,
++        )
++        assert "Similar lines in 2 files" not in out.getvalue()
++
+     def test_regression_parallel_mode_without_filepath(self) -> None:
+         # Test that parallel mode properly passes filepath
+         # https://github.com/PyCQA/pylint/issues/3564

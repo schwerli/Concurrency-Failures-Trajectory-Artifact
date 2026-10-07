@@ -1,0 +1,31 @@
+Done. Clean build with zero warnings, 16 unit tests passing, and all 58 differential cases byte-identical to the C++ binary.
+
+## What's in `/output`
+
+```
+Cargo.toml                          # bin target -> test6.rs, no dependencies
+test6.rs                            # entry point (port of tests/test6.cpp)
+src/sortedcontainers/mod.rs         # module root + re-exports
+src/sortedcontainers/sorted_list.rs # SortedList
+src/sortedcontainers/sorted_set.rs  # SortedSet
+compare.sh                          # differential harness vs. the C++ binary
+test6                               # executable from `rustc test6.rs`
+```
+
+`test6.rs` pulls the library in with `#[path = "src/sortedcontainers/mod.rs"] mod ...`, so **both** `rustc --edition 2021 -O test6.rs` and `cargo build --release` work from the same sources.
+
+## Implementation notes
+
+**Containers** (black-box, inferred from `insert`/`contains`/`size`/`union_with`): `SortedList` stores elements as a list of sorted sublists capped at a load factor of 1000 — one binary search over sublist maxima picks the sublist, a second searches inside it, and insertion only memmoves within that one small `Vec`. `SortedSet` wraps it with de-duplication. `union_with` merges the two already-sorted sequences in one pass and bulk-chunks the result, rather than re-inserting element by element.
+
+**Two behaviours I pinned down by probing the C++ binary** rather than assuming:
+
+- `std::atoi` semantics — the arg is not validated in C++, so `abc` → 0, `12xy` → 12, `"  7  "` → 7. Out-of-range values matter too: glibc truncates `strtol`'s saturating `long` to `int`, so `4294967301` → 5 and `2147483648` → `i32::MIN` (both then produce empty output as negatives). My `atoi` reproduces this exactly, including C's vertical tab as whitespace, which `is_ascii_whitespace` omits.
+- Output shape — each membership value is followed by a *trailing* space, and `n <= 0` still prints a bare newline. `std::cout` renders `bool` as `1`/`0`, matched via `u8::from(...)`.
+
+`i.wrapping_mul(2)` mirrors the C++ release build's signed-overflow wrap, which also keeps the debug binary from panicking; I verified debug and release agree.
+
+**Two things worth flagging:**
+
+1. I dropped `n=2147483647` from the differential suite. Both binaries try to allocate billions of elements there and die in the allocator — it measures the OOM killer, not the port. Values through 50000 are covered, plus every `n` from 0–13 and the load-factor boundaries (999/1000/1001, 2000/2001).
+2. `compare.sh` and `target/` are build/verification artifacts I added, not part of the deliverable — say the word if you'd like them removed.

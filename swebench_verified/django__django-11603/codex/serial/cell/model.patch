@@ -1,0 +1,118 @@
+diff --git a/django/db/models/aggregates.py b/django/db/models/aggregates.py
+index da4ff928aa..8b10829eb8 100644
+--- a/django/db/models/aggregates.py
++++ b/django/db/models/aggregates.py
+@@ -99,6 +99,7 @@ class Aggregate(Func):
+ class Avg(FixDurationInputMixin, NumericOutputFieldMixin, Aggregate):
+     function = 'AVG'
+     name = 'Avg'
++    allow_distinct = True
+ 
+ 
+ class Count(Aggregate):
+@@ -142,6 +143,7 @@ class StdDev(NumericOutputFieldMixin, Aggregate):
+ class Sum(FixDurationInputMixin, Aggregate):
+     function = 'SUM'
+     name = 'Sum'
++    allow_distinct = True
+ 
+ 
+ class Variance(NumericOutputFieldMixin, Aggregate):
+diff --git a/docs/ref/models/querysets.txt b/docs/ref/models/querysets.txt
+index f84097ae96..4c6600fe88 100644
+--- a/docs/ref/models/querysets.txt
++++ b/docs/ref/models/querysets.txt
+@@ -3378,7 +3378,7 @@ by the aggregate.
+ ``Avg``
+ ~~~~~~~
+ 
+-.. class:: Avg(expression, output_field=None, filter=None, **extra)
++.. class:: Avg(expression, output_field=None, distinct=False, filter=None, **extra)
+ 
+     Returns the mean value of the given expression, which must be numeric
+     unless you specify a different ``output_field``.
+@@ -3387,6 +3387,14 @@ by the aggregate.
+     * Return type: ``float`` if input is ``int``, otherwise same as input
+       field, or ``output_field`` if supplied
+ 
++    Has one optional argument:
++
++    .. attribute:: distinct
++
++        If ``distinct=True``, ``Avg`` returns the mean value of unique
++        values. This is the SQL equivalent of ``AVG(DISTINCT <field>)``.
++        The default value is ``False``.
++
+ ``Count``
+ ~~~~~~~~~
+ 
+@@ -3451,13 +3459,21 @@ by the aggregate.
+ ``Sum``
+ ~~~~~~~
+ 
+-.. class:: Sum(expression, output_field=None, filter=None, **extra)
++.. class:: Sum(expression, output_field=None, distinct=False, filter=None, **extra)
+ 
+     Computes the sum of all values of the given expression.
+ 
+     * Default alias: ``<field>__sum``
+     * Return type: same as input field, or ``output_field`` if supplied
+ 
++    Has one optional argument:
++
++    .. attribute:: distinct
++
++        If ``distinct=True``, ``Sum`` only includes unique values. This is
++        the SQL equivalent of ``SUM(DISTINCT <field>)``. The default value is
++        ``False``.
++
+ ``Variance``
+ ~~~~~~~~~~~~
+ 
+diff --git a/tests/aggregation/tests.py b/tests/aggregation/tests.py
+index bd6ecf699c..572fce68a3 100644
+--- a/tests/aggregation/tests.py
++++ b/tests/aggregation/tests.py
+@@ -391,6 +391,14 @@ class AggregateTestCase(TestCase):
+         vals = Book.objects.aggregate(Count("rating", distinct=True))
+         self.assertEqual(vals, {"rating__count": 4})
+ 
++    def test_avg_distinct(self):
++        vals = Book.objects.aggregate(Avg("rating", distinct=True))
++        self.assertEqual(vals, {"rating__avg": Approximate(4.125, places=3)})
++
++    def test_sum_distinct(self):
++        vals = Book.objects.aggregate(Sum("rating", distinct=True))
++        self.assertEqual(vals, {"rating__sum": 16.5})
++
+     def test_count_star(self):
+         with self.assertNumQueries(1) as ctx:
+             Book.objects.aggregate(n=Count("*"))
+diff --git a/tests/aggregation_regress/tests.py b/tests/aggregation_regress/tests.py
+index 274dc29d6d..8f8a231479 100644
+--- a/tests/aggregation_regress/tests.py
++++ b/tests/aggregation_regress/tests.py
+@@ -1506,6 +1506,8 @@ class AggregationTests(TestCase):
+         class DistinctAggregate(Aggregate):
+             allow_distinct = True
+         DistinctAggregate('foo', distinct=True)
++        Avg('foo', distinct=True)
++        Sum('foo', distinct=True)
+ 
+ 
+ class JoinPromotionTests(TestCase):
+diff --git a/tests/expressions/tests.py b/tests/expressions/tests.py
+index f5d1553dfb..702699ed76 100644
+--- a/tests/expressions/tests.py
++++ b/tests/expressions/tests.py
+@@ -1584,8 +1584,10 @@ class ReprTests(SimpleTestCase):
+         self.assertEqual(repr(Variance('a', sample=True)), "Variance(F(a), sample=True)")
+ 
+     def test_distinct_aggregates(self):
++        self.assertEqual(repr(Avg('a', distinct=True)), "Avg(F(a), distinct=True)")
+         self.assertEqual(repr(Count('a', distinct=True)), "Count(F(a), distinct=True)")
+         self.assertEqual(repr(Count('*', distinct=True)), "Count('*', distinct=True)")
++        self.assertEqual(repr(Sum('a', distinct=True)), "Sum(F(a), distinct=True)")
+ 
+     def test_filtered_aggregates(self):
+         filter = Q(a=1)

@@ -1,0 +1,35 @@
+The migration is complete and verified.
+
+## What I did
+
+Since the C++ library source wasn't present (only `test12.cpp` and the binary), I reverse-engineered all 10 functions by probing the executable — passing the same word to all four argument positions to get all 10 outputs per run.
+
+**Key findings** (the library is a partial port of Rails' inflector, with quirks faithfully preserved):
+
+- **`pluralize`** — just appends `"s"` (`box`→`boxs`, `child`→`childs`), except for 10 uncountables (`equipment, information, rice, money, species, series, fish, sheep, jeans, police`), matched exact and case-sensitively.
+- **`singularize`** — an ordered, case-sensitive regex table, first match wins. Notable quirks I confirmed and reproduced:
+  - `analyses` → `analyasis` — the `'\1\2sis'` replacement re-inserts capture group 2, which only the `(a)naly` branch fills. `databases` → `databasis` (unanchored `(b)a` branch).
+  - `taxes` → `taxis`, because `(cris|ax|test)es$` is tried before `(x|ch|ss|sh)es$`.
+  - `slice` → `slouse` and `x|ice` → `x|ouse` — the mice rule is a character class `([m|l])ice$`, so `|` is a literal member and it's unanchored.
+  - `wolves` → `wolfe`, `hives` → `hife` — the `([lr])ves$`/`(hive)s$` rules are absent.
+  - `^(ox)en$` is fully anchored (`oxens`→`oxen`, `boxen` unchanged); `(n)ews$` is a no-op rule that just blocks `s$`.
+- **Casing** is byte-wise and ASCII-only: `upcase("café")` → `CAFé`, so I used `to_ascii_uppercase` on bytes rather than Rust's Unicode-aware `to_uppercase`.
+
+## Verification
+
+- **1,626-word differential corpus** (curated edge cases, systematic prefix×suffix combos, 1,200 random strings with separators/mixed case/UTF-8) × all 10 functions = **16,260 comparisons, 0 mismatches**, byte-exact via `cmp`.
+- All 5 documented examples, argument counts 0–7 (confirming only the first four args are read), empty-string args, and 600 random 4-tuples: byte-identical stdout and matching exit codes.
+- 6 unit tests locking in the reverse-engineered rules pass via `cargo test`.
+
+## Structure (`/output`)
+
+| File | Contents |
+|---|---|
+| `test12.rs` | Entry point; pulls modules in by `#[path]` so it builds both standalone and via Cargo |
+| `src/lib.rs` | Library root |
+| `src/inflection/mod.rs` | Module wiring |
+| `src/inflection/casing.rs` | `camelize`, `underscore`, `humanize`, `dasherize`, `upcase`, `downcase` |
+| `src/inflection/rules.rs` | Uncountables + the ordered singularization rule table (each rule documented with the pattern it stands for) |
+| `src/inflection/inflector.rs` | `Inflector` facade + tests |
+
+Zero external dependencies, edition 2021, no compiler warnings. Both build paths work: `rustc -O test12.rs -o test12` (executable at `/output/test12`) and `cargo build --release` (at `/output/target/release/test12`).

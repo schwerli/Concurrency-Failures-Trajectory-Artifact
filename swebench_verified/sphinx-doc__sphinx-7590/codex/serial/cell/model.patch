@@ -1,0 +1,152 @@
+diff --git a/sphinx/domains/cpp.py b/sphinx/domains/cpp.py
+index fe52d881d..e53af7f5b 100644
+--- a/sphinx/domains/cpp.py
++++ b/sphinx/domains/cpp.py
+@@ -45,6 +45,8 @@ from sphinx.util.nodes import make_refnode
+ logger = logging.getLogger(__name__)
+ T = TypeVar('T')
+ 
++_user_defined_literal_suffix_re = re.compile(r'[a-zA-Z_][a-zA-Z0-9_]*\b')
++
+ """
+     Important note on ids
+     ----------------------------------------------------------------------------
+@@ -882,6 +884,24 @@ class ASTCharLiteral(ASTLiteral):
+         signode.append(nodes.Text(txt, txt))
+ 
+ 
++class ASTUserDefinedLiteral(ASTLiteral):
++    def __init__(self, data: str) -> None:
++        self.data = data
++
++    def _stringify(self, transform: StringifyTransform) -> str:
++        return self.data
++
++    def get_id(self, version: int) -> str:
++        # This is purely syntactic. We do not resolve which literal operator
++        # overload would be selected, so keep the source token stable as the id.
++        return self.data
++
++    def describe_signature(self, signode: TextElement, mode: str,
++                           env: "BuildEnvironment", symbol: "Symbol") -> None:
++        txt = str(self)
++        signode.append(nodes.Text(txt, txt))
++
++
+ class ASTThisLiteral(ASTExpression):
+     def _stringify(self, transform: StringifyTransform) -> str:
+         return "this"
+@@ -4643,6 +4663,11 @@ class DefinitionParser(BaseParser):
+             self.pos += 1
+         return self.definition[startPos:self.pos]
+ 
++    def _parse_user_defined_literal(self, startPos: int) -> ASTUserDefinedLiteral:
++        if self.match(_user_defined_literal_suffix_re):
++            return ASTUserDefinedLiteral(self.definition[startPos:self.pos])
++        return None
++
+     def _parse_literal(self) -> ASTLiteral:
+         # -> integer-literal
+         #  | character-literal
+@@ -4664,16 +4689,27 @@ class DefinitionParser(BaseParser):
+             if self.match(regex):
+                 while self.current_char in 'uUlLfF':
+                     self.pos += 1
++                udl = self._parse_user_defined_literal(pos)
++                if udl is not None:
++                    return udl
+                 return ASTNumberLiteral(self.definition[pos:self.pos])
+ 
++        pos = self.pos
+         string = self._parse_string()
+         if string is not None:
++            udl = self._parse_user_defined_literal(pos)
++            if udl is not None:
++                return udl
+             return ASTStringLiteral(string)
+ 
+         # character-literal
++        pos = self.pos
+         if self.match(char_literal_re):
+             prefix = self.last_match.group(1)  # may be None when no prefix
+             data = self.last_match.group(2)
++            udl = self._parse_user_defined_literal(pos)
++            if udl is not None:
++                return udl
+             try:
+                 return ASTCharLiteral(prefix, data)
+             except UnicodeDecodeError as e:
+@@ -4682,7 +4718,6 @@ class DefinitionParser(BaseParser):
+                 self.fail("Can not handle character literal"
+                           " resulting in multiple decoded characters.")
+ 
+-        # TODO: user-defined lit
+         return None
+ 
+     def _parse_fold_or_paren_expression(self) -> ASTExpression:
+diff --git a/tests/test_domain_cpp.py b/tests/test_domain_cpp.py
+index 9db741ae5..c5810dbcc 100644
+--- a/tests/test_domain_cpp.py
++++ b/tests/test_domain_cpp.py
+@@ -111,13 +111,7 @@ def test_fundamental_types():
+ 
+ 
+ def test_expressions():
+-    def exprCheck(expr, id, id4=None):
+-        ids = 'IE1CIA%s_1aE'
+-        idDict = {2: ids % expr, 3: ids % id}
+-        if id4 is not None:
+-            idDict[4] = ids % id4
+-        check('class', 'template<> C<a[%s]>' % expr, idDict)
+-
++    def parseExpr(expr):
+         class Config:
+             cpp_id_attributes = ["id_attr"]
+             cpp_paren_attributes = ["paren_attr"]
+@@ -126,6 +120,17 @@ def test_expressions():
+                                   config=Config())
+         parser.allowFallbackExpressionParsing = False
+         ast = parser.parse_expression()
++        parser.assert_end()
++        return ast
++
++    def exprCheck(expr, id, id4=None):
++        ids = 'IE1CIA%s_1aE'
++        idDict = {2: ids % expr, 3: ids % id}
++        if id4 is not None:
++            idDict[4] = ids % id4
++        check('class', 'template<> C<a[%s]>' % expr, idDict)
++
++        ast = parseExpr(expr)
+         res = str(ast)
+         if res != expr:
+             print("")
+@@ -176,7 +181,9 @@ def test_expressions():
+         exprCheck(p + "'\\U0001f34c'", t + "127820")
+         exprCheck(p + "'\\U0001F34C'", t + "127820")
+ 
+-    # TODO: user-defined lit
++    for expr in ['1q_s', '6.62607015e-34q_J', '"abc"s', "'a'_tag"]:
++        assert str(parseExpr(expr)) == expr
++
+     exprCheck('(... + Ns)', '(... + Ns)', id4='flpl2Ns')
+     exprCheck('(Ns + ...)', '(Ns + ...)', id4='frpl2Ns')
+     exprCheck('(Ns + ... + 0)', '(Ns + ... + 0)', id4='fLpl2NsL0E')
+@@ -356,6 +363,9 @@ def test_concept_definitions():
+ 
+ 
+ def test_member_definitions():
++    assert str(parse('member',
++                     'constexpr auto units::si::planck_constant = 6.62607015e-34q_J * 1q_s')
++               ) == 'constexpr auto units::si::planck_constant = 6.62607015e-34q_J * 1q_s'
+     check('member', '  const  std::string  &  name = 42',
+           {1: "name__ssCR", 2: "4name"}, output='const std::string &name = 42')
+     check('member', '  const  std::string  &  name', {1: "name__ssCR", 2: "4name"},
+@@ -560,6 +570,7 @@ def test_operators():
+     check('function', 'void operator delete()', {1: "delete-operator", 2: "dlv"})
+     check('function', 'void operator delete[]()', {1: "delete-array-operator", 2: "dav"})
+     check('function', 'operator bool() const', {1: "castto-b-operatorC", 2: "NKcvbEv"})
++    check('function', 'void operator""q_J()', {2: 'li3q_Jv'})
+     check('function', 'void operator""_udl()', {2: 'li4_udlv'})
+ 
+     check('function', 'void operator~()', {1: "inv-operator", 2: "cov"})

@@ -1,0 +1,200 @@
+# fselect
+
+Find files with SQL-like queries.
+
+[Basic usage](#basic-usage)  
+[Restrictions](#its-not-a-real-sql)  
+[Columns and fields](#columns-and-fields)  
+[File naming terminology](#file-naming-terminology)  
+[Functions](#functions)  
+[File size units](#file-size-units)  
+[Search roots](#search-roots)  
+[Operators](#operators)  
+[Arithmetic operators](#arithmetic-operators)  
+[Subqueries for IN and EXISTS](#subqueries-for-in-and-exists)  
+[Date and time specifiers](#date-and-time-specifiers)  
+[Regular expressions](#regular-expressions)  
+[MIME and file types](#mime-and-file-types)  
+[MP3 support](#mp3-support)  
+[File hashes](#file-hashes)  
+[Output formats](#output-formats)  
+[Configuration file](#configuration-file)  
+[Bash completion](#bash-completion)  
+[Command-line arguments](#command-line-arguments)  
+[Interactive mode](#interactive-mode)  
+[Environment variables](#environment-variables)  
+[Exit values](#exit-values)
+
+### Basic usage
+
+    fselect [ARGS] COLUMN[, COLUMN...] [from ROOT[, ROOT...]] [where EXPR] [group by COLUMNS] [order by COLUMNS] [limit N] [offset N] [into FORMAT]
+
+You write an SQL-like query, that's it.
+
+**fselect** command itself is like a first keyword (`select`, i.e., *file select*).
+But if you put one more `select` behind occasionally, that's not a problem.
+
+Next you put columns you are interested in. It could be a file name or path, size, modification date, etc.
+See the full list of possible columns. You can add columns with arbitrary text (put in quotes if it contains spaces). 
+A few functions (aggregating and formatting) are there for your service. You can use arithmetic expressions when it makes sense.
+
+Where to search? Specify with `from` keyword. You can list one or more directories separated with comma.
+If you leave the `from`, then current directory will be processed.
+
+What to search? Use `where` with any number of conditions.
+
+Order results like in real SQL with `order by`. All columns are supported for ordering by, 
+as well as `asc`/`desc` parameters and positional numeric shortcuts.
+
+Limiting search results is possible with `limit` and `offset`. Formatting options are supported with `into` keyword.
+
+If you want to use operators containing `>` or `<`, 
+put the whole query into the double quotes. 
+This will protect a query from the shell and output redirection.
+The same applies to queries with parentheses or `*`, `?` and other special shell
+metacharacters.
+
+It's ok to use any metacharacters in interactive mode.
+
+### It's not a real SQL
+
+Directories to search at are listed with comma separators.
+In a real SQL, such syntax would make a cross-product. Here it means just search at A, next at B, and so on.
+
+You can use curly braces instead of the regular parentheses! This helps to avoid a few of the shell pitfalls a little bit.
+Functions with no arguments don't require parentheses at all.
+
+String literals don't really need quotes. 
+You will need to put them just in case you query something with spaces inside. 
+And yes, you should use quotes for glob-patterns or regular expressions in the query 
+on Linux or macOS to prevent parameter expansion from the shell. 
+If you are on Windows, feel free to omit most of the quotes.
+
+Commas for column separation aren't needed as well. Column aliasing (with or without `as` keyword) is not supported.
+
+`where` section can contain short syntax conditions for boolean columns (like `is_audio` or `other_write`).
+
+`into` keyword specifies output format, not output table.
+
+Joins and unions are not supported (yet?).
+Subqueries have only limited support.
+
+### Columns and fields
+
+| Column                                       | Meaning                                                                                                                       | Comment                                                       |
+|----------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------|
+| `name`                                       | Returns the name (with extension) of the file                                                                                 |                                                               |
+| `filename` or `fname`                        | Returns the file name without extension                                                                                       |                                                               |
+| `extension` or `ext`                         | Returns the extension of the file                                                                                             |                                                               |
+| `path`                                       | Returns the relative path of the file                                                                                         |                                                               |
+| `abspath`                                    | Returns the absolute path of the file                                                                                         |                                                               |
+| `directory` or `dirname` or `dir`            | Returns the directory of the file                                                                                             |                                                               |
+| `absdir`                                     | Returns the absolute directory of the file                                                                                    |                                                               |
+| `size`                                       | Returns the size of the file in bytes                                                                                         |                                                               |
+| `fsize` or `hsize`                           | Returns the size of the file accompanied with the unit                                                                        |                                                               |
+| `uid`                                        | Returns the UID of the owner                                                                                                  |                                                               |
+| `gid`                                        | Returns the GID of the owner's group                                                                                          |                                                               |
+| `accessed`                                   | Returns the time the file was last accessed (YYYY-MM-DD HH:MM:SS)                                                             |                                                               |
+| `created`                                    | Returns the file creation date (YYYY-MM-DD HH:MM:SS)                                                                          | Windows, macOS, and Linux (kernel 4.11+ with ext4/btrfs/XFS)  |
+| `modified`                                   | Returns the time the file was last modified (YYYY-MM-DD HH:MM:SS)                                                             |                                                               |
+| `atime`                                      | Returns the last access time as a Unix timestamp (seconds since epoch)                                                        | Available only on Unix                                        |
+| `mtime`                                      | Returns the last modification time as a Unix timestamp (seconds since epoch)                                                  | Available only on Unix                                        |
+| `ctime`                                      | Returns the last status change time as a Unix timestamp (seconds since epoch)                                                 | Available only on Unix                                        |
+| `is_dir`                                     | Returns a boolean signifying whether the file path is a directory                                                             |                                                               |
+| `is_file`                                    | Returns a boolean signifying whether the file path is a file                                                                  |                                                               |
+| `is_symlink`                                 | Returns a boolean signifying whether the file path is a symlink                                                               |                                                               |
+| `is_pipe` or `is_fifo`                       | Returns a boolean signifying whether the file path is a FIFO or pipe file                                                     |                                                               |
+| `is_char` or `is_character`                  | Returns a boolean signifying whether the file path is a character device or character special file                            |                                                               |
+| `is_block`                                   | Returns a boolean signifying whether the file path is a block or block special file                                           |                                                               |
+| `is_socket`                                  | Returns a boolean signifying whether the file path is a socket file                                                           |                                                               |
+| `is_hidden`                                  | Returns a boolean signifying whether the file is a hidden file (e.g., files that start with a dot on *nix)                    |                                                               |
+| `has_xattrs`                                 | Returns a boolean signifying whether the file has extended attributes or alternate data streams on Windows                    |                                                               |
+| `xattr_count`                                | Returns the count of extended attributes on the file or alternate data streams on Windows                                     |                                                               |
+| `extattrs`                                   | Returns the extended file attributes as a string of chattr/lsattr flag letters                                                | Available only on Linux                                       |
+| `has_extattrs`                               | Returns a boolean signifying whether the file has any extended file attributes set                                            | Available only on Linux                                       |
+| `acl`                                        | Returns all ACL entries in standard form (POSIX on Linux, DACL on Windows)                                                    | Available only on Linux and Windows                           |
+| `has_acl`                                    | Returns a boolean signifying whether the file has POSIX ACL entries beyond standard Unix permissions or Windows explicit ACEs | Available only on Linux and Windows                           |
+| `default_acl`                                | Returns all default POSIX ACL entries in standard form                                                                        | Available only on Linux                                       |
+| `has_default_acl`                            | Returns a boolean signifying whether the directory has default POSIX ACL entries                                              | Available only on Linux                                       |
+| `has_capabilities` or `has_caps`             | Returns a boolean signifying whether the file has capabilities                                                                | Available only on Linux                                       |
+| `capabilities` or `caps`                     | Returns a string describing Linux capabilities assigned to a file                                                             | Available only on Linux                                       |
+| `device`                                     | Returns the code of device the file is stored on                                                                              | Available only on Unix                                        |
+| `rdev`                                       | Returns the device ID for special files (character and block devices)                                                         | Available only on Unix                                        |
+| `inode`                                      | Returns the number of inode                                                                                                   | Available only on Linux                                       |
+| `blocks`                                     | Returns the number of blocks (256 bytes) the file occupies                                                                    | Available only on Linux                                       |
+| `hardlinks`                                  | Returns the number of hardlinks of the file                                                                                   | Available only on Linux                                       |
+| `mode`                                       | Returns the permissions of the owner, group, and everybody (similar to the first field in `ls -la`)                           |                                                               |
+| `user`                                       | Returns the name of the owner for this file                                                                                   | Available only on *nix platforms with `users` feature enabled |
+| `user_read`                                  | Returns a boolean signifying whether the file can be read by the owner                                                        |                                                               |
+| `user_write`                                 | Returns a boolean signifying whether the file can be written by the owner                                                     |                                                               |
+| `user_exec`                                  | Returns a boolean signifying whether the file can be executed by the owner                                                    |                                                               |
+| `user_all`                                   | Returns a boolean signifying whether the file can be fully accessed by the owner                                              |                                                               |
+| `group`                                      | Returns the name of the owner's group for this file                                                                           | Available only on *nix platforms with `users` feature enabled |
+| `group_read`                                 | Returns a boolean signifying whether the file can be read by the owner's group                                                |                                                               |
+| `group_write`                                | Returns a boolean signifying whether the file can be written by the owner's group                                             |                                                               |
+| `group_exec`                                 | Returns a boolean signifying whether the file can be executed by the owner's group                                            |                                                               |
+| `group_all`                                  | Returns a boolean signifying whether the file can be fully accessed by the group                                              |                                                               |
+| `other_read`                                 | Returns a boolean signifying whether the file can be read by others                                                           |                                                               |
+| `other_write`                                | Returns a boolean signifying whether the file can be written by others                                                        |                                                               |
+| `other_exec`                                 | Returns a boolean signifying whether the file can be executed by others                                                       |                                                               |
+| `other_all`                                  | Returns a boolean signifying whether the file can be fully accessed by the others                                             |                                                               |
+| `suid` or `is_suid`                          | Returns a boolean signifying whether the file permissions have a SUID bit set                                                 |                                                               |
+| `sgid` or `is_sgid`                          | Returns a boolean signifying whether the file permissions have a SGID bit set                                                 |                                                               |
+| `sticky` or `is_sticky`                      | Returns a boolean signifying whether the file permissions have a sticky bit set                                               |                                                               |
+| `width`                                      | Returns the number of pixels along the width of the photo or MP4 file                                                         |                                                               |
+| `height`                                     | Returns the number of pixels along the height of the photo or MP4 file                                                        |                                                               |
+| `mime`                                       | Returns MIME type of the file                                                                                                 |                                                               |
+| `is_binary`                                  | Returns a boolean signifying whether the file has binary contents                                                             |                                                               |
+| `is_text`                                    | Returns a boolean signifying whether the file has text contents                                                               |                                                               |
+| `line_count`                                 | Returns a number of lines in a text file                                                                                      |                                                               |
+| `exif_datetime`                              | Returns date and time of taken photo                                                                                          |                                                               |
+| `exif_datetime_original` or `exif_dto`       | Returns original date and time when the photo was taken                                                                       |                                                               |
+| `exif_altitude` or `exif_alt`                | Returns GPS altitude of taken photo                                                                                           |                                                               |
+| `exif_latitude` or `exif_lat`                | Returns GPS latitude of taken photo                                                                                           |                                                               |
+| `exif_longitude` or `exif_lng` or `exif_lon` | Returns GPS longitude of taken photo                                                                                          |                                                               |
+| `exif_make`                                  | Returns name of the camera manufacturer                                                                                       |                                                               |
+| `exif_model`                                 | Returns camera model                                                                                                          |                                                               |
+| `exif_software`                              | Returns software name with which the photo was taken                                                                          |                                                               |
+| `exif_version`                               | Returns the version of EXIF metadata                                                                                          |                                                               |
+| `exif_exposure_time` or `exif_exptime`       | Returns exposure time of the photo taken                                                                                      |                                                               |
+| `exif_aperture`                              | Returns aperture value of the photo taken                                                                                     |                                                               |
+| `exif_shutter_speed`                         | Returns shutter speed of the photo taken                                                                                      |                                                               |
+| `exif_f_number` or `exif_f_num`              | Returns F-number of the photo taken                                                                                           |                                                               |
+| `exif_iso_speed` or `exif_iso`               | Returns ISO speed of the photo taken (EXIF 2.3 ISOSpeed tag)                                                                  |                                                               |
+| `exif_sensitivity` or `exif_photo_sensitivity` | Returns photographic sensitivity (ISO) of the photo taken                                                                   |                                                               |
+| `exif_focal_length` or `exif_focal_len`      | Returns focal length of the photo taken                                                                                       |                                                               |
+| `exif_lens_make`                             | Returns lens manufacturer used to take the photo                                                                              |                                                               |
+| `exif_lens_model`                            | Returns lens model used to take the photo                                                                                     |                                                               |
+| `exif_description` or `exif_desc`            | Returns image description from EXIF metadata                                                                                  |                                                               |
+| `exif_artist`                                | Returns the artist or photographer name                                                                                       |                                                               |
+| `exif_copyright`                             | Returns the copyright information                                                                                             |                                                               |
+| `exif_orientation`                           | Returns the image orientation                                                                                                 |                                                               |
+| `exif_flash`                                 | Returns the flash status when the photo was taken                                                                             |                                                               |
+| `exif_color_space`                           | Returns the color space of the image                                                                                          |                                                               |
+| `exif_exposure_program` or `exif_exp_program` | Returns the exposure program used                                                                                            |                                                               |
+| `exif_exposure_bias` or `exif_exp_bias`      | Returns the exposure bias value                                                                                               |                                                               |
+| `exif_white_balance` or `exif_wb`            | Returns the white balance mode                                                                                                |                                                               |
+| `exif_metering_mode`                         | Returns the metering mode                                                                                                     |                                                               |
+| `exif_scene_type` or `exif_scene`            | Returns the scene capture type                                                                                                |                                                               |
+| `exif_contrast`                              | Returns the contrast setting                                                                                                  |                                                               |
+| `exif_saturation`                            | Returns the saturation setting                                                                                                |                                                               |
+| `exif_sharpness`                             | Returns the sharpness setting                                                                                                 |                                                               |
+| `exif_body_serial` or `exif_serial`          | Returns the camera body serial number                                                                                         |                                                               |
+| `exif_lens_serial`                           | Returns the lens serial number                                                                                                |                                                               |
+| `exif_user_comment` or `exif_comment`        | Returns the user comment from EXIF metadata                                                                                   |                                                               |
+| `exif_image_width` or `exif_width`           | Returns the image width from EXIF metadata                                                                                    |                                                               |
+| `exif_image_height` or `exif_height`         | Returns the image height from EXIF metadata                                                                                   |                                                               |
+| `exif_max_aperture`                          | Returns the max aperture value of the lens                                                                                    |                                                               |
+| `exif_digital_zoom` or `exif_dzoom`          | Returns the digital zoom ratio                                                                                                |                                                               |
+| `mp3_title` or `title`                       | Returns the title of the audio file taken from the file's metadata                                                            |                                                               |
+| `mp3_album` or `album`                       | Returns the album name of the audio file taken from the file's metadata                                                       |                                                               |
+| `mp3_artist` or `artist`                     | Returns the artist of the audio file taken from the file's metadata                                                           |                                                               |
+| `mp3_genre` or `genre`                       | Returns the genre of the audio file taken from the file's metadata                                                            |                                                               |
+| `mp3_year`                                   | Returns the year of the audio file taken from the file's metadata                                                             |                                                               |
+| `mp3_freq` or `freq`                         | Returns the sampling rate of audio or video file                                                                              |                                                               |
+| `mp3_bitrate` or `bitrate`                   | Returns the bitrate of the audio file in kbps                                                                                 |                                                               |
+| `duration`                                   | Returns the duration of audio file in seconds                                                                                 |                                                               |
+| `is_shebang`                                 | Returns a boolean signifying whether the file starts with a shebang (#!)                                                      |                                                               |
+| `is_empty`                                   | Returns a boolean signifying whether the file is empty or the directory is empty                                              |                                                               |
+| `is_archive`                                 | Returns a boolean signifying whether the file is an archival file                                                             | [default extensions](#ext_archive)                            |
+| `is_audio`                                   | Returns a boolean signifying whether the file is an audio file                                                                | [default extensions](#ext_audio)                              |

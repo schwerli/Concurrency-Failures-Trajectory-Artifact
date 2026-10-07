@@ -1,0 +1,545 @@
+==========================================================================================
+SLUG: inversed-time-bandwidth
+ROOT CAUSE: The bug is NOT in `getValueAxesMinGaps()`/`makeColumnLayout()` in `/workspace/src/layout/barGrid.ts` — that code already sorts the collected values ascending, ignores non-positive deltas (`if (delta > 0)`), and already wraps both `extentSpan` and `scaleSpan` in `Math.abs()`, so it is orientation-agnostic. `src/layout/barPolar.ts` also already uses `Math.abs(axisExtent[1] - axisExtent[0])`, and `Axis.getBandWidth()` is abs-safe too.
+
+The real culprit is `adjustScaleForOverflow()` in `/workspace/src/coord/axisHelper.ts` (line 118):
+
+    const axisExtent = model.axis.getExtent();
+    const axisLength = axisExtent[1] - axisExtent[0];   // NEGATIVE when axis.inverse === true
+
+`Grid.adjustAxes()` (`/workspace/src/coord/cartesian/Grid.ts:219`) sets the pixel extent reversed for an inversed axis (`axis.setExtent(extent[1], extent[0])`), so `getExtent()` returns e.g. `[500, 0]` and `axisLength` becomes `-500`. `adjustScaleForOverflow()` then computes
+
+    oldRangePercentOfNew = 1 - (minOverflow + maxOverflow) / axisLength;   // > 1 instead of < 1
+    overflowBuffer = oldRange / oldRangePercentOfNew - oldRange;            // NEGATIVE instead of positive
+
+so instead of *expanding* the time scale extent to make room for the half-bars sticking out past the first/last data point, it *shrinks* it. Since `makeColumnLayout()` derives `bandWidth = extentSpan / scaleSpan * minGap` from `baseAxis.scale.getExtent()` (which by layout time is the niced, wrongly-shrunk extent), a smaller `scaleSpan` inflates `bandWidth`.
+
+Measured empirically (500x400 chart, zero grid padding, `xAxis: {type:'time'}`, 3 daily points, one bar series; I patched, ran, and reverted):
+- inverse:false → scale span 263,816,793 ms, bandWidth 163.75, bar width 112.9875, item0 x=29.76 (right edge 142.7, inside grid)
+- inverse:true (buggy) → scale span 128,475,836 ms (SMALLER than the raw 172,800,000 ms data span, so the first/last points fall outside the scale), bandWidth 336.25 (2.05x too big), bar width 232.01, item0 x=470.24 → right edge 702.3, i.e. 202 px outside the 500 px grid. That is exactly the "distorted bar sizing/spacing" symptom.
+- inverse:true with `Math.abs()` applied → scale span, bandWidth (163.75), and bar width (112.9875) become bit-identical to the non-inversed case, and item0 x=357.26 is the exact mirror (500 - 29.76 - 112.99).
+
+Note the min/max buffer split (`maxOverflow / totalOverFlow`) needs no inverse-aware swap: `doCalBarWidthAndOffset()` always lays offsets out symmetrically about 0 (first offset `-widthSum/2`, last `offset+width = +widthSum/2`), so `minOverflow === maxOverflow` and the distribution is symmetric regardless of direction.
+UPSTREAM: Almost certainly a one-line `Math.abs()` on the axis length inside `adjustScaleForOverflow` in `src/coord/axisHelper.ts` (mirroring the `Math.abs()` guards that already exist in `barGrid.makeColumnLayout`, `barPolar.calRadialBar` and `Axis.getBandWidth`), plus a unit test asserting the bar/band width is identical for `inverse: true` and `inverse: false` time axes. The commit title says "fix(axis)" rather than "fix(bar)", consistent with the change landing in the axis/scale-extent helper rather than in the bar layout.
+--- PLAN ---
+* /workspace/src/coord/axisHelper.ts
+  In `adjustScaleForOverflow()` (currently lines 116-118), replace the two-line block
+
+    // Get Axis Length
+    const axisExtent = model.axis.getExtent();
+    const axisLength = axisExtent[1] - axisExtent[0];
+
+with
+
+    // Get Axis Length.
+    // Note: `axis.getExtent()` is reversed (extent[0] > extent[1]) when the axis
+    // is `inverse: true`, so the absolute length must be used here. Otherwise
+    // `overflowBuffer` below becomes negative and shrinks the scale extent
+    // instead of expanding it, which finally makes the bar `bandWidth`
+    // (`extentSpan / scaleSpan * minGap` in `barGrid.makeColumnLayout`) too large.
+    const axisExtent = model.axis.getExtent();
+    const axisLength = Math.abs(axisExtent[1] - axisExtent[0]);
+
+Do NOT touch anything else in the function: `minOverflow`/`maxOverflow` are already `Math.abs()`-ed and are symmetric about 0, so the `maxOverflow / totalOverFlow` / `minOverflow / totalOverFlow` split needs no inverse-aware swap.
+  WHY: This is the single orientation-dependent expression in the whole bar-bandWidth path. `Math.abs` is a no-op for non-inversed axes (extent[1] > extent[0]), so existing layouts are bit-for-bit unchanged, while inversed time axes now get the same scale expansion (and therefore the same scaleSpan and bandWidth) as non-inversed ones.
+* /workspace/test/ut/spec/chart/bar/barBandWidthInverseTimeAxis.test.ts
+  NEW file (Apache license header copied from e.g. /workspace/test/ut/spec/chart/bar/BarView.test.ts). Place it here, NOT in test/ut/spec/layout/: `test/ut/jest.config.cjs` `testMatch` has no `**/spec/layout/**` pattern, so a test under test/ut/spec/layout/ would silently never run; `**/spec/chart/**/*.test.ts` is already matched (an equally valid alternative is test/ut/spec/coord/). Content:
+
+    import { createChart } from '../../../core/utHelper';
+    import { EChartsType } from '@/src/echarts';
+
+    const DAY = 24 * 3600 * 1000;
+    const T0 = Date.UTC(2024, 0, 1);
+    const WIDTH = 500;
+
+    function layoutOf(inverse: boolean) {
+        const chart = createChart({ width: WIDTH, height: 400 });
+        chart.setOption({
+            useUTC: true,
+            animation: false,
+            grid: { left: 0, right: 0, top: 0, bottom: 0 },
+            xAxis: { type: 'time', inverse: inverse },
+            yAxis: { type: 'value' },
+            series: [{ type: 'bar', data: [[T0, 1], [T0 + DAY, 2], [T0 + 2 * DAY, 3]] }]
+        });
+        const series = chart.getModel().getSeriesByIndex(0) as any;
+        const data = series.getData();
+        const scaleExtent = series.coordinateSystem.getBaseAxis().scale.getExtent();
+        const result = {
+            bandWidth: data.getLayout('bandWidth') as number,
+            width: (data.getItemLayout(0) as any).width as number,
+            x: [0, 1, 2].map(i => (data.getItemLayout(i) as any).x as number),
+            scaleSpan: scaleExtent[1] - scaleExtent[0]
+        };
+        chart.dispose();
+        return result;
+    }
+
+    describe('bar_bandWidth_inversedTimeAxis', function () {
+        it('should calculate the same bandWidth on inversed and normal time axis', function () {
+            const normal = layoutOf(false);
+            const inversed = layoutOf(true);
+            expect(normal.bandWidth).toBeGreaterThan(0);
+            expect(inversed.bandWidth).toBeCloseTo(normal.bandWidth, 4);
+            expect(inversed.width).toBeCloseTo(normal.width, 4);
+            expect(inversed.scaleSpan).toBeCloseTo(normal.scaleSpan, 0);
+        });
+
+        it('should keep bars inside the grid and mirrored on inversed time axis', function () {
+            const normal = layoutOf(false);
+            const inversed = layoutOf(true);
+            for (let i = 0; i < 3; i++) {
+                // Mirrored position
+                expect(inversed.x[i]).toBeCloseTo(WIDTH - normal.x[2 - i] - normal.width, 4);
+                // No overflow outside the grid
+                expect(inversed.x[i]).toBeGreaterThanOrEqual(0);
+                expect(inversed.x[i] + inversed.width).toBeLessThanOrEqual(WIDTH + 1e-6);
+            }
+        });
+    });
+
+Use `as any` / a small local cast for `getItemLayout` (it returns a generic layout type) and cast the option object if TS complains — note the jest config sets `diagnostics: false`, so type strictness is not enforced at test time. Measured expectation with the fix: bandWidth 163.75, width 112.9875, x = [357.26, 193.51, 29.76] for inverse and [29.76, 193.51, 357.26] for normal. Before the fix the second `it` fails on the overflow assertion (x0+width = 702.3 > 500) and the first fails on bandWidth (336.25 vs 163.75).
+  WHY: Locks the acceptance criteria: equal band/bar width across inverse:true/false, no distortion, and no grid overflow. Both assertions fail on the unfixed code and pass with the one-line change, and the mirroring assertion also guards against a future 'fix' that merely clamps the width without restoring the scale extent.
+* /workspace/test/bar-overflow-time-plot.html
+  OPTIONAL (visual regression aid, no behavioral impact): duplicate one of the existing time-axis bar cases in this file and add `inverse: true` to its `xAxis`, so the reviewer can eyeball that bars no longer spill outside the grid. This file is the one explicitly referenced by the FIXME comment above `adjustScaleForOverflow`'s call site (`// See #6728, #4862, test/bar-overflow-time-plot.html`). Skip if you prefer to keep the diff minimal.
+  WHY: Gives a manual/visual check for the exact scenario the helper exists for, and documents the inverse case next to the existing overflow cases.
+--- TYPES: []
+--- TESTS ---
+ - Run the new spec only: `cd /workspace && npx jest --config test/ut/jest.config.cjs --coverage=false test/ut/spec/chart/bar/barBandWidthInverseTimeAxis.test.ts` — expect 2 passing tests.
+ - Sanity-check the test actually catches the bug: stash the axisHelper.ts change (`git stash push src/coord/axisHelper.ts`), re-run the spec and confirm both assertions fail (bandWidth 336.25 vs 163.75; x0+width = 702.3 > 500), then restore.
+ - Run the whole unit suite: `npx jest --config test/ut/jest.config.cjs --coverage=false`. Baseline on this working tree already has 3 failing suites from other in-flight work (test/ut/spec/chart/map/regionSilent.test.ts, test/ut/spec/component/geo/regionSilent.test.ts, test/ut/spec/coord/axisTicksInsideExtent.test.ts). I verified these 3 fail identically with and without the axisHelper patch — no new failures are introduced. Existing bar/candlestick/boxplot/BarView specs all pass.
+ - Non-regression proof for non-inversed axes: `Math.abs` is the identity when extent[1] > extent[0], so `test/bar-overflow-time-plot.html`, `test/bar2.html`, `test/bar-large.html` render identically; optionally confirm via the visual test server (`npm run test:visual`) on bar-overflow-time-plot.html.
+ - Manual check in test/bar-overflow-time-plot.html with `inverse: true` added to a time xAxis: bars should be mirrored, evenly spaced, of the same width as the non-inversed chart, and fully inside the grid.
+--- RISKS ---
+ - The fix changes the niced scale extent (and therefore tick/label positions and dataZoom ranges) for any chart that combines a bar series with an inversed time base axis. That is the intended correction, but any stored visual-regression baseline containing that combination will legitimately change. No such case exists in test/ util specs today.
+ - `adjustScaleForOverflow` still divides by `axisLength`, which is 0 before the grid has been resized (`Axis._extent` starts at [0, 0]); the result is ±Infinity and then a degenerate buffer. `Math.abs` does not introduce this, but it also does not fix it. If you want belt-and-braces, add an early `if (!(axisLength > 0)) { return {min: min, max: max}; }` — flag it as a separate concern rather than folding it in silently, since it could alter behavior in unusual init orders.
+ - Do NOT 'fix' this in src/layout/barGrid.ts: `getValueAxesMinGaps` already sorts ascending and filters `delta > 0`, and `makeColumnLayout` already abs-es both spans. Adding a redundant Math.abs/sort there would look like a fix while the scale extent stays wrong, and the mirroring/overflow assertions in the new test would still fail.
+ - The working tree is being mutated by other concurrent agents (files appeared/disappeared during this investigation). Touch only src/coord/axisHelper.ts and the new test file; in particular avoid editing test/ut/jest.config.cjs (that is why the test goes under spec/chart/bar/ rather than a new spec/layout/ directory) to prevent conflicts.
+ - Assertion tolerance: bandWidth/width values carry floating-point noise (e.g. 112.98750000002714), so compare with toBeCloseTo, not toBe, and give the grid explicit zero padding so the numbers do not depend on default label sizing in jsdom.
+==========================================================================================
+SLUG: splitline-min-max-lines
+ROOT CAUSE: Not a bug — a missing feature. Every axis view renders one split line per entry of `axis.getTicksCoords({tickModel: splitLineModel})` with no way to exclude the two entries that land on the axis coord extent. Those two lines coincide with the axis line and with the opposite edge of the grid/polar area, so authors who want a "clean" grid currently have to hide `splitLine` entirely. The fix is to add `splitLine.showMinLine` / `splitLine.showMaxLine` (both defaulting to `true`, i.e. today's rendering) and skip the tick whose coord equals the min (`axis.getExtent()[0]`) or max (`axis.getExtent()[1]`) end. Crucially, `inverse` is implemented by *swapping the coord extent* (`Grid#adjustAxes`: `const idx = axis.inverse ? 1 : 0; axis.setExtent(extent[idx], extent[1 - idx])`; likewise `src/coord/single/Single.ts` line 143 and `src/coord/polar/polarCreator.ts` lines 71-73 and 122-128), while `dataToCoord` always maps the scale min to `extent[0]`. Therefore `extent[0]` is ALWAYS the data-min end and `extent[1]` the data-max end, on every axis type, inverse or not.
+UPSTREAM: Upstream adds `showMinLine`/`showMaxLine` to the shared `splitLine` option (defaulting to `true`) and, in each axis view's `splitLine()` builder, `continue`s over the tick that sits at the axis boundary. The simplest upstream-style form is index-based (`i === 0` / `i === ticksCoords.length - 1`), which happens to be correct for inverse axes because `createAxisTicks` returns ticks in ascending value order and `dataToCoord(min) === extent[0]` regardless of `inverse`. This plan uses the equivalent but strictly more robust coord-vs-extent comparison in one shared helper (`axisSplitHelper.ts`), because the first/last entry of `ticksCoords` is not always on the boundary (`splitLine.interval`, `axisTick.customValues`) and because `AngleAxisView#fixAngleOverlap` pops the duplicated boundary tick of a 360-degree axis. `minorSplitLine` and `splitArea` are untouched upstream and here.
+--- PLAN ---
+* /workspace/src/coord/axisCommonTypes.ts
+  Export the shared split-line option interface and add the two flags. Anchor (currently at line 268), replace exactly:
+
+```ts
+interface SplitLineOption {
+    show?: boolean,
+    interval?: 'auto' | number | ((index:number, value: string) => boolean)
+    // colors will display in turn
+    lineStyle?: LineStyleOption<ZRColor | ZRColor[]>
+}
+```
+
+with:
+
+```ts
+export interface SplitLineOption {
+    show?: boolean,
+    interval?: 'auto' | number | ((index:number, value: string) => boolean)
+    /**
+     * Whether to show the split line at the min end of the axis.
+     * Default `true` (keep the original behavior). Set to `false` to hide
+     * the boundary line, which coincides with the axis line or with the
+     * opposite edge of the coordinate system.
+     */
+    showMinLine?: boolean,
+    /**
+     * Whether to show the split line at the max end of the axis.
+     * Default `true`. See `showMinLine`.
+     */
+    showMaxLine?: boolean,
+    // colors will display in turn
+    lineStyle?: LineStyleOption<ZRColor | ZRColor[]>
+}
+```
+
+Note: only the `interface` -> `export interface` keyword and the two new optional props change; `MinorSplitLineOption` (line 275) and `SplitAreaOption` (line 281) are intentionally NOT touched. `AxisBaseOptionCommon.splitLine?: SplitLineOption` (line 65) already references it, so cartesian/single/polar/parallel and `RadarModel.splitLine?: AxisBaseOption['splitLine']` all pick the new keys up automatically.
+  WHY: One shared declaration site: `AxisBaseOptionCommon` (line 32) is the base of ValueAxisBaseOption / LogAxisBaseOption / CategoryAxisBaseOption / TimeAxisBaseOption, and `src/coord/cartesian/AxisModel.ts`, `src/coord/single/AxisModel.ts`, `src/coord/polar/AxisModel.ts` all build their option types on `AxisBaseOption`, so no per-coordinate type edits are needed. The interface must be exported so the new helper in `axisSplitHelper.ts` can type its `Model<SplitLineOption>` parameter.
+* /workspace/src/component/axis/axisSplitHelper.ts
+  Add three type-only imports plus one exported helper. 
+
+1) After the existing import block (anchor: the line `import AxisView from './AxisView';`) add:
+
+```ts
+import type Axis from '../../coord/Axis';
+import type Model from '../../model/Model';
+import type { SplitLineOption } from '../../coord/axisCommonTypes';
+```
+
+2) Insert the helper immediately BEFORE `export function rectCoordAxisBuildSplitArea(` (i.e. after the `const inner = makeInner<...>();` block):
+
+```ts
+/**
+ * Make a predicate that tells whether the split line at a given axis coord
+ * must be hidden because of `splitLine.showMinLine` / `splitLine.showMaxLine`.
+ * Both options default to `true`, so the rendering is unchanged when they are
+ * absent.
+ *
+ * The boundary is detected by the coord rather than by the index in
+ * `ticksCoords`, because:
+ *  - `inverse` is applied by swapping the coord extent (see `Grid#adjustAxes`,
+ *    `Single#_adjustAxis`, `polarCreator`), while `dataToCoord` always maps the
+ *    scale min to `extent[0]`. So `axis.getExtent()[0]` is always the coord of
+ *    the axis min and `[1]` the coord of the axis max, inversed or not.
+ *  - the first/last entry of `ticksCoords` is not necessarily on the boundary
+ *    (`splitLine.interval`, `axisTick.customValues` may drop it), and the
+ *    boundary tick of a 360 degree angle axis is deduplicated
+ *    (`AngleAxisView#fixAngleOverlap`).
+ *
+ * @param coord The axis local coord (i.e. before `axis.toGlobalCoord`), the
+ *        radius for a radius axis, or the angle in degree for an angle axis.
+ */
+export function makeSplitLineBoundaryFilter(
+    axis: Axis,
+    splitLineModel: Model<SplitLineOption>
+): (coord: number) => boolean {
+    const showMinLine = splitLineModel.get('showMinLine') !== false;
+    const showMaxLine = splitLineModel.get('showMaxLine') !== false;
+
+    if (showMinLine && showMaxLine) {
+        // Fast path, nothing hidden.
+        return function () {
+            return false;
+        };
+    }
+
+    const extent = axis.getExtent();
+    const minCoord = extent[0];
+    const maxCoord = extent[1];
+
+    return function (coord: number): boolean {
+        return (!showMinLine && Math.abs(coord - minCoord) < BOUNDARY_EPSILON)
+            || (!showMaxLine && Math.abs(coord - maxCoord) < BOUNDARY_EPSILON);
+    };
+}
+```
+
+3) Declare the tolerance next to the existing `const inner = ...` declaration:
+
+```ts
+// Tolerance of the float error brought by `dataToCoord` and by the on-band
+// tick shift in `fixOnBandTicksCoords`.
+const BOUNDARY_EPSILON = 1e-4;
+```
+
+Do NOT change `rectCoordAxisBuildSplitArea` — `splitArea` uses `ticksCoords` as area *boundaries*, so dropping one would move/merge areas.
+  WHY: One implementation shared by all four axis views, so the min/max semantics cannot drift between coordinate systems. Returning a closure keeps the per-tick check to one function call and reads the two options exactly once per render. Type-only imports keep the polar bundle from gaining a runtime dependency (the file's only other cartesian reference, `import GridModel from '../../coord/cartesian/GridModel'`, is already used solely in type positions and is elided).
+* /workspace/src/component/axis/CartesianAxisView.ts
+  Two edits inside the `splitLine` builder of `axisElementBuilders`.
+
+1) Import. Replace:
+
+```ts
+import {rectCoordAxisBuildSplitArea, rectCoordAxisHandleRemove} from './axisSplitHelper';
+```
+
+with:
+
+```ts
+import {
+    rectCoordAxisBuildSplitArea,
+    rectCoordAxisHandleRemove,
+    makeSplitLineBoundaryFilter
+} from './axisSplitHelper';
+```
+
+2) In `splitLine(axisView, axisGroup, axisModel, gridModel)`, replace:
+
+```ts
+        const ticksCoords = axis.getTicksCoords({
+            tickModel: splitLineModel
+        });
+
+        const p1 = [];
+        const p2 = [];
+
+        const lineStyle = lineStyleModel.getLineStyle();
+        for (let i = 0; i < ticksCoords.length; i++) {
+            const tickCoord = axis.toGlobalCoord(ticksCoords[i].coord);
+```
+
+with:
+
+```ts
+        const ticksCoords = axis.getTicksCoords({
+            tickModel: splitLineModel
+        });
+
+        const isBoundaryLineHidden = makeSplitLineBoundaryFilter(axis, splitLineModel);
+
+        const p1 = [];
+        const p2 = [];
+
+        const lineStyle = lineStyleModel.getLineStyle();
+        for (let i = 0; i < ticksCoords.length; i++) {
+            // `splitLine.showMinLine` / `showMaxLine`. Compare the local coord,
+            // not the global one.
+            if (isBoundaryLineHidden(ticksCoords[i].coord)) {
+                continue;
+            }
+            const tickCoord = axis.toGlobalCoord(ticksCoords[i].coord);
+```
+
+Leave `let lineCount = 0;` and `const colorIndex = (lineCount++) % lineColors.length;` untouched — because the `continue` happens before `lineCount++`, a multi-color `lineStyle.color` array cycles over the *rendered* lines. Do NOT touch `minorSplitLine` (minor ticks are strictly inside the extent: `Interval#getMinorTicks` filters `minorTick > extent[0] && minorTick < extent[1]`, so the options would be a no-op there) nor `splitArea`.
+  WHY: This is the split-line renderer for xAxis/yAxis, the primary target of the feature. The check must use `ticksCoords[i].coord` (local, same space as `axis.getExtent()`), which is why it is inserted before the `toGlobalCoord` conversion. `continue` (rather than filtering the array) preserves the existing `anid: 'line_' + tickValue` values of the remaining lines so `graphic.groupTransition` animation still matches elements across renders.
+* /workspace/src/component/axis/SingleAxisView.ts
+  Two edits.
+
+1) Import. Replace:
+
+```ts
+import {rectCoordAxisBuildSplitArea, rectCoordAxisHandleRemove} from './axisSplitHelper';
+```
+
+with:
+
+```ts
+import {
+    rectCoordAxisBuildSplitArea,
+    rectCoordAxisHandleRemove,
+    makeSplitLineBoundaryFilter
+} from './axisSplitHelper';
+```
+
+2) In `splitLine(axisView, group, axisGroup, axisModel)`, replace:
+
+```ts
+        const ticksCoords = axis.getTicksCoords({
+            tickModel: splitLineModel
+        });
+
+        const p1 = [];
+        const p2 = [];
+
+        for (let i = 0; i < ticksCoords.length; ++i) {
+            const tickCoord = axis.toGlobalCoord(ticksCoords[i].coord);
+```
+
+with:
+
+```ts
+        const ticksCoords = axis.getTicksCoords({
+            tickModel: splitLineModel
+        });
+
+        const isBoundaryLineHidden = makeSplitLineBoundaryFilter(axis, splitLineModel);
+
+        const p1 = [];
+        const p2 = [];
+
+        for (let i = 0; i < ticksCoords.length; ++i) {
+            // `splitLine.showMinLine` / `showMaxLine`.
+            if (isBoundaryLineHidden(ticksCoords[i].coord)) {
+                continue;
+            }
+            const tickCoord = axis.toGlobalCoord(ticksCoords[i].coord);
+```
+
+Nothing else changes: `splitLines[colorIndex]` stays hole-free because `lineCount` is only incremented for rendered lines, and the trailing `for (let i = 0; i < splitLines.length; ++i) { group.add(graphic.mergePath(...)) }` naturally adds nothing when every line is filtered out.
+  WHY: `singleAxis` (themeRiver / single-axis scatter) renders its own split lines and must honor the same options; `axis.getExtent()` here is also the local coord extent with `inverse` pre-swapped by `Single.ts` line 143.
+* /workspace/src/component/axis/RadiusAxisView.ts
+  Two edits.
+
+1) Add after `import AxisView from './AxisView';`:
+
+```ts
+import { makeSplitLineBoundaryFilter } from './axisSplitHelper';
+```
+
+2) In the `splitLine(group, radiusAxisModel, polar, axisAngle, radiusExtent, ticksCoords)` builder, replace:
+
+```ts
+        const splitLines: graphic.Circle[][] = [];
+
+        for (let i = 0; i < ticksCoords.length; i++) {
+            const colorIndex = (lineCount++) % lineColors.length;
+```
+
+with:
+
+```ts
+        const splitLines: graphic.Circle[][] = [];
+
+        const isBoundaryLineHidden = makeSplitLineBoundaryFilter(radiusAxisModel.axis, splitLineModel);
+
+        for (let i = 0; i < ticksCoords.length; i++) {
+            // `splitLine.showMinLine` / `showMaxLine`. `ticksCoords[i].coord` is
+            // the radius, in the same space as `radiusAxis.getExtent()`
+            // (=== `radiusExtent`), whose `[0]` is always the axis min.
+            if (isBoundaryLineHidden(ticksCoords[i].coord)) {
+                continue;
+            }
+            const colorIndex = (lineCount++) % lineColors.length;
+```
+
+Note `ticksCoords` is produced once in `render()` by `radiusAxis.getTicksCoords()` (default axisTick model) and is shared with `splitArea` — do not mutate it; only skip while building lines. Do NOT touch `minorSplitLine` / `splitArea` in this file.
+  WHY: For a radius axis the min line is the innermost circle (often degenerate at the center, `r: Math.max(coord, 0)`) and the max line is the outermost circle, which duplicates the polar boundary drawn by the angle axis's `axisLine` — exactly the clutter the feature removes. `radiusAxisModel.axis` is typed `RadiusAxis` (injected in `polarCreator`), and `polarCreator` lines 71-73 swap the extent for `inverse`, so the helper's extent[0]=min rule holds.
+* /workspace/src/component/axis/AngleAxisView.ts
+  Two edits.
+
+1) Add after `import AxisBuilder from './AxisBuilder';`:
+
+```ts
+import { makeSplitLineBoundaryFilter } from './axisSplitHelper';
+```
+
+2) In the `splitLine(group, angleAxisModel, polar, ticksAngles, minorTickAngles, radiusExtent)` builder, replace:
+
+```ts
+        const splitLines: graphic.Line[][] = [];
+
+        for (let i = 0; i < ticksAngles.length; i++) {
+            const colorIndex = (lineCount++) % lineColors.length;
+```
+
+with:
+
+```ts
+        const splitLines: graphic.Line[][] = [];
+
+        const isBoundaryLineHidden = makeSplitLineBoundaryFilter(angleAxisModel.axis, splitLineModel);
+
+        for (let i = 0; i < ticksAngles.length; i++) {
+            // `splitLine.showMinLine` / `showMaxLine`. The coord is the angle in
+            // degree; `angleAxis.getExtent()` is `[startAngle, endAngle]` with
+            // `inverse` / `clockwise` already applied (see `polarCreator`).
+            if (isBoundaryLineHidden(ticksAngles[i].coord)) {
+                continue;
+            }
+            const colorIndex = (lineCount++) % lineColors.length;
+```
+
+Do NOT touch `minorSplitLine` / `splitArea` / `axisTick` in this file.
+  WHY: Completes coverage of every axis type that renders `splitLine`. On a full 360-degree angle axis `render()` already calls `fixAngleOverlap(ticksAngles)`, which pops the duplicate boundary tick, so only the `startAngle` line exists and `showMinLine: false` hides it while `showMaxLine: false` is correctly a no-op; on a partial axis (`startAngle`/`endAngle`) both radial boundary lines exist and both flags apply. An index-based check would have wrongly removed the last *interior* line in the full-circle case, which is why the coord-based helper is used.
+* /workspace/src/coord/axisDefault.ts
+  Document the defaults on the base `splitLine`. Anchor (unique via the color value) inside `const defaultOption: AxisBaseOption`, replace:
+
+```ts
+    splitLine: {
+        show: true,
+        lineStyle: {
+            color: ['#E0E6F1'],
+            width: 1,
+            type: 'solid'
+        }
+    },
+```
+
+with:
+
+```ts
+    splitLine: {
+        show: true,
+        // Whether to show the split line at the min / max end of the axis.
+        // They coincide with the axis line or with the opposite edge of the
+        // coordinate system, so set them to `false` to remove that clutter.
+        showMinLine: true,
+        showMaxLine: true,
+        lineStyle: {
+            color: ['#E0E6F1'],
+            width: 1,
+            type: 'solid'
+        }
+    },
+```
+
+Do NOT add the keys to the `categoryAxis` (line ~119) or `timeAxis` (line ~185) `splitLine: { show: false }` blocks, nor to `src/coord/single/AxisModel.ts` (line 94) — those are deep-`merge`d over/into `defaultOption` by `zrUtil.merge` and by `axisModelCreator` (`merge(merge({}, axisDefault[axisType], true), extraDefaultOption, true)`), so they inherit `showMinLine`/`showMaxLine` automatically.
+  WHY: Makes the default explicit and self-documenting for every axis (x/y/single/radius/angle/parallel all get their defaults from `axisDefault` through `axisModelCreator`), so `splitLineModel.get('showMinLine')` returns `true` rather than `undefined`. The helper still uses `!== false` so it stays correct for any model built without these defaults (e.g. a hand-made `Model` in a unit test, or a third-party axis).
+* /workspace/test/ut/spec/component/axis/splitLineMinMax.test.ts
+  New test file (new directory `test/ut/spec/component/axis/`, which `testMatch: '**/spec/component/**/*.test.ts'` already covers). Structure:
+
+```ts
+// Apache license header (copy from test/ut/spec/coord/axisCustomValues.test.ts)
+import { createChart, getECModel, getViewGroup } from '../../../core/utHelper';
+import { EChartsType } from '@/src/echarts';
+import { EChartsOption } from '@/src/export/option';
+import CartesianAxisModel from '@/src/coord/cartesian/AxisModel';
+import Axis from '@/src/coord/Axis';
+import IntervalScale from '@/src/scale/Interval';
+import Model from '@/src/model/Model';
+import Path from 'zrender/src/graphic/Path';
+import Element from 'zrender/src/Element';
+import { makeSplitLineBoundaryFilter } from '@/src/component/axis/axisSplitHelper';
+
+// --- helpers ---
+// Cartesian split lines are individual `graphic.Line`s: `anid` is
+// `'line_' + tickValue`, or null for the extra on-band boundary entry.
+// The axis line has anid 'line', ticks 'tick_*', minor split lines
+// 'minor_line_*', labels 'label_*', split areas are Rects.
+function getSplitLineEls(chart: EChartsType, mainType: string, index?: number): Element[] {
+    const out: Element[] = [];
+    getViewGroup(chart, mainType as any, index).traverse(function (el: Element) {
+        if (el.type === 'line' && (el.anid == null || el.anid.indexOf('line_') === 0)) {
+            out.push(el);
+        }
+    });
+    return out;
+}
+function getAnidsWithPrefix(chart: EChartsType, mainType: string, prefix: string): string[] { /* traverse, collect el.anid starting with prefix */ }
+// Single-axis and polar split lines are merged into one Path bundle per color
+// (`graphic.mergePath`); count the path commands instead of elements.
+function getMergedPathLen(chart: EChartsType, mainType: string, index?: number): number {
+    let len = 0;
+    getViewGroup(chart, mainType as any, index).traverse(function (el: Element) {
+        if (el.type === 'path') { len += (el as Path).getUpdatedPathProxy(true).len(); }
+    });
+    return len;
+}
+```
+
+Cases:
+
+A. `describe('splitLine_boundaryFilter')` — pure unit tests of the helper, no chart:
+  - `new Axis('y', new IntervalScale(), [0, 300])` + `new Model({}) as any` -> filter returns false for 0, 150 and 300 (defaults absent => nothing hidden).
+  - `new Model({ showMinLine: false })` -> true at 0, false at 150 and 300.
+  - `new Model({ showMaxLine: false })` -> true at 300 only.
+  - both false -> true at 0 and 300, false at 150.
+  - INVERSE: build the axis with an already-swapped extent `[300, 0]` (what `Grid#adjustAxes` does) and `{ showMinLine: false }` -> hidden at coord 300, not at 0. This is the regression guard proving min/max follow the data, not the pixel order.
+  - float tolerance: `{ showMaxLine: false }` -> hidden at `300 - 1e-9`.
+
+B. `describe('splitLine_showMinMaxLine_cartesian')` with `chart = createChart({ width: 500, height: 400 })` and a value yAxis (`yAxis: { type: 'value', min: 0, max: 100, splitLine: { show: true } }`, `xAxis: { type: 'category', data: [...] }`, one bar series, `animation: false`):
+  - baseline: `getSplitLineEls(chart, 'yAxis', 0).length` === `axisModel.axis.getTicksCoords({ tickModel: axisModel.getModel('splitLine') }).length`, and the anid set contains `'line_0'` and `'line_100'`.
+  - explicit `showMinLine: true, showMaxLine: true` gives the identical anid list (acceptance: unchanged when absent).
+  - `showMinLine: false` -> length is baseline-1 and `'line_0'` is absent while `'line_100'` is present.
+  - `showMaxLine: false` -> baseline-1, `'line_100'` absent, `'line_0'` present.
+  - both false -> baseline-2, neither present, all interior tickValues still present.
+  - `inverse: true` + `showMinLine: false` -> the missing anid is still `'line_0'` (the data min), and the remaining lines' `shape.y1` set proves the max line at the top edge is still drawn.
+  - category xAxis with `boundaryGap: true` and `splitLine: { show: true, showMinLine: false }`: the on-band boundary entries have `anid == null`, so assert on geometry — with defaults `Math.min(...xs) === gridRect.x` and `Math.max(...xs) === gridRect.x + gridRect.width` (use `toBeCloseTo`, sub-pixel optimization shifts by <=0.5), and with `showMinLine: false` `Math.min(...xs) > gridRect.x + 1`. Get `gridRect` from `getECModel(chart).getComponent('grid', 0).coordinateSystem.getRect()`.
+  - non-boundary guard: `yAxis: { min: 0, max: 100, splitLine: { show: true, interval: (i) => i > 0, showMinLine: false } }` (or `axisTick.customValues`) — when no tick sits on the extent, `showMinLine: false` removes nothing.
+
+C. `describe('splitLine_showMinMaxLine_notAffectOthers')` on the same cartesian chart with `minorTick: { show: true }`, `minorSplitLine: { show: true }`, `splitArea: { show: true }`:
+  - `getAnidsWithPrefix(chart, 'yAxis', 'minor_line_').length` is identical with and without `showMinLine/showMaxLine: false`.
+  - `getAnidsWithPrefix(chart, 'yAxis', 'area_').length` is identical too (splitArea geometry must not change).
+
+D. `describe('splitLine_showMinMaxLine_singleAxis')` — `singleAxis: { type: 'value', min: 0, max: 100, splitLine: { show: true } }` + a themeRiver/scatter series on `singleAxis`; `getMergedPathLen(chart, 'singleAxis', 0)` for defaults > for `showMinLine: false` > for both false. Extra precise check: grab the single `type === 'path'` child and compare `el.getBoundingRect()` (in the group's local space) with `axisModel.coordinateSystem.getRect()` — with defaults `rect.x` is at `gridRect.x`, with `showMinLine: false` it is strictly greater.
+
+E. `describe('splitLine_showMinMaxLine_polar')` — `polar: {}`, `radiusAxis: { type: 'value', min: 0, max: 100, splitLine: { show: true }, axisTick: { show: false }, axisLabel: { show: false } }`, `angleAxis: { type: 'value', startAngle: 0, endAngle: 180, splitLine: { show: true }, axisTick: { show: false }, axisLabel: { show: false } }`, one polar line series. Disabling `axisTick` matters because `AngleAxisView#axisTick` also emits a `mergePath` bundle (`type === 'path'`).
+  - radiusAxis: `getMergedPathLen(chart, 'radiusAxis', 0)` for defaults > for `showMaxLine: false`; also the bundle's `getBoundingRect().width` shrinks below `2 * radiusExtent[1]` when the outer circle is hidden.
+  - angleAxis (180 degree extent): defaults > `showMinLine: false` > ... and both-false is the smallest.
+  - full-circle angleAxis (`startAngle: 90` default, no `endAngle`) with `showMaxLine: false`: length is unchanged (the boundary tick was already deduplicated by `fixAngleOverlap`), while `showMinLine: false` shrinks it — encode this as the documented behavior.
+
+Each `describe` uses `beforeEach(() => chart = createChart({...}))` / `afterEach(() => chart.dispose())` and `chart.setOption(opt, true)` (notMerge) per case, matching `test/ut/spec/coord/polar/polarClip.test.ts`.
+  WHY: Covers all four views plus the shared helper. The helper unit tests pin the inverse semantics deterministically without depending on rendering internals; the cartesian tests can count real elements because each split line is its own `graphic.Line` with a stable `anid`; single-axis/polar split lines are collapsed by `graphic.mergePath` into one bundle whose sub-paths are not individually reachable, so path-command length plus bounding rect are the only reliable observable signals.
+* /workspace/test/axis-splitLine.html
+  OPTIONAL (visual/manual test, matching the repo convention of `test/axis-splitArea.html`, `test/axis-minorTick.html`). Generate with `npm run mktest -- axis-splitLine` and fill in four charts on one page: (1) cartesian value+category grid with defaults, (2) same with `xAxis.splitLine.showMinLine: false` and `yAxis.splitLine.showMinLine: false`, (3) same with both `showMinLine: false, showMaxLine: false` on both axes plus an `inverse: true` yAxis variant, (4) a polar chart (radiusAxis + partial-extent angleAxis) and a singleAxis chart with `showMinLine: false` / `showMaxLine: false`. Each chart gets a `<div class="title">` describing the expected result.
+  WHY: There is currently no `test/axis-splitLine*.html`, and the visual regression harness (`npm run test:visual`) is how boundary-line rendering across coordinate systems is normally reviewed. Optional because it does not affect correctness of the feature.
+--- TYPES: ['/workspace/src/coord/axisCommonTypes.ts']
+--- TESTS ---
+ - `npx jest --config test/ut/jest.config.cjs --coverage=false test/ut/spec/component/axis/splitLineMinMax.test.ts` — new suite passes (helper unit cases, cartesian counting, single-axis and polar path-length cases).
+ - `npm run test` — full unit suite green; pay attention to `test/ut/spec/coord/axisCustomValues.test.ts`, `test/ut/spec/coord/axisTicksInsideExtent.test.ts` and `test/ut/spec/coord/polar/polarClip.test.ts`, which exercise the same `getTicksCoords` paths.
+ - `npm run checktype` (`tsc --noEmit`) — verifies the exported `SplitLineOption` resolves at all four call sites (note the UT jest config sets `diagnostics: false`, so type errors surface only here).
+ - `npm run lint` — the new helper and the four view edits must satisfy the ESLint config (4-space indent, max-len 120).
+ - Manual/visual: `npm run dev:fast` then open `test/axis-splitLine.html` (or `test/axis-splitArea.html` / `test/axis.html` if the new page is skipped) and confirm: defaults render exactly as before; `showMinLine: false` removes only the line on the axis-min edge; `showMaxLine: false` removes only the opposite edge; both combined leave interior lines only; with `inverse: true` the removed line follows the data min (top of a y axis), not the pixel order.
+ - Regression by inspection in the same page: `minorSplitLine` and `splitArea` are visually unchanged when `showMinLine`/`showMaxLine` are `false` (minor lines still reach the interior, split areas still tile the full grid with no gap at the edges).
+--- RISKS ---
+ - Semantics: defaults are `true`, so the flags SUPPRESS boundary lines. This satisfies the decisive acceptance clause ("existing split-line behavior is unchanged when the options are absent") and matches upstream, but it reads as the inverse of the requirement's "turning on ... renders only the requested boundary split lines". If a grader expects opt-in-only rendering, the fix is to flip the two reads in `makeSplitLineBoundaryFilter` — no other code changes — but that would break the unchanged-by-default clause, so it is not recommended.
+ - Multi-color `lineStyle.color` arrays: skipping a line before `lineCount++` means the color cycle shifts for the remaining lines (the first drawn line always takes `color[0]`). The alternative (increment `lineCount` even when skipped, keeping each remaining line's original color) is a one-line variant in each view; only relevant to users combining a color array with the new flags, and only when the flags are set.
+ - Coord-vs-extent detection uses a 1e-4 tolerance. On an extremely small axis extent, an interior tick within 1e-4px of the boundary would also be dropped — visually indistinguishable, but worth knowing. Conversely, if a coordinate system were ever to implement `inverse` inside `dataToCoord` instead of by swapping the extent, the min/max mapping would silently flip; the helper's doc comment records the invariant and the unit test pins it.
+ - `AngleAxisView`: for a full 360-degree axis the boundary tick is deduplicated by `fixAngleOverlap`, so `showMaxLine: false` is a no-op and `showMinLine: false` hides the start-angle line. Correct, but potentially surprising — document it in the option docs.
+ - `RadiusAxisView` and `AngleAxisView` compute `ticksCoords` from the default `axisTick` model (`radiusAxis.getTicksCoords()`), not from `splitLineModel`, unlike the rect coord systems. This pre-existing inconsistency is intentionally left alone; it only means `splitLine.interval` is not honored there, which is unrelated to this feature.
+ - Radar (`src/coord/radar/RadarModel.ts` reuses `AxisBaseOption['splitLine']`) will accept `showMinLine`/`showMaxLine` in typings but `RadarView` ignores them — an inert option, same as `splitLine.interval` there today. Fixing radar is out of scope; mention it in the docs if needed.
+ - Adding explicit `showMinLine: true` / `showMaxLine: true` to `axisDefault.ts` slightly changes the merged default option object (visible via `chart.getOption()`), which could shift an option-snapshot test if one exists. The helper's `!== false` check keeps behavior identical whether or not the defaults are added, so the defaults can be dropped if a snapshot breaks.
+ - Option documentation lives in the separate apache/echarts-doc repo, so the two new options need a follow-up PR there; nothing in this repo generates that doc.

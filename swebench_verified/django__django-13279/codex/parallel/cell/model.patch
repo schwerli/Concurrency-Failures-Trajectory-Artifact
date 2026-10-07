@@ -1,0 +1,52 @@
+diff --git a/django/contrib/sessions/backends/base.py b/django/contrib/sessions/backends/base.py
+index b5453160a5..35d3494c71 100644
+--- a/django/contrib/sessions/backends/base.py
++++ b/django/contrib/sessions/backends/base.py
+@@ -106,8 +106,16 @@ class SessionBase:
+         key_salt = "django.contrib.sessions" + self.__class__.__name__
+         return salted_hmac(key_salt, value).hexdigest()
+ 
++    def _legacy_encode(self, session_dict):
++        # RemovedInDjango40Warning: pre-Django 3.1 format will be invalid.
++        serialized = self.serializer().dumps(session_dict)
++        hash = self._hash(serialized)
++        return base64.b64encode(hash.encode() + b':' + serialized).decode('ascii')
++
+     def encode(self, session_dict):
+         "Return the given session dictionary serialized and encoded as a string."
++        if settings.DEFAULT_HASHING_ALGORITHM == 'sha1':
++            return self._legacy_encode(session_dict)
+         return signing.dumps(
+             session_dict, salt=self.key_salt, serializer=self.serializer,
+             compress=True,
+diff --git a/tests/sessions_tests/tests.py b/tests/sessions_tests/tests.py
+index 248dae82aa..2dd478a839 100644
+--- a/tests/sessions_tests/tests.py
++++ b/tests/sessions_tests/tests.py
+@@ -34,6 +34,7 @@ from django.test import (
+     RequestFactory, TestCase, ignore_warnings, override_settings,
+ )
+ from django.utils import timezone
++from django.utils.deprecation import RemovedInDjango40Warning
+ 
+ from .models import SessionStore as CustomDatabaseSession
+ 
+@@ -323,6 +324,18 @@ class SessionTestsMixin:
+             {'a test key': 'a test value'},
+         )
+ 
++    @ignore_warnings(category=RemovedInDjango40Warning)
++    @override_settings(SECRET_KEY='django_tests_secret_key')
++    def test_encode_legacy_sha1(self):
++        with override_settings(DEFAULT_HASHING_ALGORITHM='sha1'):
++            self.assertEqual(
++                self.session.encode({'a test key': 'a test value'}),
++                (
++                    'OWUzNTNmNWQxNTBjOWExZmM4MmQ3NzNhMDRmMjU4NmYwNDUyNGI2NDp7ImEgdGV'
++                    'zdCBrZXkiOiJhIHRlc3QgdmFsdWUifQ=='
++                ),
++            )
++
+     def test_decode_failure_logged_to_security(self):
+         bad_encode = base64.b64encode(b'flaskdj:alkdjf').decode('ascii')
+         with self.assertLogs('django.security.SuspiciousSession', 'WARNING') as cm:

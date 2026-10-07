@@ -1,0 +1,211 @@
+diff --git a/pylint/pyreverse/diagrams.py b/pylint/pyreverse/diagrams.py
+index bf9f67af..0eb691c4 100644
+--- a/pylint/pyreverse/diagrams.py
++++ b/pylint/pyreverse/diagrams.py
+@@ -117,8 +117,15 @@ class ClassDiagram(Figure, FilterMixIn):
+ 
+     def class_names(self, nodes):
+         """return class names if needed in diagram"""
++        if isinstance(nodes, str):
++            return [nodes]
++        annotation_names = []
+         names = []
+         for node in nodes:
++            if isinstance(node, str):
++                if node not in annotation_names:
++                    annotation_names.append(node)
++                continue
+             if isinstance(node, astroid.Instance):
+                 node = node._proxied
+             if (
+@@ -129,7 +136,7 @@ class ClassDiagram(Figure, FilterMixIn):
+                 if node.name not in names:
+                     node_name = node.name
+                     names.append(node_name)
+-        return names
++        return annotation_names or names
+ 
+     def nodes(self):
+         """return the list of underlying nodes"""
+diff --git a/pylint/pyreverse/inspector.py b/pylint/pyreverse/inspector.py
+index 8fa12202..dd11e020 100644
+--- a/pylint/pyreverse/inspector.py
++++ b/pylint/pyreverse/inspector.py
+@@ -60,6 +60,77 @@ def interfaces(node, herited=True, handler_func=_iface_hdlr):
+         raise astroid.exceptions.InferenceError()
+ 
+ 
++def _infer_node_values(node):
++    try:
++        return set(node.infer())
++    except astroid.InferenceError:
++        return set()
++
++
++def _get_args_annotation(arguments, node):
++    for arg, annotation in zip(
++        getattr(arguments, "posonlyargs", ()),
++        arguments.posonlyargs_annotations or (),
++    ):
++        if arg is node:
++            return annotation
++    for arg, annotation in zip(arguments.args, arguments.annotations or ()):
++        if arg is node:
++            return annotation
++    for arg, annotation in zip(arguments.kwonlyargs, arguments.kwonlyargs_annotations):
++        if arg is node:
++            return annotation
++    if getattr(arguments, "vararg", None) == node.name:
++        return arguments.varargannotation
++    if getattr(arguments, "kwarg", None) == node.name:
++        return arguments.kwargannotation
++    return None
++
++
++def _get_annotation(node):
++    if isinstance(node, astroid.AssignName):
++        if isinstance(node.parent, astroid.AnnAssign):
++            return node.parent.annotation
++        if isinstance(node.parent, astroid.Arguments):
++            return _get_args_annotation(node.parent, node)
++    if isinstance(node, astroid.AssignAttr) and isinstance(node.parent, astroid.AnnAssign):
++        return node.parent.annotation
++    return None
++
++
++def _get_annotation_label(annotation):
++    if annotation is None:
++        return None
++    if isinstance(annotation, astroid.Const) and isinstance(annotation.value, str):
++        return annotation.value
++    return annotation.as_string()
++
++
++def _get_annotation_values(node):
++    annotation = _get_annotation(node)
++    label = _get_annotation_label(annotation)
++    if label is None:
++        return set()
++    return {label}
++
++
++def _get_assigned_annotation_values(node):
++    values = _get_annotation_values(node)
++    if values:
++        return values
++    try:
++        assigned_nodes = node.assigned_stmts()
++    except astroid.InferenceError:
++        return set()
++    for assigned in assigned_nodes:
++        values |= _get_annotation_values(assigned)
++        if isinstance(assigned, astroid.Name):
++            _, assignments = assigned.lookup(assigned.name)
++            for assignment in assignments:
++                values |= _get_annotation_values(assignment)
++    return values
++
++
+ class IdGeneratorMixIn:
+     """Mixin adding the ability to generate integer uid."""
+ 
+@@ -89,7 +160,8 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
+ 
+     * Function
+       a mapping from locals names to their bounded value, which may be a
+-      constant like a string or an integer, or an astroid node
++      constant like a string or an integer, a type-hint label, or an astroid
++      node
+       (on astroid.Module, astroid.Class and astroid.Function).
+ 
+     * instance_attrs_type
+@@ -214,11 +286,11 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
+                     self.visit_classdef(frame)
+                 elif isinstance(frame, astroid.FunctionDef):
+                     self.visit_functiondef(frame)
+-                else:
+-                    self.visit_module(frame)
++            else:
++                self.visit_module(frame)
+ 
+             current = frame.locals_type[node.name]
+-            values = set(node.infer())
++            values = _infer_node_values(node) | _get_annotation_values(node)
+             frame.locals_type[node.name] = list(set(current) | values)
+         except astroid.InferenceError:
+             pass
+@@ -229,12 +301,9 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
+ 
+         handle instance_attrs_type
+         """
+-        try:
+-            values = set(node.infer())
+-            current = set(parent.instance_attrs_type[node.attrname])
+-            parent.instance_attrs_type[node.attrname] = list(current | values)
+-        except astroid.InferenceError:
+-            pass
++        values = _infer_node_values(node) | _get_assigned_annotation_values(node)
++        current = set(parent.instance_attrs_type[node.attrname])
++        parent.instance_attrs_type[node.attrname] = list(current | values)
+ 
+     def visit_import(self, node):
+         """visit an astroid.Import node
+diff --git a/tests/unittest_pyreverse_inspector.py b/tests/unittest_pyreverse_inspector.py
+index e1ff6378..4b72282c 100644
+--- a/tests/unittest_pyreverse_inspector.py
++++ b/tests/unittest_pyreverse_inspector.py
+@@ -30,6 +30,18 @@ def project():
+     return project
+ 
+ 
++def _type_names(values):
++    names = set()
++    for value in values:
++        if isinstance(value, str):
++            names.add(value)
++        elif isinstance(value, astroid.bases.Instance):
++            names.add(value.name)
++        elif isinstance(value, astroid.nodes.ClassDef):
++            names.add(value.name)
++    return names
++
++
+ def test_class_implements(project):
+     klass = project.get_module("data.clientmodule_test")["Ancestor"]
+     assert hasattr(klass, "implements")
+@@ -71,6 +83,35 @@ def test_instance_attrs_resolution(project):
+     assert type_dict["_id"][0] is astroid.Uninferable
+ 
+ 
++def test_locals_resolution_uses_annotations():
++    module = astroid.parse(
++        """
++    class Annotated:
++        value: str = None
++    """
++    )
++    klass = module["Annotated"]
++    linker = inspector.Linker(inspector.Project())
++    linker.visit(klass)
++
++    assert _type_names(klass.locals_type["value"]) == {"str"}
++
++
++def test_instance_attrs_resolution_uses_annotations():
++    module = astroid.parse(
++        """
++    class Annotated:
++        def __init__(self, value: str = None):
++            self.value = value
++    """
++    )
++    klass = module["Annotated"]
++    linker = inspector.Linker(inspector.Project())
++    linker.visit(klass)
++
++    assert _type_names(klass.instance_attrs_type["value"]) == {"str"}
++
++
+ def test_concat_interfaces():
+     cls = astroid.extract_node(
+         '''

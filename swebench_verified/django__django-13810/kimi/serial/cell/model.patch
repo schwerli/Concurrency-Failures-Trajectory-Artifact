@@ -1,0 +1,44 @@
+diff --git a/django/core/handlers/base.py b/django/core/handlers/base.py
+index 8e8c3da06a..be8a114eb1 100644
+--- a/django/core/handlers/base.py
++++ b/django/core/handlers/base.py
+@@ -51,11 +51,11 @@ class BaseHandler:
+                 middleware_is_async = middleware_can_async
+             try:
+                 # Adapt handler, if needed.
+-                handler = self.adapt_method_mode(
++                adapted_handler = self.adapt_method_mode(
+                     middleware_is_async, handler, handler_is_async,
+                     debug=settings.DEBUG, name='middleware %s' % middleware_path,
+                 )
+-                mw_instance = middleware(handler)
++                mw_instance = middleware(adapted_handler)
+             except MiddlewareNotUsed as exc:
+                 if settings.DEBUG:
+                     if str(exc):
+diff --git a/tests/middleware_exceptions/tests.py b/tests/middleware_exceptions/tests.py
+index 8b019ba524..f4a4de4024 100644
+--- a/tests/middleware_exceptions/tests.py
++++ b/tests/middleware_exceptions/tests.py
+@@ -181,6 +181,21 @@ class MiddlewareNotUsedTests(SimpleTestCase):
+             with self.assertLogs('django.request', 'DEBUG'):
+                 self.client.get('/middleware_exceptions/view/')
+ 
++    @override_settings(
++        DEBUG=False,
++        MIDDLEWARE=[
++            'middleware_exceptions.middleware.SyncAndAsyncMiddleware',
++            'middleware_exceptions.tests.MyMiddleware',
++        ],
++    )
++    async def test_middleware_not_used_async(self):
++        """
++        MiddlewareNotUsed raised by a synchronous middleware must not leave
++        the handler adapted to the wrong mode for the following middleware.
++        """
++        response = await self.async_client.get('/middleware_exceptions/view/')
++        self.assertEqual(response.content, b'OK')
++
+ 
+ @override_settings(
+     DEBUG=True,

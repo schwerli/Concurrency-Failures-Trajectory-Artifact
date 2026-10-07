@@ -1,0 +1,84 @@
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+index 3ca730e30..a873c9be2 100644
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -89,6 +89,16 @@ def _parse_annotation(annotation: str) -> List[Node]:
+                             refdomain='py', reftype=reftype, reftarget=text)
+ 
+     def unparse(node: ast.AST) -> List[Node]:
++        def unparse_sequence(nodes: Iterable[ast.AST]) -> List[Node]:
++            result = []  # type: List[Node]
++            for elem in nodes:
++                result.extend(unparse(elem))
++                result.append(addnodes.desc_sig_punctuation('', ', '))
++            if result:
++                result.pop()
++
++            return result
++
+         if isinstance(node, ast.Attribute):
+             return [nodes.Text("%s.%s" % (unparse(node.value)[0], node.attr))]
+         elif isinstance(node, ast.Expr):
+@@ -97,10 +107,7 @@ def _parse_annotation(annotation: str) -> List[Node]:
+             return unparse(node.value)
+         elif isinstance(node, ast.List):
+             result = [addnodes.desc_sig_punctuation('', '[')]  # type: List[Node]
+-            for elem in node.elts:
+-                result.extend(unparse(elem))
+-                result.append(addnodes.desc_sig_punctuation('', ', '))
+-            result.pop()
++            result.extend(unparse_sequence(node.elts))
+             result.append(addnodes.desc_sig_punctuation('', ']'))
+             return result
+         elif isinstance(node, ast.Module):
+@@ -114,12 +121,11 @@ def _parse_annotation(annotation: str) -> List[Node]:
+             result.append(addnodes.desc_sig_punctuation('', ']'))
+             return result
+         elif isinstance(node, ast.Tuple):
+-            result = []
+-            for elem in node.elts:
+-                result.extend(unparse(elem))
+-                result.append(addnodes.desc_sig_punctuation('', ', '))
+-            result.pop()
+-            return result
++            if node.elts:
++                return unparse_sequence(node.elts)
++            else:
++                return [addnodes.desc_sig_punctuation('', '('),
++                        addnodes.desc_sig_punctuation('', ')')]
+         else:
+             raise SyntaxError  # unsupported syntax
+ 
+diff --git a/tests/test_domain_py.py b/tests/test_domain_py.py
+index cc3d3cf53..06a1726c6 100644
+--- a/tests/test_domain_py.py
++++ b/tests/test_domain_py.py
+@@ -273,6 +273,23 @@ def test_parse_annotation():
+     assert_node(doctree[0], pending_xref, refdomain="py", reftype="obj", reftarget="None")
+ 
+ 
++def test_parse_annotation_empty_containers():
++    doctree = _parse_annotation("Tuple[()]")
++    assert_node(doctree, ([pending_xref, "Tuple"],
++                          [desc_sig_punctuation, "["],
++                          [desc_sig_punctuation, "("],
++                          [desc_sig_punctuation, ")"],
++                          [desc_sig_punctuation, "]"]))
++
++    doctree = _parse_annotation("Callable[[], int]")
++    assert_node(doctree, ([pending_xref, "Callable"],
++                          [desc_sig_punctuation, "["],
++                          [desc_sig_punctuation, "["],
++                          [desc_sig_punctuation, "]"],
++                          [desc_sig_punctuation, ", "],
++                          [pending_xref, "int"],
++                          [desc_sig_punctuation, "]"]))
++
+ 
+ def test_pyfunction_signature(app):
+     text = ".. py:function:: hello(name: str) -> str"
+@@ -750,4 +767,3 @@ def test_modindex_common_prefix(app):
+         True
+     )
+ 
+-

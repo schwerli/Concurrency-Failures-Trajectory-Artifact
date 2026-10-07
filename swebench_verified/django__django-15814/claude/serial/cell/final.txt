@@ -1,0 +1,10 @@
+Fixed.
+
+**Root cause.** In `Query.deferred_to_data()`, while walking the `only()`/`defer()` lookup path, `cur_model` is taken straight off the relation (`source.remote_field.model` / `source.related_model`). For an FK pointing at a *proxy* model, that's the proxy class, so `must_include` and `seen` get keyed by the proxy while the rest of the machinery (`orig_opts.concrete_model` on line 737, `field.model._meta.concrete_model` on line 761) keys by the concrete model. The two never match, so the "must include the related model's pk" entry lands under a separate key and the pk column is dropped from the SELECT. `RelatedPopulator.__init__` then can't find the pk in `init_list` and raises `ValueError`.
+
+**Fix.** Normalize to the concrete model right after resolving the relation (`django/db/models/sql/query.py:751`), which is what the surrounding code already assumes. This is the reporter's suggestion, applied one line earlier so `cur_model` itself is normalized — important because `cur_model` is used as a dict key on lines 743, 757 and 763, not just for `opts`.
+
+**Verification.**
+- Reproduced the reporter's exact models/query standalone: `ValueError: 'id' is not in list` before, and after the fix the query runs and selects the pk: `SELECT ..."custom_id", "repro_app_custommodel"."id", "repro_app_custommodel"."name" FROM ...`, with `objs[0].custom.name` reading back correctly.
+- Added a regression test using the existing `Issue.assignee` → `ProxyTrackerUser` FK in `tests/proxy_models`. This covers the harder case too — a proxy of an MTI child, which failed with `ValueError: 'baseuser_ptr_id' is not in list`.
+- Full suite: 15890 tests, only 3 failures, all of which reproduce identically on a clean stashed checkout (permission-denied tests that can't fail as designed while running as root, plus an underscore-header test).

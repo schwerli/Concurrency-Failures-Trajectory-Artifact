@@ -1,0 +1,22 @@
+Done. `min-similarity-lines=0` now disables the duplicate-code check.
+
+**Changes in `pylint/checkers/similar.py`:**
+
+- `Similar.run()` (`pylint/checkers/similar.py:391`) returns early when `min_lines == 0`, so the `symilar --duplicates=0` CLI prints nothing at all (previously it still printed the `TOTAL lines=… duplicates=…` report).
+- `SimilarChecker.process_module()` (`pylint/checkers/similar.py:825`) skips reading/appending the module stream when `min_lines == 0`. That both suppresses `R0801` and avoids the checker's memory/CPU cost entirely — which is the point of turning it off. Empty linesets mean `close()` reports 0 duplicated lines, and the `-j` map/reduce path inherits the same behavior since workers skip the modules too.
+- Option help text now documents that `0` disables the check.
+
+**Verified end-to-end** (with two identical files, `HOME` redirected so the stats cache warning doesn't interfere):
+
+| invocation | before | after |
+|---|---|---|
+| `pylint --min-similarity-lines=0` | 10.00/10, no R0801 | 10.00/10, no R0801 |
+| `pylint --min-similarity-lines=4` | R0801 raised | R0801 raised (unchanged) |
+| `pylint --min-similarity-lines=0 -j2` | no R0801 | no R0801 |
+| `symilar --duplicates=0 a.py b.py` | printed `TOTAL lines=12 duplicates=0 percent=0.00` | prints nothing, exit 0 |
+
+One thing worth flagging: on this revision the pylint path already emitted no `R0801` for `0`, because `hash_lineset` builds `range(0)` shifted iterators and `zip()` yields nothing — so the "every line treated as duplicate" symptom in the report is not reproducible here. The real observable bug at this revision is `symilar` still emitting a report, plus the checker doing full work for a disabled check. The fix makes the intent explicit in both paths rather than relying on that incidental empty-`zip` behavior.
+
+**Tests added:** `test_set_duplicate_lines_to_zero` in `tests/checkers/unittest_similar.py` (asserts empty output, exit 0) and `test_min_similarity_lines_zero_disables_duplicate_code` in `tests/test_self.py`. `ChangeLog` and `doc/whatsnew/2.11.rst` note the behavior change.
+
+Full run of `tests/test_self.py`, `tests/checkers/`, `tests/lint`, `tests/test_check_parallel.py`: 402 passed, 2 failed — `unittest_imports.py::test_wildcard_import_init` and `test_wildcard_import_non_init`, which I confirmed fail identically on a clean stash, so they're pre-existing and unrelated.

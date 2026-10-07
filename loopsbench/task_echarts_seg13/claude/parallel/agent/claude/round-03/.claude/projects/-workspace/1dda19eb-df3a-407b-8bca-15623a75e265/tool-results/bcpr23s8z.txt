@@ -1,0 +1,3472 @@
+commit bdb7615f6c749db100262647da3805250444ff63
+Author: loopsbench-agent <agent@loopsbench.local>
+Date:   Sat Aug 15 13:32:52 2026 +0000
+
+    impl: slider-handlelabel-optional
+
+ .../slider-handlelabel-optional.diff               | 3463 ++++++++++++++++++++
+ src/component/dataZoom/SliderZoomModel.ts          |    2 +-
+ 2 files changed, 3464 insertions(+), 1 deletion(-)
+diff --git a/requirement_patches/slider-handlelabel-optional.diff b/requirement_patches/slider-handlelabel-optional.diff
+new file mode 100644
+index 0000000..23dc854
+--- /dev/null
++++ b/requirement_patches/slider-handlelabel-optional.diff
+@@ -0,0 +1,3444 @@
++diff --git a/requirement_patches/slider-handlelabel-optional.diff b/requirement_patches/slider-handlelabel-optional.diff
++new file mode 100644
++index 0000000..bd70c26
++--- /dev/null
+++++ b/requirement_patches/slider-handlelabel-optional.diff
++@@ -0,0 +1,3425 @@
+++diff --git a/agent_plans/axislabel-formatter-indexing.md b/agent_plans/axislabel-formatter-indexing.md
+++new file mode 100644
+++index 0000000..1b8ee6e
+++--- /dev/null
++++++ b/agent_plans/axislabel-formatter-indexing.md
+++@@ -0,0 +1,501 @@
++++# axislabel-formatter-indexing — implementation plan
++++
++++Requirement: `/workspace/requirements/axislabel-formatter-indexing.yaml`
++++(title: `fix(axis): refactor axisLabel formatter`, category: bugfix; upstream PR mapping
++++`21432.yaml -> axislabel-formatter-indexing.yaml`, see `/workspace/requirements/.rename_map.json`)
++++
++++---
++++
++++## 1. Goal
++++
++++When an axis builds its labels from `axisLabel.customValues`, the user `axisLabel.formatter`
++++callback must be invoked with the **index of the label inside the final, filtered label
++++sequence** (`0, 1, 2, …`), i.e. the position produced by the `map` over the in-extent tick
++++list — *not* `undefined`, and *not* a value looked back up from the tick list (which would
++++collapse repeated values onto the first matching position).
++++
++++Concretely, in `createAxisLabels()` (`/workspace/src/coord/axisTickLabelBuilder.ts`) the
++++`customValues` branch currently calls `labelFormatter(tick)` with **no** second argument, so
++++every user formatter for a `value` / `log` / `time` axis receives `index === undefined`. The
++++fix is to thread the `zrUtil.map` iteration index through to `labelFormatter(tick, index)`,
++++so that:
++++
++++* values filtered out because they are outside `axis.scale.getExtent()` do not consume an
++++  index (the first *rendered* label is index `0`);
++++* the same numeric value appearing more than once yields distinct, increasing indices
++++  (`[1, 3, 3, 7]` -> `0, 1, 2, 3`), instead of every duplicate reporting the first matching
++++  position.
++++
++++Everything else (formatter signatures, `rawLabel`, `tickValue`, tick generation, category
++++axis index semantics, non-custom label generation) must stay byte-for-byte identical.
++++
++++---
++++
++++## 2. Findings (current code)
++++
++++### 2.1 The defect — `createAxisLabels`, `customValues` branch
++++
++++`/workspace/src/coord/axisTickLabelBuilder.ts:123-149`:
++++
++++```ts
++++export function createAxisLabels(axis: Axis, ctx: AxisLabelsComputingContext): {
++++    labels: AxisLabelInfoDetermined[]
++++} {
++++    const custom = axis.getLabelModel().get('customValues');
++++    if (custom) {
++++        const labelFormatter = makeLabelFormatter(axis);
++++        const extent = axis.scale.getExtent();
++++        const tickNumbers = tickValuesToNumbers(axis, custom);
++++        const ticks = zrUtil.filter(tickNumbers, val => val >= extent[0] && val <= extent[1]);
++++        return {
++++            labels: zrUtil.map(ticks, numval => {
++++                const tick = {value: numval};
++++                return {
++++                    formattedLabel: labelFormatter(tick),
++++                    rawLabel: axis.scale.getLabel(tick),
++++                    tickValue: numval,
++++                    time: undefined as ScaleTick['time'] | NullUndefined,
++++                    break: undefined as VisualAxisBreak | NullUndefined,
++++                };
++++            }),
++++        };
++++    }
++++    // Only ordinal scale support tick interval
++++    return axis.type === 'category'
++++        ? makeCategoryLabels(axis, ctx)
++++        : makeRealNumberLabels(axis);
++++}
++++```
++++
++++Line 133 `zrUtil.map(ticks, numval => {` discards the iteration index, and line 136
++++`formattedLabel: labelFormatter(tick),` calls the formatter with a single argument.
++++`ticks` is already the *filtered* list (line 131), so its `map` index is exactly the
++++"index of the rendered item in the filtered label sequence" the requirement asks for.
++++
++++### 2.2 The formatter wrapper already accepts and forwards an index
++++
++++`/workspace/src/coord/axisHelper.ts:231-294` — `makeLabelFormatter()`:
++++
++++```ts
++++export function makeLabelFormatter(axis: Axis): (tick: ScaleTick, idx?: number) => string {
++++```
++++
++++* time branch (`axisHelper.ts:242-247`): `return (axis.scale as TimeScale).getFormattedLabel(tick, idx, parsed);`
++++* string-template branch (`axisHelper.ts:248-256`): ignores `idx` (unchanged by this fix).
++++* function branch, **category** axis (`axisHelper.ts:258-272`): deliberately ignores `idx`
++++  and uses `tick.value - axis.scale.getExtent()[0]` "for back compatibility".
++++* function branch, **non-category** axis (`axisHelper.ts:273-288`):
++++
++++```ts
++++        const scaleBreakHelper = getScaleBreakHelper();
++++        return function (tick: ScaleTick, idx: number) {
++++            ...
++++            return (labelFormatter as AxisLabelValueFormatter)(
++++                getAxisRawValue<false>(axis, tick),
++++                idx,
++++                extra
++++            );
++++        };
++++```
++++
++++So the `idx` plumbing already exists end-to-end; only the call site in
++++`createAxisLabels` fails to supply it.
++++
++++### 2.3 The correct pattern already exists two functions below
++++
++++`/workspace/src/coord/axisTickLabelBuilder.ts:277-291` — `makeRealNumberLabels()`:
++++
++++```ts
++++    return {
++++        labels: zrUtil.map(ticks, function (tick, idx) {
++++            return {
++++                formattedLabel: labelFormatter(tick, idx),
++++```
++++
++++i.e. the non-custom numeric path already passes the sequence index; the `customValues`
++++path is the outlier.
++++
++++### 2.4 Public types already declare the index parameter
++++
++++`/workspace/src/coord/axisCommonTypes.ts:239-253`:
++++
++++```ts
++++export type AxisLabelValueFormatter = (
++++    value: number,
++++    index: number,
++++    extra: AxisLabelFormatterExtraParams | NullUndefined,
++++) => string;
++++```
++++
++++(and `AxisLabelCategoryFormatter`, `AxisLabelTimeFormatter` likewise). No type change needed.
++++
++++`/workspace/src/coord/axisCommonTypes.ts:322` declares
++++`customValues?: (number | string | Date)[],` on `AxisLabelBaseOption`.
++++
++++### 2.5 The rendering layer already uses the "rendered sequence index" convention
++++
++++`/workspace/src/component/axis/AxisBuilder.ts:1366` iterates the labels with
++++`each(labels, function (labelItem, index) {` and passes that same `index` to the
++++`axisLabel.color` callback (`AxisBuilder.ts:1433-1449`):
++++
++++```ts
++++                fill: isFunction(textColor)
++++                    ? textColor(
++++                        ...
++++```
++++
++++So after the fix the `formatter` index and the `color` callback index agree for
++++`customValues`, which is the user-visible consistency the requirement describes.
++++
++++### 2.6 Empirically measured current behaviour (jest probe, no repo files touched)
++++
++++Option: `xAxis: {type: 'value', min: 0, max: 10, axisLabel: {customValues: [-5, 1, 3, 3, 7, 20],
++++formatter: (v, i) => i + ':' + v}}`, read back via `axis.getViewLabels()`:
++++
++++```
++++TICKVALUES [1,3,3,7]                                             // filtering already correct
++++FORMATTED  ["undefined:1","undefined:3","undefined:3","undefined:7"]   // BUG: no index
++++CALLS      [[1,null],[3,null],[3,null],[7,null]]                 // (null == undefined via JSON)
++++```
++++
++++Control (same chart without `customValues`) is already correct and must stay correct:
++++
++++```
++++REG FORMATTED ["0:0","1:2","2:4","3:6","4:8","5:10"]
++++REG CALLS     [[0,0],[2,1],[4,2],[6,3],[8,4],[10,5]]
++++```
++++
++++Category axis control (`data: ['a','b','c','d']`, `customValues: ['a','c','a']`) —
++++index comes from the ordinal offset (`axisHelper.ts:268`), *not* from the sequence, and is
++++intentionally left untouched by this fix:
++++
++++```
++++CAT TICKVALUES [0,2,0]
++++CAT FORMATTED  ["0:a","2:c","0:a"]
++++```
++++
++++### 2.7 Related, deliberately out of scope
++++
++++* `/workspace/src/util/time.ts:343-352` (`leveledFormat`) dereferences `tick.time.level`
++++  for function formatters, while the `customValues` branch builds `{value: numval}` with no
++++  `time`. Time axis + `customValues` + function formatter therefore throws today. That is a
++++  *different* requirement (`/workspace/requirements/time-axis-customvalues-formatter.yaml`,
++++  upstream #21352) — do **not** fix it here, and do not write a unit test that exercises it.
++++* `/workspace/src/coord/axisTickLabelBuilder.ts:111-121` (`tickValuesToNumbers`) sorts with
++++  the default (lexicographic) comparator and duplicates the first/last entry for time axes.
++++  Out of scope; note only that for a time axis the duplicated first/last entries now each
++++  get their own index, which is the intended "one index per rendered item" semantics.
++++
++++---
++++
++++## 3. Plan (ordered edits)
++++
++++### Edit 1 — pass the map index to the label formatter
++++
++++File: `/workspace/src/coord/axisTickLabelBuilder.ts`
++++
++++Anchor (search verbatim; occurs exactly once, at lines 132-143):
++++
++++```ts
++++        return {
++++            labels: zrUtil.map(ticks, numval => {
++++                const tick = {value: numval};
++++                return {
++++                    formattedLabel: labelFormatter(tick),
++++                    rawLabel: axis.scale.getLabel(tick),
++++                    tickValue: numval,
++++                    time: undefined as ScaleTick['time'] | NullUndefined,
++++                    break: undefined as VisualAxisBreak | NullUndefined,
++++                };
++++            }),
++++        };
++++```
++++
++++Replacement:
++++
++++```ts
++++        return {
++++            // `index` is the index in the filtered (in-extent) label list, which is what
++++            // `axisLabel.formatter` and `axisLabel.color` callbacks receive elsewhere.
++++            // Caution: it must be preserved from the iteration rather than looked up by
++++            // value (e.g. `zrUtil.indexOf(ticks, numval)`), otherwise repeated custom
++++            // values would all be reported at the first matching position.
++++            labels: zrUtil.map(ticks, (numval, index) => {
++++                const tick = {value: numval};
++++                return {
++++                    formattedLabel: labelFormatter(tick, index),
++++                    rawLabel: axis.scale.getLabel(tick),
++++                    tickValue: numval,
++++                    time: undefined as ScaleTick['time'] | NullUndefined,
++++                    break: undefined as VisualAxisBreak | NullUndefined,
++++                };
++++            }),
++++        };
++++```
++++
++++Notes for the implementer:
++++
++++* `zrUtil.map` is typed as
++++  `map<T, R, Context>(arr: readonly T[], cb: (this: Context, val: T, index?: number, arr?: readonly T[]) => R, context?: Context): R[]`
++++  (`/workspace/node_modules/zrender/src/core/util.ts:335-339`), so `index` is
++++  `number | undefined`; `makeLabelFormatter` returns
++++  `(tick: ScaleTick, idx?: number) => string` (`/workspace/src/coord/axisHelper.ts:239`),
++++  so the call type-checks with no cast. The repo's tsconfig does not enable
++++  `strictNullChecks` (`/workspace/tsconfig.json`), so there is no additional narrowing to do.
++++* Keep the arrow-function style — the surrounding lines (`val => val >= extent[0] …`)
++++  already use arrows; 4-space indentation; no other formatting changes.
++++* No import changes are required.
++++
++++### Edit 2 — add the regression unit test (new file)
++++
++++File (new): `/workspace/test/ut/spec/coord/axisTickLabelBuilder.test.ts`
++++
++++The directory `test/ut/spec/coord/` does not exist yet, but it is already covered by
++++`testMatch: ['**/spec/coord/**/*.test.ts', …]` in
++++`/workspace/test/ut/jest.config.cjs:52`, so no jest-config change is needed.
++++
++++Full content (Apache header required — `npm run checkheader` /
++++`/workspace/build/checkheader.js` scans the repo):
++++
++++```ts
++++/*
++++* Licensed to the Apache Software Foundation (ASF) under one
++++* or more contributor license agreements.  See the NOTICE file
++++* distributed with this work for additional information
++++* regarding copyright ownership.  The ASF licenses this file
++++* to you under the Apache License, Version 2.0 (the
++++* "License"); you may not use this file except in compliance
++++* with the License.  You may obtain a copy of the License at
++++*
++++*   http://www.apache.org/licenses/LICENSE-2.0
++++*
++++* Unless required by applicable law or agreed to in writing,
++++* software distributed under the License is distributed on an
++++* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++++* KIND, either express or implied.  See the License for the
++++* specific language governing permissions and limitations
++++* under the License.
++++*/
++++
++++import { createChart, getECModel } from '../../core/utHelper';
++++import { EChartsType } from '@/src/echarts';
++++import CartesianAxisModel from '@/src/coord/cartesian/AxisModel';
++++
++++
++++describe('axisTickLabelBuilder', function () {
++++
++++    let chart: EChartsType;
++++    beforeEach(function () {
++++        chart = createChart();
++++    });
++++
++++    afterEach(function () {
++++        chart.dispose();
++++    });
++++
++++    function getXAxis(): CartesianAxisModel['axis'] {
++++        return (getECModel(chart).getComponent('xAxis', 0) as CartesianAxisModel).axis;
++++    }
++++
++++    describe('axisLabel_customValues_formatter_index', function () {
++++
++++        it('index_is_the_position_in_the_filtered_label_list', function () {
++++            const calls: [number, number][] = [];
++++            chart.setOption({
++++                xAxis: {
++++                    type: 'value',
++++                    min: 0,
++++                    max: 10,
++++                    axisLabel: {
++++                        // `-5` and `20` are out of the axis extent and must not consume an index.
++++                        // `3` is repeated and each occurrence must keep its own index.
++++                        customValues: [-5, 1, 3, 3, 7, 20],
++++                        formatter: function (value: number, index: number) {
++++                            calls.push([value, index]);
++++                            return index + ':' + value;
++++                        }
++++                    }
++++                },
++++                yAxis: { type: 'value' },
++++                series: [{ type: 'line', data: [[1, 1], [7, 7]] }]
++++            });
++++
++++            const axis = getXAxis();
++++            calls.length = 0;
++++            const labels = axis.getViewLabels();
++++
++++            expect(labels.map(item => item.tickValue)).toEqual([1, 3, 3, 7]);
++++            expect(calls).toEqual([[1, 0], [3, 1], [3, 2], [7, 3]]);
++++            expect(labels.map(item => item.formattedLabel)).toEqual(
++++                ['0:1', '1:3', '2:3', '3:7']
++++            );
++++            expect(labels.map(item => item.rawLabel)).toEqual(['1', '3', '3', '7']);
++++        });
++++
++++        it('index_of_normal_labels_is_not_changed', function () {
++++            const calls: [number, number][] = [];
++++            chart.setOption({
++++                xAxis: {
++++                    type: 'value',
++++                    min: 0,
++++                    max: 10,
++++                    splitNumber: 5,
++++                    axisLabel: {
++++                        formatter: function (value: number, index: number) {
++++                            calls.push([value, index]);
++++                            return index + ':' + value;
++++                        }
++++                    }
++++                },
++++                yAxis: { type: 'value' },
++++                series: [{ type: 'line', data: [[1, 1], [7, 7]] }]
++++            });
++++
++++            const axis = getXAxis();
++++            calls.length = 0;
++++            const labels = axis.getViewLabels();
++++
++++            expect(calls).toEqual([[0, 0], [2, 1], [4, 2], [6, 3], [8, 4], [10, 5]]);
++++            expect(labels.map(item => item.formattedLabel)).toEqual(
++++                ['0:0', '1:2', '2:4', '3:6', '4:8', '5:10']
++++            );
++++        });
++++    });
++++});
++++```
++++
++++Why this is deterministic (verified by running the same code from a scratch directory
++++against the unmodified repo):
++++
++++* `axis.getViewLabels()` re-enters `createAxisLabels()` and the `customValues` branch is
++++  **not** cached (the `axisInner` cache is only used by the category-interval paths,
++++  `/workspace/src/coord/axisTickLabelBuilder.ts:193-231`), so resetting `calls.length = 0`
++++  immediately before the call captures exactly one formatting pass.
++++* Without the reset, `calls` contains two passes (label estimation + determination) —
++++  `[[1,null],[3,null],…]` repeated twice — so the reset is required.
++++* Pre-fix, `calls` is `[[1, undefined], [3, undefined], [3, undefined], [7, undefined]]` and
++++  `formattedLabel` is `['undefined:1', …]`, so the first test fails before Edit 1 and passes
++++  after it; the second test passes both before and after (regression guard).
++++
++++### Edit 3 (optional, only if a visual case is wanted)
++++
++++`/workspace/test/axis-customTicks.html` already contains a `customValues` + `formatter`
++++case at lines 302-345 (`main5`). No change is required for the fix; adding a duplicate-value
++++case there is optional cosmetic coverage and is **not** part of this plan.
++++
++++---
++++
++++## 4. Tests
++++
++++A unit test is feasible and is specified in full in Edit 2 above:
++++`/workspace/test/ut/spec/coord/axisTickLabelBuilder.test.ts`.
++++
++++Helper API actually used (checked against `/workspace/test/ut/core/utHelper.ts` and the
++++existing `/workspace/test/ut/spec/scale/interval.test.ts`):
++++
++++* `import { createChart, getECModel } from '../../core/utHelper';` — `createChart()` takes an
++++  optional `{width, height, theme, opts}` and returns an `EChartsType`; dispose in `afterEach`.
++++* `getECModel(chart).getComponent('xAxis', 0) as CartesianAxisModel` then `.axis` —
++++  `CartesianAxisModel` is the **default** export of
++++  `/workspace/src/coord/cartesian/AxisModel.ts:67`.
++++* `axis.getViewLabels()` (`/workspace/src/coord/Axis.ts:242-247`) returns
++++  `{formattedLabel, rawLabel, tickValue, time, break}[]`; `interval.test.ts:95` uses the same
++++  accessor.
++++* Path alias `@/src/...` -> repo root is configured through
++++  `/workspace/test/ut/tsconfig.json` (`"@/*": ["../../*"]`) plus `moduleNameMapper` in
++++  `/workspace/test/ut/jest.config.cjs`. Both `../../../../src/...` relative imports and
++++  `@/src/...` are used in the existing specs; the plan uses `@/src/...` like
++++  `spec/scale/interval.test.ts`.
++++
++++---
++++
++++## 5. Verification
++++
++++```bash
++++# 1. Type check the source change (whole repo, ~1 min)
++++cd /workspace && npx tsc --noEmit          # === npm run checktype
++++
++++# 2. Run the new spec only
++++cd /workspace && npx jest --config test/ut/jest.config.cjs --coverage=false \
++++    test/ut/spec/coord/axisTickLabelBuilder.test.ts
++++
++++# 2b. Or by test name
++++cd /workspace && npm run test:single -- "axisLabel_customValues_formatter_index"
++++
++++# 3. Make sure nothing else regressed (full ut suite)
++++cd /workspace && npx jest --config test/ut/jest.config.cjs --coverage=false
++++
++++# 4. Lint the touched source file
++++cd /workspace && npx eslint src/coord/axisTickLabelBuilder.ts
++++
++++# 5. Apache license header check for the new test file
++++cd /workspace && node build/checkheader.js
++++```
++++
++++Expected: step 2 passes only after Edit 1 (it fails on the unmodified tree with
++++`Expected [[1,0],[3,1],[3,2],[7,3]] / Received [[1,undefined],…]`).
++++
++++Manual/visual (optional): `npm run dev` then open
++++`http://localhost:8080/test/axis-customTicks.html` — `main0`/`main3`/`main5` must render
++++exactly as before (their formatters branch on `value`, not on `index`).
++++
++++---
++++
++++## 6. Risks / open questions
++++
++++1. **Category axes are intentionally not changed.** For `type: 'category'`,
++++   `makeLabelFormatter` (`/workspace/src/coord/axisHelper.ts:258-272`) ignores the `idx`
++++   argument and passes `tick.value - axis.scale.getExtent()[0]` "for back compatibility", so
++++   `customValues: ['a', 'c', 'a']` still yields indices `0, 2, 0`. The requirement talks about
++++   "the same **numeric** value" and about values "filtered out because they fall outside the
++++   visible axis extent", which is the value/log/time path, and the acceptance signal
++++   explicitly asks for *no* other behaviour change — hence the minimal edit.
++++   *If a category case must also report sequence indices*, the (only) additional edit is in
++++   `/workspace/src/coord/axisHelper.ts`, replacing
++++
++++   ```ts
++++            return function (tick: ScaleTick, idx: number) {
++++                // The original intention of `idx` is "the index of the tick in all ticks".
++++   ```
++++   … body …
++++   ```ts
++++                return (labelFormatter as AxisLabelCategoryFormatter)(
++++                    getAxisRawValue<true>(axis, tick),
++++                    tick.value - axis.scale.getExtent()[0],
++++                    null // Using `null` just for backward compat.
++++                );
++++   ```
++++   with `idx != null ? idx : tick.value - axis.scale.getExtent()[0]`. This was checked to be
++++   safe for the other call site that already passes an index for category axes
++++   (`/workspace/src/coord/cartesian/legacyContainLabel.ts:99`, where
++++   `tick.value === categoryScaleExtent[0] + i`, so `idx` and the ordinal offset are equal),
++++   but it *does* change public behaviour for category `customValues`, so it is deliberately
++++   left out unless required.
++++
++++2. **Time axis.** `tickValuesToNumbers` (`axisTickLabelBuilder.ts:111-121`) duplicates the
++++   first and last value for time axes, so a time axis's formatter indices will be
++++   `0..n+1` with the first two and last two entries sharing a value. That is the intended
++++   "one index per rendered item" semantics, and it is the only user-visible index shift
++++   introduced here. Note that time axis + `customValues` + **function** formatter currently
++++   throws in `/workspace/src/util/time.ts:346` (`tick.time.level` on a `time`-less tick);
++++   that is a separate requirement (`time-axis-customvalues-formatter`) — do not test that
++++   combination here, and expect a textual (not semantic) interaction if both changes land in
++++   the same region later.
++++
++++3. **Estimate vs. determine passes.** `AxisBuilder` formats labels twice per render
++++   (`buildAxisLabel` is called with `AxisTickLabelComputingKind.estimate` and
++++   `.determine`, `/workspace/src/component/axis/AxisBuilder.ts:1332-1352`). Formatters with
++++   side effects therefore see two passes; the new test neutralises this by resetting its
++++   call log right before calling `getViewLabels()`. Do not assert on call counts across a
++++   full render.
++++
++++4. **Index type.** `zrUtil.map`'s callback declares `index?: number`; if a future
++++   `strictNullChecks` is enabled the argument stays assignable to
++++   `makeLabelFormatter`'s `idx?: number`, so no cast is needed now or then.
++++
++++5. Nothing else in the repo reads `formattedLabel` in a way that depends on the index
++++   (`getViewLabels` consumers: `/workspace/src/component/axis/AxisBuilder.ts:1352`,
++++   `/workspace/src/component/axis/AngleAxisView.ts:100`,
++++   `/workspace/src/component/timeline/SliderTimelineView.ts:468`,
++++   `/workspace/src/chart/line/LineView.ts:409`), so the blast radius is limited to the text
++++   produced by user formatters on axes that use `axisLabel.customValues`.
+++diff --git a/agent_plans/matrix-label-formatter.md b/agent_plans/matrix-label-formatter.md
+++new file mode 100644
+++index 0000000..017bdf8
+++--- /dev/null
++++++ b/agent_plans/matrix-label-formatter.md
+++@@ -0,0 +1,814 @@
++++# matrix-label-formatter — implementation plan
++++
++++> Requirement: `/workspace/requirements/matrix-label-formatter.yaml`
++++> `fix(matrix): fix matrix label formatter does not work`
++++
++++---
++++
++++## 1. Goal
++++
++++`matrix.x.label.formatter`, `matrix.y.label.formatter`, `matrix.body.label.formatter`,
++++`matrix.corner.label.formatter` (and the per-cell overrides
++++`matrix.x/y.data[i].label.formatter`, `matrix.body/corner.data[i].label.formatter`)
++++are currently **completely ignored**. The matrix view always renders the raw cell value.
++++
++++Two concrete defects:
++++
++++1. **Runtime**: `MatrixView#createMatrixCell` builds the label text as `textValue + ''` and hands
++++   it to `setLabelStyle` as `opt.defaultText`, without a `labelFetcher`. `getLabelText()` in
++++   `src/label/labelStyle.ts` only reads `normalModel.get('formatter')` **inside the
++++   `if (labelFetcher)` branch**, so with no fetcher the formatter is never read.
++++2. **Typing**: `MatrixCellStyleOption['label']` is typed as the plain `LabelOption`, which has
++++   **no** `formatter` member at all (it is explicitly commented out in `src/util/types.ts`), so
++++   even declaring a formatter is a TS error for TS users.
++++
++++After the fix:
++++
++++* a **string** formatter is expanded as a simple template (`'{name}'`, `'{value}'`, `'{coord}'` …)
++++  via `formatTplSimple`;
++++* a **function** formatter is invoked and its (non-null) return value is used as the label text;
++++* the callback receives a documented params object:
++++  `{componentType: 'matrix', componentIndex, name, value, coord, $vars}` where `coord` is the
++++  `[xLocator, yLocator]` pair already used for the matrix tooltip (`MatrixXYLocator[]`);
++++* a new public type `MatrixLabelOption` / `MatrixLabelFormatterParams` is exported from
++++  `src/coord/matrix/MatrixModel.ts` and used for `MatrixCellStyleOption['label']`, so the option
++++  is type-checked.
++++
++++---
++++
++++## 2. Findings (current code)
++++
++++### 2.1 The label text is hard-wired to the raw value
++++
++++`/workspace/src/component/matrix/MatrixView.ts:282-301`
++++
++++```ts
++++    let cellText: Text | NullUndefined;
++++
++++    if (textValue != null) {
++++        const text = textValue + '';
++++        _tmpCellLabelModel.option = cellOption ? cellOption.label : null;
++++        _tmpCellLabelModel.parentModel = parentLabelModel;
++++
++++        setLabelStyle(
++++            cellRect,
++++            // Currently do not support other states (`emphasis`, `select`, `blur`)
++++            {normal: _tmpCellLabelModel},
++++            {
++++                defaultText: text,
++++                autoOverflowArea: true,
++++                // By default based on boundingRect. But boundingRect contains borderWidth,
++++                // and borderWidth is half outside the cell. Thus specific `layoutRect` explicitly.
++++                layoutRect: clone(cellRect.shape)
++++            },
++++        );
++++```
++++
++++`text` is `const` and is never passed through any formatter. `setLabelStyle` is called with an
++++`opt` that has **no `labelFetcher`**.
++++
++++### 2.2 `setLabelStyle` only honours `formatter` when a `labelFetcher` exists
++++
++++`/workspace/src/label/labelStyle.ts:144-169`
++++
++++```ts
++++function getLabelText<TLabelDataIndex>(
++++    opt: SetLabelStyleOpt<TLabelDataIndex>,
++++    stateModels: LabelStatesModels<LabelModel>,
++++    interpolatedValue?: InterpolatableValue
++++): Record<DisplayState, string> {
++++    const labelFetcher = opt.labelFetcher;
++++    const labelDataIndex = opt.labelDataIndex;
++++    const labelDimIndex = opt.labelDimIndex;
++++    const normalModel = stateModels.normal;
++++    let baseText;
++++    if (labelFetcher) {
++++        baseText = labelFetcher.getFormattedLabel(
++++            labelDataIndex, 'normal',
++++            null,
++++            labelDimIndex,
++++            normalModel && normalModel.get('formatter'),
++++            ...
++++        );
++++    }
++++    if (baseText == null) {
++++        baseText = isFunction(opt.defaultText)
++++            ? opt.defaultText(labelDataIndex, opt, interpolatedValue)
++++            : opt.defaultText;
++++    }
++++```
++++
++++`normalModel.get('formatter')` is read **only** inside `if (labelFetcher)`. Matrix supplies none,
++++so the formatter is silently dropped and `opt.defaultText` (the raw value) wins.
++++
++++### 2.3 `label` option type has no `formatter`
++++
++++`/workspace/src/coord/matrix/MatrixModel.ts:190-206`
++++
++++```ts
++++export interface MatrixCellStyleOption {
++++    // [NOTE - padding]:
++++    ...
++++    label?: LabelOption;
++++    itemStyle?: ItemStyleOption;
++++    cursor?: string;
++++    // By default, auto decide whether to be silent, considering tooltip.
++++    silent?: boolean | NullUndefined;
++++    // Used when style conflict - especially for thick border style.
++++    z2?: number;
++++}
++++```
++++
++++and `/workspace/src/util/types.ts:1283-1303`:
++++
++++```ts
++++export interface LabelOption<
++++    TNuance extends {positionExtra: unknown} = {positionExtra: never}
++++> extends LabelCommonOption {
++++    ...
++++    // TODO: TYPE not all label support formatter
++++    // formatter?: string | ((params: CallbackDataParams) => string)
++++}
++++```
++++
++++`MatrixCellStyleOption` is the base of `MatrixDimensionOption`, `MatrixBodyOption`,
++++`MatrixCornerOption`, `MatrixBaseCellOption`, `MatrixDimensionCellOption` and
++++`MatrixBodyCornerCellOption` (see `MatrixModel.ts:135-155` and `:147-169`), so a single change
++++there covers every place a matrix label can be declared.
++++
++++### 2.4 Runtime proof of the bug (executed against the current tree)
++++
++++A throwaway jest run (jsdom, `test/ut/jest.config.cjs`) with
++++
++++```js
++++matrix: {
++++    x: { data: ['A', 'B'], label: { formatter: 'Col: {name}' } },
++++    y: { data: ['X', 'Y'], label: { formatter: (p) => '<' + p.name + '>' } }
++++}
++++```
++++
++++collected the attached text contents of the matrix view group and produced
++++`["A","B","X","Y"]` — the raw values. The function formatter was **never called**.
++++
++++### 2.5 The `xyLocator` pair that must be surfaced as `coord`
++++
++++`createMatrixCell` already receives the locator pair and forwards it to the tooltip:
++++
++++`/workspace/src/component/matrix/MatrixView.ts:321-329`
++++
++++```ts
++++        setTooltipConfig({ // At least for text overflow.
++++            el: cellRect,
++++            componentModel: matrixModel,
++++            itemName: text,
++++            itemTooltipOption: tooltipOption,
++++            formatterParamsExtra: {
++++                xyLocator: xyLocator.slice()
++++            }
++++        });
++++```
++++
++++Measured values (same probe run, `matrix.x.data: ['A','B']`, `matrix.y.data: ['X','Y']`,
++++`matrix.body.data: [{coord: ['A','X'], value: 'v1'}]`):
++++
++++| cell | text | `xyLocator` |
++++|---|---|---|
++++| x header `A` | `A` | `[0, -1]` |
++++| x header `B` | `B` | `[1, -1]` |
++++| y header `X` | `X` | `[-1, 0]` |
++++| y header `Y` | `Y` | `[-1, 1]` |
++++| body cell    | `v1` | `[0, 0]` |
++++
++++(negative locators = header/corner area, per the `[body/corner cell locating]` doc block at
++++`MatrixModel.ts:53-107`.)
++++
++++### 2.6 Available helper
++++
++++`/workspace/src/util/format.ts:155-166`
++++
++++```ts
++++/**
++++ * simple Template formatter
++++ */
++++export function formatTplSimple(tpl: string, param: Dictionary<any>, encode?: boolean) {
++++    zrUtil.each(param, function (value, key) {
++++        tpl = tpl.replace(
++++            '{' + key + '}',
++++            encode ? encodeHTML(value) : value
++++        );
++++    });
++++    return tpl;
++++}
++++```
++++
++++This is exactly the mechanism `CalendarView#_formatterLabel`
++++(`/workspace/src/component/calendar/CalendarView.ts:227-242`) uses for component-level label
++++formatters, so matrix should follow the same convention rather than inventing a `labelFetcher`.
++++
++++`isString` / `isFunction` are exported from `zrender/src/core/util`
++++(`/workspace/node_modules/zrender/src/core/util.ts:503` and `:507`).
++++
++++`MatrixXYLocator` is **already imported** in both files that need it:
++++* `/workspace/src/coord/matrix/MatrixModel.ts:30` — `import { MatrixDim, MatrixXYLocator } from './MatrixDim';`
++++* `/workspace/src/component/matrix/MatrixView.ts:22` — `import { MatrixCellLayoutInfo, MatrixDim, MatrixXYLocator } from '../../coord/matrix/MatrixDim';`
++++
++++`ComponentModel#componentIndex` exists and is already used for matrix in
++++`/workspace/src/util/graphic.ts:675` (`const componentIndex = componentModel.componentIndex;`).
++++
++++---
++++
++++## 3. Plan (ordered edits)
++++
++++### Edit 1 — `/workspace/src/coord/matrix/MatrixModel.ts`: add the label option + formatter params types
++++
++++**Anchor** (verbatim, currently at lines 182-189):
++++
++++```ts
++++export interface MatrixDimensionModel extends Model<MatrixDimensionOption> {
++++}
++++
++++/**
++++ * Two levels of cascade inheritance:
++++ *  - priority-high: style options defined in `matrix.x/y/coner/body.data[i]` (in cell)
++++ *  - priority-low: style options defined in `matrix.x/y/coner/body`
++++ */
++++```
++++
++++**Replacement**:
++++
++++```ts
++++export interface MatrixDimensionModel extends Model<MatrixDimensionOption> {
++++}
++++
++++export interface MatrixLabelOption extends LabelOption {
++++    formatter?: string | ((params: MatrixLabelFormatterParams) => string);
++++}
++++
++++export interface MatrixLabelFormatterParams {
++++    componentType: 'matrix';
++++    componentIndex: number;
++++    name: string;
++++    value: unknown;
++++    coord: MatrixXYLocator[];
++++    $vars: readonly ['name', 'value', 'coord'];
++++}
++++
++++/**
++++ * Two levels of cascade inheritance:
++++ *  - priority-high: style options defined in `matrix.x/y/coner/body.data[i]` (in cell)
++++ *  - priority-low: style options defined in `matrix.x/y/coner/body`
++++ */
++++```
++++
++++Notes:
++++* No new imports needed — `LabelOption` is imported at `MatrixModel.ts:24` and stays in use
++++  (`defaultLabelOption: LabelOption` at line 215), `MatrixXYLocator` at line 30 (already used by
++++  `MatrixCoordValueOption` at line 132).
++++
++++### Edit 2 — `/workspace/src/coord/matrix/MatrixModel.ts`: use it for the cell style option
++++
++++**Anchor** (verbatim, currently line 199-200):
++++
++++```ts
++++    label?: LabelOption;
++++    itemStyle?: ItemStyleOption;
++++```
++++
++++**Replacement**:
++++
++++```ts
++++    label?: MatrixLabelOption;
++++    itemStyle?: ItemStyleOption;
++++```
++++
++++(There is exactly one `label?: LabelOption;` occurrence in the file, inside
++++`MatrixCellStyleOption`.)
++++
++++### Edit 3 — `/workspace/src/component/matrix/MatrixView.ts`: imports
++++
++++**Anchor** (verbatim, currently line 34):
++++
++++```ts
++++import { clone, retrieve2 } from 'zrender/src/core/util';
++++```
++++
++++**Replacement**:
++++
++++```ts
++++import { clone, retrieve2, isFunction, isString } from 'zrender/src/core/util';
++++import { formatTplSimple } from '../../util/format';
++++```
++++
++++### Edit 4 — `/workspace/src/component/matrix/MatrixView.ts`: apply the formatter
++++
++++**Anchor** (verbatim, currently lines 284-289; note the blank line before `setLabelStyle`):
++++
++++```ts
++++    if (textValue != null) {
++++        const text = textValue + '';
++++        _tmpCellLabelModel.option = cellOption ? cellOption.label : null;
++++        _tmpCellLabelModel.parentModel = parentLabelModel;
++++
++++        setLabelStyle(
++++```
++++
++++**Replacement**:
++++
++++```ts
++++    if (textValue != null) {
++++        let text = textValue + '';
++++        _tmpCellLabelModel.option = cellOption ? cellOption.label : null;
++++        _tmpCellLabelModel.parentModel = parentLabelModel;
++++
++++        const formatter = _tmpCellLabelModel.getShallow('formatter');
++++        if (formatter) {
++++            const params = {
++++                componentType: 'matrix' as const,
++++                componentIndex: matrixModel.componentIndex,
++++                name: text,
++++                value: textValue as unknown,
++++                coord: xyLocator.slice() as MatrixXYLocator[],
++++                $vars: ['name', 'value', 'coord'] as const
++++            };
++++            if (isString(formatter)) {
++++                text = formatTplSimple(formatter, params);
++++            }
++++            else if (isFunction(formatter)) {
++++                const formattedText = formatter(params);
++++                if (formattedText != null) {
++++                    text = formattedText + '';
++++                }
++++            }
++++        }
++++
++++        setLabelStyle(
++++```
++++
++++Why this works / rationale:
++++
++++* `_tmpCellLabelModel` is `new Model<MatrixCellStyleOption['label']>()`
++++  (`MatrixView.ts:355`); after Edit 2 that is `MatrixLabelOption`, so `getShallow('formatter')`
++++  type-checks and returns `string | ((params: MatrixLabelFormatterParams) => string)`.
++++* `Model#getShallow` (`/workspace/src/model/Model.ts:120-135`) falls back to `parentModel` when
++++  the own option misses the key. Since `_tmpCellLabelModel.option` is the *per-cell*
++++  `data[i].label` and `_tmpCellLabelModel.parentModel` is the dimension/body/corner-level
++++  `label` model, the existing two-level cascade documented at `MatrixModel.ts:185-189` is
++++  respected for free (cell-level formatter overrides the dim/body/corner one).
++++* `text` is fed both to `setLabelStyle({defaultText: text, ...})` **and** to
++++  `setTooltipConfig({itemName: text, ...})` further down (line 321-329), so the tooltip /
++++  overflow tooltip shows the formatted text too — which is the desired behaviour, since the
++++  tooltip exists mainly to reveal truncated label text.
++++* `formattedText != null` guard: a function formatter returning `undefined` keeps the raw value
++++  instead of rendering the string `"undefined"`.
++++* Everything is inside `if (textValue != null)`, i.e. the formatter is not invoked for empty
++++  cells; that matches the pre-existing "no text ⇒ no `Text` element" behaviour and avoids
++++  creating labels for the (very numerous) empty body cells.
++++* `tsconfig.json` has no `strict`/`strictNullChecks`, so `MatrixCellStyleOption['label']`
++++  collapses to `MatrixLabelOption` and `keyof` works normally.
++++* The inferred type of the `params` const is an anonymous object type, hence it gets an implicit
++++  index signature and is assignable to `formatTplSimple`'s `param: Dictionary<any>`.
++++
++++### Edit 5 — new file `/workspace/test/matrix-label-formatter.html` (visual test)
++++
++++New file, Apache license header required (`build/checkheader.js` scans `test/**`; `.headerignore`
++++does not exclude it). Follows the conventions of `test/matrix3.html`.
++++
++++```html
++++<!DOCTYPE html>
++++<!--
++++Licensed to the Apache Software Foundation (ASF) under one
++++or more contributor license agreements.  See the NOTICE file
++++distributed with this work for additional information
++++regarding copyright ownership.  The ASF licenses this file
++++to you under the Apache License, Version 2.0 (the
++++"License"); you may not use this file except in compliance
++++with the License.  You may obtain a copy of the License at
++++
++++   http://www.apache.org/licenses/LICENSE-2.0
++++
++++Unless required by applicable law or agreed to in writing,
++++software distributed under the License is distributed on an
++++"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++++KIND, either express or implied.  See the License for the
++++specific language governing permissions and limitations
++++under the License.
++++-->
++++
++++<html>
++++    <head>
++++        <meta charset="utf-8">
++++        <meta name="viewport" content="width=device-width, initial-scale=1" />
++++        <script src="lib/simpleRequire.js"></script>
++++        <script src="lib/config.js"></script>
++++        <script src="lib/jquery.min.js"></script>
++++        <script src="lib/facePrint.js"></script>
++++        <script src="lib/testHelper.js"></script>
++++        <link rel="stylesheet" href="lib/reset.css" />
++++    </head>
++++    <body>
++++        <style>
++++        </style>
++++
++++        <div id="main0"></div>
++++        <div id="main1"></div>
++++        <div id="main2"></div>
++++
++++        <!-- Test case 1: Function formatter on x dimension -->
++++        <script>
++++        require([
++++            'echarts',
++++        ], function (echarts) {
++++            var option = {
++++                matrix: {
++++                    x: {
++++                        data: ['Column A', 'Column B', 'Column C'],
++++                        label: {
++++                            formatter: function (params) {
++++                                // Add prefix to column names
++++                                return '# ' + params.name;
++++                            }
++++                        }
++++                    },
++++                    y: {
++++                        data: ['Row 1', 'Row 2', 'Row 3'],
++++                        label: {
++++                            formatter: function (params) {
++++                                // Add prefix to row names
++++                                return '-> ' + params.name;
++++                            }
++++                        }
++++                    },
++++                    body: {
++++                        data: [
++++                            { coord: ['Column A', 'Row 1'], value: 'A1' },
++++                            { coord: ['Column B', 'Row 2'], value: 'B2' }
++++                        ],
++++                        label: {
++++                            formatter: function (params) {
++++                                return '* ' + params.name;
++++                            }
++++                        }
++++                    }
++++                },
++++            };
++++
++++            testHelper.create(echarts, 'main0', {
++++                title: [
++++                    'Test: Function formatter on x and y labels',
++++                    'x labels should have "#" prefix',
++++                    'y labels should have "->" prefix',
++++                    'body labels should have "*" prefix'
++++                ],
++++                option: option
++++            });
++++        });
++++        </script>
++++
++++        <!-- Test case 2: String template formatter on x dimension -->
++++        <script>
++++        require([
++++            'echarts',
++++        ], function (echarts) {
++++            var option = {
++++                matrix: {
++++                    x: {
++++                        data: ['A', 'B', 'C'],
++++                        label: {
++++                            formatter: 'Col: {name}'
++++                        }
++++                    },
++++                    y: {
++++                        data: ['X', 'Y', 'Z'],
++++                        label: {
++++                            formatter: 'Row: {name}'
++++                        }
++++                    }
++++                },
++++                visualMap: {
++++                    type: 'continuous',
++++                    min: 0,
++++                    max: 50,
++++                    show: false
++++                },
++++                series: {
++++                    type: 'heatmap',
++++                    coordinateSystem: 'matrix',
++++                    data: [
++++                        ['A', 'X', 10],
++++                        ['A', 'Y', 20],
++++                        ['B', 'X', 30],
++++                        ['B', 'Y', 40],
++++                        ['C', 'Z', 50]
++++                    ],
++++                    label: {
++++                        show: true
++++                    }
++++                }
++++            };
++++
++++            testHelper.create(echarts, 'main1', {
++++                title: [
++++                    'Test: String template formatter on x and y labels',
++++                    'x labels should show "Col: A", "Col: B", "Col: C"',
++++                    'y labels should show "Row: X", "Row: Y", "Row: Z"'
++++                ],
++++                option: option
++++            });
++++        });
++++        </script>
++++
++++        <!-- Test case 3: Formatter with nested structure -->
++++        <script>
++++        require([
++++            'echarts',
++++        ], function (echarts) {
++++            var option = {
++++                matrix: {
++++                    x: {
++++                        data: [{
++++                            value: 'Group 1',
++++                            children: ['A1', 'A2']
++++                        }, {
++++                            value: 'Group 2',
++++                            children: ['B1', 'B2']
++++                        }],
++++                        label: {
++++                            formatter: function (params) {
++++                                return '[' + params.name + ']';
++++                            }
++++                        }
++++                    },
++++                    y: {
++++                        data: ['Row 1', 'Row 2'],
++++                        label: {
++++                            formatter: function (params) {
++++                                return params.name + ' *';
++++                            }
++++                        }
++++                    }
++++                },
++++                visualMap: {
++++                    type: 'continuous',
++++                    min: 0,
++++                    max: 50,
++++                    show: false
++++                },
++++                series: {
++++                    type: 'heatmap',
++++                    coordinateSystem: 'matrix',
++++                    data: [
++++                        ['A1', 'Row 1', 10],
++++                        ['A2', 'Row 1', 20],
++++                        ['B1', 'Row 2', 30],
++++                        ['B2', 'Row 2', 40]
++++                    ],
++++                    label: {
++++                        show: true
++++                    }
++++                }
++++            };
++++
++++            testHelper.create(echarts, 'main2', {
++++                title: [
++++                    'Test: Formatter with nested structure',
++++                    'x labels should be wrapped in brackets: [Group 1], [A1], etc.',
++++                    'y labels should have * suffix'
++++                ],
++++                option: option
++++            });
++++        });
++++        </script>
++++
++++    </body>
++++</html>
++++```
++++
++++### Edit 6 (recommended) — new unit test, see section 4
++++
++++---
++++
++++## 4. Tests
++++
++++A unit test **is** feasible and was validated end-to-end against the current tree (see §2.4):
++++`test/ut/jest.config.cjs` `testMatch` includes `'**/spec/component/**/*.test.ts'`, matrix is
++++registered in `src/echarts.all.ts` (`use(MatrixComponent);` at line 224, which `utHelper`
++++imports), and the matrix cell labels render fine under jsdom + `jest-canvas-mock`.
++++
++++Create `/workspace/test/ut/spec/component/matrix/labelFormatter.test.ts`
++++(new directory `test/ut/spec/component/matrix/`), Apache header required:
++++
++++```ts
++++/*
++++* Licensed to the Apache Software Foundation (ASF) under one
++++* or more contributor license agreements.  See the NOTICE file
++++* distributed with this work for additional information
++++* regarding copyright ownership.  The ASF licenses this file
++++* to you under the Apache License, Version 2.0 (the
++++* "License"); you may not use this file except in compliance
++++* with the License.  You may obtain a copy of the License at
++++*
++++*   http://www.apache.org/licenses/LICENSE-2.0
++++*
++++* Unless required by applicable law or agreed to in writing,
++++* software distributed under the License is distributed on an
++++* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++++* KIND, either express or implied.  See the License for the
++++* specific language governing permissions and limitations
++++* under the License.
++++*/
++++
++++import { createChart, removeChart, getViewGroup } from '../../../core/utHelper';
++++import { EChartsType } from '../../../../../src/echarts';
++++import Element from 'zrender/src/Element';
++++import { MatrixLabelFormatterParams } from '../../../../../src/coord/matrix/MatrixModel';
++++
++++function getCellTexts(chart: EChartsType): string[] {
++++    const texts: string[] = [];
++++    getViewGroup(chart, 'matrix').traverse(function (el: Element) {
++++        const textContent = el.getTextContent();
++++        if (textContent) {
++++            texts.push(textContent.style.text as string);
++++        }
++++    });
++++    return texts;
++++}
++++
++++describe('matrix_label_formatter', function () {
++++
++++    let chart: EChartsType;
++++
++++    beforeEach(function () {
++++        chart = createChart();
++++    });
++++
++++    afterEach(function () {
++++        removeChart(chart);
++++    });
++++
++++    it('should apply string template formatter on x/y dimension labels', function () {
++++        chart.setOption({
++++            matrix: {
++++                x: {
++++                    data: ['A', 'B'],
++++                    label: { formatter: 'Col: {name}' }
++++                },
++++                y: {
++++                    data: ['X', 'Y'],
++++                    label: { formatter: 'Row: {name}' }
++++                }
++++            }
++++        });
++++        // x header cells come first, then y header cells.
++++        expect(getCellTexts(chart)).toEqual(['Col: A', 'Col: B', 'Row: X', 'Row: Y']);
++++    });
++++
++++    it('should apply callback formatter and pass name/value/coord', function () {
++++        const received: MatrixLabelFormatterParams[] = [];
++++        chart.setOption({
++++            matrix: {
++++                x: {
++++                    data: ['A', 'B'],
++++                    label: {
++++                        formatter: function (params: MatrixLabelFormatterParams) {
++++                            received.push(params);
++++                            return '<' + params.name + '>';
++++                        }
++++                    }
++++                },
++++                y: { data: ['X'] },
++++                body: {
++++                    data: [{ coord: ['A', 'X'], value: 'v1' }],
++++                    label: {
++++                        formatter: function (params: MatrixLabelFormatterParams) {
++++                            received.push(params);
++++                            return params.value + '!';
++++                        }
++++                    }
++++                }
++++            }
++++        });
++++
++++        expect(getCellTexts(chart)).toEqual(['<A>', '<B>', 'X', 'v1!']);
++++
++++        expect(received.length).toEqual(3);
++++        expect(received[0].componentType).toEqual('matrix');
++++        expect(received[0].componentIndex).toEqual(0);
++++        expect(received[0].name).toEqual('A');
++++        expect(received[0].value).toEqual('A');
++++        // x header cells live on the negative y locator (header area).
++++        expect(received[0].coord).toEqual([0, -1]);
++++        expect(received[1].coord).toEqual([1, -1]);
++++        // The body cell.
++++        expect(received[2].name).toEqual('v1');
++++        expect(received[2].coord).toEqual([0, 0]);
++++    });
++++
++++    it('should let cell level formatter override the dimension level one', function () {
++++        chart.setOption({
++++            matrix: {
++++                x: {
++++                    data: ['A', { value: 'B', label: { formatter: 'cell-{name}' } }],
++++                    label: { formatter: 'dim-{name}' }
++++                },
++++                y: { data: ['X'] }
++++            }
++++        });
++++        expect(getCellTexts(chart)).toEqual(['dim-A', 'cell-B', 'X']);
++++    });
++++
++++    it('should keep the raw text when no formatter is declared', function () {
++++        chart.setOption({
++++            matrix: {
++++                x: { data: ['A'] },
++++                y: { data: ['X'] }
++++            }
++++        });
++++        expect(getCellTexts(chart)).toEqual(['A', 'X']);
++++    });
++++
++++});
++++```
++++
++++Verified facts backing the assertions (measured on the current tree with a throwaway probe):
++++* traversal order of the matrix view group is x-header cells, then y-header cells, then
++++  body/corner cells;
++++* locators: x headers `[0,-1] [1,-1]`, y headers `[-1,0] [-1,1]`, body `[0,0]`;
++++* `el.getTextContent()` (zrender `Element#getTextContent`,
++++  `node_modules/zrender/src/Element.ts:1330`) is how the matrix label is attached — the label is
++++  *not* a child of the group, so `Group#traverse` alone would not find it.
++++
++++Caveat for the third test: `matrix.x.data[i]` is `MatrixDimensionCellOption extends
++++MatrixBaseCellOption extends MatrixCellStyleOption`, so a per-cell `label` is legal — confirmed at
++++`MatrixModel.ts:135-136` and `:157-169`. If the per-cell override assertion turns out to be
++++affected by `Model` option-merging nuances, drop that single `it(...)` block; the first two are
++++the acceptance-critical ones.
++++
++++---
++++
++++## 5. Verification
++++
++++```bash
++++cd /workspace
++++
++++# 1. Type check the whole source tree (this is the gate that catches the new
++++#    MatrixLabelOption / MatrixLabelFormatterParams typings).
++++npx tsc --noEmit
++++
++++# 2. Lint the touched TS files.
++++npx eslint src/component/matrix/MatrixView.ts src/coord/matrix/MatrixModel.ts
++++
++++# 3. Run the new unit test only.
++++npx jest --config test/ut/jest.config.cjs --coverage=false -t "matrix_label_formatter"
++++#    or by path:
++++npx jest --config test/ut/jest.config.cjs --coverage=false test/ut/spec/component/matrix/labelFormatter.test.ts
++++
++++# 4. Full unit suite (regression).
++++npm test
++++
++++# 5. Apache license header check (needed because of the new .html / .test.ts files).
++++npm run checkheader
++++
++++# 6. Manual/visual: `npm run dev` then open
++++#    http://127.0.0.1:8080/test/matrix-label-formatter.html
++++#    and confirm the three charts render "# Column A", "Col: A", "[Group 1]" etc.
++++#    Also re-open test/matrix.html, test/matrix2.html, test/matrix3.html,
++++#    test/matrix_application.html to confirm nothing regressed (they declare no
++++#    matrix label formatter, only tooltip formatters, so text must be unchanged).
++++```
++++
++++Expected before/after for the probe in §2.4: `["A","B","X","Y"]` → `["Col: A","Col: B","<X>","<Y>"]`.
++++
++++---
++++
++++## 6. Risks / open questions
++++
++++1. **`formatTplSimple` replaces only the first occurrence** of each `{key}` (it uses
++++   `String#replace` with a string pattern). `'{name}-{name}'` yields `'A-{name}'`. This matches
++++   the existing behaviour of `calendar.dayLabel/monthLabel/yearLabel.formatter`, so it is
++++   consistent with the rest of ECharts — but it is a known limitation worth noting in docs.
++++2. **`{componentType}`, `{componentIndex}`, `{coord}`, `{$vars}` are also substitutable** by
++++   `formatTplSimple` because it iterates every key of the params object. `{coord}` stringifies
++++   the array as `0,-1`. Harmless, but it means the template namespace is slightly larger than
++++   `name`/`value`.
++++3. **The formatted text also becomes the tooltip `itemName`** (`setTooltipConfig({itemName: text})`
++++   at `MatrixView.ts:324`), because `text` is reused. That is intentional (the matrix tooltip is
++++   primarily an overflow-reveal mechanism), but it is a behaviour change for users who declare a
++++   label formatter *and* rely on `matrix.tooltip.formatter(params.name)` returning the raw value.
++++   If that is undesirable, capture `const rawText = textValue + '';` before formatting and pass
++++   `rawText` to `setTooltipConfig`. The upstream fix does **not** do this — it reuses `text`.
++++4. **`getShallow` parent fallback**: `_tmpCellLabelModel.parentModel` is the dim/body/corner
++++   `label` model, whose own `parentModel` is the dim/body/corner model. A user writing
++++   `matrix.x.formatter` (not under `label`) would therefore accidentally take effect. This mirrors
++++   the existing behaviour of `_tmpCellLabelModel.get('silent')` at `MatrixView.ts:334`, so no new
++++   class of problem is introduced.
++++5. **Not covered**: the label of *series* drawn inside the matrix (heatmap/scatter labels) — those
++++   go through the normal series label pipeline and already work. Only matrix component cell
++++   labels are touched.
++++6. **`emphasis`/`blur`/`select` label states** are still unsupported by matrix cells (see the
++++   `// Currently do not support other states` comment at `MatrixView.ts:291`), so the formatter is
++++   applied to the normal state only. Consistent with the current design.
++++7. **Rich text** (`label.rich` + `{a|...}` markup) combined with a string formatter: the template
++++   substitution happens before `setLabelStyle`, so rich tags in the formatter output still work as
++++   usual; but a rich tag such as `{styleName|text}` inside the formatter string is *not* a
++++   `formatTplSimple` key so it passes through untouched. Verified by reading `formatTplSimple`,
++++   not by running a rich-text case — worth a manual smoke test if rich matrix labels matter.
+++diff --git a/agent_plans/radar-clockwise-option.md b/agent_plans/radar-clockwise-option.md
+++new file mode 100644
+++index 0000000..886a0a3
+++--- /dev/null
++++++ b/agent_plans/radar-clockwise-option.md
+++@@ -0,0 +1,684 @@
++++# radar-clockwise-option — Implementation Plan
++++
++++## 1. Goal
++++
++++Add a new `radar.clockwise` component option (boolean) to the **radar coordinate system**, so that the
++++order in which indicator axes are laid out around the circle can be reversed.
++++
++++Engineering statement:
++++
++++* `RadarOption` (`src/coord/radar/RadarModel.ts`) gains `clockwise?: boolean`, defaulting to `false`.
++++* `Radar` (`src/coord/radar/Radar.ts`) gains a public `clockwise: boolean` field (sibling of the
++++  existing `startAngle`, `cx`, `cy`, `r`, `r0` fields), read in `Radar.prototype.resize()`.
++++* The per-indicator angle computation in `Radar.prototype.resize()` changes from a fixed
++++  `+idx * 2π / n` step to a signed `dirSign * idx * 2π / n` step, where `dirSign === -1` when
++++  `clockwise` is truthy (because `coordToPoint()` uses `y = cy - coord * sin(angle)`, i.e. *increasing*
++++  angle already means *counter-clockwise* on screen).
++++* The stale `// TODO clockwise` marker at the top of `src/coord/radar/Radar.ts` is removed.
++++* Indicator 0 must stay exactly at `startAngle` in both directions (no regression for existing charts,
++++  since the default `false` reproduces today's math bit-for-bit: `dirSign === 1`).
++++* Nothing in `src/component/radar/RadarView.ts` needs to change — see Findings §2.4 for the proof that
++++  label / axis-name placement is preserved.
++++
++++## 2. Findings (current code)
++++
++++### 2.1 The feature is an explicit, long-standing TODO
++++
++++`/workspace/src/coord/radar/Radar.ts:20`
++++
++++```ts
++++// TODO clockwise
++++
++++import IndicatorAxis from './IndicatorAxis';
++++```
++++
++++### 2.2 The angle of each indicator axis is hard-coded to one direction
++++
++++`/workspace/src/coord/radar/Radar.ts:125-150` (`resize()`), verbatim:
++++
++++```ts
++++    resize(radarModel: RadarModel, api: ExtensionAPI) {
++++        const refContainer = createBoxLayoutReference(radarModel, api).refContainer;
++++
++++        const center = radarModel.get('center');
++++        const viewSize = Math.min(refContainer.width, refContainer.height) / 2;
++++        this.cx = numberUtil.parsePercent(center[0], refContainer.width) + refContainer.x;
++++        this.cy = numberUtil.parsePercent(center[1], refContainer.height) + refContainer.y;
++++
++++        this.startAngle = radarModel.get('startAngle') * Math.PI / 180;
++++
++++        // radius may be single value like `20`, `'80%'`, or array like `[10, '80%']`
++++        let radius = radarModel.get('radius');
++++        if (isString(radius) || isNumber(radius)) {
++++            radius = [0, radius];
++++        }
++++        this.r0 = numberUtil.parsePercent(radius[0], viewSize);
++++        this.r = numberUtil.parsePercent(radius[1], viewSize);
++++
++++        each(this._indicatorAxes, function (indicatorAxis, idx) {
++++            indicatorAxis.setExtent(this.r0, this.r);
++++            let angle = (this.startAngle + idx * Math.PI * 2 / this._indicatorAxes.length);
++++            // Normalize to [-PI, PI]
++++            angle = Math.atan2(Math.sin(angle), Math.cos(angle));
++++            indicatorAxis.angle = angle;
++++        }, this);
++++    }
++++```
++++
++++`idx * Math.PI * 2 / n` is always added, so indicator index always advances counter-clockwise on
++++screen. There is no way to flip it.
++++
++++Screen-direction proof — `/workspace/src/coord/radar/Radar.ts:90-96`:
++++
++++```ts
++++    coordToPoint(coord: number, indicatorIndex: number) {
++++        const indicatorAxis = this._indicatorAxes[indicatorIndex];
++++        const angle = indicatorAxis.angle;
++++        const x = this.cx + coord * Math.cos(angle);
++++        const y = this.cy - coord * Math.sin(angle);
++++        return [x, y];
++++    }
++++```
++++
++++`y` is negated, so a *larger* angle moves the point counter-clockwise in screen space. Hence
++++`clockwise: true` ⇒ step sign `-1`.
++++
++++### 2.3 The option does not exist in the model
++++
++++`/workspace/src/coord/radar/RadarModel.ts:58-63` — `RadarOption` has `startAngle` but no `clockwise`:
++++
++++```ts
++++export interface RadarOption extends ComponentOption, CircleLayoutOptionMixin {
++++    mainType?: 'radar'
++++
++++    startAngle?: number
++++
++++    shape?: 'polygon' | 'circle'
++++```
++++
++++`/workspace/src/coord/radar/RadarModel.ts:178-190` — `defaultOption` likewise:
++++
++++```ts
++++    static defaultOption: RadarOption = {
++++
++++        // zlevel: 0,
++++
++++        z: 0,
++++
++++        center: ['50%', '50%'],
++++
++++        radius: '50%',
++++
++++        startAngle: 90,
++++
++++        axisName: {
++++```
++++
++++`/workspace/src/coord/radar/Radar.ts:45-57` — the coordinate-system instance exposes `startAngle` but
++++nothing for direction:
++++
++++```ts
++++    cx: number;
++++
++++    cy: number;
++++
++++    r: number;
++++
++++    r0: number;
++++
++++    startAngle: number;
++++
++++    private _model: RadarModel;
++++```
++++
++++### 2.4 Nothing else has to change — verified consumers of `indicatorAxis.angle`
++++
++++Exhaustive grep of `.angle` / `coordToPoint` / `getIndicatorAxes` consumers:
++++
++++* `/workspace/src/component/radar/RadarView.ts:44-57` builds one `AxisBuilder` per indicator with
++++  `rotation: indicatorAxis.angle`, `position: [radar.cx, radar.cy]`, `labelDirection: -1`,
++++  `tickDirection: -1`, `nameDirection: 1`:
++++
++++  ```ts
++++            const axisBuilder = new AxisBuilder(indicatorAxis.model, api, {
++++                axisName: axisName,
++++                position: [radar.cx, radar.cy],
++++                rotation: indicatorAxis.angle,
++++                labelDirection: -1,
++++                tickDirection: -1,
++++                nameDirection: 1
++++            });
++++  ```
++++
++++  `AxisBuilder` derives every text alignment purely from `cfg.rotation` and the axis extent
++++  (`/workspace/src/component/axis/AxisBuilder.ts:588-616` `innerTextLayout`,
++++  `:1019-1047` `endTextLayout`, `:856-872` name positioning, `:913-940` name `graphic.Text`
++++  creation). It never assumes a rotation ordering across axes. Because the *set* of angles produced
++++  for `clockwise: true` is a mirror of the counter-clockwise set (for `n` indicators and
++++  `startAngle` s, `{s - k·2π/n}` normalized is the same modulo-2π lattice mirrored about `s`), every
++++  individual axis is laid out by the exact same code path with a legal rotation value. → **label
++++  placement is preserved by construction; no edit needed in `RadarView.ts`.**
++++
++++* `/workspace/src/component/radar/RadarView.ts:129-165` (`_buildSplitLineAndArea`, polygon branch)
++++  builds ring polygons as `points.concat(prevPoints)` where `prevPoints` is the previous ring
++++  *reversed*. Reversing the global winding direction (which `clockwise` does) keeps outer/inner rings
++++  counter-wound relative to each other, so the even-odd/non-zero fill of `graphic.Polygon` is
++++  unaffected.
++++
++++* `/workspace/src/chart/radar/radarLayout.ts:35-58` iterates indicator axes by index and calls
++++  `coordSys.dataToPoint(val, axisIndex)` — index-driven, direction agnostic.
++++
++++* `/workspace/src/chart/radar/RadarSeries.ts:112`, `:145-146` — same, index-driven.
++++
++++* `/workspace/src/coord/radar/Radar.ts:98-123` (`pointToData`) picks the closest axis by
++++  `Math.abs(radian - indicatorAxis.angle)`; this is symmetric in direction and needs no change.
++++
++++### 2.5 Precedent for the option name / semantics
++++
++++Other components already use a boolean `clockwise`:
++++`/workspace/src/coord/polar/AxisModel.ts:43` (`clockwise?: boolean;`),
++++`/workspace/src/component/polar/install.ts:43` (`clockwise: true,`),
++++`/workspace/src/chart/pie/PieSeries.ts:112`/`:220`,
++++`/workspace/src/chart/gauge/GaugeSeries.ts:134`/`:209`,
++++`/workspace/src/chart/sunburst/SunburstSeries.ts:129`/`:227`,
++++`/workspace/src/chart/chord/ChordSeries.ts:131`/`:308`.
++++
++++Those default to `true`, but for radar the *existing* rendering is counter-clockwise, so the default
++++here **must be `false`** to keep every existing radar chart pixel-identical. (See Risks §6.1.)
++++
++++### 2.6 Type export surface
++++
++++`/workspace/src/export/option.ts:22` re-exports the interface:
++++
++++```ts
++++import type {RadarOption as RadarComponentOption} from '../coord/radar/RadarModel';
++++```
++++
++++It picks up the new field automatically — **no edit needed** there or in `/workspace/index.d.ts`
++++(which only does `export * from './types/dist/echarts'`).
++++
++++---
++++
++++## 3. Plan — ordered edits
++++
++++### Edit 1 — `/workspace/src/coord/radar/Radar.ts` : drop the stale TODO
++++
++++**Anchor** (verbatim, includes the blank line and the following import):
++++
++++```ts
++++// TODO clockwise
++++
++++import IndicatorAxis from './IndicatorAxis';
++++```
++++
++++**Replacement:**
++++
++++```ts
++++import IndicatorAxis from './IndicatorAxis';
++++```
++++
++++### Edit 2 — `/workspace/src/coord/radar/Radar.ts` : add the `clockwise` field
++++
++++**Anchor:**
++++
++++```ts
++++    startAngle: number;
++++
++++    private _model: RadarModel;
++++```
++++
++++**Replacement:**
++++
++++```ts
++++    startAngle: number;
++++
++++    /**
++++     * Whether the indicator axes are arranged clockwise.
++++     * `false` (default) means counterclockwise, which keeps the
++++     * layout used before this option was introduced.
++++     */
++++    clockwise: boolean;
++++
++++    private _model: RadarModel;
++++```
++++
++++### Edit 3 — `/workspace/src/coord/radar/Radar.ts` : read the option in `resize()`
++++
++++**Anchor:**
++++
++++```ts
++++        this.startAngle = radarModel.get('startAngle') * Math.PI / 180;
++++```
++++
++++**Replacement:**
++++
++++```ts
++++        this.startAngle = radarModel.get('startAngle') * Math.PI / 180;
++++        this.clockwise = !!radarModel.get('clockwise');
++++```
++++
++++(`radarModel.get('clockwise')` is typed `boolean` once Edit 5 lands; `!!` guards a user passing a
++++truthy non-boolean and normalizes `undefined` → `false`.)
++++
++++### Edit 4 — `/workspace/src/coord/radar/Radar.ts` : apply the direction sign
++++
++++**Anchor** (verbatim, the whole `each` block at the end of `resize()`):
++++
++++```ts
++++        each(this._indicatorAxes, function (indicatorAxis, idx) {
++++            indicatorAxis.setExtent(this.r0, this.r);
++++            let angle = (this.startAngle + idx * Math.PI * 2 / this._indicatorAxes.length);
++++            // Normalize to [-PI, PI]
++++            angle = Math.atan2(Math.sin(angle), Math.cos(angle));
++++            indicatorAxis.angle = angle;
++++        }, this);
++++```
++++
++++**Replacement:**
++++
++++```ts
++++        // `coordToPoint` negates y, so a growing angle goes counterclockwise on
++++        // screen. Laying indicators out clockwise therefore needs a negative step.
++++        const dirSign = this.clockwise ? -1 : 1;
++++
++++        each(this._indicatorAxes, function (indicatorAxis, idx) {
++++            indicatorAxis.setExtent(this.r0, this.r);
++++            let angle = (this.startAngle + dirSign * idx * Math.PI * 2 / this._indicatorAxes.length);
++++            // Normalize to [-PI, PI]
++++            angle = Math.atan2(Math.sin(angle), Math.cos(angle));
++++            indicatorAxis.angle = angle;
++++        }, this);
++++```
++++
++++`dirSign` is a closure variable; `each(..., this)` still binds `this` to the `Radar` instance inside
++++the callback, so `this.r0` / `this.r` / `this.startAngle` keep working unchanged.
++++
++++### Edit 5 — `/workspace/src/coord/radar/RadarModel.ts` : declare the option
++++
++++**Anchor:**
++++
++++```ts
++++    startAngle?: number
++++
++++    shape?: 'polygon' | 'circle'
++++```
++++
++++**Replacement:**
++++
++++```ts
++++    startAngle?: number
++++
++++    /**
++++     * Whether the indicators are arranged clockwise.
++++     * Defaults to `false`, i.e. counterclockwise, which is the direction
++++     * used before this option existed.
++++     */
++++    clockwise?: boolean
++++
++++    shape?: 'polygon' | 'circle'
++++```
++++
++++### Edit 6 — `/workspace/src/coord/radar/RadarModel.ts` : default value
++++
++++**Anchor:**
++++
++++```ts
++++        startAngle: 90,
++++
++++        axisName: {
++++```
++++
++++**Replacement:**
++++
++++```ts
++++        startAngle: 90,
++++
++++        clockwise: false,
++++
++++        axisName: {
++++```
++++
++++### Edit 7 (new file) — `/workspace/test/ut/spec/coord/radar/radar.test.ts`
++++
++++See §4 for the full content. `test/ut/jest.config.cjs` already contains
++++`'**/spec/coord/**/*.test.ts'` in `testMatch` (verified at
++++`/workspace/test/ut/jest.config.cjs`, `testMatch` array), so the new directory is picked up with no
++++config change. Directories `test/ut/spec/coord/` and `test/ut/spec/coord/radar/` must be created.
++++
++++### Edit 8 (new file) — `/workspace/test/radar-clockwise.html`
++++
++++Visual test. Modeled on `/workspace/test/radar-axis.html` (same script/lib header, `testHelper.create`).
++++The visual runner auto-discovers `test/*.html`; no registration file needs editing.
++++
++++```html
++++<!DOCTYPE html>
++++<!--
++++Licensed to the Apache Software Foundation (ASF) under one
++++or more contributor license agreements.  See the NOTICE file
++++distributed with this work for additional information
++++regarding copyright ownership.  The ASF licenses this file
++++to you under the Apache License, Version 2.0 (the
++++"License"); you may not use this file except in compliance
++++with the License.  You may obtain a copy of the License at
++++
++++   http://www.apache.org/licenses/LICENSE-2.0
++++
++++Unless required by applicable law or agreed to in writing,
++++software distributed under the License is distributed on an
++++"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++++KIND, either express or implied.  See the License for the
++++specific language governing permissions and limitations
++++under the License.
++++-->
++++
++++
++++<html>
++++    <head>
++++        <meta charset="utf-8">
++++        <meta name="viewport" content="width=device-width, initial-scale=1" />
++++        <script src="lib/simpleRequire.js"></script>
++++        <script src="lib/config.js"></script>
++++        <script src="lib/jquery.min.js"></script>
++++        <script src="lib/facePrint.js"></script>
++++        <script src="lib/testHelper.js"></script>
++++        <link rel="stylesheet" href="lib/reset.css" />
++++    </head>
++++    <body>
++++        <style>
++++        </style>
++++
++++
++++        <div id="main0"></div>
++++        <div id="main1"></div>
++++        <div id="main2"></div>
++++
++++
++++        <script>
++++        require(['echarts'], function (echarts) {
++++
++++            var indicator = [
++++                { name: 'A', max: 100 },
++++                { name: 'B', max: 100 },
++++                { name: 'C', max: 100 },
++++                { name: 'D', max: 100 },
++++                { name: 'E', max: 100 },
++++                { name: 'F', max: 100 }
++++            ];
++++            var data = [{
++++                value: [90, 20, 40, 60, 30, 70],
++++                name: 'value'
++++            }];
++++
++++            function makeOption(radarOpt) {
++++                return {
++++                    tooltip: {},
++++                    radar: echarts.util.merge({
++++                        indicator: indicator,
++++                        radius: '60%'
++++                    }, radarOpt, true),
++++                    series: [{
++++                        type: 'radar',
++++                        areaStyle: {},
++++                        label: { show: true },
++++                        data: data
++++                    }]
++++                };
++++            }
++++
++++            testHelper.create(echarts, 'main0', {
++++                title: [
++++                    'Default (no `clockwise`): indicators A B C D E F must run',
++++                    'COUNTERCLOCKWISE starting from the top (startAngle 90).'
++++                ],
++++                option: makeOption({})
++++            });
++++
++++            testHelper.create(echarts, 'main1', {
++++                title: [
++++                    '`clockwise: true`: indicators A B C D E F must run',
++++                    'CLOCKWISE starting from the top. A stays at the top,',
++++                    'axis names / labels must stay correctly placed and readable.'
++++                ],
++++                option: makeOption({ clockwise: true })
++++            });
++++
++++            testHelper.create(echarts, 'main2', {
++++                title: [
++++                    '`clockwise: true` + `startAngle: 0` + `shape: circle`',
++++                    'A must be at the RIGHT, B below it.'
++++                ],
++++                option: makeOption({
++++                    clockwise: true,
++++                    startAngle: 0,
++++                    shape: 'circle',
++++                    axisLabel: { show: true }
++++                })
++++            });
++++        });
++++        </script>
++++
++++
++++    </body>
++++</html>
++++```
++++
++++---
++++
++++## 4. Tests
++++
++++A unit test is feasible. `test/ut/jest.config.cjs` already matches `**/spec/coord/**/*.test.ts`,
++++`utHelper.createChart()` boots a real chart from `src/echarts.all` (which registers `RadarChart`, and
++++`src/chart/radar/install.ts` `use(installRadarComponent)` pulls in the radar coordinate system), and
++++`utHelper.getECModel(chart).getComponent('radar', 0)` gives the `RadarModel` whose
++++`.coordinateSystem` is the `Radar` instance.
++++
++++Helper API confirmed in `/workspace/test/ut/core/utHelper.ts`:
++++`createChart({width, height, theme, opts})`, `getECModel(chart)`, `getGraphicElements(chart, mainType, index)`.
++++Path alias `@/*` → repo root is declared in `/workspace/test/ut/tsconfig.json`.
++++
++++New file `/workspace/test/ut/spec/coord/radar/radar.test.ts`:
++++
++++```ts
++++/*
++++* Licensed to the Apache Software Foundation (ASF) under one
++++* or more contributor license agreements.  See the NOTICE file
++++* distributed with this work for additional information
++++* regarding copyright ownership.  The ASF licenses this file
++++* to you under the Apache License, Version 2.0 (the
++++* "License"); you may not use this file except in compliance
++++* with the License.  You may obtain a copy of the License at
++++*
++++*   http://www.apache.org/licenses/LICENSE-2.0
++++*
++++* Unless required by applicable law or agreed to in writing,
++++* software distributed under the License is distributed on an
++++* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++++* KIND, either express or implied.  See the License for the
++++* specific language governing permissions and limitations
++++* under the License.
++++*/
++++
++++import { createChart, getECModel, getGraphicElements } from '../../../core/utHelper';
++++import { EChartsType } from '@/src/echarts';
++++import RadarModel from '@/src/coord/radar/RadarModel';
++++import Radar from '@/src/coord/radar/Radar';
++++
++++describe('coord_radar_clockwise', function () {
++++
++++    let chart: EChartsType;
++++
++++    beforeEach(function () {
++++        chart = createChart({ width: 400, height: 400 });
++++    });
++++
++++    afterEach(function () {
++++        chart.dispose();
++++    });
++++
++++    function setRadarOption(radarOption: object): Radar {
++++        chart.setOption({
++++            radar: Object.assign({
++++                center: ['50%', '50%'],
++++                radius: 100,
++++                startAngle: 90,
++++                indicator: [
++++                    { name: 'a', max: 100 },
++++                    { name: 'b', max: 100 },
++++                    { name: 'c', max: 100 },
++++                    { name: 'd', max: 100 }
++++                ]
++++            }, radarOption),
++++            series: [{
++++                type: 'radar',
++++                data: [{ value: [10, 20, 30, 40] }]
++++            }]
++++        }, true);
++++
++++        return (getECModel(chart).getComponent('radar', 0) as RadarModel).coordinateSystem;
++++    }
++++
++++    function expectPointCloseTo(pt: number[], x: number, y: number): void {
++++        expect(pt[0]).toBeCloseTo(x, 4);
++++        expect(pt[1]).toBeCloseTo(y, 4);
++++    }
++++
++++    it('defaults to counterclockwise (backward compatible)', function () {
++++        const radar = setRadarOption({});
++++        const r = radar.r;
++++
++++        expect(radar.clockwise).toBe(false);
++++
++++        // startAngle 90 -> indicator 0 on top.
++++        expectPointCloseTo(radar.coordToPoint(r, 0), radar.cx, radar.cy - r);
++++        // Counterclockwise -> indicator 1 on the left.
++++        expectPointCloseTo(radar.coordToPoint(r, 1), radar.cx - r, radar.cy);
++++        expectPointCloseTo(radar.coordToPoint(r, 2), radar.cx, radar.cy + r);
++++        expectPointCloseTo(radar.coordToPoint(r, 3), radar.cx + r, radar.cy);
++++    });
++++
++++    it('lays indicators out clockwise when `clockwise: true`', function () {
++++        const radar = setRadarOption({ clockwise: true });
++++        const r = radar.r;
++++
++++        expect(radar.clockwise).toBe(true);
++++
++++        // The first indicator must still sit at `startAngle`.
++++        expectPointCloseTo(radar.coordToPoint(r, 0), radar.cx, radar.cy - r);
++++        // Clockwise -> indicator 1 on the right.
++++        expectPointCloseTo(radar.coordToPoint(r, 1), radar.cx + r, radar.cy);
++++        expectPointCloseTo(radar.coordToPoint(r, 2), radar.cx, radar.cy + r);
++++        expectPointCloseTo(radar.coordToPoint(r, 3), radar.cx - r, radar.cy);
++++    });
++++
++++    it('mirrors the angle set so `startAngle` is still honored', function () {
++++        const ccw = setRadarOption({ startAngle: 0 });
++++        expectPointCloseTo(ccw.coordToPoint(ccw.r, 0), ccw.cx + ccw.r, ccw.cy);
++++        expectPointCloseTo(ccw.coordToPoint(ccw.r, 1), ccw.cx, ccw.cy - ccw.r);
++++
++++        const cw = setRadarOption({ startAngle: 0, clockwise: true });
++++        expectPointCloseTo(cw.coordToPoint(cw.r, 0), cw.cx + cw.r, cw.cy);
++++        expectPointCloseTo(cw.coordToPoint(cw.r, 1), cw.cx, cw.cy + cw.r);
++++    });
++++
++++    it('keeps all axis names rendered in both directions', function () {
++++        function getAxisNames(): string[] {
++++            const names: string[] = [];
++++            const els = getGraphicElements(chart, 'radar', 0);
++++            for (let i = 0; i < els.length; i++) {
++++                const el = els[i] as any;
++++                if (el.anid === 'name' && el.style && el.style.text != null) {
++++                    names.push(el.style.text);
++++                }
++++            }
++++            return names.sort();
++++        }
++++
++++        setRadarOption({});
++++        expect(getAxisNames()).toEqual(['a', 'b', 'c', 'd']);
++++
++++        setRadarOption({ clockwise: true });
++++        expect(getAxisNames()).toEqual(['a', 'b', 'c', 'd']);
++++    });
++++
++++    it('reverses the data polygon point order accordingly', function () {
++++        const ccw = setRadarOption({});
++++        const ccwP1 = ccw.dataToPoint(20, 1);
++++        expect(ccwP1[0]).toBeLessThan(ccw.cx);
++++
++++        const cw = setRadarOption({ clockwise: true });
++++        const cwP1 = cw.dataToPoint(20, 1);
++++        expect(cwP1[0]).toBeGreaterThan(cw.cx);
++++    });
++++});
++++```
++++
++++Notes on the sketch:
++++
++++* `radar.cx`/`radar.cy`/`radar.r` are read off the coordinate system rather than hard-coded so the
++++  assertions do not depend on `createBoxLayoutReference` details.
++++* Angles are asserted through `coordToPoint()` instead of raw `indicatorAxis.angle`, because the
++++  `Math.atan2(sin, cos)` normalization makes the exact sign at ±π floating-point fragile
++++  (e.g. `atan2(sin(2π), cos(2π))` yields `-2.4e-16`, and `atan2(sin(-π), cos(-π))` yields `-π`).
++++  `toBeCloseTo(..., 4)` on the resulting points is stable.
++++* `anid === 'name'` is the marker `AxisBuilder` sets on the axis-name text
++++  (`/workspace/src/component/axis/AxisBuilder.ts` — `textEl.anid = 'name';`), which makes the label
++++  assertion selector-based rather than index-based.
++++* If `Object.assign` is undesirable for the ES3 target of the *source* tree, note the tests compile
++++  with `test/ut/tsconfig.json` (`target: ES6`) so it is fine; alternatively use
++++  `zrUtil.extend` imported from `zrender/src/core/util`.
++++
++++## 5. Verification
++++
++++```bash
++++# 1. Type check the whole source tree (must be clean).
++++cd /workspace && npx tsc --noEmit -p tsconfig.json
++++
++++# 2. Lint the touched files.
++++cd /workspace && npx eslint src/coord/radar/Radar.ts src/coord/radar/RadarModel.ts
++++
++++# 3. Run the new unit test only.
++++cd /workspace && npx jest --config test/ut/jest.config.cjs --coverage=false -t "coord_radar_clockwise"
++++
++++# 4. Run the whole UT suite to prove no regression.
++++cd /workspace && npm run test
++++
++++# 5. Visual check (manual): serve the test dir and open the new page.
++++cd /workspace && npm run test:visual   # then open test/radar-clockwise.html
++++```
++++
++++Expected results:
++++
++++* `tsc --noEmit` reports no new errors (`clockwise` is a declared member of `RadarOption`, so
++++  `radarModel.get('clockwise')` type-checks and returns `boolean`).
++++* The new spec passes all five cases.
++++* No other UT changes status — the default `clockwise: false` makes `dirSign === 1`, i.e. the exact
++++  arithmetic that exists today.
++++* In `test/radar-clockwise.html`, chart `main0` (default) and chart `main1` (`clockwise: true`) are
++++  mirror images about the vertical axis, both with correctly positioned, non-overlapping axis names.
++++
++++## 6. Risks / open questions
++++
++++1. **Default value.** I chose `clockwise: false` so that every existing radar chart renders
++++   identically (the requirement says the change must not break "the rest of the radar rendering
++++   contract"). Every other ECharts component that has `clockwise` defaults it to `true`
++++   (`src/component/polar/install.ts:43`, `src/chart/pie/PieSeries.ts:220`,
++++   `src/chart/gauge/GaugeSeries.ts:209`, `src/chart/sunburst/SunburstSeries.ts:227`,
++++   `src/chart/chord/ChordSeries.ts:308`), so there is a naming-consistency argument for `true`. If the
++++   upstream decision was `true`, the *only* change needed is the literal in Edit 6 (plus the doc
++++   comments and the two "default" assertions in the spec) — the mechanism is identical.
++++2. **`pointToData` nearest-axis search.** `/workspace/src/coord/radar/Radar.ts:98-123` uses
++++   `Math.abs(radian - indicatorAxis.angle)` without wrap-around handling, so an axis at `+π` and a
++++   pointer at `-π` are considered maximally far apart. This is a pre-existing bug, direction-agnostic,
++++   and deliberately left untouched to keep the change minimal. It is worth flagging in review.
++++3. **Split-area winding.** `_buildSplitLineAndArea` (`src/component/radar/RadarView.ts:129-165`)
++++   produces ring polygons whose winding flips with `clockwise`. Canvas/SVG fill for the
++++   outer-forward/inner-reversed pair is winding-symmetric, so no visual change is expected, but the
++++   `shape: 'polygon'` + `splitArea` case is the one to eyeball in the visual test.
++++4. **`radar.axisName.formatter` / `triggerEvent`.** Both are keyed off the indicator model, not the
++++   angle, so they follow the reordered axes automatically. No action.
++++5. **Docs.** The option reference lives in the separate `apache/echarts-doc` repository; adding
++++   `radar.clockwise` there is out of scope for this repo but should be filed as a follow-up.
++++6. **`echarts.util.merge` in the visual test — verified available.** `src/export/api.ts:54` does
++++   `export * as util from './api/util'`, and `src/export/api/util.ts:20-23` re-exports
++++   `extend, defaults, clone, merge`. `src/export/core.ts` does `export * from './api'`, so
++++   `echarts.util.merge(target, source, true)` is on the public surface. No fallback needed.
+++diff --git a/agent_plans/release-6-0-0-rc1.md b/agent_plans/release-6-0-0-rc1.md
+++new file mode 100644
+++index 0000000..e886b04
+++--- /dev/null
++++++ b/agent_plans/release-6-0-0-rc1.md
+++@@ -0,0 +1,429 @@
++++# release-6-0-0-rc1 — implementation plan
++++
++++Requirement source: `/workspace/requirements/release-6-0-0-rc1.yaml`
++++(title: `chore: release 6.0.0-rc.1`, category: `other`)
++++
++++---
++++
++++## 1. Goal
++++
++++Cut the 6.0.0 release candidate: move every **version string that is a source of truth for
++++the published package** from `6.0.0-beta.1` to `6.0.0-rc.1`, so that
++++
++++* the npm manifest (`package.json` / `package-lock.json`),
++++* the runtime constant exported by the library (`echarts.version`, i.e.
++++  `src/core/echarts.ts` → re-exported through `src/export/core.ts` → `src/export/all.ts` →
++++  `src/echarts.all.ts` → `index.js` / `dist/echarts*.js`),
++++
++++all report the *same* `6.0.0-rc.1` string, and so that the generated bundles produced by
++++`npm run release` (which inline the `version` constant from `src/core/echarts.ts` and are
++++published under the `package.json` version) are coherent with the RC source snapshot.
++++
++++Nothing else changes. This is a release-metadata-only commit: **no behavior change, no API
++++change, no option change**. The already-correct `zrender` pin (`6.0.0-rc.1`, in both
++++`package.json` `dependencies` and the `dependencies` constant in `src/core/echarts.ts`)
++++must be left untouched.
++++
++++Scope note about "distributable artifacts": `dist/` is **not** git-ignored upstream
++++(`git check-ignore -v dist/echarts.js` exits 1, i.e. not ignored; `.headerignore` ends with
++++a `dist` entry, `.eslintignore` starts with `/dist`), but this snapshot contains **no**
++++tracked `dist/` files (`git ls-files | grep -c '^dist/'` → `0`) and the bundler entry
++++points (`build/build.js`, `build/build-i18n.js`) referenced by the `release` npm script are
++++absent from the snapshot too (`ls /workspace/build` → only `addHeader.js`,
++++`checkheader.js`, `package.json`, `pre-publish.js`, `preamble.js`, `template/`,
++++`testDts.js`). Therefore the bundles cannot and should not be regenerated/committed here;
++++the actionable, reviewable part of the release commit is the version metadata below. See
++++§6 for the rationale.
++++
++++---
++++
++++## 2. Findings — current state (all four occurrences of the stale version)
++++
++++`6.0.0-beta.1` appears in exactly four places in the whole tree
++++(verified with `grep -rIn --exclude-dir=node_modules --exclude-dir=.git "beta\.1"`):
++++
++++### 2.1 `/workspace/package.json:3`
++++
++++```json
++++{
++++  "name": "echarts",
++++  "version": "6.0.0-beta.1",
++++  "description": "Apache ECharts is a powerful, interactive charting and data visualization library for browser",
++++```
++++
++++(2-space indentation; the file also already pins the RC of the renderer at
++++`/workspace/package.json:70`:)
++++
++++```json
++++  "dependencies": {
++++    "tslib": "2.3.0",
++++    "zrender": "6.0.0-rc.1"
++++  },
++++```
++++
++++### 2.2 `/workspace/package-lock.json:3` (root manifest mirror)
++++
++++```json
++++{
++++  "name": "echarts",
++++  "version": "6.0.0-beta.1",
++++  "lockfileVersion": 2,
++++  "requires": true,
++++```
++++
++++### 2.3 `/workspace/package-lock.json:9` (the `packages[""]` self entry, 6-space indentation)
++++
++++```json
++++  "packages": {
++++    "": {
++++      "name": "echarts",
++++      "version": "6.0.0-beta.1",
++++      "license": "Apache-2.0",
++++      "dependencies": {
++++        "tslib": "2.3.0",
++++        "zrender": "6.0.0-rc.1"
++++      },
++++```
++++
++++Note there is **no** `packages[""].version` duplicate elsewhere; the lockfile's
++++`node_modules/zrender` entry (`/workspace/package-lock.json:11800-11802`) and the legacy
++++`dependencies.zrender` entry (`/workspace/package-lock.json:20570-20572`) already resolve
++++`https://registry.npmjs.org/zrender/-/zrender-6.0.0-rc.1.tgz`, and the installed copy is
++++already correct (`node_modules/zrender/package.json` → `"version": "6.0.0-rc.1"`), so the
++++lockfile needs **no** dependency-graph regeneration — only the two self-version fields.
++++
++++### 2.4 `/workspace/src/core/echarts.ts:147` (the runtime constant)
++++
++++```ts
++++type ModelFinder = modelUtil.ModelFinder;
++++
++++export const version = '6.0.0-beta.1';
++++
++++export const dependencies = {
++++    zrender: '6.0.0-rc.1'
++++};
++++```
++++
++++This constant is the public `echarts.version`: `src/export/core.ts:22` does
++++`export * from '../core/echarts';`, and `src/export/all.ts` / `src/echarts.all.ts`
++++re-export from there, so the value flows into `index.js`, `lib/echarts.js` and every
++++`dist/echarts*.js` bundle.
++++
++++### 2.5 Things that deliberately do **not** need editing (checked)
++++
++++* `index.d.ts`, `package.README.md`, `README.md` — no version literal
++++  (`grep -n "version\|beta\|rc\." index.d.ts package.README.md` → no hits).
++++* `ssr/client/src/index.ts` — no version literal.
++++* `i18n/*.js`, `theme/*.js` — generated, no version literal.
++++* `build/pre-publish.js`, `build/testDts.js`, `build/preamble.js` — the only `version`
++++  mentions are `build/pre-publish.js:298` (a comment: *"For lower ts version…"*) and
++++  `build/testDts.js:66` (`semver.gte(version + '.0', MIN_VERSION)` over TypeScript
++++  versions). Nothing reads or rewrites the package version.
++++* `.github/workflows/*.yml` — `source-release.yml` derives `RELEASE_VERSION` from the git
++++  tag (`echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}"`), `nightly.yml` calls
++++  `build/nightly/prepare.js` (absent from the snapshot). No hard-coded version to bump.
++++* `test/ut/**` — no test currently references the version
++++  (`grep -rn "version" /workspace/test/ut` → nothing).
++++
++++---
++++
++++## 3. Plan — ordered edits
++++
++++> All edits are literal string replacements. Apply in this order so that a partially
++++> applied change never leaves `src` newer than the manifest.
++++
++++### Edit 1 — `/workspace/package.json`
++++
++++Anchor (verbatim, line 3, unique in the file — the only `6.0.0-beta.1` there):
++++
++++```
++++  "version": "6.0.0-beta.1",
++++```
++++
++++Replacement:
++++
++++```
++++  "version": "6.0.0-rc.1",
++++```
++++
++++Resulting head of file:
++++
++++```json
++++{
++++  "name": "echarts",
++++  "version": "6.0.0-rc.1",
++++  "description": "Apache ECharts is a powerful, interactive charting and data visualization library for browser",
++++```
++++
++++### Edit 2 — `/workspace/package-lock.json` (root `version`, line 3)
++++
++++Anchor (verbatim — include the neighbouring lines to disambiguate from the
++++`packages[""]` occurrence, which is indented with 6 spaces):
++++
++++```
++++  "name": "echarts",
++++  "version": "6.0.0-beta.1",
++++  "lockfileVersion": 2,
++++```
++++
++++Replacement:
++++
++++```
++++  "name": "echarts",
++++  "version": "6.0.0-rc.1",
++++  "lockfileVersion": 2,
++++```
++++
++++### Edit 3 — `/workspace/package-lock.json` (`packages[""].version`, line 9)
++++
++++Anchor (verbatim, 6-space indent, followed by the `license` line):
++++
++++```
++++      "name": "echarts",
++++      "version": "6.0.0-beta.1",
++++      "license": "Apache-2.0",
++++```
++++
++++Replacement:
++++
++++```
++++      "name": "echarts",
++++      "version": "6.0.0-rc.1",
++++      "license": "Apache-2.0",
++++```
++++
++++> Equivalent mechanical alternative for edits 1–3:
++++> `npm version 6.0.0-rc.1 --no-git-tag-version` (npm ≥ 7 updates `package.json` and both
++++> lockfile self-version fields and nothing else). Verify afterwards with
++++> `git diff --stat` that only those three lines changed — if npm rewrites the lockfile
++++> graph, revert and do the manual string edits instead.
++++
++++### Edit 4 — `/workspace/src/core/echarts.ts`
++++
++++Anchor (verbatim, line 147; unique in the file):
++++
++++```ts
++++export const version = '6.0.0-beta.1';
++++```
++++
++++Replacement:
++++
++++```ts
++++export const version = '6.0.0-rc.1';
++++```
++++
++++Do **not** touch the following block (already correct):
++++
++++```ts
++++export const dependencies = {
++++    zrender: '6.0.0-rc.1'
++++};
++++```
++++
++++### Edit 5 (optional, recommended) — regression test, new file
++++
++++`/workspace/test/ut/spec/release/versionConsistency.test.ts` — see §4. This is a new
++++directory (`test/ut/spec/release/`); it is already covered by the jest `testMatch`
++++(`/workspace/test/ut/jest.config.cjs:56`: `'**/spec/release/**/*.test.ts'`), so no jest
++++config change is required.
++++
++++### Non-edits (explicitly out of scope)
++++
++++* Do not regenerate or commit `dist/`, `lib/`, `types/`, `i18n/*.js`, `index.js` — all are
++++  build outputs; `lib`, `types`, `index.js` etc. are git-ignored (`/workspace/.gitignore`
++++  lines ~186-211) and `dist/` is untracked in this snapshot.
++++* Do not bump `zrender` (already `6.0.0-rc.1` in `package.json:70`,
++++  `src/core/echarts.ts:150`, and the lockfile).
++++* Do not edit `NOTICE`, `LICENSE`, or workflow files — other requirements own those.
++++
++++---
++++
++++## 4. Tests
++++
++++A unit test is feasible and cheap. The jest config already whitelists a `spec/release`
++++folder that does not yet exist:
++++
++++`/workspace/test/ut/jest.config.cjs:47-60`
++++
++++```js
++++    testMatch: [
++++        '**/spec/api/*.test.ts',
++++        '**/spec/chart/**/*.test.ts',
++++        '**/spec/component/**/*.test.ts',
++++        '**/spec/config/**/*.test.ts',
++++        '**/spec/coord/**/*.test.ts',
++++        '**/spec/data/*.test.ts',
++++        '**/spec/model/*.test.ts',
++++        '**/spec/package/**/*.test.ts',
++++        '**/spec/release/**/*.test.ts',
++++        '**/spec/series/**/*.test.ts',
++++        '**/spec/scale/*.test.ts',
++++        '**/spec/util/*.test.ts'
++++    ],
++++```
++++
++++Helper API facts verified before writing the sketch:
++++
++++* Spec files import source through the `@/` alias, not relative paths — e.g.
++++  `/workspace/test/ut/spec/util/number.test.ts:20-24`:
++++  `import { linearMap, ... } from '@/src/util/number';`.
++++  The alias comes from `/workspace/test/ut/tsconfig.json` (`"paths": { "@/*": ["../../*"] }`)
++++  mapped by `pathsToModuleNameMapper(compilerOptions.paths, { prefix: '<rootDir>/' })`
++++  with `rootDir = test/ut`, so `@/src/core/echarts` → `/workspace/src/core/echarts` and
++++  `@/package.json` → `/workspace/package.json`.
++++* `createChart` lives in `/workspace/test/ut/core/utHelper.ts:33`
++++  (`export function createChart(params?: {...}): EChartsType`) — **not needed** for this
++++  test; no chart instance is involved.
++++* `esModuleInterop: true` is set in `test/ut/tsconfig.json` and `@types/node` is installed
++++  (`/workspace/node_modules/@types/node`), so `import * as fs from 'fs'` compiles; ts-jest
++++  runs with `diagnostics: false, isolatedModules: true`, so JSON is read at runtime rather
++++  than imported (avoids needing `resolveJsonModule`).
++++
++++New file `/workspace/test/ut/spec/release/versionConsistency.test.ts` (Apache header
++++required — `npm run checkheader` / the husky pre-commit hook checks `.ts` files; copy the
++++exact 18-line header used by every other spec, e.g.
++++`/workspace/test/ut/spec/util/number.test.ts:1-18`):
++++
++++```ts
++++/*
++++* Licensed to the Apache Software Foundation (ASF) under one
++++* or more contributor license agreements.  See the NOTICE file
++++* distributed with this work for additional information
++++* regarding copyright ownership.  The ASF licenses this file
++++* to you under the Apache License, Version 2.0 (the
++++* "License"); you may not use this file except in compliance
++++* with the License.  You may obtain a copy of the License at
++++*
++++*   http://www.apache.org/licenses/LICENSE-2.0
++++*
++++* Unless required by applicable law or agreed to in writing,
++++* software distributed under the License is distributed on an
++++* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++++* KIND, either express or implied.  See the License for the
++++* specific language governing permissions and limitations
++++* under the License.
++++*/
++++
++++import * as fs from 'fs';
++++import * as path from 'path';
++++import { version, dependencies } from '@/src/core/echarts';
++++
++++const RELEASE_VERSION = '6.0.0-rc.1';
++++
++++function readJSON(relativeToRepoRoot: string): any {
++++    // __dirname === <repo>/test/ut/spec/release
++++    const filePath = path.resolve(__dirname, '../../../../', relativeToRepoRoot);
++++    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
++++}
++++
++++describe('release/version', function () {
++++
++++    it('echarts runtime version is the release candidate version', function () {
++++        expect(version).toEqual(RELEASE_VERSION);
++++        expect(version).not.toMatch(/beta/);
++++    });
++++
++++    it('package.json version matches the runtime version', function () {
++++        const pkg = readJSON('package.json');
++++        expect(pkg.version).toEqual(version);
++++    });
++++
++++    it('package-lock.json self versions match package.json', function () {
++++        const pkg = readJSON('package.json');
++++        const lock = readJSON('package-lock.json');
++++        expect(lock.version).toEqual(pkg.version);
++++        expect(lock.packages[''].version).toEqual(pkg.version);
++++    });
++++
++++    it('declared zrender dependency matches the package manifest', function () {
++++        const pkg = readJSON('package.json');
++++        expect(dependencies.zrender).toEqual(pkg.dependencies.zrender);
++++        expect(dependencies.zrender).toEqual('6.0.0-rc.1');
++++    });
++++
++++});
++++```
++++
++++Naming note: the file is deliberately called `versionConsistency.test.ts` rather than
++++`version.test.ts` to avoid colliding with any externally supplied
++++`test/ut/spec/release/version.test.ts`.
++++
++++Pre-existing tests that must keep passing: the whole `test/ut` suite — the change is a
++++string literal, so nothing else is affected.
++++
++++---
++++
++++## 5. Verification
++++
++++Run from `/workspace`:
++++
++++1. No stale version literal remains:
++++   ```
++++   grep -rIn --exclude-dir=node_modules --exclude-dir=.git "6\.0\.0-beta" .
++++   ```
++++   → must print nothing (before the change it prints exactly the 4 lines listed in §2).
++++2. New version present in exactly the expected 4 places:
++++   ```
++++   grep -rIn --exclude-dir=node_modules --exclude-dir=.git "\"version\": \"6\.0\.0-rc\.1\"\|version = '6\.0\.0-rc\.1'" package.json package-lock.json src/core/echarts.ts
++++   ```
++++3. Manifests still parse:
++++   ```
++++   node -e "['package.json','package-lock.json'].forEach(f=>{const j=require('./'+f);console.log(f, j.version)})"
++++   ```
++++   → both print `6.0.0-rc.1`.
++++4. Type check unaffected:
++++   ```
++++   npx tsc --noEmit
++++   ```
++++   (equivalently `npm run checktype`).
++++5. Lint of the touched source file:
++++   ```
++++   npx eslint src/core/echarts.ts
++++   ```
++++6. Unit tests, targeted then full:
++++   ```
++++   npx jest --config test/ut/jest.config.cjs --coverage=false -t "release/version"
++++   npx jest --config test/ut/jest.config.cjs
++++   ```
++++7. License header check for the new test file:
++++   ```
++++   npm run checkheader
++++   ```
++++8. Dependency coherence (optional, needs network-free local `node_modules`):
++++   ```
++++   npm ls zrender
++++   ```
++++   → `zrender@6.0.0-rc.1`, matching `dependencies.zrender` in `src/core/echarts.ts:150`.
++++
++++Expected diff size: 4 changed lines across 3 files (+ the optional new test file).
++++
++++---
++++
++++## 6. Risks / open questions
++++
++++* **Bundles / `dist/`.** The requirement's wording ("distributable artifacts", "published
++++  bundles", "packaged outputs") maps upstream to a release commit that *also* carries the
++++  regenerated `dist/echarts*.js`, `dist/echarts*.min.js`, `dist/echarts.esm.mjs`,
++++  `dist/extension/*`, i18n and ssr outputs. In this snapshot those artifacts are neither
++++  present nor tracked, and the scripts that build them (`build/build.js`,
++++  `build/build-i18n.js`, `build/dev-fast.js`, `build/nightly/*`, `build/source-release/*`)
++++  are missing, so `npm run release` cannot run. Regenerating them is therefore out of
++++  scope; the source-of-truth version strings are what make the eventually-built bundles
++++  coherent, because the bundles inline `src/core/echarts.ts`'s `version` constant and are
++++  published under `package.json`'s `version`.
++++* **Lockfile drift.** If the implementer uses `npm version` or `npm install` instead of
++++  the literal string edits, npm may rewrite unrelated lockfile entries (resolved URLs,
++++  integrity hashes, `lockfileVersion`). Keep the diff to the two self-version fields;
++++  `lockfileVersion` must stay `2`.
++++* **Hidden/external test naming.** The jest config already matches `**/spec/release/**` and
++++  `**/spec/package/**`, but neither directory exists yet. An externally supplied test very
++++  likely asserts `version === '6.0.0-rc.1'` and/or `package.json.version`; both are covered
++++  by the edits above. Should such a test assert on `dist/` files, it cannot pass in this
++++  snapshot for the reason above.
++++* **Version-string format.** Upstream uses `6.0.0-rc.1` (dot before the number), matching
++++  the already-pinned `zrender@6.0.0-rc.1` and the `requirements/release-6-0-0-rc1.yaml`
++++  title `chore: release 6.0.0-rc.1`. Do not write `6.0.0-rc1`.
++++* **Semver ordering.** `6.0.0-rc.1 > 6.0.0-beta.1` per semver, so consumers with
++++  `^6.0.0-beta.1` ranges resolve forward as intended; no downstream range edits needed.
++++* **`ssr/client`** has no independent manifest in this snapshot (`ls /workspace/ssr/client`
++++  → only `src/`), so there is no second package version to keep in sync.
+++diff --git a/agent_plans/seriesdata-each-example.md b/agent_plans/seriesdata-each-example.md
+++new file mode 100644
+++index 0000000..00ba6f7
+++--- /dev/null
++++++ b/agent_plans/seriesdata-each-example.md
+++@@ -0,0 +1,470 @@
++++# seriesdata-each-example — implementation plan
++++
++++Requirement: `/workspace/requirements/seriesdata-each-example.yaml`
++++Title: `chore: fix example description for the `each` method of `SeriesData``
++++Category: bugfix (documentation-only / JSDoc correctness)
++++
++++---
++++
++++## 1. Goal
++++
++++The `@example` JSDoc blocks attached to `SeriesData#each` and `DataStore#each` only show
++++**string (named) dimensions** (`'x'`, `['x', 'y']`). That is strictly narrower than what the
++++signatures accept:
++++
++++* `SeriesData#each` takes `ItrParamDims = DimensionLoose | Array<DimensionLoose>` where
++++  `DimensionLoose = DimensionName | DimensionIndexLoose = string | number | string`, i.e. a
++++  **numeric store/series dimension index is fully supported** (it is resolved through
++++  `SeriesData#_getStoreDimIndex` → `getDimensionIndex` → `_recognizeDimIndex`).
++++* `DataStore#each` takes `dims: DimensionIndex[]` where `DimensionIndex = number`, i.e. it
++++  accepts **only an array of numeric indexes** — the current example (`list.each('x', …)`,
++++  a non-array string) is not even a valid call for that method, and the `@param ctx default this`
++++  tag documents a parameter the method does not have.
++++
++++The change is docs-only: update both `@example` blocks so they demonstrate valid iteration usage
++++including numeric dimension indexes, and (for `DataStore`) drop the bogus `@param ctx` tag and use
++++the correct receiver name. **No runtime behavior changes.** Optionally add a unit test that pins
++++the documented contract (numeric dim indexes iterate identically to named dims) so the doc claim is
++++actually enforced.
++++
++++---
++++
++++## 2. Findings
++++
++++### 2.1 `SeriesData#each` — example only shows named dimensions
++++
++++`/workspace/src/data/SeriesData.ts:881-898`
++++
++++```ts
++++    /**
++++     * Data iteration
++++     * @param ctx default this
++++     * @example
++++     *  list.each('x', function (x, idx) {});
++++     *  list.each(['x', 'y'], function (x, y, idx) {});
++++     *  list.each(function (idx) {})
++++     */
++++    each<Ctx>(cb: EachCb0<Ctx>, ctx?: Ctx, ctxCompat?: Ctx): void;
++++    each<Ctx>(dims: DimensionLoose, cb: EachCb1<Ctx>, ctx?: Ctx): void;
++++    each<Ctx>(dims: [DimensionLoose], cb: EachCb1<Ctx>, ctx?: Ctx): void;
++++    each<Ctx>(dims: [DimensionLoose, DimensionLoose], cb: EachCb2<Ctx>, ctx?: Ctx): void;
++++    each<Ctx>(dims: ItrParamDims, cb: EachCb<Ctx>, ctx?: Ctx): void;
++++    each<Ctx>(
++++        dims: ItrParamDims | EachCb<Ctx>,
++++        cb: EachCb<Ctx> | Ctx,
++++        ctx?: Ctx
++++    ): void {
++++```
++++
++++The `dims` type alias, `/workspace/src/data/SeriesData.ts:62`:
++++
++++```ts
++++type ItrParamDims = DimensionLoose | Array<DimensionLoose>;
++++```
++++
++++and `/workspace/src/util/types.ts:601-606`:
++++
++++```ts
++++export type DimensionIndex = number;
++++...
++++export type DimensionIndexLoose = DimensionIndex | string;
++++export type DimensionName = string;
++++export type DimensionLoose = DimensionName | DimensionIndexLoose;
++++```
++++
++++Runtime proof that numbers work — `/workspace/src/data/SeriesData.ts:910`:
++++
++++```ts
++++        const dimIndices = map(normalizeDimensions(dims), this._getStoreDimIndex, this);
++++```
++++
++++`/workspace/src/data/SeriesData.ts:451-459`:
++++
++++```ts
++++    private _getStoreDimIndex(dim: DimensionLoose): DimensionIndex {
++++        const dimIdx = this.getDimensionIndex(dim);
++++        if (__DEV__) {
++++            if (dimIdx == null) {
++++                throw new Error('Unknown dimension ' + dim);
++++            }
++++        }
++++        return dimIdx;
++++    }
++++```
++++
++++`/workspace/src/data/SeriesData.ts:400-416`:
++++
++++```ts
++++    getDimensionIndex(dim: DimensionLoose): DimensionIndex {
++++        const dimIdx = this._recognizeDimIndex(dim);
++++        if (dimIdx != null) {
++++            return dimIdx;
++++        }
++++        ...
++++    }
++++```
++++
++++So `data.each(0, cb)` / `data.each([0, 1], cb)` are valid and always have been; the example simply
++++never showed it.
++++
++++### 2.2 `DataStore#each` — example is invalid for this signature
++++
++++`/workspace/src/data/DataStore.ts:1087-1095`
++++
++++```ts
++++    /**
++++     * Data iteration
++++     * @param ctx default this
++++     * @example
++++     *  list.each('x', function (x, idx) {});
++++     *  list.each(['x', 'y'], function (x, y, idx) {});
++++     *  list.each(function (idx) {})
++++     */
++++    each(dims: DimensionIndex[], cb: EachCb): void {
++++```
++++
++++Three separate inaccuracies:
++++
++++1. `dims` is `DimensionIndex[]` (= `number[]`), so `'x'` and `['x', 'y']` are type errors, and the
++++   "no dims" overload `each(function (idx) {})` does not exist here — the array form `each([], cb)`
++++   is what produces the index-only callback (see the `case 0:` branch below).
++++2. There is no `ctx` parameter at all, yet `@param ctx default this` is present. Contrast with
++++   `SeriesData#each`, which really does take `ctx`.
++++3. The receiver is named `list`, but this class is `DataStore`, not `SeriesData`/`List`.
++++
++++The implementation confirming (1), `/workspace/src/data/DataStore.ts:1095-1128`:
++++
++++```ts
++++    each(dims: DimensionIndex[], cb: EachCb): void {
++++        if (!this._count) {
++++            return;
++++        }
++++        const dimSize = dims.length;
++++        const chunks = this._chunks;
++++
++++        for (let i = 0, len = this.count(); i < len; i++) {
++++            const rawIdx = this.getRawIndex(i);
++++            // Simple optimization
++++            switch (dimSize) {
++++                case 0:
++++                    (cb as EachCb0)(i);
++++                    break;
++++                case 1:
++++                    (cb as EachCb1)(chunks[dims[0]][rawIdx], i);
++++                    break;
++++                case 2:
++++                    (cb as EachCb2)(
++++                        chunks[dims[0]][rawIdx], chunks[dims[1]][rawIdx], i
++++                    );
++++                    break;
++++                default:
++++                    let k = 0;
++++                    const value = [];
++++                    for (; k < dimSize; k++) {
++++                        value[k] = chunks[dims[k]][rawIdx];
++++                    }
++++                    // Index
++++                    value[k] = i;
++++                    (cb as EachCb).apply(null, value);
++++            }
++++        }
++++    }
++++```
++++
++++`dims[0]` is used directly as a key into `this._chunks` (a `DataValueChunk[]` indexed by store
++++dimension index), so only numbers are meaningful.
++++
++++`DataStore` callback types, `/workspace/src/data/DataStore.ts:64-67`:
++++
++++```ts
++++type EachCb0 = (idx: number) => void;
++++type EachCb1 = (x: ParsedValue, idx: number) => void;
++++type EachCb2 = (x: ParsedValue, y: ParsedValue, idx: number) => void;
++++type EachCb = (...args: any) => void;
++++```
++++
++++### 2.3 Scope check — these are the only two occurrences
++++
++++```
++++$ grep -rn "list.each(" /workspace/src /workspace/test --include=*.ts --include=*.js --include=*.html
++++/workspace/src/data/SeriesData.ts:885
++++/workspace/src/data/SeriesData.ts:886
++++/workspace/src/data/SeriesData.ts:887
++++/workspace/src/data/DataStore.ts:1091
++++/workspace/src/data/DataStore.ts:1092
++++/workspace/src/data/DataStore.ts:1093
++++```
++++
++++Both blocks are byte-identical (verified with `sed -n '881,888p' … | cat -A` and
++++`sed -n '1087,1094p' … | cat -A`), 4-space indented, `*` continuation aligned at column 6.
++++No other file (`index.d.ts`, `extension-src/`, `ssr/`, `test/*.html`, `theme/`) contains this
++++example text.
++++
++++### 2.4 No existing test covers `each`
++++
++++`/workspace/test/ut/spec/data/SeriesData.test.ts` has `it('map')` (line 148), `it('mapArray')`
++++(line 158), `it('filterSelf')` (line 166) inside `describe('Data Manipulation')`, but
++++**no `each` test at all** (`grep -n "each" test/ut/spec/data/SeriesData.test.ts` → no matches).
++++There is no `DataStore.test.ts`.
++++
++++### 2.5 Lint constraints
++++
++++`/workspace/.eslintrc-common.yaml:174-180`:
++++
++++```yaml
++++    max-len:
++++        - 2
++++        - 120
++++        - 4
++++        -
++++            ignoreUrls: true
++++            ignoreComments: true
++++```
++++
++++`ignoreComments: true`, so comment length is unconstrained; all new lines are well under 120 anyway.
++++
++++---
++++
++++## 3. Plan
++++
++++### Edit 1 — `/workspace/src/data/SeriesData.ts`: show numeric dim indexes in the `each` example
++++
++++**Anchor** (verbatim, lines 881-889; include the trailing overload line so the match is unambiguous
++++within the file):
++++
++++```ts
++++    /**
++++     * Data iteration
++++     * @param ctx default this
++++     * @example
++++     *  list.each('x', function (x, idx) {});
++++     *  list.each(['x', 'y'], function (x, y, idx) {});
++++     *  list.each(function (idx) {})
++++     */
++++    each<Ctx>(cb: EachCb0<Ctx>, ctx?: Ctx, ctxCompat?: Ctx): void;
++++```
++++
++++**Replacement:**
++++
++++```ts
++++    /**
++++     * Data iteration.
++++     * `dims` can be dimension names or numeric dimension indexes, or an array of them.
++++     * @param ctx default this
++++     * @example
++++     *  list.each('x', function (x, idx) {});
++++     *  list.each(0, function (x, idx) {});
++++     *  list.each(['x', 'y'], function (x, y, idx) {});
++++     *  list.each([0, 1], function (x, y, idx) {});
++++     *  list.each(function (idx) {});
++++     */
++++    each<Ctx>(cb: EachCb0<Ctx>, ctx?: Ctx, ctxCompat?: Ctx): void;
++++```
++++
++++Notes:
++++* Keeps the existing `@param ctx default this` — `SeriesData#each` really does accept `ctx`
++++  (`each<Ctx>(dims, cb, ctx?)`, used at `/workspace/src/data/SeriesData.ts:908`).
++++* Adds the missing terminating `;` on the last example line (the current
++++  `list.each(function (idx) {})` line is missing it while the other two have it).
++++
++++### Edit 2 — `/workspace/src/data/DataStore.ts`: make the `each` example a valid call
++++
++++**Anchor** (verbatim, lines 1087-1095; include the trailing signature line for unambiguity):
++++
++++```ts
++++    /**
++++     * Data iteration
++++     * @param ctx default this
++++     * @example
++++     *  list.each('x', function (x, idx) {});
++++     *  list.each(['x', 'y'], function (x, y, idx) {});
++++     *  list.each(function (idx) {})
++++     */
++++    each(dims: DimensionIndex[], cb: EachCb): void {
++++```
++++
++++**Replacement:**
++++
++++```ts
++++    /**
++++     * Data iteration.
++++     * `dims` is an array of numeric store dimension indexes.
++++     * Pass an empty array to only iterate over the data indexes.
++++     * @example
++++     *  store.each([0], function (x, idx) {});
++++     *  store.each([0, 1], function (x, y, idx) {});
++++     *  store.each([], function (idx) {});
++++     */
++++    each(dims: DimensionIndex[], cb: EachCb): void {
++++```
++++
++++Notes:
++++* `@param ctx default this` is removed because `DataStore#each` has no `ctx` parameter
++++  (signature is `each(dims: DimensionIndex[], cb: EachCb): void`). This is the
++++  "API contract shown in docs matches the real behavior" half of the acceptance signal.
++++* Receiver renamed `list` → `store` to match the class (`class DataStore`,
++++  `/workspace/src/data/DataStore.ts`; the file's other internal reference at line 783 is a
++++  commented-out `this.each(dims, …)`, not user-facing, and is left untouched).
++++* `DimensionIndex` is already imported in this file (it is used in the signature itself), so no
++++  import changes are needed. Verify with
++++  `grep -n "DimensionIndex" /workspace/src/data/DataStore.ts | head -3`.
++++
++++### Edit 3 (test, see §4) — `/workspace/test/ut/spec/data/SeriesData.test.ts`
++++
++++Add an `each` spec that locks the documented contract. Placement: inside
++++`describe('Data Manipulation', …)`, immediately **before** `it('map', …)`.
++++
++++**Anchor** (verbatim, lines 148-150):
++++
++++```ts
++++        it('map', function () {
++++            const data = new SeriesData(['x', 'y'], new Model());
++++            data.initData([[10, 15], [20, 25], [30, 35]]);
++++```
++++
++++**Replacement:**
++++
++++```ts
++++        it('each', function () {
++++            const data = new SeriesData(['x', 'y'], new Model());
++++            data.initData([[10, 15], [20, 25], [30, 35]]);
++++
++++            // No dimension: only the data index is passed.
++++            const indices: number[] = [];
++++            data.each(function (idx) {
++++                indices.push(idx);
++++            });
++++            expect(indices).toEqual([0, 1, 2]);
++++
++++            // Single dimension, by name and by numeric index.
++++            const byName: unknown[] = [];
++++            data.each('y', function (y, idx) {
++++                byName.push([y, idx]);
++++            });
++++            const byIndex: unknown[] = [];
++++            data.each(1, function (y, idx) {
++++                byIndex.push([y, idx]);
++++            });
++++            expect(byName).toEqual([[15, 0], [25, 1], [35, 2]]);
++++            expect(byIndex).toEqual(byName);
++++
++++            // Multiple dimensions, by name and by numeric index.
++++            const pairsByName: unknown[] = [];
++++            data.each(['x', 'y'], function (x, y, idx) {
++++                pairsByName.push([x, y, idx]);
++++            });
++++            const pairsByIndex: unknown[] = [];
++++            data.each([0, 1], function (x, y, idx) {
++++                pairsByIndex.push([x, y, idx]);
++++            });
++++            expect(pairsByName).toEqual([[10, 15, 0], [20, 25, 1], [30, 35, 2]]);
++++            expect(pairsByIndex).toEqual(pairsByName);
++++
++++            // `ctx` is bound as `this` inside the callback.
++++            const ctx = { hits: 0 };
++++            data.each('x', function (this: typeof ctx) {
++++                this.hits++;
++++            }, ctx);
++++            expect(ctx.hits).toEqual(3);
++++
++++            // The underlying store iterates by numeric dimension index only.
++++            const storePairs: unknown[] = [];
++++            data.getStore().each([0, 1], function (x: number, y: number, idx: number) {
++++                storePairs.push([x, y, idx]);
++++            });
++++            expect(storePairs).toEqual(pairsByName);
++++
++++            const storeIndices: number[] = [];
++++            data.getStore().each([], function (idx: number) {
++++                storeIndices.push(idx);
++++            });
++++            expect(storeIndices).toEqual([0, 1, 2]);
++++        });
++++
++++        it('map', function () {
++++            const data = new SeriesData(['x', 'y'], new Model());
++++            data.initData([[10, 15], [20, 25], [30, 35]]);
++++```
++++
++++Verified APIs used by the test:
++++* `new SeriesData(['x', 'y'], new Model())` + `initData([[10, 15], …])` — exact pattern already used
++++  at `/workspace/test/ut/spec/data/SeriesData.test.ts:149-150`, `159-160`, `167-168`.
++++* `SeriesData#getStore(): DataStore` — `/workspace/src/data/SeriesData.ts:517-519`.
++++* `DataStore#each(dims: DimensionIndex[], cb: EachCb)` — `/workspace/src/data/DataStore.ts:1095`;
++++  `EachCb = (...args: any) => void` so explicit param types on the callback are fine.
++++* Imports already present at the top of the spec: `SeriesData` from `@/src/data/SeriesData`,
++++  `Model` from `@/src/model/Model` (lines 22-23). **No new imports are required.**
++++
++++---
++++
++++## 4. Tests
++++
++++**Feasible?** The doc text itself is not testable, but the *behavior it now documents* is, and it is
++++currently untested. Adding `it('each', …)` to
++++`/workspace/test/ut/spec/data/SeriesData.test.ts` is worthwhile and cheap.
++++
++++* Harness: jest + ts-jest, config `/workspace/test/ut/jest.config.cjs` (`preset: 'ts-jest'`,
++++  `testEnvironment: 'jsdom'`, `testMatch` includes `'**/spec/data/*.test.ts'`, path alias `@/` via
++++  `pathsToModuleNameMapper(compilerOptions.paths)` from `/workspace/test/ut/tsconfig.json`).
++++* This spec does **not** use `createChart` from `../core/utHelper` — it constructs `SeriesData`
++++  directly (checked: `/workspace/test/ut/spec/data/SeriesData.test.ts:22-33` imports only
++++  `SeriesData`, `Model`, `Source` helpers, `SeriesDimensionDefine`, `OrdinalMeta`, `DataStore`,
++++  `DefaultDataProvider`, `SeriesDataSchema`). Follow that style — do **not** introduce `createChart`
++++  here.
++++* Apache license header: the file already has one (lines 1-18); no new file is created, so no new
++++  header is needed.
++++* `ts-jest` runs with `diagnostics: false, isolatedModules: true`
++++  (`/workspace/test/ut/jest.config.cjs:37-41`), so the test will not fail on incidental typing
++++  strictness — but the code above is written to type-check anyway.
++++
++++If the reviewer prefers a strictly docs-only diff, Edit 3 can be dropped without affecting the
++++acceptance signals; Edits 1 and 2 alone satisfy the requirement.
++++
++++---
++++
++++## 5. Verification
++++
++++```bash
++++# 1. Type check the whole project (docs-only edits must not perturb it).
++++cd /workspace && npx tsc --noEmit
++++
++++# 2. Lint the two touched source files.
++++cd /workspace && npx eslint src/data/SeriesData.ts src/data/DataStore.ts
++++
++++# 3. Run the new/updated unit test.
++++cd /workspace && npx jest --config test/ut/jest.config.cjs test/ut/spec/data/SeriesData.test.ts
++++
++++# 3b. Or just the new case by name.
++++cd /workspace && npx jest --config test/ut/jest.config.cjs -t "each"
++++
++++# 4. Confirm the stale examples are gone and no other copy remains.
++++cd /workspace && grep -rn "list.each('x'" src/ test/ index.d.ts extension-src/ ssr/ theme/ || echo "OK: no stale examples"
++++```
++++
++++Expected results: `tsc --noEmit` and `eslint` clean (same as before the change, since the source
++++edits are comments only), the `SeriesData` suite green including the new `each` case, and the final
++++`grep` printing `OK: no stale examples`.
++++
++++---
++++
++++## 6. Risks / open questions
++++
++++* **Risk: essentially zero at runtime.** Edits 1 and 2 touch only block comments; no emitted code
++++  changes. `tsc`/`eslint`/bundle output are unaffected.
++++* **Open question — exact wording.** The requirement (`chore: fix example description …`) does not
++++  dictate the literal example text. The plan chooses the smallest coherent form that hits every
++++  acceptance signal: it adds numeric-index examples (`each(0, …)`, `each([0, 1], …)`) to
++++  `SeriesData` so readers cannot infer "named dimensions only", and rewrites the `DataStore`
++++  example into calls that actually type-check against `dims: DimensionIndex[]`. A reviewer may
++++  prefer replacing rather than adding the string examples in `SeriesData`; keeping both is safer
++++  since both are genuinely supported there.
++++* **Open question — `@param ctx` on `DataStore#each`.** Removing it is a docs correctness fix
++++  (`DataStore#each` has no `ctx`), and is covered by the acceptance clause "the API contract shown
++++  in docs matches the real behavior". If a strictly minimal diff is desired, that one line can be
++++  left alone; the `@example` lines are the mandatory part.
++++* **Note:** `/workspace/src/data/DataStore.ts:783` contains a commented-out
++++  `//     this.each(dims, function () {` inside a disabled block. It is not part of the public
++++  docs and is intentionally left untouched.
++++* **Not covered elsewhere:** `SeriesData#filterSelf`, `#map`, `#mapArray` accept the same
++++  `ItrParamDims` but carry no `@example` blocks, so there is nothing to fix there. Adding examples
++++  to them is out of scope for this requirement.
+++diff --git a/agent_plans/toolbox-emphasis-color.md b/agent_plans/toolbox-emphasis-color.md
+++new file mode 100644
+++index 0000000..b8c7ba9
+++--- /dev/null
++++++ b/agent_plans/toolbox-emphasis-color.md
+++@@ -0,0 +1,478 @@
++++# toolbox-emphasis-color — implementation plan
++++
++++## 1. Goal
++++
++++`ToolboxModel.defaultOption` currently declares the *same* colour token for the normal icon
++++stroke and for the emphasis (hover / active) icon stroke:
++++
++++* `iconStyle.borderColor` → `tokens.color.accent50`
++++* `emphasis.iconStyle.borderColor` → `tokens.color.accent50`
++++
++++Because `ToolboxView` maps `borderColor` → `style.stroke` for both the normal style and the
++++`'emphasis'` element state, hovering a toolbox icon (or an icon being switched into the
++++`emphasis` icon status by `dataZoom` / `brush` / `magicType`) produces **no visible change** —
++++the emphasis state paints exactly the same stroke colour as the normal state.
++++
++++Engineering change: give the toolbox emphasis state a *darker*, clearly distinct accent token
++++(`tokens.color.accent70`, `#404c76`) so `emphasis.iconStyle.borderColor` differs from
++++`iconStyle.borderColor` (`tokens.color.accent50`, `#6578ba`). This is a one-line default-option
++++change; no view/render logic needs to change because the plumbing already works.
++++
++++---
++++
++++## 2. Findings
++++
++++### 2.1 The defect — identical normal / emphasis colour
++++
++++`/workspace/src/component/toolbox/ToolboxModel.ts:136-146`
++++
++++```ts
++++        showTitle: true,
++++
++++        iconStyle: {
++++            borderColor: tokens.color.accent50,
++++            color: 'none'
++++        },
++++        emphasis: {
++++            iconStyle: {
++++                borderColor: tokens.color.accent50
++++            }
++++        },
++++```
++++
++++`iconStyle.borderColor` and `emphasis.iconStyle.borderColor` are both `tokens.color.accent50`.
++++
++++### 2.2 The tokens involved
++++
++++`/workspace/src/visual/tokens.ts:146-164` defines the accent ramp:
++++
++++```ts
++++    accent05: '#eff1f9',
++++    accent10: '#e0e4f2',
++++    accent15: '#d0d6ec',
++++    accent20: '#c0c9e6',
++++    accent25: '#b1bbdf',
++++    accent30: '#a1aed9',
++++    accent35: '#91a0d3',
++++    accent40: '#8292cc',
++++    accent45: '#7285c6',
++++    accent50: '#6578ba',
++++    accent55: '#5c6da9',
++++    accent60: '#536298',
++++    accent65: '#4a5787',
++++    accent70: '#404c76',
++++    accent75: '#374165',
++++    accent80: '#2e3654',
++++    accent85: '#252b43',
++++    accent90: '#1b2032',
++++    accent95: '#121521',
++++```
++++
++++`accent50` = `#6578ba` (HSL l ≈ 0.563); `accent70` = `#404c76` (HSL l ≈ 0.357) — two ramp steps
++++darker, clearly distinguishable on the default light background.
++++
++++### 2.3 The `borderColor` → `stroke` mapping (why the option is the right lever)
++++
++++`/workspace/src/model/mixin/itemStyle.ts:25-41` — `ITEM_STYLE_KEY_MAP` contains
++++`['stroke', 'borderColor']`, so `Model#getItemStyle()` turns `borderColor` into `style.stroke`.
++++
++++`/workspace/src/component/toolbox/ToolboxView.ts:172-220`:
++++
++++```ts
++++            const iconStyleModel = featureModel.getModel('iconStyle');
++++            const iconStyleEmphasisModel = featureModel.getModel(['emphasis', 'iconStyle']);
++++```
++++
++++```ts
++++                path.setStyle(iconStyleModel.getItemStyle());
++++
++++                const pathEmphasisState = path.ensureState('emphasis');
++++                pathEmphasisState.style = iconStyleEmphasisModel.getItemStyle();
++++```
++++
++++The feature-level `Model` is created with `toolboxModel` as parent
++++(`/workspace/src/component/toolbox/ToolboxView.ts:97`:
++++`const featureModel = new Model(featureOpt, toolboxModel, toolboxModel.ecModel) as ToolboxFeatureModel;`),
++++so an unset per-feature `emphasis.iconStyle.borderColor` falls back to `ToolboxModel.defaultOption`.
++++Therefore fixing the default option fixes every built-in and user-defined feature icon at once.
++++
++++### 2.4 Where the emphasis state is entered
++++
++++* Hover: `/workspace/src/component/toolbox/ToolboxView.ts:252-279` — `mouseover` handler calls
++++  `api.enterEmphasis(this)`.
++++* Programmatic "active" icon status:
++++  `/workspace/src/component/toolbox/ToolboxView.ts:150-158`
++++
++++  ```ts
++++            featureModel.setIconStatus = function (this: ToolboxFeatureModel, iconName: string, status: DisplayState) {
++++                const option = this.option;
++++                const iconPaths = this.iconPaths;
++++                option.iconStatus = option.iconStatus || {};
++++                option.iconStatus[iconName] = status;
++++                if (iconPaths[iconName]) {
++++                    (status === 'emphasis' ? enterEmphasis : leaveEmphasis)(iconPaths[iconName]);
++++                }
++++            };
++++  ```
++++
++++  Callers that rely on emphasis being visually distinct:
++++  `/workspace/src/component/toolbox/feature/DataZoom.ts:270` and `:290`,
++++  `/workspace/src/component/toolbox/feature/Brush.ts:72`,
++++  `/workspace/src/component/toolbox/feature/MagicType.ts:146,169,229`.
++++
++++### 2.5 Precedent in the codebase for "normal accent50 → emphasis accentN0"
++++
++++`/workspace/src/component/timeline/SliderTimelineModel.ts:113-133` uses exactly this ramp for
++++its icon-like controls:
++++
++++```ts
++++            color: tokens.color.accent50,
++++            borderColor: tokens.color.accent50,
++++            borderWidth: 0
++++        },
++++        emphasis: {
++++            ...
++++            controlStyle: {
++++                color: tokens.color.accent70,
++++                borderColor: tokens.color.accent70
++++            },
++++        },
++++```
++++
++++`/workspace/src/component/dataZoom/SliderZoomModel.ts:191-194,218-228` follows the same idea
++++(`handleStyle.borderColor: accent20` → `emphasis.handleStyle.borderColor: accent40`).
++++
++++The pre-v6 theme also used a visibly different emphasis colour —
++++`/workspace/theme/v5.js:537-548`:
++++
++++```js
++++        toolbox: {
++++            borderColor: '#ccc',
++++            padding: 5,
++++            itemGap: 8,
++++            iconStyle: {
++++                borderColor: '#666',
++++            },
++++            emphasis: {
++++                iconStyle: {
++++                    borderColor: '#3E98C5'
++++                }
++++            }
++++        },
++++```
++++
++++So `accent70` is the ramp-consistent choice for the toolbox.
++++
++++### 2.6 Dark theme (context, not part of the required fix)
++++
++++`/workspace/src/theme/dark.ts:100-104` only overrides the *normal* toolbox icon colour:
++++
++++```ts
++++    toolbox: {
++++        iconStyle: {
++++            borderColor: color.accent50
++++        }
++++    },
++++```
++++
++++`tokens.darkColor` is only consumed by `src/theme/dark.ts` (verified: `grep -rn "darkColor" /workspace/src`
++++returns only `src/theme/dark.ts:22`), so in dark mode `emphasis.iconStyle.borderColor` keeps the
++++*light* token value. See §6 for the optional follow-up.
++++
++++### 2.7 No existing coverage
++++
++++* `grep -rln "toolbox" /workspace/test/ut/spec/` → only `/workspace/test/ut/spec/model/Global.test.ts`
++++  (unrelated). There is **no** `test/ut/spec/component/toolbox/` directory today.
++++* Visual tests exist but are manual: `/workspace/test/toolbox-title.html`,
++++  `/workspace/test/toolbox-custom.html`, `/workspace/test/toolbox-tooltip.html`,
++++  `/workspace/test/toolbox-textStyle.html`, `/workspace/test/toolbox-stack.html`.
++++
++++---
++++
++++## 3. Plan
++++
++++### Edit 1 — required: darken the toolbox emphasis icon colour
++++
++++**File:** `/workspace/src/component/toolbox/ToolboxModel.ts`
++++
++++**Anchor (search verbatim — currently at lines 138-146, unique in the file):**
++++
++++```ts
++++        iconStyle: {
++++            borderColor: tokens.color.accent50,
++++            color: 'none'
++++        },
++++        emphasis: {
++++            iconStyle: {
++++                borderColor: tokens.color.accent50
++++            }
++++        },
++++```
++++
++++**Replacement:**
++++
++++```ts
++++        iconStyle: {
++++            borderColor: tokens.color.accent50,
++++            color: 'none'
++++        },
++++        emphasis: {
++++            iconStyle: {
++++                borderColor: tokens.color.accent70
++++            }
++++        },
++++```
++++
++++That is: the single token reference on the `emphasis.iconStyle.borderColor` line changes from
++++`tokens.color.accent50` to `tokens.color.accent70`. No import changes are needed — `tokens` is
++++already imported at `/workspace/src/component/toolbox/ToolboxModel.ts:34`
++++(`import tokens from '../../visual/tokens';`) and `accent70` already exists on the `ColorToken`
++++interface at `/workspace/src/visual/tokens.ts:59`.
++++
++++No other file has to change for the acceptance signal to hold: `ToolboxView` already reads the
++++emphasis model through the feature-model → toolbox-model parent chain (§2.3).
++++
++++### Edit 2 — recommended: add a regression unit test
++++
++++Upstream shipped the fix as a bare one-liner, so this file is a *recommended* addition rather
++++than a strict requirement. It locks in the invariant "emphasis stroke ≠ normal stroke".
++++
++++**New file:** `/workspace/test/ut/spec/component/toolbox/emphasisColor.test.ts`
++++(the `test/ut/spec/component/toolbox/` directory must be created; it is matched by the existing
++++`'**/spec/component/**/*.test.ts'` entry in `/workspace/test/ut/jest.config.cjs:50`).
++++
++++**Full content:**
++++
++++```ts
++++/*
++++* Licensed to the Apache Software Foundation (ASF) under one
++++* or more contributor license agreements.  See the NOTICE file
++++* distributed with this work for additional information
++++* regarding copyright ownership.  The ASF licenses this file
++++* to you under the Apache License, Version 2.0 (the
++++* "License"); you may not use this file except in compliance
++++* with the License.  You may obtain a copy of the License at
++++*
++++*   http://www.apache.org/licenses/LICENSE-2.0
++++*
++++* Unless required by applicable law or agreed to in writing,
++++* software distributed under the License is distributed on an
++++* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++++* KIND, either express or implied.  See the License for the
++++* specific language governing permissions and limitations
++++* under the License.
++++*/
++++
++++import { createChart, getECModel, getViewGroup } from '../../../core/utHelper';
++++import { EChartsType } from '../../../../../src/echarts';
++++import tokens from '../../../../../src/visual/tokens';
++++import Displayable from 'zrender/src/graphic/Displayable';
++++import { PathStyleProps } from 'zrender/src/graphic/Path';
++++
++++describe('component/toolbox/emphasisColor', function () {
++++
++++    let chart: EChartsType;
++++
++++    beforeEach(function () {
++++        chart = createChart();
++++    });
++++
++++    afterEach(function () {
++++        chart.dispose();
++++    });
++++
++++    it('emphasis iconStyle borderColor should differ from the normal one', function () {
++++        chart.setOption({
++++            toolbox: {
++++                feature: {
++++                    saveAsImage: {},
++++                    restore: {}
++++                }
++++            },
++++            xAxis: {},
++++            yAxis: {},
++++            series: [{
++++                type: 'line',
++++                data: [1, 2, 3]
++++            }]
++++        });
++++
++++        const toolboxModel = getECModel(chart).getComponent('toolbox');
++++        const normalBorderColor = toolboxModel.get(['iconStyle', 'borderColor'] as any);
++++        const emphasisBorderColor = toolboxModel.get(['emphasis', 'iconStyle', 'borderColor'] as any);
++++
++++        expect(normalBorderColor).toEqual(tokens.color.accent50);
++++        expect(emphasisBorderColor).toEqual(tokens.color.accent70);
++++        expect(emphasisBorderColor).not.toEqual(normalBorderColor);
++++    });
++++
++++    it('rendered toolbox icons should have a distinct stroke in the emphasis state', function () {
++++        chart.setOption({
++++            toolbox: {
++++                feature: {
++++                    saveAsImage: {},
++++                    restore: {}
++++                }
++++            },
++++            xAxis: {},
++++            yAxis: {},
++++            series: [{
++++                type: 'line',
++++                data: [1, 2, 3]
++++            }]
++++        });
++++
++++        const toolboxGroup = getViewGroup(chart, 'toolbox');
++++        const iconPaths = toolboxGroup.children().filter(function (el) {
++++            return !!(el.states && el.states.emphasis);
++++        }) as Displayable[];
++++
++++        expect(iconPaths.length).toBeGreaterThan(0);
++++
++++        iconPaths.forEach(function (path) {
++++            const normalStroke = (path.style as PathStyleProps).stroke;
++++            const emphasisStroke = (path.states.emphasis.style as PathStyleProps).stroke;
++++            expect(normalStroke).toEqual(tokens.color.accent50);
++++            expect(emphasisStroke).toEqual(tokens.color.accent70);
++++            expect(emphasisStroke).not.toEqual(normalStroke);
++++        });
++++    });
++++
++++});
++++```
++++
++++Notes that make the second test valid against the real code:
++++
++++* `createChart`, `getECModel` and `getViewGroup` are all real exports of
++++  `/workspace/test/ut/core/utHelper.ts` (lines 33, 141 and 152 respectively);
++++  `getViewGroup(chart, 'toolbox')` resolves the component view group via
++++  `chart._componentsMap[component.__viewId].group`.
++++* `utHelper` imports `../../../src/echarts.all`, so the toolbox component is registered.
++++* Only the icon paths get an `'emphasis'` state
++++  (`/workspace/src/component/toolbox/ToolboxView.ts:219`); the background `Rect` added by
++++  `listComponentHelper.makeBackground` (`/workspace/src/component/toolbox/ToolboxView.ts:321`,
++++  implementation `/workspace/src/component/helper/listComponent.ts:34-58`) has no states, so the
++++  `filter` above cleanly selects the icons.
++++* `ts-jest` is configured with `diagnostics: false`
++++  (`/workspace/test/ut/jest.config.cjs:39`), so the `as any` path-argument casts are only there
++++  for editor ergonomics.
++++
++++---
++++
++++## 4. Tests
++++
++++A unit test is feasible and cheap — see Edit 2. Two levels are asserted:
++++
++++1. **Model level** — `ToolboxModel` default option: `emphasis.iconStyle.borderColor` resolves to
++++   `tokens.color.accent70` and is not equal to `iconStyle.borderColor`. This directly encodes the
++++   yaml acceptance signal.
++++2. **Render level** — every rendered toolbox icon `Displayable` has
++++   `states.emphasis.style.stroke !== style.stroke`, which is what actually drives the pixel change
++++   when `enterEmphasis` / `api.enterEmphasis` runs.
++++
++++The existing helper API was verified against `/workspace/test/ut/spec/component/dataZoom/helper.test.ts`,
++++which uses exactly `import { createChart, getECModel } from '../../../core/utHelper';` plus
++++`beforeEach(() => chart = createChart())` / `afterEach(() => chart.dispose())`.
++++
++++Manual/visual verification: open `/workspace/test/toolbox-title.html` (or
++++`/workspace/test/toolbox-custom.html`) after `npm run dev` and hover the icons — the stroke must
++++visibly darken. `/workspace/test/dataZoom-toolbox.html` additionally exercises the
++++`setIconStatus(..., 'emphasis')` "active" path.
++++
++++---
++++
++++## 5. Verification
++++
++++```bash
++++# Type check the source change
++++cd /workspace && npx tsc --noEmit -p tsconfig.json
++++
++++# Lint the touched file
++++cd /workspace && npx eslint src/component/toolbox/ToolboxModel.ts
++++
++++# Run the new spec only (no coverage, faster)
++++cd /workspace && npx jest --config test/ut/jest.config.cjs --coverage=false \
++++    -t "emphasis iconStyle borderColor should differ from the normal one"
++++
++++# Or the whole new file
++++cd /workspace && npx jest --config test/ut/jest.config.cjs --coverage=false \
++++    test/ut/spec/component/toolbox/emphasisColor.test.ts
++++
++++# Full unit-test suite (guards against a snapshot/expectation elsewhere pinning accent50)
++++cd /workspace && npm run test
++++```
++++
++++Quick assertion without jest:
++++
++++```bash
++++cd /workspace && grep -n -A 9 "iconStyle: {" src/component/toolbox/ToolboxModel.ts
++++# expect: iconStyle.borderColor = tokens.color.accent50
++++#         emphasis.iconStyle.borderColor = tokens.color.accent70
++++```
++++
++++---
++++
++++## 6. Risks / open questions
++++
++++* **Dark mode is not improved by this change.** `/workspace/src/theme/dark.ts:100-104` overrides
++++  only `toolbox.iconStyle.borderColor` (with `tokens.darkColor.accent50`, HSL l ≈ 0.737) and leaves
++++  the emphasis to fall through to the light-mode default. After this change that default becomes
++++  `#404c76` (l ≈ 0.357) — a dark navy on a dark background, i.e. hover becomes *less* visible in
++++  dark mode than the pre-fix state (which was `#6578ba`). This was already broken before (the two
++++  colours were merely equal), and the upstream fix (apache/echarts PR #21384, commit
++++  `cc1815120e`, `fix(toolbox): fix default emphasis color`) touched **only**
++++  `src/component/toolbox/ToolboxModel.ts`. **Recommendation: keep Edit 1 as the scoped fix** and
++++  treat the dark theme as a separate change; the sibling requirement
++++  `/workspace/requirements/toolbox-dataview-darkmode.yaml` covers the toolbox dark-mode work.
++++  If a dark-mode-safe hover is wanted in the same patch, the minimal addition would be, at
++++  `/workspace/src/theme/dark.ts:100-104`, anchor:
++++
++++  ```ts
++++    toolbox: {
++++        iconStyle: {
++++            borderColor: color.accent50
++++        }
++++    },
++++  ```
++++
++++  replaced with:
++++
++++  ```ts
++++    toolbox: {
++++        iconStyle: {
++++            borderColor: color.accent50
++++        },
++++        emphasis: {
++++            iconStyle: {
++++                borderColor: color.accent70
++++            }
++++        }
++++    },
++++  ```
++++
++++  (`tokens.darkColor.accent70` has l ≈ 0.943, i.e. brighter than the dark `accent50` — correct
++++  direction for a dark background.) This is **optional / out of scope** for this requirement.
++++
++++* **User themes that only override `toolbox.iconStyle`** (e.g. `/workspace/theme/dark.js:116`,
++++  `/workspace/theme/shine.js:69`, `/workspace/theme/macarons.js:84`, `/workspace/theme/infographic.js:78`,
++++  `/workspace/theme/dark-*.js:108`) will now hover to `accent70` instead of their own icon colour.
++++  That is the intended behaviour change (previously they hovered to `accent50`, which was already
++++  not their icon colour), and `/workspace/theme/v5.js:541-548` already sets both keys explicitly.
++++
++++* **Choice of shade.** `accent70` is fixed by the upstream fix and matches
++++  `SliderTimelineModel`'s `controlStyle` (`accent50` → `emphasis accent70`). Any other shade
++++  (`accent60`, `accent80`) would satisfy the yaml literally but diverge from upstream; do not
++++  substitute.
++++
++++* **`emphasis.iconStyle.color` stays unset**, so the icon fill remains `'none'` from the normal
++++  style — only the stroke changes on hover. That matches the screenshots in PR #21384 and needs
++++  no extra work.
++++
++++* **Title text colour is derived from the emphasis style.** `/workspace/src/component/toolbox/ToolboxView.ts:266-270`
++++  does `fill: iconStyleEmphasisModel.get('textFill') || hoverStyle.fill || hoverStyle.stroke || tokens.color.neutral99`.
++++  Since `hoverStyle.fill` is undefined, the hover title text colour changes from `#6578ba` to
++++  `#404c76` as a side effect — darker and higher contrast on the default light background, so this
++++  is an improvement, but it is a visible diff in any toolbox screenshot test.
++++
++++* **No existing unit test or snapshot pins `accent50` for the toolbox**
++++  (`grep -rn "accent" /workspace/test` returns nothing), so no test updates are forced.
+++diff --git a/src/component/dataZoom/SliderZoomModel.ts b/src/component/dataZoom/SliderZoomModel.ts
+++index 75c9d51..19f6fef 100644
+++--- a/src/component/dataZoom/SliderZoomModel.ts
++++++ b/src/component/dataZoom/SliderZoomModel.ts
+++@@ -124,7 +124,7 @@ export interface SliderDataZoomOption extends DataZoomOption, BoxLayoutOptionMix
+++     brushStyle?: ItemStyleOption
+++ 
+++     emphasis?: {
+++-        handleLabel: SliderHandleLabelOption
++++        handleLabel?: SliderHandleLabelOption
+++         handleStyle?: ItemStyleOption
+++         moveHandleStyle?: ItemStyleOption
+++     },
++diff --git a/src/component/dataZoom/SliderZoomModel.ts b/src/component/dataZoom/SliderZoomModel.ts
++index 75c9d51..19f6fef 100644
++--- a/src/component/dataZoom/SliderZoomModel.ts
+++++ b/src/component/dataZoom/SliderZoomModel.ts
++@@ -124,7 +124,7 @@ export interface SliderDataZoomOption extends DataZoomOption, BoxLayoutOptionMix
++     brushStyle?: ItemStyleOption
++ 
++     emphasis?: {
++-        handleLabel: SliderHandleLabelOption
+++        handleLabel?: SliderHandleLabelOption
++         handleStyle?: ItemStyleOption
++         moveHandleStyle?: ItemStyleOption
++     },
+diff --git a/src/component/dataZoom/SliderZoomModel.ts b/src/component/dataZoom/SliderZoomModel.ts
+index 75c9d51..19f6fef 100644
+--- a/src/component/dataZoom/SliderZoomModel.ts
++++ b/src/component/dataZoom/SliderZoomModel.ts
+@@ -124,7 +124,7 @@ export interface SliderDataZoomOption extends DataZoomOption, BoxLayoutOptionMix
+     brushStyle?: ItemStyleOption
+ 
+     emphasis?: {
+-        handleLabel: SliderHandleLabelOption
++        handleLabel?: SliderHandleLabelOption
+         handleStyle?: ItemStyleOption
+         moveHandleStyle?: ItemStyleOption
+     },

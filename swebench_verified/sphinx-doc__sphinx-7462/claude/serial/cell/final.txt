@@ -1,0 +1,21 @@
+Fixed in `sphinx/domains/python.py:100` and `:118`.
+
+## Root cause
+
+`_parse_annotation`'s `unparse()` builds a list by appending a `", "` separator after every element, then unconditionally calls `result.pop()` to strip the trailing one. With zero elements there is no separator to strip, so the `pop()` either crashes or eats a bracket:
+
+- **`ast.Tuple`** — `Tuple[()]` yields an empty tuple node, so `result` is `[]` and `pop()` raises `IndexError: pop from empty list`. This is the reported crash.
+- **`ast.List`** — the list branch seeds `result` with the opening `[`, so `pop()` doesn't crash but silently removes that bracket. I found this while investigating: `Callable[[], int]` was rendering as `Callable[], int]`. Same root cause, one line away, so I fixed it in the same pass.
+
+Both `pop()` calls are now guarded on `node.elts`, and an empty tuple renders as `()` so `Tuple[()]` round-trips to its source form.
+
+## Verification
+
+- Reproduced the reporter's scenario end-to-end as an actual HTML build. Pre-fix it dies with `IndexError: pop from empty list` (confirmed by stashing the fix and rebuilding); post-fix it succeeds and renders `foo() → Tuple[()]` and `bar(cb: Callable[[], int]) → Tuple[int, int]`.
+- `tests/test_domain_py.py`: 28 passed, including two new cases in `test_parse_annotation`.
+
+Two caveats worth flagging:
+
+- `tests/test_util_inspect.py::test_signature_annotations` and `tests/test_ext_autodoc.py::test_autodoc` fail, but they **also fail on the clean tree** — this Sphinx 3.1-dev predates Python 3.9 and `sphinx.util.typing.stringify` touches `typing._special`, which 3.9 removed. Unrelated to this change.
+- That same incompatibility means I could not verify the fix through the **autodoc** path specifically (autodoc crashes on `_special` before annotations reach the parser), so I drove `_parse_annotation` through the build via explicit `py:function` directives instead. On a supported Python the autodoc path routes into the same fixed code.
+- I attributed the changelog entry to issue **#7461** under 3.0.2; I inferred that number rather than confirming it, so it's worth a check before merging.

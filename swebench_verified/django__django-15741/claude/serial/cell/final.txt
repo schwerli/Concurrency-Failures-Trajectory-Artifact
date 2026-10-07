@@ -1,0 +1,26 @@
+Done.
+
+## Root cause
+
+`get_format()` used `format_type` in two places that require a real `str`:
+- as part of `cache_key` (a lazy proxy hashes/compares by identity, so caching would never hit), and
+- as the attribute name in `getattr(module, format_type, None)` — which raises `TypeError: getattr(): attribute name must be string`.
+
+Before the 4.1 change to `mark_safe()`, a lazy string reaching the `date` filter got eagerly evaluated to a `str` on the way in, so `get_format()` never saw a proxy. Once `mark_safe()` stopped evaluating lazy objects, the proxy flowed straight through `defaultfilters.date` → `formats.date_format` → `get_format` and blew up.
+
+## Change
+
+`django/utils/formats.py:116` — coerce once, after the `lang`/`use_l10n` resolution and before the cache key is built, so both the lookup and the cache see a plain string:
+
+```python
+format_type = str(format_type)  # format_type may be lazy.
+```
+
+Placing it there (rather than at the top) keeps it out of the way of the `settings._USE_L10N_INTERNAL` fallback and means lazy translations are resolved at call time, under the active language — which is the point of passing a lazy format in the first place.
+
+## Verification
+
+- Reproduced the exact `TypeError` from the ticket with `some_date|date:_('Y-m-d')`; after the fix it renders `2022-04-11`.
+- Added two regression tests to `tests/i18n/tests.py`: one on `get_format()` directly with `gettext_lazy("DATE_FORMAT")`, one end-to-end through the `date` filter.
+- `i18n utils_tests template_tests forms_tests`: 3166 tests, 1 failure — `template_tests.test_loaders.FileSystemLoaderTests.test_permissions_error`. That one is unrelated and pre-existing: I confirmed it fails identically with my change stashed, because the suite is running as uid 0 and root ignores the `chmod` the test relies on.
+- Added a 4.0.5 release note. Note the ticket number there is my inference (`33742`) — worth correcting if you have the real one.

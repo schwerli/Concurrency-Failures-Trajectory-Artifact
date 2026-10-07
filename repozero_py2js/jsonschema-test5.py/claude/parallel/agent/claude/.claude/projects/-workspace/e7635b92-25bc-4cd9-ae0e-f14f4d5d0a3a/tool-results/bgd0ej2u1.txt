@@ -1,0 +1,188 @@
+{}                                                                             | 1                          => out="0\n"   # empty schema {} => always valid, 0 errors
+{"unknownKeyword":123,"foo":"bar","nullable":true}                             | 1                          => out="0\n"   # schema with only unknown keywords => 0 errors (unknown keywords ignored, no schema validation)
+true                                                                           | 1                          => out="0\n"   # boolean schema true at root => 0
+false                                                                          | 1                          => out="1\n"   # boolean schema false at root => 1
+false                                                                          | null                       => out="1\n"   # root false rejects even null => 1
+true                                                                           | null                       => out="0\n"   # root true accepts null => 0
+false                                                                          | {"a":[1,{}]}               => out="1\n"   # root false yields exactly ONE error regardless of instance size
+{"type":"integer"}                                                             | 1                          => out="0\n"   # int is integer
+{"type":"number"}                                                              | 1                          => out="0\n"   # int is number
+{"type":"string"}                                                              | 1                          => out="1\n"   # int is not string => 1
+{"type":"boolean"}                                                             | 1                          => out="1\n"   # 1 is NOT boolean (no truthiness) => 1
+{"type":"boolean"}                                                             | 0                          => out="1\n"   # 0 is NOT boolean => 1
+{"type":"integer"}                                                             | 1.0                        => out="0\n"   # DRAFT6+ QUIRK: 1.0 IS an integer => 0
+{"type":"integer"}                                                             | 1e2                        => out="0\n"   # 1e2 (=100.0 float) IS an integer => 0
+{"type":"integer"}                                                             | 1E2                        => out="0\n"   # uppercase exponent same => 0
+{"type":"integer"}                                                             | 100.0                      => out="0\n"   # 100.0 IS an integer => 0
+{"type":"integer"}                                                             | -0.0                       => out="0\n"   # -0.0 IS an integer => 0
+{"type":"integer"}                                                             | 0.1                        => out="1\n"   # 0.1 not integer => 1
+{"type":"number"}                                                              | 1.5                        => out="0\n"   # 1.5 is number => 0
+{"type":"integer"}                                                             | 1.0000000000000001         => out="0\n"   # rounds to exactly 1.0 in binary64 => IS integer => 0
+{"type":"integer"}                                                             | 2.0000000000000004         => out="1\n"   # does not round to 2.0 => NOT integer => 1
+{"type":"integer"}                                                             | 1.7976931348623157e308     => out="0\n"   # max finite double is_integer() => 0
+{"type":"integer"}                                                             | 1e309                      => out="1\n"   # overflows to inf => NOT integer => 1
+{"type":"integer"}                                                             | 1e400                      => out="1\n"   # inf is not integer => 1
+{"type":"number"}                                                              | 1e400                      => out="0\n"   # inf IS a number => 0
+{"type":"number"}                                                              | NaN                        => out="0\n"   # PYTHON-ONLY LITERAL: json.loads accepts NaN; NaN is a number => 0
+{"type":"integer"}                                                             | NaN                        => out="1\n"   # NaN is not integer => 1
+{"type":"integer"}                                                             | Infinity                   => out="1\n"   # PYTHON-ONLY LITERAL Infinity accepted; not integer => 1
+{"type":"number"}                                                              | Infinity                   => out="0\n"   # Infinity is a number => 0
+undefined                                                                      | undefined                  => out="0\n"   # -Infinity accepted by json.loads (must use --a= form, see argparse note) => 0
+{"type":"integer"}                                                             | 9007199254740993           => out="0\n"   # 2^53+1 exact Python int => integer => 0
+{"type":"integer"}                                                             | 10000000000000000000000000 => out="0\n"   # GOTCHA: 401-digit int literal => Python arbitrary-precision int => IS integer (0); JS JSON.parse gives Infinity => would say 1
+{"type":"number"}                                                              | 10000000000000000000000000 => out="0\n"   # huge int literal is also a number => 0
+{"type":"number"}                                                              | "1"                        => out="1\n"   # digit string is NOT a number => 1
+{"type":"integer"}                                                             | "1"                        => out="1\n"   # digit string is NOT an integer => 1
+{"type":"string"}                                                              | ""                         => out="0\n"   # empty string is string => 0
+{"type":"boolean"}                                                             | true                       => out="0\n"   # true is boolean => 0
+{"type":"boolean"}                                                             | false                      => out="0\n"   # false is boolean => 0
+{"type":"integer"}                                                             | true                       => out="1\n"   # bool is NOT integer even though Python bool subclasses int => 1
+{"type":"number"}                                                              | true                       => out="1\n"   # bool is NOT number => 1
+{"type":"integer"}                                                             | false                      => out="1\n"   # false is NOT integer => 1
+{"type":"number"}                                                              | false                      => out="1\n"   # false is NOT number => 1
+{"type":"string"}                                                              | true                       => out="1\n"   # bool is not string => 1
+{"type":"null"}                                                                | null                       => out="0\n"   # null IS a type name => 0
+{"type":"null"}                                                                | 0                          => out="1\n"   # 0 is not null => 1
+{"type":"null"}                                                                | ""                         => out="1\n"   # empty string is not null => 1
+{"type":"null"}                                                                | []                         => out="1\n"   # [] is not null => 1
+{"type":"null"}                                                                | false                      => out="1\n"   # false is not null => 1
+{"type":"object"}                                                              | null                       => out="1\n"   # null is not object => 1
+{"type":"object"}                                                              | {}                         => out="0\n"   # {} is object => 0
+{"type":"object"}                                                              | []                         => out="1\n"   # array is not object => 1
+{"type":"array"}                                                               | []                         => out="0\n"   # [] is array => 0
+{"type":"array"}                                                               | {}                         => out="1\n"   # object is not array => 1
+{"type":"array"}                                                               | "abc"                      => out="1\n"   # string is NOT array (no iterable coercion) => 1
+{"type":["string","boolean"]}                                                  | 1                          => out="1\n"   # type array, no match => exactly 1 error (not one per listed type)
+{"type":["string","boolean","null","object","array"]}                          | 1                          => out="1\n"   # 5 non-matching types => still exactly 1 error
+{"type":["number","integer"]}                                                  | 1                          => out="0\n"   # matches both => 0
+{"type":["integer","integer"]}                                                 | 1                          => out="0\n"   # duplicate names fine => 0
+{"type":["object","array","string","number","integer","boolean","null"]}       | 1                          => out="0\n"   # all 7 names => 0
+{"type":["object","array","number","integer","boolean","null"]}                | "x"                        => out="1\n"   # all but string => 1
+{"type":[]}                                                                    | 1                          => out="1\n"   # EMPTY type array => nothing matches => 1 error
+{"type":[]}                                                                    | null                       => out="1\n"   # empty type array rejects null too => 1
+{"type":[],"minLength":5}                                                      | "ab"                       => out="2\n"   # empty type array + minLength both fail => 2
+{"type":"integer","type":"string"}                                             | 1                          => out="1\n"   # duplicate JSON keys in schema: LAST wins (json.loads) => 1
+{"type":"bogus"}                                                               | 1                          => EXIT 1   # EXCEPTION: unknown type name raises UnknownType => exit 1, empty stdout
+{"type":"int"}                                                                 | 1                          => EXIT 1   # EXCEPTION: python-ish name 'int' is unknown
+{"type":"Integer"}                                                             | 1                          => EXIT 1   # EXCEPTION: type names are case-sensitive
+{"type":"Object"}                                                              | 1                          => EXIT 1   # EXCEPTION: 'Object' unknown
+{"type":"any"}                                                                 | 1                          => EXIT 1   # EXCEPTION: draft3 'any' not supported in draft7
+{"type":"none"}                                                                | 1                          => EXIT 1   # EXCEPTION: 'none' unknown
+{"type":5}                                                                     | 1                          => EXIT 1   # EXCEPTION: numeric type value
+{"type":null}                                                                  | 1                          => EXIT 1   # EXCEPTION: null type value
+{"type":true}                                                                  | 1                          => EXIT 1   # EXCEPTION?: boolean type value
+{"type":{"a":1}}                                                               | 1                          => EXIT 1   # EXCEPTION: object type value (unhashable)
+{"type":[true]}                                                                | 1                          => EXIT 1   # EXCEPTION: boolean inside type array
+{"type":[["string"]]}                                                          | 1                          => EXIT 1   # EXCEPTION: nested array inside type array
+{"type":["string","bogus"]}                                                    | 1                          => EXIT 1   # EXCEPTION: unknown name reached because 'string' did not match
+{"type":["string",null]}                                                       | 1                          => EXIT 1   # EXCEPTION: null element reached
+{"type":["string","bogus"]}                                                    | "x"                        => out="0\n"   # SHORT-CIRCUIT: 'string' matches first so 'bogus' never checked => 0
+{"type":["string",null]}                                                       | "x"                        => out="0\n"   # short-circuit past null element => 0
+{"type":["bogus","string"]}                                                    | "x"                        => EXIT 1   # unknown name FIRST => raises even though string would match
+{"type":["integer","bogus"]}                                                   | 1                          => out="0\n"   # integer matches first => 0
+{"properties":{"x":{"type":"bogus"}}}                                          | {}                         => out="0\n"   # unevaluated subschema: property absent => never validated => 0
+{"items":{"type":"bogus"}}                                                     | []                         => out="0\n"   # empty array => items subschema never applied => 0
+{"items":{"type":"bogus"}}                                                     | [1]                        => EXIT 1   # one item => subschema applied => raises
+{"anyOf":[{"type":"string"},{"type":"bogus"}]}                                 | "x"                        => out="0\n"   # anyOf breaks on first valid branch => bogus never evaluated => 0
+{"anyOf":[{"type":"bogus"},{"type":"string"}]}                                 | "x"                        => EXIT 1   # anyOf evaluates branches in order => raises
+{"oneOf":[{"type":"string"},{"type":"bogus"}]}                                 | "x"                        => EXIT 1   # oneOf must check ALL branches => raises even after a match
+{"allOf":[{"type":"string"},{"type":"bogus"}]}                                 | "x"                        => EXIT 1   # allOf checks all => raises
+{"not":{"type":"bogus"}}                                                       | 1                          => EXIT 1   # not evaluates its subschema => raises
+{"if":{"type":"bogus"},"then":true}                                            | 1                          => EXIT 1   # if is always evaluated => raises
+{"if":false,"then":{"type":"bogus"}}                                           | 1                          => out="0\n"   # if false => then skipped => 0
+{"if":true,"then":{"type":"bogus"}}                                            | 1                          => EXIT 1   # if true => then evaluated => raises
+{"if":true,"else":{"type":"bogus"}}                                            | 1                          => out="0\n"   # if true => else skipped => 0
+{"additionalProperties":{"type":"bogus"}}                                      | {"a":1}                    => EXIT 1   # additionalProperties subschema applied to extra prop => raises
+{"propertyNames":{"type":"bogus"}}                                             | {"a":1,"b":2,"c":3}        => EXIT 1   # propertyNames applied to each key => raises
+{"properties":{"x":false}}                                                     | {"x":1}                    => out="1\n"   # nested boolean false schema => 1
+{"properties":{"x":true}}                                                      | {"x":1}                    => out="0\n"   # nested boolean true schema => 0
+{"properties":{"x":false}}                                                     | {"a":1}                    => out="0\n"   # false subschema not applied when key absent => 0
+{"properties":{"x":false}}                                                     | 5                          => out="0\n"   # properties ignored for non-object => 0
+{"properties":{"x":false,"y":false}}                                           | {"x":1,"y":2}              => out="2\n"   # one error per failing property => 2
+{"items":false}                                                                | 5                          => out="0\n"   # items ignored for non-array => 0
+{"items":false}                                                                | []                         => out="0\n"   # items:false vacuous for empty array => 0
+{"items":false}                                                                | [1,2]                      => out="2\n"   # items:false => ONE error PER item => 2
+{"items":false}                                                                | [1,2,3]                    => out="3\n"   # 3 items => 3 errors
+{"items":true}                                                                 | [1,2]                      => out="0\n"   # items:true => 0
+{"items":[false,true,false]}                                                   | [1,2,3]                    => out="2\n"   # tuple form: positional booleans, 2 fail => 2
+{"items":[false,false]}                                                        | [1,2,3]                    => out="2\n"   # tuple shorter than array, extras unconstrained => 2
+{"items":[true,true],"additionalItems":false}                                  | [1,2,3]                    => out="1\n"   # additionalItems:false with tuple items => 1 error for the extra item
+{"items":{"type":"integer"},"additionalItems":false}                           | [1,2,3]                    => out="0\n"   # additionalItems ignored when items is a schema (not array) => 0
+{"additionalProperties":false}                                                 | {"a":1,"b":2}              => out="1\n"   # additionalProperties:false => ONE aggregated error listing all extras => 1
+{"additionalProperties":false,"properties":{"a":true}}                         | {"a":1,"b":2}              => out="1\n"   # only b is additional => 1
+{"patternProperties":{"^a":false}}                                             | {"a":1}                    => out="1\n"   # patternProperties boolean false => 1
+{"propertyNames":false}                                                        | {"a":1}                    => out="1\n"   # propertyNames:false => 1 error per key
+{"propertyNames":false}                                                        | {"a":1,"b":2}              => out="2\n"   # propertyNames:false with 2 keys => 2
+{"propertyNames":false}                                                        | {}                         => out="0\n"   # no keys => 0
+{"contains":false}                                                             | [1]                        => out="1\n"   # contains:false => 1
+{"contains":false}                                                             | []                         => out="1\n"   # contains:false on EMPTY array still 1 error
+{"contains":true}                                                              | []                         => out="1\n"   # contains:true on empty array => 1 (nothing to contain)
+{"contains":true}                                                              | [1]                        => out="0\n"   # contains:true with an item => 0
+{"dependencies":{"a":false}}                                                   | {"a":1}                    => out="1\n"   # dependencies boolean-schema false => 1
+{"dependencies":{"a":false}}                                                   | {}                         => out="0\n"   # dependency key absent => 0
+{"not":true}                                                                   | 1                          => out="1\n"   # not:true => always 1
+{"not":false}                                                                  | 1                          => out="0\n"   # not:false => 0
+{"not":{}}                                                                     | 1                          => out="1\n"   # not:{} (empty schema always valid) => 1
+{"not":{"not":false}}                                                          | 1                          => out="1\n"   # double negation => 1
+{"allOf":[false,false]}                                                        | 1                          => out="2\n"   # allOf: each failing branch yields its own top-level error => 2
+{"allOf":[false,true,false]}                                                   | 1                          => out="2\n"   # allOf 2 of 3 fail => 2
+{"anyOf":[false,false]}                                                        | 1                          => out="1\n"   # anyOf failure aggregates into ONE error => 1
+{"anyOf":[false,true]}                                                         | 1                          => out="0\n"   # anyOf one valid => 0
+{"oneOf":[false,false]}                                                        | 1                          => out="1\n"   # oneOf none valid => 1
+{"oneOf":[true,true]}                                                          | 1                          => out="1\n"   # oneOf two valid => 1 (too many matches)
+{"oneOf":[true,false]}                                                         | 1                          => out="0\n"   # oneOf exactly one valid => 0
+{"oneOf":[{"type":"integer"},{"type":"number"}]}                               | 1                          => out="1\n"   # 1 matches both integer and number => oneOf => 1
+{"if":false,"then":false}                                                      | 1                          => out="0\n"   # if false and no else => 0
+{"if":true,"then":false}                                                       | 1                          => out="1\n"   # if true, then false => 1
+{"if":true,"else":false}                                                       | 1                          => out="0\n"   # if true => else ignored => 0
+{"if":false,"else":false}                                                      | 1                          => out="1\n"   # if false => else applied => 1
+{"definitions":{"f":false}}                                                    | 1                          => out="0\n"   # definitions are not applied => 0
+{"$ref":"#/definitions/f","definitions":{"f":false}}                           | 1                          => out="1\n"   # $ref resolving to boolean false => 1
+{"$ref":"#/definitions/t","definitions":{"t":true}}                            | 1                          => out="0\n"   # $ref to boolean true => 0
+{"$ref":"#/definitions/f","definitions":{"f":false},"type":"string"}           | 1                          => out="1\n"   # DRAFT7: $ref present => sibling keywords IGNORED; only ref error => 1
+{"$ref":"#/definitions/t","definitions":{"t":true},"type":"string"}            | 1                          => out="0\n"   # $ref true + sibling type:string that would fail => 0 (siblings ignored)
+{"$ref":"#/definitions/t","definitions":{"t":true},"type":"bogus"}             | 1                          => out="0\n"   # sibling type never evaluated => no exception => 0
+{"definitions":{"a":false},"properties":{"x":{"$ref":"#/definitions/a"}}}      | {"x":1}                    => out="1\n"   # nested $ref to false => 1
+{"required":["a"],"properties":{"a":false}}                                    | {"a":1}                    => out="1\n"   # present but false subschema => 1
+{"required":["a"],"properties":{"a":false}}                                    | {}                         => out="1\n"   # missing required => 1 (properties not applied)
+{"type":"string","minimum":5,"maxLength":0}                                    | 1                          => out="2\n"   # COUNT: 3 keywords, 2 applicable failures (maxLength ignored for non-string) => 2
+{"type":"integer","minLength":5}                                               | "abc"                      => out="2\n"   # type + minLength both fail => 2
+{"properties":{"a":{"properties":{"b":{"type":"string"}},"required":["z","y"]} | {"a":{"b":1}}              => out="3\n"   # nested errors propagate individually: 1 type + 2 required => 3
+{"properties":{"x":false,"y":false},"additionalProperties":false}              | {"x":1,"y":2,"z":3}        => out="3\n"   # 2 property errors + 1 additionalProperties error => 3
+{"items":{"items":false}}                                                      | [[1,2],[3]]                => out="3\n"   # deep nesting: 3 leaf items => 3 top-level errors
+{"properties":{"a":{"items":false}}}                                           | {"a":[1,"x"]}              => out="2\n"   # nested items:false => 2
+{"properties":{"a":{"items":{"type":"integer"}}}}                              | {"a":[1,"x"]}              => out="1\n"   # only 'x' fails => 1
+{"items":{"type":"boolean"}}                                                   | [true,1,1.0,"1",null]      => out="4\n"   # only true is boolean => 4
+{"items":{"type":"integer"}}                                                   | [true,1,1.0,"1",null]      => out="3\n"   # 1 and 1.0 are integers; true is not => 3
+{"items":{"type":"number"}}                                                    | [true,1,1.0,"1",null]      => out="3\n"   # 1 and 1.0 are numbers; true is not => 3
+{"items":{"type":["integer","string"]}}                                        | [true,1,1.0,"1",null]      => out="2\n"   # 1,1.0,"1" pass => 2
+{"enum":[true]}                                                                | 1                          => out="1\n"   # enum does NOT treat 1 == True (Python 1==True but jsonschema unbools) => 1
+{"enum":[1]}                                                                   | true                       => out="1\n"   # true != 1 for enum => 1
+{"const":true}                                                                 | 1                          => out="1\n"   # const true vs 1 => 1
+{"const":1}                                                                    | true                       => out="1\n"   # const 1 vs true => 1
+{"const":1}                                                                    | 1.0                        => out="0\n"   # 1.0 == 1 numerically => const matches => 0
+{"enum":[false]}                                                               | 0                          => out="1\n"   # 0 != false for enum => 1
+5                                                                              | 5                          => EXIT 1   # EXCEPTION: non-object non-boolean root schema (number)
+"foo"                                                                          | 5                          => EXIT 1   # EXCEPTION: string root schema
+[]                                                                             | 5                          => EXIT 1   # EXCEPTION: array root schema
+null                                                                           | 5                          => EXIT 1   # EXCEPTION: null root schema
+[1,2]                                                                          | 5                          => EXIT 1   # EXCEPTION: non-empty array root schema
+{"properties":{"x":5}}                                                         | {"x":1}                    => EXIT 1   # EXCEPTION?: non-boolean non-object nested subschema
+{"properties":{"x":"str"}}                                                     | {"x":1}                    => EXIT 1   # EXCEPTION?: string nested subschema
+{"properties":{"x":5}}                                                         | {}                         => out="0\n"   # unreached bad subschema => 0
+{"minLength":"abc"}                                                            | 1                          => out="0\n"   # invalid keyword value not reached for non-string => 0 (no schema validation)
+{}                                                                             | {bad                       => EXIT 1   # EXCEPTION: invalid instance JSON
+{bad                                                                           | 1                          => EXIT 1   # EXCEPTION: invalid schema JSON
+{}                                                                             |                            => EXIT 1   # EXCEPTION: empty instance string is not valid JSON
+{"type":"integer"}                                                             | 01                         => EXIT 1   # EXCEPTION: leading-zero number invalid JSON
+{"type":"boolean"}                                                             | True                       => EXIT 1   # EXCEPTION: Python-style True is not valid JSON
+{"type":"integer"}                                                             |   1                        => out="0\n"   # surrounding whitespace tolerated => 0
+{"type":"integer"}                                                             | -1                         => out="0\n"   # argparse negative-number matcher allows bare -1 as a value => 0
+{"type":"integer"}                                                             | -1.5                       => out="1\n"   # -1.5 also matches negative-number regex => 1
+{"type":"integer"}                                                             | -1e5                       => EXIT 2   # ARGPARSE GOTCHA: '-1e5' does not match ^-\d+$|^-\d*\.\d+$ => treated as an option => EXIT 2
+undefined                                                                      | undefined                  => out="0\n"   # same value via --a=... form parses fine => 0
+undefined                                                                      | undefined                  => out="1\n"   # -inf is not an integer => 1
+undefined                                                                      | undefined                  => EXIT 2   # missing --a => argparse EXIT 2
+undefined                                                                      | undefined                  => EXIT 2   # missing --b => argparse EXIT 2
+
+186 cases -> /workspace/probe/observed/types-boolean-schemas.json

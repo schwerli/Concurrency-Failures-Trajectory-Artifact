@@ -1,0 +1,72 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 33cc636b22..5036335bec 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -748,7 +748,7 @@ class Query(BaseExpression):
+                     cur_model = source.related_model
+                 else:
+                     cur_model = source.remote_field.model
+-                opts = cur_model._meta
++                opts = cur_model._meta.concrete_model._meta
+                 # Even if we're "just passing through" this model, we must add
+                 # both the current model's pk and the related reference field
+                 # (if it's not a reverse relation) to the things we select.
+diff --git a/tests/defer/models.py b/tests/defer/models.py
+index 6de2e2af97..9837f7c7a3 100644
+--- a/tests/defer/models.py
++++ b/tests/defer/models.py
+@@ -58,3 +58,18 @@ class ShadowParent(models.Model):
+ 
+ class ShadowChild(ShadowParent):
+     name = models.CharField(default="adonis", max_length=6)
++
++
++class CustomModel(models.Model):
++    name = models.CharField(max_length=16)
++
++
++class ProxyCustomModel(CustomModel):
++    class Meta:
++        proxy = True
++
++
++class AnotherModel(models.Model):
++    custom = models.ForeignKey(
++        ProxyCustomModel, on_delete=models.SET_NULL, null=True, blank=True
++    )
+diff --git a/tests/defer/tests.py b/tests/defer/tests.py
+index d2cff258b4..71c6cb2393 100644
+--- a/tests/defer/tests.py
++++ b/tests/defer/tests.py
+@@ -2,10 +2,12 @@ from django.core.exceptions import FieldError
+ from django.test import TestCase
+ 
+ from .models import (
++    AnotherModel,
+     BigChild,
+     Child,
+     ChildProxy,
+     Primary,
++    ProxyCustomModel,
+     RefreshPrimaryProxy,
+     Secondary,
+     ShadowChild,
+@@ -194,6 +196,18 @@ class DeferTests(AssertionMixin, TestCase):
+         obj = ShadowChild.objects.defer("name").get()
+         self.assertEqual(obj.name, "adonis")
+ 
++    def test_only_with_select_related_on_proxy_model(self):
++        # only() after select_related() on a relation to a proxy model must
++        # not crash. Regression for #33776.
++        custom = ProxyCustomModel.objects.create(name="custom")
++        AnotherModel.objects.create(custom=custom)
++        with self.assertNumQueries(1):
++            obj = AnotherModel.objects.select_related("custom").only("custom__name")[
++                0
++            ]
++            self.assertEqual(obj.custom.name, "custom")
++            self.assertEqual(obj.custom_id, custom.pk)
++
+ 
+ class BigChildDeferTests(AssertionMixin, TestCase):
+     @classmethod

@@ -1,0 +1,21 @@
+Done. The port is at `/output`, byte-exact against the C++ binary.
+
+## What I did
+
+The library header wasn't in the workspace, so I recovered `adjustSaturation`'s behavior by probing the compiled binary. It converts RGB→HSL, scales saturation, clamps, converts back. Four details mattered and none were guessable from the interface:
+
+**Hue round-trips through degrees.** `rgb_to_hsl` divides the sector value by 6 *then* multiplies by 360; `hsl_to_rgb` divides by 360. Collapsing that to a single `*60` is algebraically identical, and it's what I wrote first — it failed 26/2000 cases. The hue ramp subtracts nearly equal quantities, so a one-ulp shift in hue moves a channel's low digits by percent (`9.83477e-06` vs `1.01924e-05`). I settled it by building a variant matrix (3 hue forms × normalized/percent S,L) and diffing all six against cached reference output: exactly one combination scored 0 mismatches.
+
+**Only saturation is clamped.** Channels are never clamped, so `255 128 64` reads as out-of-gamut and collapses to `159.5 159.5 159.5`, and `-0.5 0.2 0.3` prints negative. Saturation uses two one-sided comparisons, not `clamp` — that's what makes an infinity clamp to `1` while a `NaN` passes through, matching the `-nan` output for infinite input.
+
+**`std::max`/`std::min` keep the first argument on `NaN`.** My initial `if r > g { r } else { g }` agreed for all finite input but returned `0.6 0.6 0.6` where C++ gave `nan nan nan`.
+
+**`stof`'s `ERANGE` is judged pre-rounding.** `1.1754943e-38` is a range error but `1.17549435e-38` isn't, though both round to the same float. Rather than guess, I wrote a C probe against `strtof` to read `errno` directly, which showed the test is on the value rounded to 24 bits with an unbounded exponent. That reduces to a comparison against `2^-126 - 2^-151`.
+
+## Verification
+
+14 000 generated inputs byte-identical, covering equal-channel ties, the `l > 0.5` and hue-sector branches, both clamps, and `%e`/`%f` style switches. Plus every argument count, `nan`/`inf`/`-nan` in all four positions, and the error paths with matching exit code 134 and stderr text. 9 unit tests pass; both build paths compile warning-free with no dependencies.
+
+Two caveats worth flagging:
+- The 5 documented examples were far too weak to pin this down — all 5 pass against a naive `f64` mean-luminance implementation that's wrong nearly everywhere else. The fuzzing is what established correctness.
+- `test9.rs` pulls modules in via `#[path]` rather than through the lib target, because requirement 7 asks for `rustc test9.rs` to work while requirement 5 asks for modules. Cargo consequently compiles the modules twice (once for the lib, once for the bin) — harmless, but it's why the declarations look unusual.

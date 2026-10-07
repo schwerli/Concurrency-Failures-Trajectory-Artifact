@@ -1,0 +1,11 @@
+Fixed. The root cause and change:
+
+**Root cause** — On backends without a native JSON type (MySQL, Oracle, SQLite), the left side of a key transform compiles to `JSON_EXTRACT(col, '$.key')`, which yields a *JSON* value, while `JSONField.get_prep_value()` serializes the right side to a JSON *string* (`0` → `'0'`, `foo` → `'"foo"'`). `KeyTransformExact` already bridged that gap by wrapping the rhs in `JSON_EXTRACT(...)`/`JSON_VALUE(...)`, but no `in` lookup was registered on `KeyTransform`, so the generic `In` compared a JSON value against a raw string and matched nothing.
+
+**Fix** — `django/db/models/fields/json.py:381`: added `KeyTransformIn`, registered on `KeyTransform`. It hooks `resolve_expression_parameter()` (the per-item hook used by `In.batch_process_rhs`) and applies the same rhs wrapping `KeyTransformExact` uses: `JSON_EXTRACT(%s, '$')` on SQLite/MySQL, an inlined `JSON_QUERY`/`JSON_VALUE` on Oracle (which can't bind those arguments), and PostgreSQL left untouched since it compares JSON natively.
+
+Working at the per-parameter level rather than overriding `process_rhs` matters: an earlier attempt that rewrote the whole rhs string corrupted `value__key__in=<subquery>` (SQLite raised `malformed JSON` on a query that worked before). The parameter hook only runs for direct values, so subqueries and expression items in the list are passed through untouched — I verified the subquery case still returns the same rows as before the change.
+
+**Tests** — `tests/model_fields/test_jsonfield.py:630`: `test_key_in` covers ints, strings, list indexes, and list/dict values. All 9 subtests fail on the unpatched tree and pass with the fix; `model_fields`, `lookup`, `queries`, `expressions`, `annotations`, `aggregation`, and `db_functions` (1447 tests) pass.
+
+Two caveats worth flagging: only SQLite was executable here, so the MySQL and Oracle branches are reasoned from the existing `KeyTransformExact` handling rather than run. The MariaDB branch (`JSON_UNQUOTE(JSON_EXTRACT(...))`) is the one piece I'm least certain about — it differs from what `exact` does on MariaDB, and I included it because that's where upstream Django converged, but it's untested here and worth confirming if you run MariaDB.

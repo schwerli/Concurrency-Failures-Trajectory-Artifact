@@ -1,0 +1,43 @@
+The migration is complete and verified against the reference executable.
+
+## Structure
+
+```
+/output/
+├── lib/
+│   ├── aes/
+│   │   ├── galois.mjs       GF(2⁸) arithmetic (gmul, ginv, rotl8)
+│   │   ├── tables.mjs       S-box, inverse S-box, RCON, MixColumns tables — all derived, not transcribed
+│   │   ├── keySchedule.mjs  FIPS-197 key expansion (Nk = 4/6/8)
+│   │   └── block.mjs        AES block cipher: SubBytes/ShiftRows/MixColumns/AddRoundKey
+│   ├── modes/
+│   │   └── cbc.mjs          AESModeOfOperationCBC — stateful chaining, one block per call
+│   ├── python/
+│   │   ├── bytes.mjs        UTF-8 encode + exact CPython `repr(bytes)`
+│   │   ├── argparse.mjs     argparse port (usage/help layout, abbreviation, exit codes)
+│   │   ├── textwrap.mjs     textwrap.wrap + COLUMNS-aware width
+│   │   └── errors.mjs       ValueError + traceback / PyInstaller banner
+│   └── pyaes.mjs            barrel re-export, so the entry file reads like the original
+└── test17.mjs               entry point
+```
+
+Pure ESM, relative imports only with `.mjs` suffixes, no npm packages, no `node:crypto`.
+
+## Verification
+
+| Suite | Result |
+|---|---|
+| 4 provided sample cases | byte-identical stdout (`cmp` clean), rc 0 |
+| Randomized fuzz, 299 cases (keys 16/24/32 B, 1–6 blocks, quotes/backslash/`\t\n\r`/UTF-8) | 0 diffs |
+| CLI/error suite, 30 cases | 0 diffs (stdout, stderr, exit code) |
+| `--help` + usage across 23 `COLUMNS` widths (10–200) | 0 diffs |
+| FIPS-197 AES-128/192/256 + SP800-38A CBC vectors | pass, with decrypt round-trip |
+
+Details worth flagging:
+
+- **Not just AES-128.** The reference accepts 24- and 32-byte keys, so the key schedule implements all three (including the extra `SubWord` AES-256 needs). Confirmed against the executable and FIPS vectors.
+- **`repr()` quote selection.** CPython switches to `b"..."` only when the data contains `'` but no `"` — sample case 1 exercises both branches in one run.
+- **Error paths replicated**, including check ordering (IV length before key size) and the fact that Python buffers all blocks before printing, so a bad final block yields *no* stdout and rc 1.
+- **argparse `--` handling** initially diverged: the separator token itself survives into `unrecognized arguments` because no positional consumes it. Fixed and covered by tests. The narrow-terminal `max_help_position` clamp (`min(24, max(width-20, 4))`) was a second divergence, also fixed.
+- `prog` is set to `test17_executable` to match the reference byte-for-byte on usage/error output. If you'd rather it self-report as `test17.mjs`, that's a one-line change in `test17.mjs:20`.
+- The only intentionally unmatched byte is the PID in the PyInstaller banner (`[PYI-<pid>:ERROR]`), which is nondeterministic in the original too; it's normalized in the diff harness.

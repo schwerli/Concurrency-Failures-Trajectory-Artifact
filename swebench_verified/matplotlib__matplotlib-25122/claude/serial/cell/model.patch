@@ -1,0 +1,86 @@
+diff --git a/doc/api/next_api_changes/behavior/25122-JD.rst b/doc/api/next_api_changes/behavior/25122-JD.rst
+new file mode 100644
+index 0000000000..a6f8a220f4
+--- /dev/null
++++ b/doc/api/next_api_changes/behavior/25122-JD.rst
+@@ -0,0 +1,10 @@
++Correct spectral window correction for windows with negative values
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++The spectral functions in `matplotlib.mlab` (and thus `~.Axes.psd`,
++`~.Axes.csd`, `~.Axes.specgram`, `~.Axes.magnitude_spectrum` and friends)
++compensate for the windowing loss by dividing by the sum of the window.
++Previously the sum of the *absolute values* of the window was used, which gave
++incorrect scaling for windows that take negative values, such as the flattop
++window.  The results are unchanged for windows that are non-negative, e.g. the
++default Hanning window.
+diff --git a/lib/matplotlib/mlab.py b/lib/matplotlib/mlab.py
+index 3552904c3d..7ba42f7ab2 100644
+--- a/lib/matplotlib/mlab.py
++++ b/lib/matplotlib/mlab.py
+@@ -395,12 +395,12 @@ def _spectral_helper(x, y=None, NFFT=None, Fs=None, detrend_func=None,
+     elif mode == 'psd':
+         result = np.conj(result) * result
+     elif mode == 'magnitude':
+-        result = np.abs(result) / np.abs(window).sum()
++        result = np.abs(result) / window.sum()
+     elif mode == 'angle' or mode == 'phase':
+         # we unwrap the phase later to handle the onesided vs. twosided case
+         result = np.angle(result)
+     elif mode == 'complex':
+-        result /= np.abs(window).sum()
++        result /= window.sum()
+ 
+     if mode == 'psd':
+ 
+@@ -427,7 +427,7 @@ def _spectral_helper(x, y=None, NFFT=None, Fs=None, detrend_func=None,
+             result /= (np.abs(window)**2).sum()
+         else:
+             # In this case, preserve power in the segment, not amplitude
+-            result /= np.abs(window).sum()**2
++            result /= window.sum()**2
+ 
+     t = np.arange(NFFT/2, len(x) - NFFT/2 + 1, NFFT - noverlap)/Fs
+ 
+diff --git a/lib/matplotlib/tests/test_mlab.py b/lib/matplotlib/tests/test_mlab.py
+index 86beb5c8c8..a2d16f1986 100644
+--- a/lib/matplotlib/tests/test_mlab.py
++++ b/lib/matplotlib/tests/test_mlab.py
+@@ -1072,3 +1072,37 @@ def test_psd_oversampling():
+                     sides='onesided')
+     Su_1side = np.append([Su[0]], Su[1:4] + Su[4:][::-1])
+     assert_almost_equal(np.sum(P), np.sum(Su_1side))  # same energy
++
++
++def test_psd_window_with_negative_values():
++    """
++    The window correction must use the sum of the window, not the sum of its
++    absolute values, otherwise windows with negative lobes (e.g. flattop) are
++    scaled wrongly.
++    """
++    NFFT = 512
++    Fs = 1000.0
++    amplitude = 2.5
++    # A flattop window, which takes negative values.
++    n = np.arange(NFFT)
++    coefs = [0.21557895, 0.41663158, 0.277263158, 0.083578947, 0.006947368]
++    window = sum((-1)**k * a * np.cos(2 * np.pi * k * n / (NFFT - 1))
++                 for k, a in enumerate(coefs))
++    assert (window < 0).any()
++
++    # A sine wave whose frequency falls exactly on a frequency bin, so that
++    # the expected spectra are known analytically.
++    freq = 100 * Fs / NFFT
++    y = amplitude * np.sin(2 * np.pi * freq * np.arange(NFFT) / Fs)
++
++    spec, _ = mlab.magnitude_spectrum(y, Fs=Fs, window=window)
++    assert_allclose(spec.max(), amplitude / 2, rtol=1e-6)
++
++    spec, _ = mlab.psd(y, NFFT=NFFT, Fs=Fs, window=window, noverlap=0,
++                       scale_by_freq=False)
++    assert_allclose(spec.max(), amplitude**2 / 2, rtol=1e-6)
++
++    # With density scaling, the integral over frequency is the signal power.
++    spec, freqs = mlab.psd(y, NFFT=NFFT, Fs=Fs, window=window, noverlap=0,
++                           scale_by_freq=True)
++    assert_allclose(np.trapz(spec, freqs), amplitude**2 / 2, rtol=1e-6)

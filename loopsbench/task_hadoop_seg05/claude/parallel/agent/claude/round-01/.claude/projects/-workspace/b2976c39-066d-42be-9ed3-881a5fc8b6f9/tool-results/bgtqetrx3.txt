@@ -1,0 +1,690 @@
+===== ValueAggregatorJobBase.java
+     1	/**
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *
+    10	 *     http://www.apache.org/licenses/LICENSE-2.0
+    11	 *
+    12	 * Unless required by applicable law or agreed to in writing, software
+    13	 * distributed under the License is distributed on an "AS IS" BASIS,
+    14	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    15	 * See the License for the specific language governing permissions and
+    16	 * limitations under the License.
+    17	 */
+    18	
+    19	package org.apache.hadoop.mapreduce.lib.aggregate;
+    20	
+    21	import java.util.ArrayList;
+    22	
+    23	import org.apache.hadoop.classification.InterfaceAudience;
+    24	import org.apache.hadoop.classification.InterfaceStability;
+    25	import org.apache.hadoop.conf.Configuration;
+    26	import org.apache.hadoop.io.Writable;
+    27	import org.apache.hadoop.io.WritableComparable;
+    28	
+    29	/**
+    30	 * This abstract class implements some common functionalities of the
+    31	 * the generic mapper, reducer and combiner classes of Aggregate.
+    32	 */
+    33	@InterfaceAudience.Public
+    34	@InterfaceStability.Stable
+    35	public class ValueAggregatorJobBase<K1 extends WritableComparable<?>,
+    36	                                             V1 extends Writable>
+    37	{
+    38	  public static final String DESCRIPTOR = "mapreduce.aggregate.descriptor";
+    39	  public static final String DESCRIPTOR_NUM = 
+    40	    "mapreduce.aggregate.descriptor.num";
+    41	  public static final String USER_JAR = "mapreduce.aggregate.user.jar.file";
+    42	  
+    43	  protected static ArrayList<ValueAggregatorDescriptor> aggregatorDescriptorList = null;
+    44	
+    45	  public static void setup(Configuration job) {
+    46	    initializeMySpec(job);
+    47	    logSpec();
+    48	  }
+    49	
+    50	  protected static ValueAggregatorDescriptor getValueAggregatorDescriptor(
+    51	      String spec, Configuration conf) {
+    52	    if (spec == null)
+    53	      return null;
+    54	    String[] segments = spec.split(",", -1);
+    55	    String type = segments[0];
+    56	    if (type.compareToIgnoreCase("UserDefined") == 0) {
+    57	      String className = segments[1];
+    58	      return new UserDefinedValueAggregatorDescriptor(className, conf);
+    59	    }
+    60	    return null;
+    61	  }
+    62	
+    63	  protected static ArrayList<ValueAggregatorDescriptor> getAggregatorDescriptors(
+    64	      Configuration conf) {
+    65	    int num = conf.getInt(DESCRIPTOR_NUM, 0);
+    66	    ArrayList<ValueAggregatorDescriptor> retv = 
+    67	      new ArrayList<ValueAggregatorDescriptor>(num);
+    68	    for (int i = 0; i < num; i++) {
+    69	      String spec = conf.get(DESCRIPTOR + "." + i);
+    70	      ValueAggregatorDescriptor ad = getValueAggregatorDescriptor(spec, conf);
+    71	      if (ad != null) {
+    72	        retv.add(ad);
+    73	      }
+    74	    }
+    75	    return retv;
+    76	  }
+    77	
+    78	  private static void initializeMySpec(Configuration conf) {
+    79	    aggregatorDescriptorList = getAggregatorDescriptors(conf);
+    80	    if (aggregatorDescriptorList.size() == 0) {
+    81	      aggregatorDescriptorList
+    82	          .add(new UserDefinedValueAggregatorDescriptor(
+    83	              ValueAggregatorBaseDescriptor.class.getCanonicalName(), conf));
+    84	    }
+    85	  }
+    86	
+    87	  protected static void logSpec() {
+    88	  }
+    89	}
+===== ValueAggregatorMapper.java
+     1	/**
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *
+    10	 *     http://www.apache.org/licenses/LICENSE-2.0
+    11	 *
+    12	 * Unless required by applicable law or agreed to in writing, software
+    13	 * distributed under the License is distributed on an "AS IS" BASIS,
+    14	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    15	 * See the License for the specific language governing permissions and
+    16	 * limitations under the License.
+    17	 */
+    18	
+    19	package org.apache.hadoop.mapreduce.lib.aggregate;
+    20	
+    21	import java.io.IOException;
+    22	import java.util.Iterator;
+    23	import java.util.Map.Entry;
+    24	
+    25	import org.apache.hadoop.classification.InterfaceAudience;
+    26	import org.apache.hadoop.classification.InterfaceStability;
+    27	import org.apache.hadoop.io.Text;
+    28	import org.apache.hadoop.io.Writable;
+    29	import org.apache.hadoop.io.WritableComparable;
+    30	import org.apache.hadoop.mapreduce.Mapper;
+    31	
+    32	/**
+    33	 * This class implements the generic mapper of Aggregate.
+    34	 */
+    35	@InterfaceAudience.Public
+    36	@InterfaceStability.Stable
+    37	public class ValueAggregatorMapper<K1 extends WritableComparable<?>,
+    38	                                   V1 extends Writable>
+    39	  extends Mapper<K1, V1, Text, Text> {
+    40	
+    41	  public void setup(Context context) 
+    42	      throws IOException, InterruptedException {
+    43	    ValueAggregatorJobBase.setup(context.getConfiguration());
+    44	  }
+    45	  
+    46	  /**
+    47	   *  the map function. It iterates through the value aggregator descriptor 
+    48	   *  list to generate aggregation id/value pairs and emit them.
+    49	   */
+    50	  public void map(K1 key, V1 value,
+    51	      Context context) throws IOException, InterruptedException  {
+    52	
+    53	    Iterator<?> iter = 
+    54	      ValueAggregatorJobBase.aggregatorDescriptorList.iterator();
+    55	    while (iter.hasNext()) {
+    56	      ValueAggregatorDescriptor ad = (ValueAggregatorDescriptor) iter.next();
+    57	      Iterator<Entry<Text, Text>> ens =
+    58	        ad.generateKeyValPairs(key, value).iterator();
+    59	      while (ens.hasNext()) {
+    60	        Entry<Text, Text> en = ens.next();
+    61	        context.write(en.getKey(), en.getValue());
+    62	      }
+    63	    }
+    64	  }
+    65	}
+===== ValueAggregatorReducer.java
+     1	/**
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *
+    10	 *     http://www.apache.org/licenses/LICENSE-2.0
+    11	 *
+    12	 * Unless required by applicable law or agreed to in writing, software
+    13	 * distributed under the License is distributed on an "AS IS" BASIS,
+    14	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    15	 * See the License for the specific language governing permissions and
+    16	 * limitations under the License.
+    17	 */
+    18	
+    19	package org.apache.hadoop.mapreduce.lib.aggregate;
+    20	
+    21	import java.io.IOException;
+    22	
+    23	import org.apache.hadoop.classification.InterfaceAudience;
+    24	import org.apache.hadoop.classification.InterfaceStability;
+    25	import org.apache.hadoop.io.Text;
+    26	import org.apache.hadoop.io.Writable;
+    27	import org.apache.hadoop.io.WritableComparable;
+    28	import org.apache.hadoop.mapreduce.Reducer;
+    29	
+    30	/**
+    31	 * This class implements the generic reducer of Aggregate.
+    32	 */
+    33	@InterfaceAudience.Public
+    34	@InterfaceStability.Stable
+    35	public class ValueAggregatorReducer<K1 extends WritableComparable<?>,
+    36	                                    V1 extends Writable>
+    37	  extends Reducer<Text, Text, Text, Text> {
+    38	
+    39	  public void setup(Context context) 
+    40	      throws IOException, InterruptedException {
+    41	    ValueAggregatorJobBase.setup(context.getConfiguration());
+    42	  }
+    43	
+    44	  /**
+    45	   * @param key
+    46	   *        the key is expected to be a Text object, whose prefix indicates
+    47	   *        the type of aggregation to aggregate the values. In effect, data
+    48	   *        driven computing is achieved. It is assumed that each aggregator's
+    49	   *        getReport method emits appropriate output for the aggregator. This
+    50	   *        may be further customized.
+    51	   * @param values the values to be aggregated
+    52	   * @param context 
+    53	   */
+    54	  public void reduce(Text key, Iterable<Text> values,
+    55	      Context context) throws IOException, InterruptedException {
+    56	    String keyStr = key.toString();
+    57	    int pos = keyStr.indexOf(ValueAggregatorDescriptor.TYPE_SEPARATOR);
+    58	    String type = keyStr.substring(0, pos);
+    59	    keyStr = keyStr.substring(pos + 
+    60	               ValueAggregatorDescriptor.TYPE_SEPARATOR.length());
+    61	    long uniqCount = context.getConfiguration().
+    62	      getLong(UniqValueCount.MAX_NUM_UNIQUE_VALUES, Long.MAX_VALUE);
+    63	    ValueAggregator aggregator = ValueAggregatorBaseDescriptor
+    64	      .generateValueAggregator(type, uniqCount);
+    65	    for (Text value : values) {
+    66	      aggregator.addNextValue(value);
+    67	    }
+    68	
+    69	    String val = aggregator.getReport();
+    70	    key = new Text(keyStr);
+    71	    context.write(key, new Text(val));
+    72	  }
+    73	}
+===== ValueAggregatorCombiner.java
+     1	/**
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *
+    10	 *     http://www.apache.org/licenses/LICENSE-2.0
+    11	 *
+    12	 * Unless required by applicable law or agreed to in writing, software
+    13	 * distributed under the License is distributed on an "AS IS" BASIS,
+    14	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    15	 * See the License for the specific language governing permissions and
+    16	 * limitations under the License.
+    17	 */
+    18	
+    19	package org.apache.hadoop.mapreduce.lib.aggregate;
+    20	
+    21	import java.io.IOException;
+    22	import java.util.Iterator;
+    23	
+    24	import org.apache.hadoop.classification.InterfaceAudience;
+    25	import org.apache.hadoop.classification.InterfaceStability;
+    26	import org.apache.hadoop.io.Text;
+    27	import org.apache.hadoop.io.Writable;
+    28	import org.apache.hadoop.io.WritableComparable;
+    29	import org.apache.hadoop.mapreduce.Reducer;
+    30	
+    31	/**
+    32	 * This class implements the generic combiner of Aggregate.
+    33	 */
+    34	@InterfaceAudience.Public
+    35	@InterfaceStability.Stable
+    36	public class ValueAggregatorCombiner<K1 extends WritableComparable<?>,
+    37	                                     V1 extends Writable>
+    38	  extends Reducer<Text, Text, Text, Text> {
+    39	
+    40	  /** Combines values for a given key.  
+    41	   * @param key the key is expected to be a Text object, whose prefix indicates
+    42	   * the type of aggregation to aggregate the values. 
+    43	   * @param values the values to combine
+    44	   * @param context to collect combined values
+    45	   */
+    46	  public void reduce(Text key, Iterable<Text> values, Context context) 
+    47	      throws IOException, InterruptedException {
+    48	    String keyStr = key.toString();
+    49	    int pos = keyStr.indexOf(ValueAggregatorDescriptor.TYPE_SEPARATOR);
+    50	    String type = keyStr.substring(0, pos);
+    51	    long uniqCount = context.getConfiguration().
+    52	      getLong(UniqValueCount.MAX_NUM_UNIQUE_VALUES, Long.MAX_VALUE);
+    53	    ValueAggregator aggregator = ValueAggregatorBaseDescriptor
+    54	      .generateValueAggregator(type, uniqCount);
+    55	    for (Text val : values) {
+    56	      aggregator.addNextValue(val);
+    57	    }
+    58	    Iterator<?> outputs = aggregator.getCombinerOutput().iterator();
+    59	
+    60	    while (outputs.hasNext()) {
+    61	      Object v = outputs.next();
+    62	      if (v instanceof Text) {
+    63	        context.write(key, (Text)v);
+    64	      } else {
+    65	        context.write(key, new Text(v.toString()));
+    66	      }
+    67	    }
+    68	  }
+    69	}
+===== ValueAggregatorBaseDescriptor.java
+     1	/**
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *
+    10	 *     http://www.apache.org/licenses/LICENSE-2.0
+    11	 *
+    12	 * Unless required by applicable law or agreed to in writing, software
+    13	 * distributed under the License is distributed on an "AS IS" BASIS,
+    14	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    15	 * See the License for the specific language governing permissions and
+    16	 * limitations under the License.
+    17	 */
+    18	
+    19	package org.apache.hadoop.mapreduce.lib.aggregate;
+    20	
+    21	import java.util.ArrayList;
+    22	import java.util.Map.Entry;
+    23	
+    24	import org.apache.hadoop.classification.InterfaceAudience;
+    25	import org.apache.hadoop.classification.InterfaceStability;
+    26	import org.apache.hadoop.conf.Configuration;
+    27	import org.apache.hadoop.io.Text;
+    28	import org.apache.hadoop.mapreduce.MRJobConfig;
+    29	
+    30	/** 
+    31	 * This class implements the common functionalities of 
+    32	 * the subclasses of ValueAggregatorDescriptor class.
+    33	 */
+    34	@InterfaceAudience.Public
+    35	@InterfaceStability.Stable
+    36	public class ValueAggregatorBaseDescriptor 
+    37	    implements ValueAggregatorDescriptor {
+    38	
+    39	  static public final String UNIQ_VALUE_COUNT = "UniqValueCount";
+    40	
+    41	  static public final String LONG_VALUE_SUM = "LongValueSum";
+    42	
+    43	  static public final String DOUBLE_VALUE_SUM = "DoubleValueSum";
+    44	
+    45	  static public final String VALUE_HISTOGRAM = "ValueHistogram";
+    46	  
+    47	  static public final String LONG_VALUE_MAX = "LongValueMax";
+    48	  
+    49	  static public final String LONG_VALUE_MIN = "LongValueMin";
+    50	  
+    51	  static public final String STRING_VALUE_MAX = "StringValueMax";
+    52	  
+    53	  static public final String STRING_VALUE_MIN = "StringValueMin";
+    54	  
+    55	  public String inputFile = null;
+    56	
+    57	  private static class MyEntry implements Entry<Text, Text> {
+    58	    Text key;
+    59	
+    60	    Text val;
+    61	
+    62	    public Text getKey() {
+    63	      return key;
+    64	    }
+    65	
+    66	    public Text getValue() {
+    67	      return val;
+    68	    }
+    69	
+    70	    public Text setValue(Text val) {
+    71	      this.val = val;
+    72	      return val;
+    73	    }
+    74	
+    75	    public MyEntry(Text key, Text val) {
+    76	      this.key = key;
+    77	      this.val = val;
+    78	    }
+    79	  }
+    80	
+    81	  /**
+    82	   * 
+    83	   * @param type the aggregation type
+    84	   * @param id the aggregation id
+    85	   * @param val the val associated with the id to be aggregated
+    86	   * @return an Entry whose key is the aggregation id prefixed with 
+    87	   * the aggregation type.
+    88	   */
+    89	  public static Entry<Text, Text> generateEntry(String type, 
+    90	      String id, Text val) {
+    91	    Text key = new Text(type + TYPE_SEPARATOR + id);
+    92	    return new MyEntry(key, val);
+    93	  }
+    94	
+    95	  /**
+    96	   * 
+    97	   * @param type the aggregation type
+    98	   * @param uniqCount the limit in the number of unique values to keep, 
+    99	   *                  if type is UNIQ_VALUE_COUNT 
+   100	   * @return a value aggregator of the given type.
+   101	   */
+   102	  static public ValueAggregator generateValueAggregator(String type, long uniqCount) {
+   103	    if (type.compareToIgnoreCase(LONG_VALUE_SUM) == 0) {
+   104	      return new LongValueSum();
+   105	    } if (type.compareToIgnoreCase(LONG_VALUE_MAX) == 0) {
+   106	      return new LongValueMax();
+   107	    } else if (type.compareToIgnoreCase(LONG_VALUE_MIN) == 0) {
+   108	      return new LongValueMin();
+   109	    } else if (type.compareToIgnoreCase(STRING_VALUE_MAX) == 0) {
+   110	      return new StringValueMax();
+   111	    } else if (type.compareToIgnoreCase(STRING_VALUE_MIN) == 0) {
+   112	      return new StringValueMin();
+   113	    } else if (type.compareToIgnoreCase(DOUBLE_VALUE_SUM) == 0) {
+   114	      return new DoubleValueSum();
+   115	    } else if (type.compareToIgnoreCase(UNIQ_VALUE_COUNT) == 0) {
+   116	      return new UniqValueCount(uniqCount);
+   117	    } else if (type.compareToIgnoreCase(VALUE_HISTOGRAM) == 0) {
+   118	      return new ValueHistogram();
+   119	    }
+   120	    return null;
+   121	  }
+   122	
+   123	  /**
+   124	   * Generate 1 or 2 aggregation-id/value pairs for the given key/value pair.
+   125	   * The first id will be of type LONG_VALUE_SUM, with "record_count" as
+   126	   * its aggregation id. If the input is a file split,
+   127	   * the second id of the same type will be generated too, with the file name 
+   128	   * as its aggregation id. This achieves the behavior of counting the total 
+   129	   * number of records in the input data, and the number of records 
+   130	   * in each input file.
+   131	   * 
+   132	   * @param key
+   133	   *          input key
+   134	   * @param val
+   135	   *          input value
+   136	   * @return a list of aggregation id/value pairs. An aggregation id encodes an
+   137	   *         aggregation type which is used to guide the way to aggregate the
+   138	   *         value in the reduce/combiner phrase of an Aggregate based job.
+   139	   */
+   140	  public ArrayList<Entry<Text, Text>> generateKeyValPairs(Object key,
+   141	                                                          Object val) {
+   142	    ArrayList<Entry<Text, Text>> retv = new ArrayList<Entry<Text, Text>>();
+   143	    String countType = LONG_VALUE_SUM;
+   144	    String id = "record_count";
+   145	    Entry<Text, Text> e = generateEntry(countType, id, ONE);
+   146	    if (e != null) {
+   147	      retv.add(e);
+   148	    }
+   149	    if (this.inputFile != null) {
+   150	      e = generateEntry(countType, this.inputFile, ONE);
+   151	      if (e != null) {
+   152	        retv.add(e);
+   153	      }
+   154	    }
+   155	    return retv;
+   156	  }
+   157	
+   158	  /**
+   159	   * get the input file name.
+   160	   * 
+   161	   * @param conf a configuration object
+   162	   */
+   163	  public void configure(Configuration conf) {
+   164	    this.inputFile = conf.get(MRJobConfig.MAP_INPUT_FILE);
+   165	  }
+   166	}
+===== ValueAggregatorJob.java
+     1	/**
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *
+    10	 *     http://www.apache.org/licenses/LICENSE-2.0
+    11	 *
+    12	 * Unless required by applicable law or agreed to in writing, software
+    13	 * distributed under the License is distributed on an "AS IS" BASIS,
+    14	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    15	 * See the License for the specific language governing permissions and
+    16	 * limitations under the License.
+    17	 */
+    18	
+    19	package org.apache.hadoop.mapreduce.lib.aggregate;
+    20	
+    21	import java.io.IOException;
+    22	import java.util.ArrayList;
+    23	
+    24	import org.apache.hadoop.classification.InterfaceAudience;
+    25	import org.apache.hadoop.classification.InterfaceStability;
+    26	import org.apache.hadoop.conf.Configuration;
+    27	import org.apache.hadoop.fs.Path;
+    28	import org.apache.hadoop.io.Text;
+    29	import org.apache.hadoop.mapreduce.InputFormat;
+    30	import org.apache.hadoop.mapreduce.Job;
+    31	import org.apache.hadoop.mapreduce.MRJobConfig;
+    32	import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+    33	import org.apache.hadoop.mapreduce.lib.input.SequenceFileInputFormat;
+    34	import org.apache.hadoop.mapreduce.lib.input.TextInputFormat;
+    35	import org.apache.hadoop.mapreduce.lib.jobcontrol.ControlledJob;
+    36	import org.apache.hadoop.mapreduce.lib.jobcontrol.JobControl;
+    37	import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+    38	import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat;
+    39	import org.apache.hadoop.util.GenericOptionsParser;
+    40	
+    41	/**
+    42	 * This is the main class for creating a map/reduce job using Aggregate
+    43	 * framework. The Aggregate is a specialization of map/reduce framework,
+    44	 * specializing for performing various simple aggregations.
+    45	 * 
+    46	 * Generally speaking, in order to implement an application using Map/Reduce
+    47	 * model, the developer is to implement Map and Reduce functions (and possibly
+    48	 * combine function). However, a lot of applications related to counting and
+    49	 * statistics computing have very similar characteristics. Aggregate abstracts
+    50	 * out the general patterns of these functions and implementing those patterns.
+    51	 * In particular, the package provides generic mapper/redducer/combiner 
+    52	 * classes, and a set of built-in value aggregators, and a generic utility 
+    53	 * class that helps user create map/reduce jobs using the generic class. 
+    54	 * The built-in aggregators include:
+    55	 * 
+    56	 * sum over numeric values count the number of distinct values compute the
+    57	 * histogram of values compute the minimum, maximum, media,average, standard
+    58	 * deviation of numeric values
+    59	 * 
+    60	 * The developer using Aggregate will need only to provide a plugin class
+    61	 * conforming to the following interface:
+    62	 * 
+    63	 * public interface ValueAggregatorDescriptor { public ArrayList&lt;Entry&gt;
+    64	 * generateKeyValPairs(Object key, Object value); public void
+    65	 * configure(Configuration conf); }
+    66	 * 
+    67	 * The package also provides a base class, ValueAggregatorBaseDescriptor,
+    68	 * implementing the above interface. The user can extend the base class and
+    69	 * implement generateKeyValPairs accordingly.
+    70	 * 
+    71	 * The primary work of generateKeyValPairs is to emit one or more key/value
+    72	 * pairs based on the input key/value pair. The key in an output key/value pair
+    73	 * encode two pieces of information: aggregation type and aggregation id. The
+    74	 * value will be aggregated onto the aggregation id according the aggregation
+    75	 * type.
+    76	 * 
+    77	 * This class offers a function to generate a map/reduce job using Aggregate
+    78	 * framework. The function takes the following parameters: input directory spec
+    79	 * input format (text or sequence file) output directory a file specifying the
+    80	 * user plugin class
+    81	 * 
+    82	 */
+    83	@InterfaceAudience.Public
+    84	@InterfaceStability.Stable
+    85	public class ValueAggregatorJob {
+    86	
+    87	  public static JobControl createValueAggregatorJobs(String args[],
+    88	    Class<? extends ValueAggregatorDescriptor>[] descriptors) 
+    89	  throws IOException {
+    90	    
+    91	    JobControl theControl = new JobControl("ValueAggregatorJobs");
+    92	    ArrayList<ControlledJob> dependingJobs = new ArrayList<ControlledJob>();
+    93	    Configuration conf = new Configuration();
+    94	    if (descriptors != null) {
+    95	      conf = setAggregatorDescriptors(descriptors);
+    96	    }
+    97	    Job job = createValueAggregatorJob(conf, args);
+    98	    ControlledJob cjob = new ControlledJob(job, dependingJobs);
+    99	    theControl.addJob(cjob);
+   100	    return theControl;
+   101	  }
+   102	
+   103	  public static JobControl createValueAggregatorJobs(String args[]) 
+   104	      throws IOException {
+   105	    return createValueAggregatorJobs(args, null);
+   106	  }
+   107	  
+   108	  /**
+   109	   * Create an Aggregate based map/reduce job.
+   110	   * 
+   111	   * @param conf The configuration for job
+   112	   * @param args the arguments used for job creation. Generic hadoop
+   113	   * arguments are accepted.
+   114	   * @return a Job object ready for submission.
+   115	   * 
+   116	   * @throws IOException
+   117	   * @see GenericOptionsParser
+   118	   */
+   119	  public static Job createValueAggregatorJob(Configuration conf, String args[])
+   120	      throws IOException {
+   121	
+   122	    GenericOptionsParser genericParser 
+   123	      = new GenericOptionsParser(conf, args);
+   124	    args = genericParser.getRemainingArgs();
+   125	    
+   126	    if (args.length < 2) {
+   127	      System.out.println("usage: inputDirs outDir "
+   128	          + "[numOfReducer [textinputformat|seq [specfile [jobName]]]]");
+   129	      GenericOptionsParser.printGenericCommandUsage(System.out);
+   130	      System.exit(2);
+   131	    }
+   132	    String inputDir = args[0];
+   133	    String outputDir = args[1];
+   134	    int numOfReducers = 1;
+   135	    if (args.length > 2) {
+   136	      numOfReducers = Integer.parseInt(args[2]);
+   137	    }
+   138	
+   139	    Class<? extends InputFormat> theInputFormat = null;
+   140	    if (args.length > 3 && 
+   141	        args[3].compareToIgnoreCase("textinputformat") == 0) {
+   142	      theInputFormat = TextInputFormat.class;
+   143	    } else {
+   144	      theInputFormat = SequenceFileInputFormat.class;
+   145	    }
+   146	
+   147	    Path specFile = null;
+   148	
+   149	    if (args.length > 4) {
+   150	      specFile = new Path(args[4]);
+   151	    }
+   152	
+   153	    String jobName = "";
+   154	    
+   155	    if (args.length > 5) {
+   156	      jobName = args[5];
+   157	    }
+   158	
+   159	    if (specFile != null) {
+   160	      conf.addResource(specFile);
+   161	    }
+   162	    String userJarFile = conf.get(ValueAggregatorJobBase.USER_JAR);
+   163	    if (userJarFile != null) {
+   164	      conf.set(MRJobConfig.JAR, userJarFile);
+   165	    }
+   166	
+   167	    Job theJob = Job.getInstance(conf);
+   168	    if (userJarFile == null) {
+   169	      theJob.setJarByClass(ValueAggregator.class);
+   170	    } 
+   171	    theJob.setJobName("ValueAggregatorJob: " + jobName);
+   172	
+   173	    FileInputFormat.addInputPaths(theJob, inputDir);
+   174	
+   175	    theJob.setInputFormatClass(theInputFormat);
+   176	    
+   177	    theJob.setMapperClass(ValueAggregatorMapper.class);
+   178	    FileOutputFormat.setOutputPath(theJob, new Path(outputDir));
+   179	    theJob.setOutputFormatClass(TextOutputFormat.class);
+   180	    theJob.setMapOutputKeyClass(Text.class);
+   181	    theJob.setMapOutputValueClass(Text.class);
+   182	    theJob.setOutputKeyClass(Text.class);
+   183	    theJob.setOutputValueClass(Text.class);
+   184	    theJob.setReducerClass(ValueAggregatorReducer.class);
+   185	    theJob.setCombinerClass(ValueAggregatorCombiner.class);
+   186	    theJob.setNumReduceTasks(numOfReducers);
+   187	    return theJob;
+   188	  }
+   189	
+   190	  public static Job createValueAggregatorJob(String args[], 
+   191	      Class<? extends ValueAggregatorDescriptor>[] descriptors) 
+   192	      throws IOException {
+   193	    return createValueAggregatorJob(
+   194	             setAggregatorDescriptors(descriptors), args);
+   195	  }
+   196	  
+   197	  public static Configuration setAggregatorDescriptors(
+   198	      Class<? extends ValueAggregatorDescriptor>[] descriptors) {
+   199	    Configuration conf = new Configuration();
+   200	    conf.setInt(ValueAggregatorJobBase.DESCRIPTOR_NUM, descriptors.length);
+   201	    //specify the aggregator descriptors
+   202	    for(int i=0; i< descriptors.length; i++) {
+   203	      conf.set(ValueAggregatorJobBase.DESCRIPTOR + i, 
+   204	               "UserDefined," + descriptors[i].getName());
+   205	    }
+   206	    return conf;
+   207	  }
+   208	  
+   209	  /**
+   210	   * create and run an Aggregate based map/reduce job.
+   211	   * 
+   212	   * @param args the arguments used for job creation
+   213	   * @throws IOException
+   214	   */
+   215	  public static void main(String args[]) 
+   216	      throws IOException, InterruptedException, ClassNotFoundException {
+   217	    Job job = ValueAggregatorJob.createValueAggregatorJob(
+   218	                new Configuration(), args);
+   219	    int ret = job.waitForCompletion(true) ? 0 : 1;
+   220	    System.exit(ret);
+   221	  }
+   222	}

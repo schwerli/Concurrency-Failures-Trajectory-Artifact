@@ -1,0 +1,30 @@
+Done. The migration is complete and verified.
+
+## What was built
+
+`/output/` — Cargo project, `std` only (Cargo.lock has exactly 1 package: the crate itself):
+
+| File | Contents |
+|---|---|
+| `test11.rs` | Entry point in the package root — arg parsing, polygon assembly, output |
+| `src/earcut/mod.rs` | The triangulator (ear clipping + hole elimination + z-order hashing) |
+| `src/earcut/nodes.rs` | Index-based node arena replacing the C++ `Node*` object pool |
+| `src/gear.rs` | Gear-ring vertex generation |
+| `src/cli.rs` | `atoi` reimplementation |
+| `Cargo.toml` | `[[bin]] path = "test11.rs"`, no dependencies |
+
+Both build paths work with zero warnings: `rustc -O test11.rs -o test11` → `/output/test11`, and `cargo build --release` → `/output/target/release/test11`.
+
+## Implementation notes
+
+- **The library was not on disk** — only `test11.cpp` and the compiled binary were present, so `earcut` was re-derived from the interface and validated against the reference binary rather than transliterated.
+- **Pointers → arena indices.** `Node*` became `usize` into a `Vec<Node>` with `usize::MAX` as the null sentinel. This preserves a subtlety the algorithm depends on: `remove_node` unlinks a node from its neighbours but leaves the node's *own* `prev`/`next` intact, so callers can still step off a just-removed node (e.g. `last = last->next` after removal in the ring builder).
+- **Float semantics kept identical:** `std::min/max<double>` were ported as explicit comparisons rather than `f64::min/max` (which differ on NaN/`-0.0`), arithmetic grouping in `area`/`point_in_triangle` was preserved to avoid reassociation, and the angle expressions keep the C++ evaluation order. `f64::cos/sin` lower to the same glibc libm calls, so coordinates are bit-identical.
+
+## Verification
+
+- **Byte-exact match** against `test11_executable` for every `n` in −2..400, plus `n` = 1000/1500/5000, no-args (default 11), and non-numeric args (`abc`, `12abc`, ` 7`, `+9`, `0x10`, `3.9`). 0 mismatches, both binaries. Output format matches exactly, including the trailing space and absence of a trailing newline.
+- The `n ≥ 41` cases (>80 vertices) cross the threshold that enables z-order hashing, so both the plain and hashed ear tests are covered by the comparison.
+- 6 unit tests (`cargo test`) cover the paths this test case *cannot* reach — hole bridging, concave rings, winding-order normalization, and degenerate input — checked by triangle count and total area. All pass.
+
+One caveat worth stating plainly: the hole-elimination and self-intersection-repair code is exercised only by my own tests, not by a C++ reference, since the header was unavailable. It is area/count-correct on the cases above, but I can't claim bit-level parity with the original there the way I can for the gear polygon.

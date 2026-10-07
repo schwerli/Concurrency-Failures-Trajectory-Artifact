@@ -1,0 +1,42 @@
+Done. Here is the delivered code.
+
+## Structure
+
+```
+/output
+├── lib/
+│   ├── pytypes/          Python value semantics
+│   │   ├── chars.mjs       Unicode: isspace(), Nd digit values, printability
+│   │   ├── bytes.mjs       PyBytes + str.encode('ascii') / UnicodeEncodeError
+│   │   ├── escape.mjs      repr() escaping for str and bytes
+│   │   ├── int.mjs         int(str) → BigInt, ValueError
+│   │   └── repr.mjs        repr() dispatch over bytes / int / list
+│   ├── bencode/          the codec
+│   │   ├── encoder.mjs
+│   │   ├── decoder.mjs
+│   │   └── index.mjs       public encode / decode
+│   └── cli/
+│       ├── io.mjs          synchronous stdout/stderr writes
+│       ├── errors.mjs      SystemExit, ArgumentError
+│       ├── argparse.mjs    ArgumentParser
+│       └── traceback.mjs   CPython traceback rendering
+└── test6.mjs             entry point
+```
+
+## Key behaviors I reverse-engineered from the executable
+
+- **Arbitrary-precision ints** — `--b 123456789012345678901234567890` round-trips, so integers are carried as `BigInt`, not `Number`.
+- **Python `int()` parsing** — strips whitespace (including `\x1c`–`\x1f`/`\x85`, but *not* U+FEFF), accepts `+`/`-`, single underscores *between* digits, and any Unicode Nd block (`٤٢` → 42), while rejecting `0x10`, `1e3`, `1_`, `1__0`.
+- **`bytes` repr quoting** — `b'x'` normally, `b"it's"` when the text has `'` but no `"`, and `b'a\'b"c'` when it has both; `\t\n\r` short escapes, `\xNN` below 0x20 and at/above 0x7f.
+- **argparse fidelity** — `--a=v` form, unique-prefix abbreviation (`--he` → `--help`), last-occurrence wins, and one-pass option/value classification so `--a -5` succeeds while `--a -x` fails with *expected one argument*. Missing-required is reported before unrecognized; a bare `--` becomes an extra.
+
+## Verification
+
+I built a differential harness against `/workspace/dataset/test6_executable`, comparing stdout, stderr, and exit code:
+
+- **71/71** hand-picked cases, covering the 4 samples plus escaping, big ints, every int-parsing form, all argparse error paths, `--help`, and non-ASCII failures.
+- **300/300 + 120/120** randomized rounds over full printable ASCII plus control characters and 1–25-digit signed integers.
+
+Two notes on that harness: it normalizes the program name, since `prog` comes from the script filename in both runtimes (`test6.mjs` vs `test6_executable`) and cannot match by construction. It also runs the reference with cwd=`/workspace/dataset` — without `test6.py` on disk the PyInstaller build omits the traceback's source and caret lines; with it present, they appear and match. The `[PYI-NNN:ERROR]` line the executable appends on crash is a packaging artifact whose number is the PID, so it is not reproducible and is not reproduced; the Python-level traceback, empty stdout, and exit code 1 all match.
+
+I deleted the two harness scripts to leave `/output` as just the library and entry point — say the word if you'd like them kept as a regression suite.

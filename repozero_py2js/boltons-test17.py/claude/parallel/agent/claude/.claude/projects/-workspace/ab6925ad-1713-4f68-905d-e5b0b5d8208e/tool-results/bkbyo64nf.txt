@@ -1,0 +1,1033 @@
+// Node.js port of test17.py.
+//
+// Same CLI (`--a`, required, comma-separated), same 20 results, same print
+// order and the same byte-for-byte formatting as Python's `print`.
+
+import { ArgumentParser } from './lib/argparse.mjs';
+import { camel2under, under2camel, slugify, unitLen, cardinalize } from './lib/strutils.mjs';
+import { FrozenDict } from './lib/dictutils.mjs';
+import { PyDict } from './lib/pydict.mjs';
+import { pyPrint } from './lib/pyrepr.mjs';
+import { pyLen, pyReplace, pySplit, pyUpper } from './lib/pyunicode.mjs';
+
+const parser = new ArgumentParser();
+parser.addArgument('--a', {
+  type: (value) => value,
+  required: true,
+  help: 'Comma-separated strings',
+});
+const args = parser.parseArgs();
+
+const strings = pySplit(args.a, ',');
+
+// Group one: string conversion (15 API calls)
+const result1 = strings.map((s) => camel2under(s)); // batch camel -> under
+pyPrint(result1);
+const result2 = strings.map((s) => under2camel(s)); // batch under -> camel
+pyPrint(result2);
+const result3 = strings.map((s) => slugify(s)); // batch slug creation
+pyPrint(result3);
+const result4 = camel2under(strings[0]); // convert the first
+pyPrint(result4);
+const result5 = under2camel(result4); // convert it back
+pyPrint(result5);
+const result6 = slugify(strings[strings.length - 1]); // slug of the last
+pyPrint(result6);
+const result7 = unitLen(strings, 'string'); // length description
+pyPrint(result7);
+const result8 = cardinalize('string', strings.length); // plural form
+pyPrint(result8);
+const result9 = camel2under(strings.join('')); // convert after joining
+pyPrint(result9);
+const result10 = slugify(strings.join('_')); // slugify after joining
+pyPrint(result10);
+const result11 = under2camel(pyReplace(result9, ' ', '_')); // convert after processing
+pyPrint(result11);
+const result12 = unitLen(strings.slice(0, 3), 'item'); // description of the first 3
+pyPrint(result12);
+const result13 = cardinalize('item', 1); // singular form
+pyPrint(result13);
+const result14 = camel2under('TestString'); // fixed string conversion
+pyPrint(result14);
+const result15 = slugify('Test String!'); // fixed string slugify
+pyPrint(result15);
+
+// Group two: dictionary mapping (5 API calls)
+const mapping = PyDict.fromZip(strings, result1);
+const result16 = new FrozenDict(mapping.items()); // create an immutable dict
+pyPrint(result16);
+const result17 = mapping.mapEntries((k, v) => [v, k], FrozenDict); // reversed mapping
+pyPrint(result17);
+const result18 = mapping.mapEntries((k, v) => [k, pyLen(v)], FrozenDict); // length mapping
+pyPrint(result18);
+const result19 = mapping.mapEntries((k, v) => [pyUpper(k), v], FrozenDict); // upper-cased keys
+pyPrint(result19);
+const result20 = mapping.mapEntries((k, v) => [k, slugify(v)], FrozenDict); // slugified values
+pyPrint(result20);
+=== LIB ===
+total 48
+drwxr-xr-x 2 root root  4096 Aug  7 16:30 .
+drwxr-xr-x 3 root root  4096 Aug  7 16:31 ..
+-rw-r--r-- 1 root root 11122 Aug  7 16:30 argparse.mjs
+-rw-r--r-- 1 root root   784 Aug  7 16:24 dictutils.mjs
+-rw-r--r-- 1 root root  2039 Aug  7 16:23 pydict.mjs
+-rw-r--r-- 1 root root  2754 Aug  7 16:23 pyrepr.mjs
+-rw-r--r-- 1 root root  7647 Aug  7 16:21 pyunicode.mjs
+-rw-r--r-- 1 root root  7892 Aug  7 16:25 strutils.mjs
+--- /output/lib/argparse.mjs ---
+// A faithful subset of Python's `argparse`.
+//
+// Only what this program's parser needs is modelled: the automatic `-h/--help`
+// action plus long options that take exactly one value. The classification rules
+// are the interesting part, and each was pinned down against the executable:
+//
+//   * `--a=value` and `--a value` are both accepted; a repeated option keeps the
+//     last value.
+//   * Long options may be abbreviated, so `--h` and `--he` reach `--help`, while
+//     `--ab` matches nothing (abbreviation only ever shortens).
+//   * A token that looks like an option cannot serve as a value: `--a -x`,
+//     `--a -h` and `--a --` all fail with "expected one argument". But a
+//     negative number (`--a -5`, `--a -5.5`) or a token containing a space
+//     (`--a "-x y"`) is a value, because those cannot be options.
+//   * `--` makes every later token positional; with no positionals declared it
+//     stays in the leftovers, so `--a=1 -- x y` reports "unrecognized
+//     arguments: -- x y".
+//   * A missing required option is reported before unrecognized leftovers, so
+//     `--A z` complains about `--a` being required rather than about `--A`.
+//   * `-h` anywhere wins immediately: `--a x -h` prints help and exits 0.
+
+import { basename } from 'node:path';
+
+const NEGATIVE_NUMBER_RE = /^-\d+$|^-\d*\.\d+$/;
+
+/** Terminal width the way Python's argparse derives it, minus its 2-col margin. */
+function terminalWidth() {
+  const fromEnv = Number.parseInt(process.env.COLUMNS ?? '', 10);
+  const columns = Number.isInteger(fromEnv) && fromEnv > 0 ? fromEnv : 80;
+  return columns - 2;
+}
+
+/** Greedy wrap identical to the textwrap call argparse uses for help text. */
+function wrap(text, width) {
+  const words = text.split(/\s+/u).filter((word) => word !== '');
+  if (words.length === 0) return [];
+  const lines = [];
+  let line = words[0];
+  for (const word of words.slice(1)) {
+    if (line.length + 1 + word.length <= width) {
+      line += ` ${word}`;
+    } else {
+      lines.push(line);
+      line = word;
+    }
+  }
+  lines.push(line);
+  return lines;
+}
+
+class Action {
+  constructor({ optionStrings, dest, help, required, takesValue, isHelp, type }) {
+    this.optionStrings = optionStrings;
+    this.dest = dest;
+    this.help = help;
+    this.required = required;
+    this.takesValue = takesValue;
+    this.isHelp = isHelp;
+    this.type = type;
+  }
+
+  /** `A` for `--a A`: argparse's default metavar is the upper-cased dest. */
+  get metavar() {
+    return this.dest.toUpperCase();
+  }
+
+  /** How the action appears in the usage line, e.g. `-h` or `--a A`. */
+  formatUsage() {
+    const first = this.optionStrings[0];
+    return this.takesValue ? `${first} ${this.metavar}` : first;
+  }
+
+  /** How the action appears in the options list, e.g. `-h, --help`. */
+  formatInvocation() {
+    if (!this.takesValue) return this.optionStrings.join(', ');
+    return this.optionStrings.map((option) => `${option} ${this.metavar}`).join(', ');
+  }
+
+  /** argparse's `_get_action_name`, used by the required-argument message. */
+  get name() {
+    return this.optionStrings.join('/');
+  }
+}
+
+export class ArgumentParser {
+  constructor({ prog, addHelp = true } = {}) {
+    this.prog = prog ?? basename(process.argv[1] ?? 'prog');
+    this.actions = [];
+    this.optionStringActions = new Map();
+    if (addHelp) {
+      this.addArgument('-h', '--help', {
+        help: 'show this help message and exit',
+        isHelp: true,
+      });
+    }
+  }
+
+  addArgument(...args) {
+    const options = typeof args.at(-1) === 'object' ? args.pop() : {};
+    const optionStrings = args;
+    if (optionStrings.length === 0) {
+      throw new Error('this port only supports optional arguments');
+    }
+    const { help = '', required = false, isHelp = false, type = (v) => v } = options;
+    // argparse derives dest from the first long option, dropping the dashes and
+    // turning inner dashes into underscores.
+    const longest = optionStrings.find((option) => option.startsWith('--')) ?? optionStrings[0];
+    const dest = longest.replace(/^-+/u, '').replace(/-/gu, '_');
+    const action = new Action({
+      optionStrings,
+      dest,
+      help,
+      required,
+      takesValue: !isHelp,
+      isHelp,
+      type,
+    });
+    this.actions.push(action);
+    for (const option of optionStrings) {
+      this.optionStringActions.set(option, action);
+    }
+    return action;
+  }
+
+  // -------------------------------------------------------------------------
+  // Token classification
+  // -------------------------------------------------------------------------
+
+  /**
+   * argparse's `_get_option_tuples`: abbreviation matching. Returns every
+   * option whose name starts with the given token.
+   */
+  _getOptionTuples(token) {
+    const result = [];
+    if (token.startsWith('--')) {
+      let prefix = token;
+      let explicitArg = null;
+      const equals = token.indexOf('=');
+      if (equals !== -1) {
+        prefix = token.slice(0, equals);
+        explicitArg = token.slice(equals + 1);
+      }
+      for (const [option, action] of this.optionStringActions) {
+        if (option.startsWith(prefix)) {
+          result.push([action, option, explicitArg]);
+        }
+      }
+      return result;
+    }
+    // Single-dash token: either an exact short option with an attached value,
+    // or the prefix of a longer option name.
+    const shortOptionPrefix = token.slice(0, 2);
+    const shortExplicitArg = token.slice(2);
+    for (const [option, action] of this.optionStringActions) {
+      if (option === shortOptionPrefix) {
+        result.push([action, option, shortExplicitArg]);
+      } else if (option.startsWith(token)) {
+        result.push([action, option, null]);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * argparse's `_parse_optional`. Returns `null` when the token is a plain
+   * value, or `[action, optionString, explicitArg]` when it looks like an
+   * option -- with a `null` action when no such option exists.
+   */
+  _parseOptional(token) {
+    if (token === '') return null;
+    if (!token.startsWith('-')) return null;
+
+    const exact = this.optionStringActions.get(token);
+    if (exact !== undefined) return [exact, token, null];
+
+    if (token.length === 1) return null; // a bare "-" is a value
+
+    const equals = token.indexOf('=');
+    if (equals !== -1) {
+      const optionString = token.slice(0, equals);
+      const action = this.optionStringActions.get(optionString);
+      if (action !== undefined) {
+        return [action, optionString, token.slice(equals + 1)];
+      }
+    }
+
+    const tuples = this._getOptionTuples(token);
+    if (tuples.length > 1) {
+      const names = tuples.map(([, option]) => option).join(', ');
+      this.error(`ambiguous option: ${token} could match ${names}`);
+    }
+    if (tuples.length === 1) return tuples[0];
+
+    // No negative-number-like options are declared, so numbers are values.
+    if (NEGATIVE_NUMBER_RE.test(token)) return null;
+    if (token.includes(' ')) return null;
+
+    return [null, token, null]; // an unknown option
+  }
+
+  // -------------------------------------------------------------------------
+  // Parsing
+  // -------------------------------------------------------------------------
+
+  parseKnownArgs(argv) {
+    const namespace = {};
+    for (const action of this.actions) {
+      if (!action.isHelp) namespace[action.dest] = null;
+    }
+
+    const extras = [];
+    const seen = new Set();
+    let doubleDashSeen = false;
+    let i = 0;
+
+    while (i < argv.length) {
+      const token = argv[i];
+
+      if (doubleDashSeen) {
+        extras.push(token);
+        i++;
+        continue;
+      }
+      if (token === '--') {
+        // Everything after this is positional. With no positionals declared the
+        // separator itself also survives into the leftovers.
+        doubleDashSeen = true;
+        extras.push(token);
+        i++;
+        continue;
+      }
+
+      const parsed = this._parseOptional(token);
+      if (parsed === null) {
+        extras.push(token);
+        i++;
+        continue;
+      }
+
+      const [action, optionString, explicitArg] = parsed;
+      if (action === null) {
+        extras.push(token);
+        i++;
+        continue;
+      }
+      i++;
+
+      if (action.isHelp) {
+        this.printHelp();
+        process.exit(0);
+      }
+
+      let value;
+      if (explicitArg !== null) {
+        value = explicitArg;
+      } else {
+        const next = i < argv.length ? argv[i] : undefined;
+        if (next === undefined || next === '--' || this._parseOptional(next) !== null) {
+          this.error(`argument ${optionString}: expected one argument`);
+        }
+        value = next;
+        i++;
+      }
+
+      namespace[action.dest] = action.type(value);
+      seen.add(action);
+    }
+
+    // Required options are reported before unrecognized leftovers.
+    const missing = this.actions.filter((action) => action.required && !seen.has(action));
+    if (missing.length > 0) {
+      this.error(
+        `the following arguments are required: ${missing.map((a) => a.name).join(', ')}`,
+      );
+    }
+
+    return [namespace, extras];
+  }
+
+  parseArgs(argv = process.argv.slice(2)) {
+    const [namespace, extras] = this.parseKnownArgs(argv);
+    if (extras.length > 0) {
+      this.error(`unrecognized arguments: ${extras.join(' ')}`);
+    }
+    return namespace;
+  }
+
+  // -------------------------------------------------------------------------
+  // Help and errors
+  // -------------------------------------------------------------------------
+
+  formatUsage() {
+    const parts = this.actions.map((action) =>
+      action.required ? action.formatUsage() : `[${action.formatUsage()}]`,
+    );
+    return `usage: ${[this.prog, ...parts].join(' ')}\n`;
+  }
+
+  formatHelp() {
+    const width = terminalWidth();
+    const invocations = this.actions.map((action) => action.formatInvocation());
+    // argparse: action_max_length is the widest invocation plus its indent.
+    const actionMaxLength = Math.max(...invocations.map((text) => text.length + 2));
+    const helpPosition = Math.min(actionMaxLength + 2, 24);
+    const helpWidth = Math.max(width - helpPosition, 11);
+    const actionWidth = helpPosition - 4;
+
+    let out = `${this.formatUsage()}\noptions:\n`;
+    for (const [index, action] of this.actions.entries()) {
+      const header = invocations[index];
+      const lines = wrap(action.help, helpWidth);
+      if (lines.length === 0) {
+        out += `  ${header}\n`;
+        continue;
+      }
+      if (header.length <= actionWidth) {
+        out += `  ${header.padEnd(actionWidth)}  ${lines[0]}\n`;
+      } else {
+        out += `  ${header}\n`;
+        out += `${' '.repeat(helpPosition)}${lines[0]}\n`;
+      }
+      for (const line of lines.slice(1)) {
+        out += `${' '.repeat(helpPosition)}${line}\n`;
+      }
+    }
+    return out;
+  }
+
+  printHelp() {
+    process.stdout.write(this.formatHelp());
+  }
+
+  /** argparse's `error()`: usage plus message on stderr, then exit status 2. */
+  error(message) {
+    process.stderr.write(this.formatUsage());
+    process.stderr.write(`${this.prog}: error: ${message}\n`);
+    process.exit(2);
+  }
+}
+--- /output/lib/dictutils.mjs ---
+// boltons.dictutils -- the immutable mapping.
+//
+// Behaviour reproduced from the reference program: printing a FrozenDict yields
+// `FrozenDict(` + the plain dict repr + `)`, e.g.
+//   FrozenDict({'helloWorld': 'hello_world', 'foo_bar': 'foo_bar'})
+// Empty input therefore prints `FrozenDict({})`.
+//
+// The real FrozenDict rejects every mutating operation with a TypeError naming
+// the class, so the same guard is kept here even though this port never trips it.
+
+import { PyDict } from './pydict.mjs';
+
+export class FrozenDict extends PyDict {
+  __repr__() {
+    return `${this.constructor.name}(${this.reprBody()})`;
+  }
+
+  set() {
+    this._raiseFrozenTypeError();
+  }
+
+  _raiseFrozenTypeError() {
+    throw new TypeError(`${this.constructor.name} object is immutable`);
+  }
+}
+--- /output/lib/pydict.mjs ---
+// An insertion-ordered mapping with Python `dict` semantics.
+//
+// A JS `Map` already matches Python's dict on the two points that matter for
+// output: iteration follows first-insertion order, and re-assigning an existing
+// key updates the value *in place* without moving it. So `dict(zip(...))` over
+// input with repeats collapses to a shorter dict that keeps the earliest
+// position of each key, exactly as the reference program shows.
+
+import { pyRepr } from './pyrepr.mjs';
+
+export class PyDict {
+  constructor(entries = []) {
+    this._map = new Map();
+    for (const [key, value] of entries) {
+      this._map.set(key, value);
+    }
+  }
+
+  /** Python `dict(zip(keys, values))`: pairs up to the shorter of the two. */
+  static fromZip(keys, values) {
+    const length = Math.min(keys.length, values.length);
+    const entries = [];
+    for (let i = 0; i < length; i++) {
+      entries.push([keys[i], values[i]]);
+    }
+    return new this(entries);
+  }
+
+  /** Python `len(dict)`. */
+  get size() {
+    return this._map.size;
+  }
+
+  /** Python `dict.items()`, as an array of `[key, value]` pairs. */
+  items() {
+    return [...this._map.entries()];
+  }
+
+  /** Python `dict.keys()`. */
+  keys() {
+    return [...this._map.keys()];
+  }
+
+  /** Python `dict.values()`. */
+  values() {
+    return [...this._map.values()];
+  }
+
+  get(key) {
+    return this._map.get(key);
+  }
+
+  has(key) {
+    return this._map.has(key);
+  }
+
+  set(key, value) {
+    this._map.set(key, value);
+    return this;
+  }
+
+  /**
+   * Python dict-comprehension over this mapping: `{f(k): g(v) for k, v in ...}`.
+   * Later collisions overwrite earlier ones, matching Python.
+   */
+  mapEntries(fn, DictClass = PyDict) {
+    return new DictClass(this.items().map(([key, value]) => fn(key, value)));
+  }
+
+  /** The `{...}` part of Python's dict repr. */
+  reprBody() {
+    const inner = this.items()
+      .map(([key, value]) => `${pyRepr(key)}: ${pyRepr(value)}`)
+      .join(', ');
+    return `{${inner}}`;
+  }
+
+  __repr__() {
+    return this.reprBody();
+  }
+}
+--- /output/lib/pyrepr.mjs ---
+// Python `repr()` / `print()` reproduction.
+//
+// CPython's string repr, confirmed against the reference program:
+//   * The quote is `'` unless the text contains `'` and no `"`, in which case
+//     it becomes `"` -- so `q'"r` reprs as `'q\'"r'` but `it's` reprs as `"it's"`.
+//   * `\\`, the active quote, `\t`, `\n` and `\r` get short escapes.
+//   * Anything below U+0020, plus U+007F, becomes `\xXX`.
+//   * Everything else printable (per `str.isprintable()`) is emitted literally,
+//     including astral characters -- U+1F600 stays a literal emoji.
+//   * Remaining unprintables widen by magnitude: `\xXX` below U+0100,
+//     `\uXXXX` below U+10000, `\UXXXXXXXX` above -- hence `\xa0` and `​`.
+
+import { codePoints, isPrintableCodePoint } from './pyunicode.mjs';
+
+function hex(code, width) {
+  return code.toString(16).padStart(width, '0');
+}
+
+/** Python `repr()` of a `str`. */
+export function reprStr(str) {
+  const quote = str.includes("'") && !str.includes('"') ? '"' : "'";
+  let out = quote;
+  for (const cp of codePoints(str)) {
+    const code = cp.codePointAt(0);
+    if (cp === quote || cp === '\\') {
+      out += `\\${cp}`;
+    } else if (cp === '\t') {
+      out += '\\t';
+    } else if (cp === '\n') {
+      out += '\\n';
+    } else if (cp === '\r') {
+      out += '\\r';
+    } else if (code < 0x20 || code === 0x7f) {
+      out += `\\x${hex(code, 2)}`;
+    } else if (code < 0x7f) {
+      out += cp;
+    } else if (isPrintableCodePoint(cp)) {
+      out += cp;
+    } else if (code <= 0xff) {
+      out += `\\x${hex(code, 2)}`;
+    } else if (code <= 0xffff) {
+      out += `\\u${hex(code, 4)}`;
+    } else {
+      out += `\\U${hex(code, 8)}`;
+    }
+  }
+  return out + quote;
+}
+
+/** Python `repr()` of an `int`. */
+export function reprInt(value) {
+  if (!Number.isInteger(value)) {
+    throw new TypeError(`not an integer: ${value}`);
+  }
+  return String(value);
+}
+
+/**
+ * Python `repr()` of any value in the small model this port needs:
+ * `str`, `int`, `list` (a JS array) and objects that provide `__repr__`.
+ */
+export function pyRepr(value) {
+  if (typeof value === 'string') return reprStr(value);
+  if (typeof value === 'number') return reprInt(value);
+  if (Array.isArray(value)) return `[${value.map(pyRepr).join(', ')}]`;
+  if (value !== null && typeof value.__repr__ === 'function') {
+    return value.__repr__();
+  }
+  throw new TypeError(`no repr for ${typeof value}`);
+}
+
+/** Python `str()`: strings pass through untouched, everything else reprs. */
+export function pyStr(value) {
+  if (typeof value === 'string') return value;
+  return pyRepr(value);
+}
+
+/** Python `print(value)`: `str()` the value, terminate with a single newline. */
+export function pyPrint(value) {
+  process.stdout.write(`${pyStr(value)}\n`);
+}
+--- /output/lib/pyunicode.mjs ---
+// Python-level Unicode/text primitives.
+//
+// Everything here was derived from the observed behaviour of the reference
+// program (CPython 3.12 semantics), not from reading CPython source:
+//   * `len()` / iteration count Unicode code points, while JS strings are
+//     sequences of UTF-16 units.
+//   * `str.capitalize()` title-cases the first code point (NOT upper-cases it)
+//     and lower-cases the remainder: U+00DF 'x' -> 'Ssx', U+01F3 'y' -> U+01F2
+//     'y', U+1F80 'q' -> U+1F88 'q'.
+//   * `str.isprintable()` drives `repr()` escaping.
+//   * `str.strip()` uses Python's own whitespace set, which differs from
+//     JS `String.prototype.trim()` at both ends.
+//
+// The source of this module is deliberately pure ASCII: every non-ASCII string
+// is built from numeric code points so the data cannot be silently altered by
+// an editor, a transcoding step, or a copy/paste.
+
+/** Convenience: build a string from a list of code point numbers. */
+function chars(...codes) {
+  return String.fromCodePoint(...codes);
+}
+
+/** Split a string into its Unicode code points (Python iteration order). */
+export function codePoints(str) {
+  return Array.from(str);
+}
+
+/** Python `len(str)`: number of code points. */
+export function pyLen(str) {
+  return codePoints(str).length;
+}
+
+/** Python `str.lower()`. Full mapping, including Greek final-sigma context. */
+export function pyLower(str) {
+  return str.toLowerCase();
+}
+
+/** Python `str.upper()`. Full mapping, so U+00DF -> 'SS'. */
+export function pyUpper(str) {
+  return str.toUpperCase();
+}
+
+// ---------------------------------------------------------------------------
+// Title-case mapping
+// ---------------------------------------------------------------------------
+// For nearly every code point the title form equals the upper form. Where the
+// upper form expands to several code points, the title form is the upper form
+// with everything after the leading code point lower-cased (U+00DF -> 'SS' ->
+// 'Ss'; U+FB00 -> 'FF' -> 'Ff'). Two families break that rule and need
+// explicit data:
+//   1. the Latin digraphs, whose title form is a third, distinct code point;
+//   2. the Greek letters with ypogegrammeni, whose title form keeps the
+//      combining/prosgegrammeni shape instead of expanding to a capital iota.
+// One lone code point also breaks it: U+0149 titles to U+02BC U+004E, but its
+// upper form starts with an uncased modifier letter, so the "lower-case the
+// tail" rule would wrongly yield U+02BC U+006E.
+const TITLE_EXCEPTIONS = new Map();
+
+// Latin digraphs DZ, LJ, NJ and DZ-with-caron. Each is a run of three code
+// points (upper, title, lower) that all title to the middle one.
+for (const upper of [0x01c4, 0x01c7, 0x01ca, 0x01f1]) {
+  const title = chars(upper + 1);
+  TITLE_EXCEPTIONS.set(chars(upper), title);
+  TITLE_EXCEPTIONS.set(chars(upper + 1), title);
+  TITLE_EXCEPTIONS.set(chars(upper + 2), title);
+}
+
+// U+0149 LATIN SMALL LETTER N PRECEDED BY APOSTROPHE -> U+02BC U+004E.
+TITLE_EXCEPTIONS.set(chars(0x0149), chars(0x02bc, 0x004e));
+
+// The 1F80..1FAF runs: each block of 8 lower-case forms titles to the 8
+// capital-with-prosgegrammeni forms that follow it, which title to themselves.
+for (const base of [0x1f80, 0x1f90, 0x1fa0]) {
+  for (let i = 0; i < 8; i++) {
+    const title = chars(base + 8 + i);
+    TITLE_EXCEPTIONS.set(chars(base + i), title);
+    TITLE_EXCEPTIONS.set(title, title);
+  }
+}
+
+// Greek vowels with ypogegrammeni outside those runs. The title form keeps the
+// combining ypogegrammeni U+0345 (or collapses to the single prosgegrammeni
+// code point) where the upper form would expand to a capital iota U+0399.
+for (const [source, title] of [
+  [[0x1fb2], [0x1fba, 0x0345]],
+  [[0x1fb3], [0x1fbc]],
+  [[0x1fb4], [0x0386, 0x0345]],
+  [[0x1fb7], [0x0391, 0x0342, 0x0345]],
+  [[0x1fbc], [0x1fbc]],
+  [[0x1fc2], [0x1fca, 0x0345]],
+  [[0x1fc3], [0x1fcc]],
+  [[0x1fc4], [0x0389, 0x0345]],
+  [[0x1fc7], [0x0397, 0x0342, 0x0345]],
+  [[0x1fcc], [0x1fcc]],
+  [[0x1ff2], [0x1ffa, 0x0345]],
+  [[0x1ff3], [0x1ffc]],
+  [[0x1ff4], [0x038f, 0x0345]],
+  [[0x1ff7], [0x03a9, 0x0342, 0x0345]],
+  [[0x1ffc], [0x1ffc]],
+]) {
+  TITLE_EXCEPTIONS.set(chars(...source), chars(...title));
+}
+
+/** Python's full title mapping for a single code point. */
+export function titleCodePoint(cp) {
+  const known = TITLE_EXCEPTIONS.get(cp);
+  if (known !== undefined) return known;
+  const upper = cp.toUpperCase();
+  const parts = codePoints(upper);
+  if (parts.length <= 1) return upper;
+  return parts[0] + parts.slice(1).join('').toLowerCase();
+}
+
+/** Python `str.capitalize()`. */
+export function pyCapitalize(str) {
+  const cps = codePoints(str);
+  if (cps.length === 0) return '';
+  return titleCodePoint(cps[0]) + cps.slice(1).join('').toLowerCase();
+}
+
+const CASED_RE = /\p{Cased}/u;
+
+/** Python `str.title()`: title-case the head of every run of cased characters. */
+export function pyTitle(str) {
+  let out = '';
+  let previousIsCased = false;
+  for (const cp of codePoints(str)) {
+    out += previousIsCased ? cp.toLowerCase() : titleCodePoint(cp);
+    previousIsCased = CASED_RE.test(cp);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// str.isprintable()
+// ---------------------------------------------------------------------------
+// Python treats the separator and "other" categories as unprintable, with the
+// plain space U+0020 carved out as an explicit exception. `\p{Cn}` (unassigned)
+// is part of that set, which is why unassigned code points also escape.
+const UNPRINTABLE_RE = /^[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]$/u;
+
+/** Python `str.isprintable()` for a single code point. */
+export function isPrintableCodePoint(cp) {
+  if (cp === ' ') return true;
+  return !UNPRINTABLE_RE.test(cp);
+}
+
+// ---------------------------------------------------------------------------
+// str.strip()
+// ---------------------------------------------------------------------------
+// Python's whitespace set: \t\n\v\f\r, the file/group/record/unit separators
+// U+001C..U+001F, space, NEL, NBSP and the Unicode space separators. Notably it
+// does NOT include U+FEFF (which JS `trim()` strips) and DOES include
+// U+001C..U+001F and U+0085 (which JS `trim()` keeps).
+const PY_WHITESPACE = new Set(
+  [
+    0x09, 0x0a, 0x0b, 0x0c, 0x0d, // tab, newline, vtab, formfeed, return
+    0x1c, 0x1d, 0x1e, 0x1f, // file/group/record/unit separators
+    0x20, // space
+    0x85, // NEL
+    0xa0, // NBSP
+    0x1680, // OGHAM SPACE MARK
+    0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005,
+    0x2006, 0x2007, 0x2008, 0x2009, 0x200a,
+    0x2028, // LINE SEPARATOR
+    0x2029, // PARAGRAPH SEPARATOR
+    0x202f, // NARROW NO-BREAK SPACE
+    0x205f, // MEDIUM MATHEMATICAL SPACE
+    0x3000, // IDEOGRAPHIC SPACE
+  ].map((cp) => chars(cp)),
+);
+
+/** Python `str.strip()` with no argument. */
+export function pyStrip(str) {
+  const cps = codePoints(str);
+  let start = 0;
+  let end = cps.length;
+  while (start < end && PY_WHITESPACE.has(cps[start])) start++;
+  while (end > start && PY_WHITESPACE.has(cps[end - 1])) end--;
+  return cps.slice(start, end).join('');
+}
+
+/**
+ * Python `str.split(sep)` for a non-empty separator. JS `String.split` already
+ * agrees for this case (both keep empty leading/trailing fields), so this is a
+ * named alias that documents the intent at the call sites.
+ */
+export function pySplit(str, sep) {
+  if (sep === '') throw new Error('empty separator');
+  return str.split(sep);
+}
+
+/** Python `str.replace(old, new)`: replaces every occurrence, not just the first. */
+export function pyReplace(str, oldSub, newSub) {
+  return str.split(oldSub).join(newSub);
+}
+--- /output/lib/strutils.mjs ---
+// boltons.strutils -- the string helpers this program uses.
+//
+// Reverse-engineered from the reference program's observable behaviour. The
+// non-obvious findings, each confirmed against the executable:
+//
+//   camel2under  Inserts `_` before an ASCII capital that either follows an
+//                ASCII lower-case letter or digit, or precedes an ASCII
+//                lower-case letter (and is not at position 0), then lower-cases
+//                everything. The character classes are ASCII-only, so
+//                'hello,World' -> 'hello _world' keeps the space and gains an
+//                underscore, while accented text is merely lower-cased:
+//                U+00F4 + 'W' + U+00F6 never splits.
+//                  'ABCDef' -> 'abc_def'   'x1Y2z' -> 'x1_y2z'
+//                  'HTTPServer' -> 'http_server'   'aB' -> 'a_b'
+//
+//   under2camel  Splits on `_` and capitalizes each piece, so it destroys any
+//                existing capitals: 'helloWorld' -> 'Helloworld'. An empty
+//                piece contributes a literal `_`, which is why '' -> '_' and
+//                'a__b' -> 'A_B'.
+//
+//   slugify      Splits on runs of ASCII punctuation and ASCII whitespace,
+//                drops the empty pieces, rejoins with `_` and lower-cases.
+//                Backslash is NOT a separator (the reference keeps 'e\\f'
+//                intact) and non-ASCII spaces are not separators either
+//                (U+00A0 survives inside a slug).
+//
+//   unit_len     `'<count> <cardinalize(noun, count)>'`, e.g. '3 strings'.
+
+import {
+  codePoints,
+  pyLower,
+  pyCapitalize,
+  pyStrip,
+  pyTitle,
+  pyUpper,
+} from './pyunicode.mjs';
+
+// Matches the capital that needs an underscore in front of it. Both branches
+// use ASCII-only classes, exactly like the reference implementation's pattern.
+const CAMEL_BOUNDARY_RE = /((?<=[a-z0-9])[A-Z]|(?!^)[A-Z](?=[a-z]))/gu;
+
+/** boltons `camel2under`: 'CamelCase' -> 'camel_case'. */
+export function camel2under(camelString) {
+  return pyLower(camelString.replace(CAMEL_BOUNDARY_RE, '_$1'));
+}
+
+/** boltons `under2camel`: 'under_score' -> 'UnderScore'. */
+export function under2camel(underString) {
+  return underString
+    .split('_')
+    .map((word) => pyCapitalize(word) || '_')
+    .join('');
+}
+
+// ASCII punctuation plus ASCII whitespace -- the separator set for slugify.
+//
+// Backslash is absent on purpose. The reference builds a regex character class
+// by concatenating its punctuation and whitespace strings, and the backslash
+// that precedes `]` in that punctuation run is consumed as an escape for it. The
+// net effect is that `]` is a separator and `\` is not, which the executable
+// confirms: input 'e\\f' slugifies to 'e\\f' rather than splitting.
+const PUNCT_WS = new Set(
+  codePoints('!"#$%&\'()*+,-./:;<=>?@[]^_`{|}~ \t\n\v\f\r'),
+);
+
+/** boltons `split_punct_ws`: split on separator runs, dropping empty pieces. */
+export function splitPunctWs(text) {
+  const parts = [];
+  let current = '';
+  for (const cp of codePoints(text)) {
+    if (PUNCT_WS.has(cp)) {
+      if (current !== '') {
+        parts.push(current);
+        current = '';
+      }
+    } else {
+      current += cp;
+    }
+  }
+  if (current !== '') {
+    parts.push(current);
+  }
+  return parts;
+}
+
+/** boltons `slugify`: 'Test String!' -> 'test_string'. */
+export function slugify(text, delim = '_', lower = true, ascii = false) {
+  if (ascii) {
+    // Not reachable from this program, and the reference's ascii=True path
+    // could not be observed through its public interface, so it is refused
+    // rather than guessed at.
+    throw new Error('slugify(ascii=true) is not supported by this port');
+  }
+  const ret = splitPunctWs(text).join(delim);
+  // The reference computes `lower and ret.lower() or ret`; when ret is empty
+  // both branches are the empty string, so the truthiness dance is harmless.
+  return (lower && pyLower(ret)) || ret;
+}
+
+// Irregular singular/plural pairs. Only 'string' and 'item' are ever pluralized
+// by this program (both take the regular '+s' path), so this table exists for
+// the library's own sake and is not exercised by the port's output.
+const IRREGULAR_SINGULAR_TO_PLURAL = new Map([
+  ['person', 'people'],
+  ['man', 'men'],
+  ['woman', 'women'],
+  ['child', 'children'],
+  ['foot', 'feet'],
+  ['tooth', 'teeth'],
+  ['goose', 'geese'],
+  ['mouse', 'mice'],
+  ['louse', 'lice'],
+  ['ox', 'oxen'],
+  ['die', 'dice'],
+  ['datum', 'data'],
+  ['medium', 'media'],
+  ['index', 'indices'],
+  ['matrix', 'matrices'],
+  ['vertex', 'vertices'],
+  ['appendix', 'appendices'],
+  ['analysis', 'analyses'],
+  ['basis', 'bases'],
+  ['crisis', 'crises'],
+  ['thesis', 'theses'],
+  ['diagnosis', 'diagnoses'],
+  ['phenomenon', 'phenomena'],
+  ['criterion', 'criteria'],
+  ['cactus', 'cacti'],
+  ['focus', 'foci'],
+  ['fungus', 'fungi'],
+  ['nucleus', 'nuclei'],
+  ['radius', 'radii'],
+  ['syllabus', 'syllabi'],
+  ['alumnus', 'alumni'],
+  ['knife', 'knives'],
+  ['life', 'lives'],
+  ['wife', 'wives'],
+  ['leaf', 'leaves'],
+  ['half', 'halves'],
+  ['wolf', 'wolves'],
+  ['self', 'selves'],
+  ['shelf', 'shelves'],
+  ['thief', 'thieves'],
+  ['loaf', 'loaves'],
+  ['potato', 'potatoes'],
+  ['tomato', 'tomatoes'],
+  ['hero', 'heroes'],
+  ['echo', 'echoes'],
+  ['volcano', 'volcanoes'],
+  ['quiz', 'quizzes'],
+  ['series', 'series'],
+  ['species', 'species'],
+  ['sheep', 'sheep'],
+  ['fish', 'fish'],
+  ['deer', 'deer'],
+  ['moose', 'moose'],
+  ['aircraft', 'aircraft'],
+]);
+
+const IRREGULAR_PLURAL_TO_SINGULAR = new Map(
+  [...IRREGULAR_SINGULAR_TO_PLURAL].map(([singular, plural]) => [plural, singular]),
+);
+
+/** Carry the casing pattern of `master` over to `disciple`. */
+function matchCase(master, disciple) {
+  if (pyStrip(master) === '') return disciple;
+  if (pyLower(master) === master) return pyLower(disciple);
+  if (pyUpper(master) === master) return pyUpper(disciple);
+  if (pyTitle(master) === master) return pyTitle(disciple);
+  return disciple;
+}
+
+/** boltons `pluralize`: singular -> plural, preserving the casing pattern. */
+export function pluralize(word) {
+  const original = word;
+  const lowered = pyLower(pyStrip(word));
+  if (lowered === '') return original;
+
+  const irregular = IRREGULAR_SINGULAR_TO_PLURAL.get(lowered);
+  if (irregular !== undefined) return matchCase(original, irregular);
+
+  if (lowered.endsWith('y') && !'aeiou'.includes(lowered.slice(-2, -1))) {
+    return matchCase(original, `${lowered.slice(0, -1)}ies`);
+  }
+  if (
+    lowered.endsWith('s') ||
+    lowered.endsWith('x') ||
+    lowered.endsWith('z') ||
+    lowered.endsWith('ch') ||
+    lowered.endsWith('sh')
+  ) {
+    return matchCase(original, `${lowered}es`);
+  }
+  return matchCase(original, `${lowered}s`);
+}
+
+/** boltons `singularize`: plural -> singular, preserving the casing pattern. */
+export function singularize(word) {
+  const original = word;
+  const lowered = pyLower(pyStrip(word));
+  if (lowered === '') return original;
+
+  const irregular = IRREGULAR_PLURAL_TO_SINGULAR.get(lowered);
+  if (irregular !== undefined) return matchCase(original, irregular);
+
+  if (lowered.endsWith('ies') && lowered.length > 4) {
+    return matchCase(original, `${lowered.slice(0, -3)}y`);
+  }
+  if (lowered.endsWith('es') && lowered.length > 3) {
+    return matchCase(original, lowered.slice(0, -2));
+  }
+  if (lowered.endsWith('s') && !lowered.endsWith('ss') && lowered.length > 2) {
+    return matchCase(original, lowered.slice(0, -1));
+  }
+  return original;
+}
+
+/** boltons `cardinalize`: pluralize `unitNoun` unless there is exactly one. */
+export function cardinalize(unitNoun, count) {
+  if (count !== 1) return pluralize(unitNoun);
+  return unitNoun;
+}
+
+/** boltons `unit_len`: '3 strings' / '1 item'. */
+export function unitLen(sizedIterable, unitNoun = 'item') {
+  const count = sizedIterable.length;
+  if (typeof count !== 'number') return null;
+  return `${count} ${cardinalize(unitNoun, count)}`;
+}

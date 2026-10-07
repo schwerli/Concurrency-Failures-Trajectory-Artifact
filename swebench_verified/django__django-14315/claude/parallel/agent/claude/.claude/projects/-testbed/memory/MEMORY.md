@@ -1,0 +1,1 @@
+- [Django testbed test runner](django-testbed-test-runner.md) — use /opt/miniconda3/envs/testbed/bin/python; default python can't import django

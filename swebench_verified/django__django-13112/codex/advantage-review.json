@@ -1,0 +1,130 @@
+{
+  "schema_version": 2,
+  "phase": "fixed",
+  "pair_id": "swebench_verified/django__django-13112/codex",
+  "task": {
+    "plain_summary_zh": "修复 Django 3.1b1 中混合大小写应用名下的关系字段迁移问题，用户的 DJ_RegLogin 应用在 migrate/makemigrations 时把关系目标错误写成小写 app_label。",
+    "acceptance_target_zh": "官方测试要求 mixed-case app_label 的 ForeignKey/M2M 关系在 ProjectState 渲染时能解析，不再报 app 未安装或 lazy reference 指向小写 app_label 的错误。"
+  },
+  "modes": {
+    "parallel": {
+      "solution_passed": true,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 386.556
+    },
+    "serial": {
+      "solution_passed": false,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 191.984
+    }
+  },
+  "reconstruction": {
+    "parallel_strategy_zh": "并行主线程直接检查 Django 迁移状态和关系字段反构造逻辑，修复 ForeignObject.deconstruct() 对带点字符串关系保留 app_label 大小写、只小写模型名，并做本地 py_compile 与复现验证；同时派生子线程调查混合大小写 app_label 的其他迁移解析路径。",
+    "serial_strategy_zh": "串行线程先因 /workspace 无源码而把任务偏向诊断，随后在 /testbed 中阅读 Django 源码和历史，识别出 app_label 被小写化的原因，但最终只给出使用小写 app label/AppConfig 的规避建议，没有修改代码、没有提交补丁、没有运行测试。",
+    "realized_parallelism_zh": "并行在 02:16:17 启动 /root/inspect_case_bug，父线程继续诊断、打补丁和验证；02:18:58 的 list_agents 显示父子都在运行，子线程在 02:19:09 成功修改 operations/utils.py 与迁移测试后于 02:19:23 被中断。这个重叠是真实有用工作，但没有直接证明子线程修改造成官方通过。",
+    "parallel_workers": 2,
+    "peak_overlapping_useful_workers": 2
+  },
+  "baseline_audit": {
+    "same_task_and_prompt": true,
+    "serial_run_valid": true,
+    "parallel_run_valid": true,
+    "external_or_harness_issues_zh": []
+  },
+  "decision": "exclude",
+  "exclusion_code": "ordinary_implementation_variance",
+  "decision_reason_zh": "并行确实通过且串行没有通过，但可测的官方通过主要由父线程单独完成的 ForeignObject.deconstruct() 修复解释；子线程虽然并发落地了 operations/utils.py 和额外测试，但官方评测只注入并运行 migrations.test_state 的 mixed-case 测试，现有证据不能把子线程贡献与官方质量提升建立因果链。因此这是并行单路径实现优于串行诊断空补丁的差异，而不是可保留的并发优势。",
+  "advantage": null,
+  "new_pattern_candidate": {
+    "is_candidate": false,
+    "name_zh": null,
+    "mechanism_zh": null,
+    "why_existing_dimensions_fail_zh": null
+  },
+  "evidence": {
+    "parallel": [
+      {
+        "path": "parallel/cell/status.json",
+        "line": 135,
+        "summary_zh": "协议记录了并行子活动、子路径和 spawn 调用，说明并行模式实际启用。"
+      },
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/13/rollout-2026-08-13T02-16-01-019ff8e7-b0a2-77e0-8b54-f2fbfb2aea44.jsonl",
+        "line": 33,
+        "summary_zh": "父线程在 02:16:17 启动 /root/inspect_case_bug 子线程。"
+      },
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/13/rollout-2026-08-13T02-16-01-019ff8e7-b0a2-77e0-8b54-f2fbfb2aea44.jsonl",
+        "line": 201,
+        "summary_zh": "list_agents 显示父线程和 inspect_case_bug 子线程同时处于 running。"
+      },
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/13/rollout-2026-08-13T02-16-17-019ff8e7-f053-7073-8ea8-48499a0d7b6a.jsonl",
+        "line": 241,
+        "summary_zh": "子线程成功应用 operations/utils.py、test_state.py、test_operations.py 的补丁。"
+      },
+      {
+        "path": "parallel/cell/model.patch",
+        "line": 15,
+        "summary_zh": "最终补丁包含父线程主张的 ForeignObject.deconstruct() mixed-case app_label 修复。"
+      }
+    ],
+    "serial": [
+      {
+        "path": "serial/cell/status.json",
+        "line": 126,
+        "summary_zh": "串行协议记录无子活动、无子路径，multi-agent 版本为 disabled。"
+      },
+      {
+        "path": "serial/cell/status.json",
+        "line": 240,
+        "summary_zh": "串行尝试的 patch_bytes 为 0，说明没有提交代码补丁。"
+      },
+      {
+        "path": "serial/cell/evaluation/official-run/predictions.jsonl",
+        "line": 1,
+        "summary_zh": "串行官方预测文件中的 model_patch 为空字符串。"
+      },
+      {
+        "path": "serial/cell/final.txt",
+        "line": 1,
+        "summary_zh": "串行最终回答给出 app_label 规避建议，而不是修复 Django 源码。"
+      }
+    ],
+    "evaluator": [
+      {
+        "path": "parallel/cell/evaluation/official-run/logs/run_evaluation/formal-codex-parallel-django__django-13112/uiuc-codex-parallel/django__django-13112/eval.sh",
+        "line": 18,
+        "summary_zh": "官方评测重置 test_state.py 后注入自己的 mixed-case app_label 测试。"
+      },
+      {
+        "path": "parallel/cell/evaluation/official-run/logs/run_evaluation/formal-codex-parallel-django__django-13112/uiuc-codex-parallel/django__django-13112/eval.sh",
+        "line": 61,
+        "summary_zh": "官方评测运行的是 migrations.test_state 测试目标。"
+      },
+      {
+        "path": "parallel/cell/evaluation/official-run/logs/run_evaluation/formal-codex-parallel-django__django-13112/uiuc-codex-parallel/django__django-13112/test_output.txt",
+        "line": 474,
+        "summary_zh": "官方注入的 test_reference_mixed_case_app_label 通过。"
+      },
+      {
+        "path": "parallel/cell/evaluation/official-run/logs/run_evaluation/formal-codex-parallel-django__django-13112/uiuc-codex-parallel/django__django-13112/report.json",
+        "line": 6,
+        "summary_zh": "官方报告标记并行实例 resolved 为 true。"
+      },
+      {
+        "path": "serial/cell/evaluation/summary.json",
+        "line": 40,
+        "summary_zh": "串行评测记录 patch_exists 为 false，质量失败来自空补丁而非评测崩溃。"
+      }
+    ]
+  },
+  "case_narrative_zh": "这个任务要求修复 Django 在混合大小写 app_label 下迁移关系目标被错误小写化的问题。并行运行中，父线程很快定位到 ForeignObject.deconstruct() 对带点字符串关系直接 lower() 的行为，提交 related.py 修复并验证；同时子线程独立调查并在重叠时间内修改 operations/utils.py 和一些迁移测试。串行运行只有一个模型上下文，虽然读到相关源码并理解 app_label 被小写化的症状，但最终没有修改文件，只给出使用小写 app_label 的规避建议，因此官方评测为空补丁失败。基线本身有效，且并行确有真实并发；但官方评测脚本重置 test_state.py、注入自己的 StateTests.test_reference_mixed_case_app_label，并只运行 migrations.test_state。已观察到的官方通过与父线程的 related.py 修复直接相连，而子线程落地的 operations/utils/test_operations 贡献没有被证明解释这个可测质量提升。由于缺少并发工作到收益的因果链，本例按普通实现差异排除，不编码为互补工作、多路尝试或独立校验优势。",
+  "confidence": "high"
+}

@@ -1,0 +1,100 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index d5aa968400..adc5fc747c 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -144,6 +144,10 @@ class ForwardManyToOneDescriptor:
+         # we must manage the reverse relation cache manually.
+         if not remote_field.multiple:
+             for rel_obj in queryset:
++                # If the related object has been prefetched, don't overwrite
++                # the cached value.
++                if remote_field.is_cached(rel_obj):
++                    continue
+                 instance = instances_dict[rel_obj_attr(rel_obj)]
+                 remote_field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.field.get_cache_name(), False
+@@ -376,6 +380,10 @@ class ReverseOneToOneDescriptor:
+         # Since we're going to assign directly in the cache,
+         # we must manage the reverse relation cache manually.
+         for rel_obj in queryset:
++            # If the related object has been prefetched, don't overwrite
++            # the cached value.
++            if self.related.field.is_cached(rel_obj):
++                continue
+             instance = instances_dict[rel_obj_attr(rel_obj)]
+             self.related.field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.related.get_cache_name(), False
+@@ -646,6 +654,10 @@ def create_reverse_many_to_one_manager(superclass, rel):
+             # Since we just bypassed this class' get_queryset(), we must manage
+             # the reverse relation manually.
+             for rel_obj in queryset:
++                # If the related object has been prefetched, don't overwrite
++                # the cached value.
++                if self.field.is_cached(rel_obj):
++                    continue
+                 instance = instances_dict[rel_obj_attr(rel_obj)]
+                 setattr(rel_obj, self.field.name, instance)
+             cache_name = self.field.remote_field.get_cache_name()
+diff --git a/tests/defer_regress/tests.py b/tests/defer_regress/tests.py
+index ccd6556c80..64fcdd047c 100644
+--- a/tests/defer_regress/tests.py
++++ b/tests/defer_regress/tests.py
+@@ -217,6 +217,58 @@ class DeferRegressionTest(TestCase):
+         qs = SpecialFeature.objects.only('feature__item__name').select_related('feature__item')
+         self.assertEqual(len(qs), 1)
+ 
++    def test_prefetch_related_only_back_to_parent_one_to_one(self):
++        """
++        Following a prefetch back to the parent object must use the inner
++        queryset's instance, not the deferred parent instance.
++        """
++        item = Item.objects.create(name="first", value=42)
++        OneToOneItem.objects.create(item=item, name="one-to-one")
++        queryset = Item.objects.only("name").prefetch_related(
++            models.Prefetch(
++                "one_to_one_item",
++                queryset=OneToOneItem.objects.prefetch_related(
++                    models.Prefetch("item", queryset=Item.objects.only("value")),
++                ),
++            ),
++        )
++        with self.assertNumQueries(3):
++            item = queryset.get()
++        with self.assertNumQueries(0):
++            self.assertEqual(item.one_to_one_item.item.value, 42)
++
++    def test_prefetch_related_only_back_to_parent_foreign_key(self):
++        item = Item.objects.create(name="first", value=42)
++        RelatedItem.objects.create(item=item)
++        queryset = Item.objects.only("name").prefetch_related(
++            models.Prefetch(
++                "relateditem_set",
++                queryset=RelatedItem.objects.prefetch_related(
++                    models.Prefetch("item", queryset=Item.objects.only("value")),
++                ),
++            ),
++        )
++        with self.assertNumQueries(3):
++            item = queryset.get()
++        with self.assertNumQueries(0):
++            self.assertEqual(item.relateditem_set.all()[0].item.value, 42)
++
++    def test_prefetch_related_only_forward_to_parent(self):
++        item = Item.objects.create(name="first", value=42)
++        OneToOneItem.objects.create(item=item, name="one-to-one")
++        queryset = OneToOneItem.objects.only("item").prefetch_related(
++            models.Prefetch(
++                "item",
++                queryset=Item.objects.only("value").prefetch_related(
++                    "one_to_one_item"
++                ),
++            ),
++        )
++        with self.assertNumQueries(3):
++            one_to_one = queryset.get()
++        with self.assertNumQueries(0):
++            self.assertEqual(one_to_one.item.one_to_one_item.name, "one-to-one")
++
+ 
+ class DeferAnnotateSelectRelatedTest(TestCase):
+     def test_defer_annotate_select_related(self):

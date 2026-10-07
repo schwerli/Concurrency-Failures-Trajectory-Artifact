@@ -1,0 +1,168 @@
+2026-08-15 09:58:09,407 - INFO - Creating container for sphinx-doc__sphinx-7748...
+2026-08-15 09:58:09,635 - INFO - Container for sphinx-doc__sphinx-7748 created: ab2280418bff6f83b553a07d6f171930b2308db0cc4b2ad05deaf65beb400ea4
+2026-08-15 09:58:09,997 - INFO - Container for sphinx-doc__sphinx-7748 started: ab2280418bff6f83b553a07d6f171930b2308db0cc4b2ad05deaf65beb400ea4
+2026-08-15 09:58:09,997 - INFO - Intermediate patch for sphinx-doc__sphinx-7748 written to logs/run_evaluation/formal-kimi-serial-sphinx-doc__sphinx-7748/uiuc-kimi-serial/sphinx-doc__sphinx-7748/patch.diff, now applying to container...
+2026-08-15 09:58:10,107 - INFO - >>>>> Applied Patch:
+Checking patch CHANGES...
+Checking patch sphinx/ext/autodoc/__init__.py...
+Applied patch CHANGES cleanly.
+Applied patch sphinx/ext/autodoc/__init__.py cleanly.
+
+2026-08-15 09:58:10,361 - INFO - Git diff before:
+diff --git a/CHANGES b/CHANGES
+index 6c2761c53..147737902 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -46,6 +46,8 @@ Features added
+   ``:meta public:`` in info-field-list
+ * #7487: autodoc: Allow to generate docs for singledispatch functions by
+   py:autofunction
++* #4826: autodoc: Support signatures of overloaded functions and methods in
++  docstring when :confval:`autodoc_docstring_signature` is enabled
+ * #7143: autodoc: Support final classes and methods
+ * #7384: autodoc: Support signatures defined by ``__new__()``, metaclasses and
+   builtin base classes
+diff --git a/sphinx/ext/autodoc/__init__.py b/sphinx/ext/autodoc/__init__.py
+index f8e4be999..588d29ddc 100644
+--- a/sphinx/ext/autodoc/__init__.py
++++ b/sphinx/ext/autodoc/__init__.py
+@@ -1044,6 +1044,7 @@ class DocstringSignatureMixin:
+                           RemovedInSphinx40Warning, stacklevel=2)
+         docstrings = self.get_doc()
+         self._new_docstrings = docstrings[:]
++        self._signatures = []  # type: List[str]
+         result = None
+         for i, doclines in enumerate(docstrings):
+             # no lines in docstring, no match
+@@ -1062,9 +1063,30 @@ class DocstringSignatureMixin:
+                     valid_names.extend(cls.__name__ for cls in self.object.__mro__)
+             if base not in valid_names:
+                 continue
++
++            # collect the signatures of the overloads following the first one
++            signatures = [(args, retann)]  # type: List[Tuple[str, str]]
++            for line in doclines[1:]:
++                match = py_ext_sig_re.match(line)
++                if match:
++                    exmod, path, base, _args, _retann = match.groups()
++                    if base in valid_names:
++                        signatures.append((_args, _retann))
++                        continue
++                break
++
++            # the first signature is used as the primary signature, and the
++            # remaining ones are rendered as additional signature lines
++            args, retann = signatures[0]
++            for _args, _retann in signatures[1:]:
++                sig = "(%s)" % _args if _args is not None else ''
++                if _retann:
++                    sig += " -> %s" % _retann
++                self._signatures.append(sig)
++
+             # re-prepare docstring to ignore more leading indentation
+             tab_width = self.directive.state.document.settings.tab_width  # type: ignore
+-            self._new_docstrings[i] = prepare_docstring('\n'.join(doclines[1:]),
++            self._new_docstrings[i] = prepare_docstring('\n'.join(doclines[len(signatures):]),
+                                                         tabsize=tab_width)
+             result = args, retann
+             # don't look any further
+@@ -1088,7 +1110,14 @@ class DocstringSignatureMixin:
+             result = self._find_signature()
+             if result is not None:
+                 self.args, self.retann = result
+-        return super().format_signature(**kwargs)  # type: ignore
++
++        sig = super().format_signature(**kwargs)  # type: ignore
++
++        if getattr(self, '_signatures', None):
++            # append the signatures of the overloaded functions/methods
++            sig = "\n".join([sig] + self._signatures)
++
++        return sig
+ 
+ 
+ class DocstringStripSignatureMixin(DocstringSignatureMixin):
+2026-08-15 09:58:10,362 - INFO - Eval script for sphinx-doc__sphinx-7748 written to logs/run_evaluation/formal-kimi-serial-sphinx-doc__sphinx-7748/uiuc-kimi-serial/sphinx-doc__sphinx-7748/eval.sh; copying to container...
+2026-08-15 09:58:13,997 - INFO - Test runtime: 3.58 seconds
+2026-08-15 09:58:13,997 - INFO - Test output for sphinx-doc__sphinx-7748 written to logs/run_evaluation/formal-kimi-serial-sphinx-doc__sphinx-7748/uiuc-kimi-serial/sphinx-doc__sphinx-7748/test_output.txt
+2026-08-15 09:58:14,061 - INFO - Git diff after:
+diff --git a/CHANGES b/CHANGES
+index 6c2761c53..147737902 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -46,6 +46,8 @@ Features added
+   ``:meta public:`` in info-field-list
+ * #7487: autodoc: Allow to generate docs for singledispatch functions by
+   py:autofunction
++* #4826: autodoc: Support signatures of overloaded functions and methods in
++  docstring when :confval:`autodoc_docstring_signature` is enabled
+ * #7143: autodoc: Support final classes and methods
+ * #7384: autodoc: Support signatures defined by ``__new__()``, metaclasses and
+   builtin base classes
+diff --git a/sphinx/ext/autodoc/__init__.py b/sphinx/ext/autodoc/__init__.py
+index f8e4be999..588d29ddc 100644
+--- a/sphinx/ext/autodoc/__init__.py
++++ b/sphinx/ext/autodoc/__init__.py
+@@ -1044,6 +1044,7 @@ class DocstringSignatureMixin:
+                           RemovedInSphinx40Warning, stacklevel=2)
+         docstrings = self.get_doc()
+         self._new_docstrings = docstrings[:]
++        self._signatures = []  # type: List[str]
+         result = None
+         for i, doclines in enumerate(docstrings):
+             # no lines in docstring, no match
+@@ -1062,9 +1063,30 @@ class DocstringSignatureMixin:
+                     valid_names.extend(cls.__name__ for cls in self.object.__mro__)
+             if base not in valid_names:
+                 continue
++
++            # collect the signatures of the overloads following the first one
++            signatures = [(args, retann)]  # type: List[Tuple[str, str]]
++            for line in doclines[1:]:
++                match = py_ext_sig_re.match(line)
++                if match:
++                    exmod, path, base, _args, _retann = match.groups()
++                    if base in valid_names:
++                        signatures.append((_args, _retann))
++                        continue
++                break
++
++            # the first signature is used as the primary signature, and the
++            # remaining ones are rendered as additional signature lines
++            args, retann = signatures[0]
++            for _args, _retann in signatures[1:]:
++                sig = "(%s)" % _args if _args is not None else ''
++                if _retann:
++                    sig += " -> %s" % _retann
++                self._signatures.append(sig)
++
+             # re-prepare docstring to ignore more leading indentation
+             tab_width = self.directive.state.document.settings.tab_width  # type: ignore
+-            self._new_docstrings[i] = prepare_docstring('\n'.join(doclines[1:]),
++            self._new_docstrings[i] = prepare_docstring('\n'.join(doclines[len(signatures):]),
+                                                         tabsize=tab_width)
+             result = args, retann
+             # don't look any further
+@@ -1088,7 +1110,14 @@ class DocstringSignatureMixin:
+             result = self._find_signature()
+             if result is not None:
+                 self.args, self.retann = result
+-        return super().format_signature(**kwargs)  # type: ignore
++
++        sig = super().format_signature(**kwargs)  # type: ignore
++
++        if getattr(self, '_signatures', None):
++            # append the signatures of the overloaded functions/methods
++            sig = "\n".join([sig] + self._signatures)
++
++        return sig
+ 
+ 
+ class DocstringStripSignatureMixin(DocstringSignatureMixin):
+2026-08-15 09:58:14,061 - INFO - Grading answer for sphinx-doc__sphinx-7748...
+2026-08-15 09:58:14,065 - INFO - report: {'sphinx-doc__sphinx-7748': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': False, 'tests_status': {'FAIL_TO_PASS': {'success': [], 'failure': ['tests/test_ext_autodoc_configs.py::test_autoclass_content_and_docstring_signature_init', 'tests/test_ext_autodoc_configs.py::test_autoclass_content_and_docstring_signature_both']}, 'PASS_TO_PASS': {'success': ['tests/test_ext_autodoc_configs.py::test_autoclass_content_class', 'tests/test_ext_autodoc_configs.py::test_autoclass_content_init', 'tests/test_ext_autodoc_configs.py::test_autoclass_content_both', 'tests/test_ext_autodoc_configs.py::test_autodoc_inherit_docstrings', 'tests/test_ext_autodoc_configs.py::test_autodoc_docstring_signature', 'tests/test_ext_autodoc_configs.py::test_autoclass_content_and_docstring_signature_class', 'tests/test_ext_autodoc_configs.py::test_mocked_module_imports', 'tests/test_ext_autodoc_configs.py::test_autodoc_typehints_signature', 'tests/test_ext_autodoc_configs.py::test_autodoc_typehints_none', 'tests/test_ext_autodoc_configs.py::test_autodoc_typehints_description', 'tests/test_ext_autodoc_configs.py::test_autodoc_default_options', 'tests/test_ext_autodoc_configs.py::test_autodoc_default_options_with_values'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for sphinx-doc__sphinx-7748: resolved: False
+2026-08-15 09:58:14,066 - INFO - Attempting to stop container sweb.eval.sphinx-doc__sphinx-7748.formal-kimi-serial-sphinx-doc__sphinx-7748...
+2026-08-15 09:58:30,358 - INFO - Container sweb.eval.sphinx-doc__sphinx-7748.formal-kimi-serial-sphinx-doc__sphinx-7748 stopped successfully.
+2026-08-15 09:58:30,359 - INFO - Attempting to remove container sweb.eval.sphinx-doc__sphinx-7748.formal-kimi-serial-sphinx-doc__sphinx-7748...
+2026-08-15 09:58:33,259 - INFO - Container sweb.eval.sphinx-doc__sphinx-7748.formal-kimi-serial-sphinx-doc__sphinx-7748 removed successfully.

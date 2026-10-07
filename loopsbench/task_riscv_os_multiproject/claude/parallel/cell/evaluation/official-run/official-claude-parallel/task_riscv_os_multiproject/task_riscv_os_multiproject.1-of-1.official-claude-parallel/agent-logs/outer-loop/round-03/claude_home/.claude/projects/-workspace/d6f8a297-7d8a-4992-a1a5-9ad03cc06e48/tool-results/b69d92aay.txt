@@ -1,0 +1,1064 @@
+     1	/******************************************************************************
+     2	 *
+     3	 * Copyright (C) 2010 - 2019 Xilinx, Inc.  All rights reserved.
+     4	 *
+     5	 * Permission is hereby granted, free of charge, to any person
+     6	 *obtaining a copy of this software and associated documentation
+     7	 *files (the "Software"), to deal in the Software without
+     8	 *restriction, including without limitation the rights to use,
+     9	 *copy, modify, merge, publish, distribute, sublicense, and/or sell
+    10	 * copies of the Software, and to permit persons to whom the
+    11	 *Software is furnished to do so, subject to the following
+    12	 *conditions:
+    13	 *
+    14	 * The above copyright notice and this permission notice shall be
+    15	 *included in all copies or substantial portions of the Software.
+    16	 *
+    17	 * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+    18	 *EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+    19	 *OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+    20	 *NONINFRINGEMENT. IN NO EVENT SHALL XILINX  BE LIABLE FOR ANY
+    21	 *CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+    22	 *CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+    23	 *CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    24	 * SOFTWARE.
+    25	 *
+    26	 * Except as contained in this notice, the name of the Xilinx shall
+    27	 *not be used in advertising or otherwise to promote the sale, use
+    28	 *or other dealings in this Software without prior written
+    29	 *authorization from Xilinx.
+    30	 *
+    31	 ******************************************************************************/
+    32	/****************************************************************************/
+    33	/**
+    34	 *
+    35	 *
+    36	 * Functional guide to example:
+    37	 *
+    38	 * - EmacPsErrorHandler() demonstrates how to manage asynchronous
+    39	 *errors.
+    40	 *
+    41	 * - EmacPsResetDevice() demonstrates how to reset the driver/HW
+    42	 *without loosing all configuration settings.
+    43	 *
+    44	 *
+    45	 * <pre>
+    46	 * MODIFICATION HISTORY:
+    47	 *
+    48	 * Ver   Who  Date     Changes
+    49	 * ----- ---- --------
+    50	 *------------------------------------------------------- 1.00a wsy
+    51	 *01/10/10 First release 1.00a asa  11/25/11 The cache disable
+    52	 *routines are removed. So now both I-cache and D-cache are
+    53	 *enabled. The array RxBuffer is removed to avoid an extra copy
+    54	 *from RxBuffer to RxFrame. Now the address of RxFrame is submitted
+    55	 *to the Rx BD instead of the address of RxBuffer. In function
+    56	 *EmacPsDmaSingleFrameIntrExample, BdRxPtr is made as a pointer
+    57	 *instead of array of pointers. This is done since on the Rx path
+    58	 *we now submit a single BD instead of all 32 BDs. Because of this
+    59	 *change, relevant changes are made throughout the function
+    60	 *		      EmacPsDmaSingleFrameIntrExample.
+    61	 *		      Cache invalidation is now being done for the RxFrame
+    62	 *		      buffer.
+    63	 *		      The unnecessary cache flush (Xil_DCacheFlushRange) is
+    64	 *		      removed. This was being done towards the end of the
+    65	 *		      example which was unnecessary.
+    66	 * 1.00a asa 01/24/12  Support for Zynq board is added. The SLCR
+    67	 *divisors are different for Zynq. Changes are made for the same.
+    68	 * 		      Presently the SLCR GEM clock divisors are hard-coded
+    69	 *		      assuming that IO PLL output frequency is 1000 MHz.
+    70	 * 		      The BDs are allocated at the address 0xFF00000 and
+    71	 *the 1 MB address range starting from this address is made
+    72	 * 		      uncached. This is because, for GEM the BDs need to be
+    73	 * 		      placed in uncached memory. The RX BDs are allocated
+    74	 *at address 0xFF00000 and TX BDs are allocated at address
+    75	 * 		      0xFF10000.
+    76	 * 		      The MDIO divisor used of 224 is used for Zynq board.
+    77	 * 1.01a asa 02/27/12  The hardcoded SLCR divisors for Zynq are
+    78	 *removed. The divisors are obtained from xparameters.h.c. The
+    79	 *sleep values are reduced for Zynq. One sleep is added after MDIO
+    80	 *divisor is set. Some of the prints are removed. 1.01a asa
+    81	 *03/14/12  The SLCR divisor support for ENET1 is added. 1.01a asa
+    82	 *04/15/12  The funcation calls to Xil_DisableMMU and Xil_EnableMMU
+    83	 *		      are removed for setting the translation table
+    84	 *		      attributes for the BD memory region.
+    85	 * 1.05a asa 09/22/13 Cache handling is changed to fix an issue
+    86	 *(CR#663885). The cache invalidation of the Rx frame is now moved
+    87	 *to XEmacPsRecvHandler so that invalidation happens after the
+    88	 *			  received data is available in the memory. The
+    89	 *variable TxFrameLength is now made global. 2.1	srt 07/11/14
+    90	 *Implemented 64-bit changes and modified as per Zynq Ultrascale Mp
+    91	 *GEM specification 3.0  kpc  01/23/14 Removed PEEP board related
+    92	 *code 3.0  hk   03/18/15 Added support for jumbo frames. Add cache
+    93	 *flush after BD terminate entries. 3.2  hk   10/15/15 Added clock
+    94	 *control using CRL_APB_GEM_REF_CTRL register. Enabled 1G speed for
+    95	 *ZynqMP GEM. Select GEM interrupt based on instance present.
+    96	 *                    Manage differences between emulation platform
+    97	 *and silicon. 3.2  mus  20/02/16.Added support for INTC interrupt
+    98	 *controlller. Added support to access zynq emacps interrupt from
+    99	 *                    microblaze.
+   100	 * 3.3 kpc   12/09/16 Fixed issue when -O2 is enabled
+   101	 * 3.4 ms    01/23/17 Modified xil_printf statement in main
+   102	 *function to ensure that "Successfully ran" and "Failed" strings
+   103	 *                   are available in all examples. This is a fix
+   104	 *for CR-965028. 3.5 hk    08/14/17 Dont perform data cache
+   105	 *operations when CCI is enabled on ZynqMP. 3.8 hk    10/01/18 Fix
+   106	 *warning for redefinition of interrupt number. 3.9 hk    02/12/19
+   107	 *Change MDC divisor for Versal emulation. 03/06/19 Fix BD space
+   108	 *assignment and its memory attributes. 03/20/19 Fix alignment
+   109	 *pragmas for IAR compiler.
+   110	 *
+   111	 * </pre>
+   112	 *
+   113	 *****************************************************************************/
+   114	
+   115	#include <os/stdio.h>
+   116	#include "xemacps_example.h"
+   117	#include "xemacps_hw.h"
+   118	#include "xemacps_bdring.h"
+   119	#include "xparameters.h"
+   120	#include "xemacps.h"
+   121	#include <net.h>
+   122	
+   123	#include <os/sched.h>
+   124	#include <assert.h>
+   125	
+   126	/*************************** Constant Definitions
+   127	 * ***************************/
+   128	
+   129	#define RXBD_CNT 32 /* Number of RxBDs to use */
+   130	
+   131	/*
+   132	 * SLCR setting
+   133	 */
+   134	uintptr_t XPS_SYS_CTRL_BASEADDR;
+   135	#define SLCR_LOCK_ADDR (XPS_SYS_CTRL_BASEADDR + 0x4)
+   136	#define SLCR_UNLOCK_ADDR (XPS_SYS_CTRL_BASEADDR + 0x8)
+   137	#define SLCR_GEM0_CLK_CTRL_ADDR (XPS_SYS_CTRL_BASEADDR + 0x140)
+   138	#define SLCR_GEM1_CLK_CTRL_ADDR (XPS_SYS_CTRL_BASEADDR + 0x144)
+   139	
+   140	#define SLCR_LOCK_KEY_VALUE 0x767B
+   141	#define SLCR_UNLOCK_KEY_VALUE 0xDF0D
+   142	#define SLCR_ADDR_GEM_RST_CTRL (XPS_SYS_CTRL_BASEADDR + 0x214)
+   143	
+   144	#define CRL_GEM_DIV_MASK 0x003F3F00
+   145	#define CRL_GEM_1G_DIV0 0x00000C00
+   146	#define CRL_GEM_1G_DIV1 0x00010000
+   147	
+   148	#define JUMBO_FRAME_SIZE 10240
+   149	#define FRAME_HDR_SIZE 18
+   150	
+   151	#define GEMVERSION_VERSAL 0x107
+   152	
+   153	/*************************** Variable Definitions
+   154	 * ***************************/
+   155	
+   156	
+   157	EthernetFrame TxFrame; /* Transmit buffer */
+   158	EthernetFrame RxFrame; /* Receive buffer */
+   159	
+   160	/*
+   161	 * Buffer descriptors are allocated in uncached memory. The memory
+   162	 * is made uncached by setting the attributes appropriately in the
+   163	 * MMU table.
+   164	 */
+   165	#define RXBD_SPACE_BYTES XEmacPs_BdRingMemCalc(XEMACPS_BD_ALIGNMENT, RXBD_CNT)
+   166	#define TXBD_SPACE_BYTES XEmacPs_BdRingMemCalc(XEMACPS_BD_ALIGNMENT, TXBD_CNT)
+   167	
+   168	/*
+   169	 * Buffer descriptors are allocated in uncached memory. The memory
+   170	 * is made uncached by setting the attributes appropriately in the
+   171	 * MMU table. The minimum region for which attribute settings take
+   172	 * effect is 2MB for arm 64 variants(A53) and 1MB for the rest (R5
+   173	 * and A9). Hence the same is allocated, even if not used fully by
+   174	 * this example, to make sure none of the adjacent global memory is
+   175	 * affected.
+   176	 */
+   177	
+   178	u8 bd_space[0x200000] __attribute__((aligned(0x200000)));
+   179	
+   180	
+   181	u8 *RxBdSpacePtr;
+   182	u8 *TxBdSpacePtr;
+   183	
+   184	#define FIRST_FRAGMENT_SIZE 64
+   185	
+   186	/*
+   187	 * Counters to be incremented by callbacks
+   188	 */
+   189	volatile s32 FramesRx;     /* Frames have been received */
+   190	volatile s32 FramesTx;     /* Frames have been sent */
+   191	volatile s32 DeviceErrors; /* Number of errors detected in the device */
+   192	
+   193	u32 TxFrameLength;
+   194	
+   195	XEmacPs_Bd BdTxTerminate __attribute__((aligned(64)));
+   196	XEmacPs_Bd BdRxTerminate __attribute__((aligned(64)));
+   197	
+   198	u32 GemVersion;
+   199	u32 Platform;
+   200	
+   201	XEmacPs_Config xemacps_config;
+   202	
+   203	/*************************** Function Prototypes
+   204	 * ****************************/
+   205	
+   206	/*
+   207	 * Example
+   208	 */
+   209	LONG EmacPsDmaIntrExample(
+   210	    XEmacPs *EmacPsInstancePtr);
+   211	
+   212	LONG EmacPsDmaSingleFrameIntrExample(XEmacPs *EmacPsInstancePtr);
+   213	
+   214	static void XEmacPsSendHandler(void *Callback);
+   215	static void XEmacPsRecvHandler(void *Callback);
+   216	static void XEmacPsErrorHandler(void *Callback, u8 direction, u32 word);
+   217	
+   218	/*
+   219	 * Utility routines
+   220	 */
+   221	static LONG EmacPsResetDevice(XEmacPs *EmacPsInstancePtr);
+   222	void XEmacPsClkSetup(XEmacPs *EmacPsInstancePtr);
+   223	void XEmacPs_SetMdioDivisor(XEmacPs *InstancePtr, XEmacPs_MdcDiv Divisor);
+   224	/****************************************************************************/
+   225	/**
+   226	 *
+   227	 * This is the main function for the EmacPs example. This function
+   228	 *is not included if the example is generated from the TestAppGen
+   229	 *test tool.
+   230	 *
+   231	 * @param	None.
+   232	 *
+   233	 * @return	XST_SUCCESS to indicate success, otherwise XST_FAILURE.
+   234	 *
+   235	 * @note		None.
+   236	 *
+   237	 ****************************************************************************/
+   238	int xemacps_example_main(void)
+   239	{
+   240	    LONG Status;
+   241	
+   242	    xil_printf("Entering into main() \r\n");
+   243	
+   244	    /*
+   245	     * Call the EmacPs DMA interrupt example , specify the
+   246	     * parameters generated in xparameters.h
+   247	     */
+   248	    Status = EmacPsDmaIntrExample(&EmacPsInstance);
+   249	
+   250	    if (Status != XST_SUCCESS) {
+   251	        EmacPsUtilErrorTrap("Emacps intr dma Example Failed\r\n");
+   252	        return XST_FAILURE;
+   253	    }
+   254	
+   255	    xil_printf("Successfully ran Emacps intr dma Example\r\n");
+   256	    return XST_SUCCESS;
+   257	}
+   258	
+   259	XEmacPs_Bd* BdTxPtr;
+   260	XEmacPs_Bd* BdRxPtr;
+   261	
+   262	LONG EmacPsSetupBD(XEmacPs *EmacPsInstancePtr)
+   263	{
+   264	    /* Allocate Rx and Tx BD space each */
+   265	    // TODO:
+   266	    RxBdSpacePtr = &(bd_space[0]);
+   267		TxBdSpacePtr = &(bd_space[0x10000]);
+   268	
+   269	    /*
+   270	     * Setup RxBD space And Create the RxBD ring
+   271	     */
+   272	    BdRxPtr = (XEmacPs_Bd*)RxBdSpacePtr;
+   273	    XEmacPs_Bd* CurPtr = BdRxPtr;
+   274	    for(int i = 0; i < RXBD_CNT; i++){
+   275	        XEmacPs_BdSetRxNew(CurPtr);
+   276	        XEmacPs_BdSetAddressRx(CurPtr, kva2pa((uintptr_t)&rx_buffers[i]));
+   277	        CurPtr++;
+   278	    }
+   279	
+   280	    /*
+   281	     * Setup TxBD space And Create the TxBD ring
+   282	     */
+   283	    BdTxPtr = (XEmacPs_Bd*)TxBdSpacePtr;
+   284	    XEmacPs_BdSetStatus(BdTxPtr, XEMACPS_TXBUF_USED_MASK);
+   285	    XEmacPs_BdSetAddressTx(BdTxPtr, kva2pa((uintptr_t)&tx_buffer));
+   286	    XEmacPs_BdSetLast(BdTxPtr);
+   287	    // At least 2 BDs is needed
+   288	    XEmacPs_BdSetStatus(BdTxPtr + 1, XEMACPS_TXBUF_USED_MASK);
+   289	
+   290	    return XST_SUCCESS;
+   291	}
+   292	
+   293	#define PHY_DETECT_REG1 2
+   294	#define PHY_DETECT_REG2 3
+   295	#define PHY_ID_RTL		0x1c
+   296	
+   297	LONG EmacPsInitPhy(XEmacPs * EmacPsInstancePtr, u32 *Speed)
+   298	{
+   299		LONG Status;
+   300		u16 PhyIdentity;
+   301		u16 PhyIdentity2;
+   302		u32 PhyAddr;
+   303	
+   304		/*
+   305		 * Detect the PHY address
+   306		 */
+   307		PhyAddr = XEmacPsDetectPHY(EmacPsInstancePtr);
+   308	
+   309		if (PhyAddr >= 32) {
+   310			EmacPsUtilErrorTrap("Error detect phy");
+   311			return XST_FAILURE;
+   312		}
+   313	
+   314	    /* phy id is stored in {phy reg 2, phy reg 3}
+   315	     * PYNQ use RTL 8211E
+   316	     */
+   317		if (XEmacPs_PhyRead(EmacPsInstancePtr, PhyAddr, PHY_DETECT_REG1, &PhyIdentity) != XST_SUCCESS) {
+   318			EmacPsUtilErrorTrap("Phy Read Error");
+   319		}
+   320	    if (XEmacPs_PhyRead(EmacPsInstancePtr, PhyAddr, PHY_DETECT_REG2, &PhyIdentity2) != XST_SUCCESS) {
+   321			EmacPsUtilErrorTrap("Phy Read Error");
+   322		}
+   323		xil_printf("phy identity: %x\n\r", ((uint32_t) PhyIdentity << 16) | PhyIdentity2);
+   324	
+   325		if (PhyIdentity == PHY_ID_RTL) {
+   326			Status = EmacPsUtilRtlPhyInit(EmacPsInstancePtr, Speed, PhyAddr);
+   327		} else {
+   328			EmacPsUtilErrorTrap("Unknown phy identity");
+   329		}
+   330	
+   331		if (Status != XST_SUCCESS) {
+   332			EmacPsUtilErrorTrap("Error setup phy loopback");
+   333			return XST_FAILURE;
+   334		}
+   335	
+   336		return XST_SUCCESS;
+   337	}
+   338	
+   339	LONG EmacPsSetupDevice(XEmacPs *EmacPsInstancePtr)
+   340	{
+   341	    LONG Status;
+   342	    XEmacPs_Config *Config = &xemacps_config; 
+   343	
+   344	    /*************************************/
+   345	    /* Setup device for first-time usage */
+   346	    /*************************************/
+   347	
+   348	    Status =
+   349	        XEmacPs_CfgInitialize(EmacPsInstancePtr, Config, Config->BaseAddress);
+   350	
+   351	    if (Status != XST_SUCCESS) {
+   352	        EmacPsUtilErrorTrap("Error in initialize");
+   353	        return XST_FAILURE;
+   354	    } else {
+   355	        xil_printf("XEmacPs_CfgInitialize success! \r\n");
+   356	    }
+   357	
+   358	    GemVersion = ((Xil_In32(Config->BaseAddress + 0xFC)) >> 16) & 0xFFF;
+   359		xil_printf("GemVersion: %x\n\r", GemVersion);
+   360	
+   361		Platform = PLATFORM_VERSALEMU;
+   362	
+   363	    XEmacPsClkSetup(EmacPsInstancePtr);
+   364	    xil_printf("XEmacPsClkSetup success! \r\n");
+   365	
+   366	    XEmacPs_Reset(EmacPsInstancePtr);
+   367	
+   368	    /*
+   369	     * Set the MAC address
+   370	     */
+   371	    Status = XEmacPs_SetMacAddress(EmacPsInstancePtr, EmacPsMAC, 1);
+   372	    if (Status != XST_SUCCESS) {
+   373	        EmacPsUtilErrorTrap("Error setting MAC address");
+   374	        return XST_FAILURE;
+   375	    } else {
+   376	        //char testMacAddr[6]
+   377	        //void XEmacPs_GetMacAddress(EmacPsInstancePtr, , u8 Index)
+   378			xil_printf("MAC address success! \r\n");
+   379		}
+   380	    /*
+   381	     * Setup callbacks
+   382	     */
+   383	    Status = XEmacPs_SetHandler(
+   384	        EmacPsInstancePtr, XEMACPS_HANDLER_DMASEND, (void *)XEmacPsSendHandler,
+   385	        EmacPsInstancePtr);
+   386	    Status |= XEmacPs_SetHandler(
+   387	        EmacPsInstancePtr, XEMACPS_HANDLER_DMARECV, (void *)XEmacPsRecvHandler,
+   388	        EmacPsInstancePtr);
+   389	    Status |= XEmacPs_SetHandler(
+   390	        EmacPsInstancePtr, XEMACPS_HANDLER_ERROR, (void *)XEmacPsErrorHandler,
+   391	        EmacPsInstancePtr);
+   392	    if (Status != XST_SUCCESS) {
+   393	        EmacPsUtilErrorTrap("Error assigning handlers");
+   394	        return XST_FAILURE;
+   395	    } else {
+   396			xil_printf("Assigning handlers success! \r\n");
+   397		}
+   398	
+   399	    return XST_SUCCESS;
+   400	}
+   401	
+   402	LONG EmacPsInit(XEmacPs *EmacPsInstancePtr)
+   403	{
+   404	    LONG status = XST_SUCCESS;
+   405	    status = EmacPsSetupDevice(EmacPsInstancePtr);
+   406	    if (status != XST_SUCCESS) {
+   407	        xil_printf("setup device error!\n\r");
+   408	    }
+   409	
+   410	    status = EmacPsSetupBD(EmacPsInstancePtr);
+   411	    if (status != XST_SUCCESS) {
+   412	        xil_printf("setup BD error!\n\r");
+   413	    }
+   414	
+   415	    /*
+   416	     * Set emacps to phy loopback or init phy for link
+   417	     */
+   418	    if (GemVersion == 2) {
+   419	        XEmacPs_SetMdioDivisor(EmacPsInstancePtr, MDC_DIV_224);
+   420	        EmacpsDelay(1);
+   421	        // NOTE: for convenience you can enter loopback mode to test your code.
+   422	        // EmacPsUtilEnterLocalLoopback(EmacPsInstancePtr);
+   423	        // EmacPsUtilEnterLoopback(EmacPsInstancePtr, EMACPS_LOOPBACK_SPEED_1G);
+   424	        u32 speed = EMACPS_LOOPBACK_SPEED_1G;
+   425	        if (EmacPsInitPhy(EmacPsInstancePtr, &speed) != XST_SUCCESS) {
+   426	            EmacPsUtilErrorTrap("init phy error!\n\r");
+   427	        }
+   428	        XEmacPs_SetOperatingSpeed(EmacPsInstancePtr, EMACPS_LOOPBACK_SPEED_1G);
+   429	    }
+   430	
+   431	    /* clear any existed int status */
+   432		XEmacPs_WriteReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_ISR_OFFSET,
+   433				   XEMACPS_IXR_ALL_MASK);
+   434	
+   435	    /* Enable TX and RX interrupts */
+   436	    /* TODO: 
+   437	     * NOTE: you can use XEmacPs_IntEnable and XEmacPs_IntDisable
+   438	     *       enable these bits: 
+   439	     *          (XEMACPS_IXR_TX_ERR_MASK | XEMACPS_IXR_RX_ERR_MASK |
+   440	     *          (u32)XEMACPS_IXR_FRAMERX_MASK | (u32)XEMACPS_IXR_TXCOMPL_MASK)
+   441	     */
+   442	    
+   443	    return status;
+   444	}
+   445	
+   446	LONG EmacPsSend(XEmacPs *EmacPsInstancePtr, EthernetFrame *TxFrame, size_t length)
+   447	{
+   448	    LONG Status = XST_SUCCESS;
+   449	
+   450	    // Setup TxBD
+   451	    // set length, clear tx used bit
+   452	    XEmacPs_BdSetLength(BdTxPtr, length);
+   453	    XEmacPs_BdClearTxUsed(BdTxPtr);
+   454	
+   455	    // remember to flush dcache
+   456	    Xil_DCacheFlushRange(0, 64);
+   457	
+   458	    // set tx queue base
+   459	    XEmacPs_SetQueuePtr(EmacPsInstancePtr, (UINTPTR)BdTxPtr, 0, XEMACPS_SEND);
+   460	
+   461	    /* Enable transmitter if not already enabled */
+   462		if ((EmacPsInstancePtr->Options & (u32)XEMACPS_TRANSMITTER_ENABLE_OPTION)!=0x00000000U) {
+   463			u32 Reg = XEmacPs_ReadReg(EmacPsInstancePtr->Config.BaseAddress,
+   464						XEMACPS_NWCTRL_OFFSET);
+   465			if ((!(Reg & XEMACPS_NWCTRL_TXEN_MASK))==TRUE) {
+   466				XEmacPs_WriteReg(EmacPsInstancePtr->Config.BaseAddress,
+   467						   XEMACPS_NWCTRL_OFFSET,
+   468					   Reg | (u32)XEMACPS_NWCTRL_TXEN_MASK);
+   469			}
+   470		}
+   471	
+   472		// start transmit
+   473	    XEmacPs_Transmit(EmacPsInstancePtr);
+   474	
+   475	    return Status;
+   476	}
+   477	
+   478	LONG EmacPsWaitSend(XEmacPs *EmacPsInstancePtr)
+   479	{
+   480	    while(!XEmacPs_BdIsTxUsed(BdTxPtr)) {
+   481			Xil_DCacheFlushRange(0, 64);
+   482	    }
+   483	    return XST_SUCCESS;
+   484	}
+   485	
+   486	LONG EmacPsRecv(XEmacPs *EmacPsInstancePtr, EthernetFrame *RxFrame, int num_packet)
+   487	{
+   488	    LONG Status = XST_SUCCESS;
+   489	
+   490	    /* disable receiver */
+   491		if ((EmacPsInstancePtr->Options & XEMACPS_RECEIVER_ENABLE_OPTION) != 0x00000000U) {
+   492			u32 Reg = XEmacPs_ReadReg(EmacPsInstancePtr->Config.BaseAddress,
+   493						XEMACPS_NWCTRL_OFFSET);
+   494			if ((Reg & XEMACPS_NWCTRL_RXEN_MASK)) {
+   495				XEmacPs_WriteReg(EmacPsInstancePtr->Config.BaseAddress,
+   496						   XEMACPS_NWCTRL_OFFSET,
+   497					   Reg & (~(u32)XEMACPS_NWCTRL_RXEN_MASK));
+   498	            XEmacPs_WriteReg(EmacPsInstancePtr->Config.BaseAddress,
+   499						   XEMACPS_RXSR_OFFSET, 0xf);
+   500			}
+   501		}
+   502	    
+   503	    /*
+   504	     * Setup buffer address to associated BD.
+   505	     * Remember to set wrap bit and clear owner bit.
+   506	     */
+   507	    XEmacPs_Bd* CurPtr = BdRxPtr;
+   508	    for(int i = 0; i < num_packet; i++){
+   509	        XEmacPs_BdWrite(CurPtr, XEMACPS_BD_STAT_OFFSET, 0);
+   510	        XEmacPs_BdClearRxNew(CurPtr);
+   511	        XEmacPs_BdClearRxWrap(CurPtr);
+   512	        CurPtr++;
+   513	    }
+   514	    CurPtr--;
+   515	    XEmacPs_BdSetRxWrap((UINTPTR)CurPtr);
+   516	    
+   517	    // flush again!
+   518	    Xil_DCacheFlushRange(0, 64);
+   519	
+   520	    /*
+   521	     * Set the Queue pointers
+   522	     */
+   523	    // TODO: set rx queue base
+   524	    XEmacPs_SetQueuePtr(EmacPsInstancePtr, (UINTPTR)BdRxPtr, 0, XEMACPS_RECV);
+   525	
+   526		/* Enable receiver if not already enabled */
+   527		if ((EmacPsInstancePtr->Options & XEMACPS_RECEIVER_ENABLE_OPTION) != 0x00000000U) {
+   528			u32 Reg = XEmacPs_ReadReg(EmacPsInstancePtr->Config.BaseAddress,
+   529						XEMACPS_NWCTRL_OFFSET);
+   530			if ((!(Reg & XEMACPS_NWCTRL_RXEN_MASK))==TRUE) {
+   531				XEmacPs_WriteReg(EmacPsInstancePtr->Config.BaseAddress,
+   532						   XEMACPS_NWCTRL_OFFSET,
+   533					   Reg | (u32)XEMACPS_NWCTRL_RXEN_MASK);
+   534			}
+   535		}
+   536	
+   537	    return Status;
+   538	}
+   539	
+   540	LONG EmacPsWaitRecv(XEmacPs *EmacPsInstancePtr, int num_packet, u32* RxFrLen)
+   541	{
+   542	    /*
+   543	     * Wait for Rx indication
+   544	     */
+   545	    XEmacPs_Bd* CurPtr = BdRxPtr;
+   546	    for(int i = 0; i < num_packet; i++){
+   547	        while(!XEmacPs_BdIsRxNew(CurPtr)) {
+   548	            Xil_DCacheFlushRange(0, 64);
+   549	        }
+   550	        *(RxFrLen + i) = XEmacPs_BdGetLength(CurPtr);
+   551	        CurPtr++;
+   552	    }
+   553	
+   554	    return XST_SUCCESS;
+   555	}
+   556	
+   557	/****************************************************************************/
+   558	/**
+   559	 *
+   560	 * This function demonstrates the usage of the EmacPs driver by
+   561	 *sending by sending and receiving frames in interrupt driven DMA
+   562	 *mode.
+   563	 *
+   564	 *
+   565	 * @param	IntcInstancePtr is a pointer to the instance of the Intc
+   566	 *driver.
+   567	 * @param	EmacPsInstancePtr is a pointer to the instance of the
+   568	 *EmacPs driver.
+   569	 * @param	EmacPsDeviceId is Device ID of the EmacPs Device ,
+   570	 *typically XPAR_<EMACPS_instance>_DEVICE_ID value from
+   571	 *xparameters.h.
+   572	 * @param	EmacPsIntrId is the Interrupt ID and is typically
+   573	 *		XPAR_<EMACPS_instance>_INTR value from xparameters.h.
+   574	 *
+   575	 * @return	XST_SUCCESS to indicate success, otherwise XST_FAILURE.
+   576	 *
+   577	 * @note		None.
+   578	 *
+   579	 *****************************************************************************/
+   580	LONG EmacPsDmaIntrExample(
+   581	    XEmacPs *EmacPsInstancePtr)
+   582	{
+   583	    LONG Status = EmacPsInit(EmacPsInstancePtr);
+   584	
+   585	    /*
+   586	     * Run the EmacPs DMA Single Frame Interrupt example
+   587	     */
+   588		xil_printf("Start run the EmacPs DMA Single Frame Interrupt example\n\r");
+   589	    Status = EmacPsDmaSingleFrameIntrExample(EmacPsInstancePtr);
+   590	    if (Status != XST_SUCCESS) {
+   591	        return XST_FAILURE;
+   592	    } else {
+   593			xil_printf("Run the EmacPs DMA Single Frame Interrupt example success\n\r");
+   594		}
+   595	
+   596	    /*
+   597	     * Stop the device
+   598	     */
+   599	    XEmacPs_Stop(EmacPsInstancePtr);
+   600	
+   601	    return XST_SUCCESS;
+   602	}
+   603	
+   604	/****************************************************************************/
+   605	/**
+   606	 *
+   607	 * This function demonstrates the usage of the EMACPS by sending
+   608	 *and receiving a single frame in DMA interrupt mode. The source
+   609	 *packet will be described by two descriptors. It will be received
+   610	 *into a buffer described by a single descriptor.
+   611	 *
+   612	 * @param	EmacPsInstancePtr is a pointer to the instance of the
+   613	 *EmacPs driver.
+   614	 *
+   615	 * @return	XST_SUCCESS to indicate success, otherwise XST_FAILURE.
+   616	 *
+   617	 * @note		None.
+   618	 *
+   619	 *****************************************************************************/
+   620	LONG EmacPsDmaSingleFrameIntrExample(XEmacPs *EmacPsInstancePtr)
+   621	{
+   622	    u32 PayloadSize = 1000;
+   623	
+   624	    /*
+   625	     * Clear variables shared with callbacks
+   626	     */
+   627	    FramesRx     = 0;
+   628	    FramesTx     = 0;
+   629	    DeviceErrors = 0;
+   630	
+   631	    /*
+   632	     * Calculate the frame length (not including FCS)
+   633	     */
+   634	    TxFrameLength = XEMACPS_HDR_SIZE + PayloadSize;
+   635	
+   636	    /*
+   637	     * Setup packet to be transmitted
+   638	     */
+   639	    EmacPsUtilFrameHdrFormatMAC(&TxFrame, BroadcastMAC);
+   640	    EmacPsUtilFrameHdrFormatType(&TxFrame, PayloadSize);
+   641	    EmacPsUtilFrameSetPayloadData(&TxFrame, PayloadSize);
+   642		xil_printf("Setup packet to be transmitted\n\r");
+   643	    Xil_DCacheFlushRange((UINTPTR)&TxFrame, sizeof(EthernetFrame));
+   644	
+   645	    /*
+   646	     * Clear out receive packet memory area
+   647	     */
+   648	    EmacPsUtilFrameMemClear(&RxFrame);
+   649		xil_printf("Clear out receive packet memory area\n\r");
+   650	    Xil_DCacheFlushRange((UINTPTR)&RxFrame, sizeof(EthernetFrame));
+   651	
+   652	    EmacPsRecv(EmacPsInstancePtr, &RxFrame, 1);
+   653	    EmacPsSend(EmacPsInstancePtr, &TxFrame, TxFrameLength);
+   654	
+   655	    EmacPsWaitSend(EmacPsInstancePtr);
+   656	    u32 RxFrLen;
+   657	    EmacPsWaitRecv(EmacPsInstancePtr, 1, &RxFrLen);
+   658	
+   659	    /*
+   660	     * Start the device
+   661	     */
+   662	
+   663	    // XEmacPs_Start(EmacPsInstancePtr);
+   664		// xil_printf("Start device\n\r");
+   665	
+   666	    /* Start transmit */
+   667	    // XEmacPs_Transmit(EmacPsInstancePtr);
+   668		// xil_printf("Start transmit\n\r"); 
+   669	
+   670	
+   671	    if (EmacPsUtilFrameVerify(&TxFrame, &RxFrame) != 0) {
+   672	        for (int i = 0; i < (TxFrameLength / 16) - 1; ++i) {
+   673	            xil_printf("Tx > ");
+   674	            for (int j = 0; j < 16; ++j) {
+   675	                xil_printf("%02x ", ((u8*)&TxFrame)[i*16 + j]);
+   676	            }
+   677	            xil_printf("\n\rRx > ");
+   678	            for (int j = 0; j < 16; ++j) {
+   679	                xil_printf("%02x ", ((u8*)&RxFrame)[i*16 + j]);
+   680	            }
+   681	            xil_printf("\n\r");
+   682	        }
+   683	        EmacPsUtilErrorTrap("Data mismatch");
+   684	        return XST_FAILURE;
+   685	    } else {
+   686			xil_printf("Data match success\n\r");
+   687		}
+   688	
+   689	    /*
+   690	     * Finished this example. If everything worked correctly, all
+   691	     * TxBDs and RxBDs should be free for allocation. Stop the
+   692	     * device.
+   693	     */
+   694	    XEmacPs_Stop(EmacPsInstancePtr);
+   695	
+   696	    return XST_SUCCESS;
+   697	}
+   698	
+   699	/****************************************************************************/
+   700	/**
+   701	 * This function resets the device but preserves the options set by
+   702	 *the user.
+   703	 *
+   704	 * The descriptor list could be reinitialized with the same calls
+   705	 *to XEmacPs_BdRingClone() as used in main(). Doing this is a
+   706	 *matter of preference. In many cases, an OS may have resources
+   707	 *tied up in the descriptors. Reinitializing in this case may bad
+   708	 *for the OS since its resources may be permamently lost.
+   709	 *
+   710	 * @param	EmacPsInstancePtr is a pointer to the instance of the
+   711	 *EmacPs driver.
+   712	 *
+   713	 * @return	XST_SUCCESS if successful, else XST_FAILURE.
+   714	 *
+   715	 * @note		None.
+   716	 *
+   717	 *****************************************************************************/
+   718	static LONG EmacPsResetDevice(XEmacPs *EmacPsInstancePtr)
+   719	{
+   720	    LONG Status = 0;
+   721	    u8 MacSave[6];
+   722	    u32 Options;
+   723	    XEmacPs_Bd BdTemplate;
+   724	
+   725	    /*
+   726	     * Stop device
+   727	     */
+   728	    XEmacPs_Stop(EmacPsInstancePtr);
+   729	
+   730	    /*
+   731	     * Save the device state
+   732	     */
+   733	    XEmacPs_GetMacAddress(EmacPsInstancePtr, &MacSave, 1);
+   734	    Options = XEmacPs_GetOptions(EmacPsInstancePtr);
+   735	
+   736	    /*
+   737	     * Stop and reset the device
+   738	     */
+   739	    XEmacPs_Reset(EmacPsInstancePtr);
+   740	
+   741	    /*
+   742	     * Restore the state
+   743	     */
+   744	    XEmacPs_SetMacAddress(EmacPsInstancePtr, &MacSave, 1);
+   745	    Status |= XEmacPs_SetOptions(EmacPsInstancePtr, Options);
+   746	    Status |= XEmacPs_ClearOptions(EmacPsInstancePtr, ~Options);
+   747	    if (Status != XST_SUCCESS) {
+   748	        EmacPsUtilErrorTrap("Error restoring state after reset");
+   749	        return XST_FAILURE;
+   750	    }
+   751	
+   752	    /*
+   753	     * Setup callbacks
+   754	     */
+   755	    Status = XEmacPs_SetHandler(
+   756	        EmacPsInstancePtr, XEMACPS_HANDLER_DMASEND, (void *)XEmacPsSendHandler,
+   757	        EmacPsInstancePtr);
+   758	    Status |= XEmacPs_SetHandler(
+   759	        EmacPsInstancePtr, XEMACPS_HANDLER_DMARECV, (void *)XEmacPsRecvHandler,
+   760	        EmacPsInstancePtr);
+   761	    Status |= XEmacPs_SetHandler(
+   762	        EmacPsInstancePtr, XEMACPS_HANDLER_ERROR, (void *)XEmacPsErrorHandler,
+   763	        EmacPsInstancePtr);
+   764	    if (Status != XST_SUCCESS) {
+   765	        EmacPsUtilErrorTrap("Error assigning handlers");
+   766	        return XST_FAILURE;
+   767	    }
+   768	
+   769	    /*
+   770	     * Setup RxBD space.
+   771	     *
+   772	     * We have already defined a properly aligned area of memory to
+   773	     * store RxBDs at the beginning of this source code file so
+   774	     * just pass its address into the function. No MMU is being
+   775	     * used so the physical and virtual addresses are the same.
+   776	     *
+   777	     * Setup a BD template for the Rx channel. This template will
+   778	     * be copied to every RxBD. We will not have to explicitly set
+   779	     * these again.
+   780	     */
+   781	    XEmacPs_BdClear(&BdTemplate);
+   782	
+   783	    /*
+   784	     * Create the RxBD ring
+   785	     */
+   786	    Status = XEmacPs_BdRingCreate(
+   787	        &(XEmacPs_GetRxRing(EmacPsInstancePtr)), kva2pa((UINTPTR)RxBdSpacePtr),
+   788	        (UINTPTR)RxBdSpacePtr, XEMACPS_BD_ALIGNMENT, RXBD_CNT, &(XEmacPs_GetTxRing(EmacPsInstancePtr)));
+   789	    if (Status != XST_SUCCESS) {
+   790	        EmacPsUtilErrorTrap("Error setting up RxBD space, BdRingCreate");
+   791	        return XST_FAILURE;
+   792	    }
+   793	
+   794	    Status = XEmacPs_BdRingClone(
+   795	        &(XEmacPs_GetRxRing(EmacPsInstancePtr)), &BdTemplate, XEMACPS_RECV);
+   796	    if (Status != XST_SUCCESS) {
+   797	        EmacPsUtilErrorTrap("Error setting up RxBD space, BdRingClone");
+   798	        return XST_FAILURE;
+   799	    }
+   800	
+   801	    /*
+   802	     * Setup TxBD space.
+   803	     *
+   804	     * Like RxBD space, we have already defined a properly aligned
+   805	     * area of memory to use.
+   806	     *
+   807	     * Also like the RxBD space, we create a template. Notice we
+   808	     * don't set the "last" attribute. The examples will be
+   809	     * overriding this attribute so it does no good to set it up
+   810	     * here.
+   811	     */
+   812	    XEmacPs_BdClear(&BdTemplate);
+   813	    XEmacPs_BdSetStatus(&BdTemplate, XEMACPS_TXBUF_USED_MASK);
+   814	
+   815	    /*
+   816	     * Create the TxBD ring
+   817	     */
+   818	    Status = XEmacPs_BdRingCreate(
+   819	        &(XEmacPs_GetTxRing(EmacPsInstancePtr)), kva2pa((UINTPTR)TxBdSpacePtr),
+   820	        (UINTPTR)TxBdSpacePtr, XEMACPS_BD_ALIGNMENT, TXBD_CNT, &(XEmacPs_GetRxRing(EmacPsInstancePtr)));
+   821	    if (Status != XST_SUCCESS) {
+   822	        EmacPsUtilErrorTrap("Error setting up TxBD space, BdRingCreate");
+   823	        return XST_FAILURE;
+   824	    }
+   825	    Status = XEmacPs_BdRingClone(
+   826	        &(XEmacPs_GetTxRing(EmacPsInstancePtr)), &BdTemplate, XEMACPS_SEND);
+   827	    if (Status != XST_SUCCESS) {
+   828	        EmacPsUtilErrorTrap("Error setting up TxBD space, BdRingClone");
+   829	        return XST_FAILURE;
+   830	    }
+   831	
+   832	    /*
+   833	     * Restart the device
+   834	     */
+   835	    XEmacPs_Start(EmacPsInstancePtr);
+   836	
+   837	    return XST_SUCCESS;
+   838	}
+   839	
+   840	void handle_xemacps_irq()
+   841	{
+   842	    int send_flag = 0, recv_flag = 0;
+   843	    Xil_DCacheFlushRange(0, 64);
+   844	    u32 reg;
+   845	    reg = XEmacPs_ReadReg(EmacPsInstance.Config.BaseAddress, XEMACPS_TXSR_OFFSET);
+   846	    if(reg & XEMACPS_TXSR_TXCOMPL_MASK) {
+   847			send_flag = 1;
+   848	    }
+   849	    reg = XEmacPs_ReadReg(EmacPsInstance.Config.BaseAddress, XEMACPS_RXSR_OFFSET);
+   850	    if(reg & XEMACPS_RXSR_FRAMERX_MASK) {
+   851			recv_flag = 1;
+   852	    }
+   853	    assert(send_flag || recv_flag);
+   854	
+   855	    if(send_flag && send_transaction){
+   856	        XEmacPsSendHandler((void*)&EmacPsInstance);
+   857	    }
+   858	    else if(recv_flag && recv_transaction){
+   859	        XEmacPsRecvHandler((void*)&EmacPsInstance);
+   860	    }
+   861	}
+   862	
+   863	/****************************************************************************/
+   864	/**
+   865	 *
+   866	 * This the Transmit handler callback function and will increment a
+   867	 *shared counter that can be shared by the main thread of
+   868	 *operation.
+   869	 *
+   870	 * @param	Callback is the pointer to the instance of the EmacPs
+   871	 *device.
+   872	 *
+   873	 * @return	None.
+   874	 *
+   875	 * @note		None.
+   876	 *
+   877	 *****************************************************************************/
+   878	static void XEmacPsSendHandler(void *Callback)
+   879	{
+   880	    // TODO: you finish sending packet now
+   881	    XEmacPs *EmacPsInstancePtr = (XEmacPs *)Callback;
+   882	    /*
+   883	     * Disable the transmit related interrupts
+   884	     */
+   885	    /*XEmacPs_IntDisable(
+   886	        EmacPsInstancePtr,
+   887	        (XEMACPS_IXR_TXCOMPL_MASK | XEMACPS_IXR_TX_ERR_MASK));*/
+   888	
+   889	    /*
+   890	     * Increment the counter so that main thread knows something
+   891	     * happened.
+   892	     */
+   893	    do_unblock(net_send_queue.next);
+   894	    u32 Reg = XEmacPs_ReadReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_ISR_OFFSET);
+   895	    Reg = Reg | XEMACPS_IXR_TXCOMPL_MASK;
+   896		XEmacPs_WriteReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_ISR_OFFSET, Reg);
+   897	    send_transaction = 0;
+   898	}
+   899	
+   900	/****************************************************************************/
+   901	/**
+   902	 *
+   903	 * This is the Receive handler callback function and will increment
+   904	 *a shared counter that can be shared by the main thread of
+   905	 *operation.
+   906	 *
+   907	 * @param	Callback is a pointer to the instance of the EmacPs
+   908	 *device.
+   909	 *
+   910	 * @return	None.
+   911	 *
+   912	 * @note		None.
+   913	 *
+   914	 *****************************************************************************/
+   915	static void XEmacPsRecvHandler(void *Callback)
+   916	{
+   917	    // TODO: you finish receiving packet now
+   918	    XEmacPs *EmacPsInstancePtr = (XEmacPs *)Callback;
+   919	
+   920	    /*
+   921	     * Disable the transmit related interrupts
+   922	     */
+   923	    /*XEmacPs_IntDisable(
+   924	        EmacPsInstancePtr,
+   925	        (XEMACPS_IXR_FRAMERX_MASK | XEMACPS_IXR_RX_ERR_MASK));*/
+   926	
+   927	    /*
+   928	     * Increment the counter so that main thread knows something
+   929	     * happened.
+   930	     */
+   931	    
+   932	    XEmacPs_Bd* CurPtr = BdRxPtr;
+   933	    for(int i = 0; i < _num_packet; i++){
+   934	        while(!XEmacPs_BdIsRxNew(CurPtr)) {
+   935	            Xil_DCacheFlushRange(0, 64);
+   936	        }
+   937	        rx_len[i] = XEmacPs_BdGetLength(CurPtr);
+   938	        CurPtr++;
+   939	    }
+   940	    uintptr_t rx_curr = _addr;
+   941	    for(int i = 0; i < _num_packet; i++){
+   942	        memcpy((uint8_t*)rx_curr, (uint8_t*)&rx_buffers[i], rx_len[i]);
+   943	        *(_frLength + i) = rx_len[i];
+   944	        rx_curr += rx_len[i];
+   945	    }
+   946	    do_unblock(net_recv_queue.next);
+   947	    u32 Reg = XEmacPs_ReadReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_ISR_OFFSET);
+   948	    Reg = Reg | XEMACPS_IXR_FRAMERX_MASK;
+   949		XEmacPs_WriteReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_ISR_OFFSET, Reg);
+   950	    recv_transaction = 0;
+   951	}
+   952	
+   953	
+   954	/****************************************************************************/
+   955	/**
+   956	 *
+   957	 * This is the Error handler callback function and this function
+   958	 *increments the error counter so that the main thread knows the
+   959	 *number of errors.
+   960	 *
+   961	 * @param	Callback is the callback function for the driver. This
+   962	 *		parameter is not used in this example.
+   963	 * @param	Direction is passed in from the driver specifying which
+   964	 *		direction error has occurred.
+   965	 * @param	ErrorWord is the status register value passed in.
+   966	 *
+   967	 * @return	None.
+   968	 *
+   969	 * @note		None.
+   970	 *
+   971	 *****************************************************************************/
+   972	static void XEmacPsErrorHandler(void *Callback, u8 Direction, u32 ErrorWord)
+   973	{
+   974	    XEmacPs *EmacPsInstancePtr = (XEmacPs *)Callback;
+   975	
+   976	    /*
+   977	     * Increment the counter so that main thread knows something
+   978	     * happened. Reset the device and reallocate resources ...
+   979	     */
+   980	    DeviceErrors++;
+   981	
+   982	    switch (Direction) {
+   983	        case XEMACPS_RECV:
+   984	            if (ErrorWord & XEMACPS_RXSR_HRESPNOK_MASK) {
+   985	                EmacPsUtilErrorTrap("Receive DMA error");
+   986	            }
+   987	            if (ErrorWord & XEMACPS_RXSR_RXOVR_MASK) {
+   988	                EmacPsUtilErrorTrap("Receive over run");
+   989	            }
+   990	            if (ErrorWord & XEMACPS_RXSR_BUFFNA_MASK) {
+   991	                EmacPsUtilErrorTrap("Receive buffer not available");
+   992	            }
+   993	            break;
+   994	        case XEMACPS_SEND:
+   995	            if (ErrorWord & XEMACPS_TXSR_HRESPNOK_MASK) {
+   996	                EmacPsUtilErrorTrap("Transmit DMA error");
+   997	            }
+   998	            if (ErrorWord & XEMACPS_TXSR_URUN_MASK) {
+   999	                EmacPsUtilErrorTrap("Transmit under run");
+  1000	            }
+  1001	            if (ErrorWord & XEMACPS_TXSR_BUFEXH_MASK) {
+  1002	                EmacPsUtilErrorTrap("Transmit buffer exhausted");
+  1003	            }
+  1004	            if (ErrorWord & XEMACPS_TXSR_RXOVR_MASK) {
+  1005	                EmacPsUtilErrorTrap("Transmit retry excessed limits");
+  1006	            }
+  1007	            if (ErrorWord & XEMACPS_TXSR_FRAMERX_MASK) {
+  1008	                EmacPsUtilErrorTrap("Transmit collision");
+  1009	            }
+  1010	            if (ErrorWord & XEMACPS_TXSR_USEDREAD_MASK) {
+  1011	                EmacPsUtilErrorTrap("Transmit buffer not available");
+  1012	            }
+  1013	            break;
+  1014	    }
+  1015	    /*
+  1016	     * Bypassing the reset functionality as the default tx status
+  1017	     * for q0 is USED BIT READ. so, the first interrupt will be tx
+  1018	     * used bit and it resets the core always.
+  1019	     */
+  1020	    if (GemVersion == 2) {
+  1021	        EmacPsResetDevice(EmacPsInstancePtr);
+  1022	    }
+  1023	}
+  1024	
+  1025	/****************************************************************************/
+  1026	/**
+  1027	 *
+  1028	 * This function sets up the clock divisors for 1000Mbps.
+  1029	 *
+  1030	 * @param	EmacPsInstancePtr is a pointer to the instance of the
+  1031	 *EmacPs driver.
+  1032	 * @param	EmacPsIntrId is the Interrupt ID and is typically
+  1033	 *			XPAR_<EMACPS_instance>_INTR value from xparameters.h.
+  1034	 * @return	None.
+  1035	 *
+  1036	 * @note		None.
+  1037	 *
+  1038	 *****************************************************************************/
+  1039	void XEmacPsClkSetup(XEmacPs *EmacPsInstancePtr)
+  1040	{
+  1041	    u32 ClkCntrl;
+  1042	    if (GemVersion == 2) {
+  1043	        /*************************************/
+  1044	        /* Setup device for first-time usage */
+  1045	        /*************************************/
+  1046	
+  1047	        /* SLCR unlock */
+  1048	        *(volatile unsigned int *)(SLCR_UNLOCK_ADDR) = SLCR_UNLOCK_KEY_VALUE;
+  1049	        /* GEM0 1G clock configuration*/
+  1050	        ClkCntrl = *(volatile unsigned int *)(SLCR_GEM0_CLK_CTRL_ADDR);
+  1051	        ClkCntrl &= EMACPS_SLCR_DIV_MASK;
+  1052	        ClkCntrl |= (XPAR_PS7_ETHERNET_0_ENET_SLCR_1000MBPS_DIV1 << 20);
+  1053	        ClkCntrl |= (XPAR_PS7_ETHERNET_0_ENET_SLCR_1000MBPS_DIV0 << 8);
+  1054	        *(volatile unsigned int *)(SLCR_GEM0_CLK_CTRL_ADDR) = ClkCntrl;
+  1055	
+  1056	        /* SLCR lock */
+  1057	        *(unsigned int *)(SLCR_LOCK_ADDR) = SLCR_LOCK_KEY_VALUE;
+  1058	
+  1059	        unsigned long count = 0;
+  1060	        while (count < 0xffff) {
+  1061	            count++;
+  1062	        }
+  1063	    }
+  1064	}

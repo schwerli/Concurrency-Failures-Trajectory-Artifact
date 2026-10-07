@@ -1,0 +1,130 @@
+diff --git a/django/utils/autoreload.py b/django/utils/autoreload.py
+index cc65c043ab..8d16135c43 100644
+--- a/django/utils/autoreload.py
++++ b/django/utils/autoreload.py
+@@ -219,7 +219,13 @@ def get_child_arguments():
+     import __main__
+     py_script = Path(sys.argv[0])
+ 
+-    args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions]
++    args = [sys.executable]
++    if sys.implementation.name == 'cpython':
++        args.extend(
++            '-X%s' % opt if value is True else '-X%s=%s' % (opt, value)
++            for opt, value in getattr(sys, '_xoptions', {}).items()
++        )
++    args += ['-W%s' % o for o in sys.warnoptions]
+     # __spec__ is set when the server was started with the `-m` option,
+     # see https://docs.python.org/3/reference/import.html#main-spec
+     # __spec__ may not exist, e.g. when running in a Conda env.
+diff --git a/tests/utils_tests/test_autoreload.py b/tests/utils_tests/test_autoreload.py
+index 7c28a9d4d0..7a296dc19f 100644
+--- a/tests/utils_tests/test_autoreload.py
++++ b/tests/utils_tests/test_autoreload.py
+@@ -167,6 +167,12 @@ class TestIterModulesAndFiles(SimpleTestCase):
+ 
+ 
+ class TestChildArguments(SimpleTestCase):
++    def setUp(self):
++        super().setUp()
++        self.xoptions_patcher = mock.patch.object(sys, '_xoptions', {}, create=True)
++        self.xoptions_patcher.start()
++        self.addCleanup(self.xoptions_patcher.stop)
++
+     @mock.patch.dict(sys.modules, {'__main__': django.__main__})
+     @mock.patch('sys.argv', [django.__main__.__file__, 'runserver'])
+     @mock.patch('sys.warnoptions', [])
+@@ -203,6 +209,39 @@ class TestChildArguments(SimpleTestCase):
+             [sys.executable, '-Werror', __file__, 'runserver']
+         )
+ 
++    @mock.patch('__main__.__spec__', None)
++    @mock.patch('sys.argv', [__file__, 'runserver'])
++    @mock.patch('sys.warnoptions', [])
++    def test_xoptions(self):
++        with mock.patch.object(sys.implementation, 'name', 'cpython'):
++            with mock.patch.object(
++                sys,
++                '_xoptions',
++                {'utf8': True, 'pycache_prefix': '/tmp/pycache'},
++                create=True,
++            ):
++                self.assertEqual(
++                    autoreload.get_child_arguments(),
++                    [
++                        sys.executable,
++                        '-Xutf8',
++                        '-Xpycache_prefix=/tmp/pycache',
++                        __file__,
++                        'runserver',
++                    ],
++                )
++
++    @mock.patch('__main__.__spec__', None)
++    @mock.patch('sys.argv', [__file__, 'runserver'])
++    @mock.patch('sys.warnoptions', [])
++    def test_xoptions_ignored_non_cpython(self):
++        with mock.patch.object(sys.implementation, 'name', 'pypy'):
++            with mock.patch.object(sys, '_xoptions', {'utf8': True}, create=True):
++                self.assertEqual(
++                    autoreload.get_child_arguments(),
++                    [sys.executable, __file__, 'runserver']
++                )
++
+     @mock.patch('__main__.__spec__', None)
+     @mock.patch('sys.warnoptions', [])
+     def test_exe_fallback(self):
+@@ -462,12 +501,19 @@ class TestRaiseLastException(SimpleTestCase):
+ class RestartWithReloaderTests(SimpleTestCase):
+     executable = '/usr/bin/python'
+ 
+-    def patch_autoreload(self, argv):
++    def patch_autoreload(self, argv, xoptions=None):
+         patch_call = mock.patch('django.utils.autoreload.subprocess.run', return_value=CompletedProcess(argv, 0))
+         patches = [
+             mock.patch('django.utils.autoreload.sys.argv', argv),
+             mock.patch('django.utils.autoreload.sys.executable', self.executable),
+             mock.patch('django.utils.autoreload.sys.warnoptions', ['all']),
++            mock.patch.object(
++                autoreload.sys,
++                '_xoptions',
++                {} if xoptions is None else xoptions,
++                create=True,
++            ),
++            mock.patch.object(autoreload.sys.implementation, 'name', 'cpython'),
+         ]
+         for p in patches:
+             p.start()
+@@ -497,8 +543,31 @@ class RestartWithReloaderTests(SimpleTestCase):
+         with mock.patch('django.__main__.__file__', main):
+             with mock.patch.dict(sys.modules, {'__main__': django.__main__}):
+                 autoreload.restart_with_reloader()
++        self.assertEqual(mock_call.call_count, 1)
++        self.assertEqual(mock_call.call_args[0][0], [self.executable, '-Wall', '-m', 'django'] + argv[1:])
++
++    def test_xoptions(self):
++        with tempfile.TemporaryDirectory() as temp_dir:
++            script = Path(temp_dir) / 'manage.py'
++            script.touch()
++            argv = [str(script), 'runserver']
++            mock_call = self.patch_autoreload(
++                argv,
++                xoptions={'utf8': True, 'pycache_prefix': '/tmp/pycache'},
++            )
++            with mock.patch('__main__.__spec__', None):
++                autoreload.restart_with_reloader()
+             self.assertEqual(mock_call.call_count, 1)
+-            self.assertEqual(mock_call.call_args[0][0], [self.executable, '-Wall', '-m', 'django'] + argv[1:])
++            self.assertEqual(
++                mock_call.call_args[0][0],
++                [
++                    self.executable,
++                    '-Xutf8',
++                    '-Xpycache_prefix=/tmp/pycache',
++                    '-Wall',
++                    *argv,
++                ],
++            )
+ 
+ 
+ class ReloaderTests(SimpleTestCase):

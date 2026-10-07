@@ -1,0 +1,963 @@
+     1	/**
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *
+    10	 *     http://www.apache.org/licenses/LICENSE-2.0
+    11	 *
+    12	 * Unless required by applicable law or agreed to in writing, software
+    13	 * distributed under the License is distributed on an "AS IS" BASIS,
+    14	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    15	 * See the License for the specific language governing permissions and
+    16	 * limitations under the License.
+    17	 */
+    18	package org.apache.hadoop.hdfs.server.federation.metrics;
+    19	
+    20	import static org.apache.hadoop.util.Time.now;
+    21	
+    22	import java.io.IOException;
+    23	import java.lang.reflect.Method;
+    24	import java.math.BigInteger;
+    25	import java.net.InetAddress;
+    26	import java.net.InetSocketAddress;
+    27	import java.net.UnknownHostException;
+    28	import java.text.SimpleDateFormat;
+    29	import java.util.ArrayList;
+    30	import java.util.Arrays;
+    31	import java.util.Collection;
+    32	import java.util.Collections;
+    33	import java.util.Date;
+    34	import java.util.HashMap;
+    35	import java.util.HashSet;
+    36	import java.util.LinkedHashMap;
+    37	import java.util.LinkedHashSet;
+    38	import java.util.LinkedList;
+    39	import java.util.List;
+    40	import java.util.Map;
+    41	import java.util.Set;
+    42	import java.util.concurrent.TimeUnit;
+    43	import java.util.function.Function;
+    44	import java.util.function.ToIntFunction;
+    45	import java.util.function.ToLongFunction;
+    46	import java.util.stream.Collectors;
+    47	
+    48	import javax.management.NotCompliantMBeanException;
+    49	import javax.management.ObjectName;
+    50	import javax.management.StandardMBean;
+    51	
+    52	import org.apache.hadoop.conf.Configuration;
+    53	import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+    54	import org.apache.hadoop.hdfs.protocol.HdfsConstants.DatanodeReportType;
+    55	import org.apache.hadoop.hdfs.server.federation.resolver.ActiveNamenodeResolver;
+    56	import org.apache.hadoop.hdfs.server.federation.resolver.FederationNamenodeContext;
+    57	import org.apache.hadoop.hdfs.server.federation.resolver.FederationNamespaceInfo;
+    58	import org.apache.hadoop.hdfs.server.federation.resolver.RemoteLocation;
+    59	import org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys;
+    60	import org.apache.hadoop.hdfs.server.federation.router.Router;
+    61	import org.apache.hadoop.hdfs.server.federation.router.RouterRpcServer;
+    62	import org.apache.hadoop.hdfs.server.federation.router.RouterServiceState;
+    63	import org.apache.hadoop.hdfs.server.federation.router.security.RouterSecurityManager;
+    64	import org.apache.hadoop.hdfs.server.federation.store.MembershipStore;
+    65	import org.apache.hadoop.hdfs.server.federation.store.MountTableStore;
+    66	import org.apache.hadoop.hdfs.server.federation.store.RouterStore;
+    67	import org.apache.hadoop.hdfs.server.federation.store.StateStoreService;
+    68	import org.apache.hadoop.hdfs.server.federation.store.protocol.GetMountTableEntriesRequest;
+    69	import org.apache.hadoop.hdfs.server.federation.store.protocol.GetMountTableEntriesResponse;
+    70	import org.apache.hadoop.hdfs.server.federation.store.protocol.GetNamenodeRegistrationsRequest;
+    71	import org.apache.hadoop.hdfs.server.federation.store.protocol.GetNamenodeRegistrationsResponse;
+    72	import org.apache.hadoop.hdfs.server.federation.store.protocol.GetNamespaceInfoRequest;
+    73	import org.apache.hadoop.hdfs.server.federation.store.protocol.GetNamespaceInfoResponse;
+    74	import org.apache.hadoop.hdfs.server.federation.store.protocol.GetRouterRegistrationsRequest;
+    75	import org.apache.hadoop.hdfs.server.federation.store.protocol.GetRouterRegistrationsResponse;
+    76	import org.apache.hadoop.hdfs.server.federation.store.records.BaseRecord;
+    77	import org.apache.hadoop.hdfs.server.federation.store.records.MembershipState;
+    78	import org.apache.hadoop.hdfs.server.federation.store.records.MembershipStats;
+    79	import org.apache.hadoop.hdfs.server.federation.store.records.MountTable;
+    80	import org.apache.hadoop.hdfs.server.federation.store.records.RouterState;
+    81	import org.apache.hadoop.hdfs.server.federation.store.records.StateStoreVersion;
+    82	import org.apache.hadoop.metrics2.annotation.Metrics;
+    83	import org.apache.hadoop.metrics2.util.MBeans;
+    84	import org.apache.hadoop.security.UserGroupInformation;
+    85	import org.apache.hadoop.util.StringUtils;
+    86	import org.apache.hadoop.util.VersionInfo;
+    87	import org.codehaus.jettison.json.JSONObject;
+    88	import org.eclipse.jetty.util.ajax.JSON;
+    89	import org.slf4j.Logger;
+    90	import org.slf4j.LoggerFactory;
+    91	
+    92	import org.apache.hadoop.classification.VisibleForTesting;
+    93	
+    94	/**
+    95	 * Implementation of the Router metrics collector.
+    96	 */
+    97	@Metrics(name="RBFActivity", about="RBF metrics", context="dfs")
+    98	public class RBFMetrics implements RouterMBean, FederationMBean {
+    99	
+   100	  private static final Logger LOG =
+   101	      LoggerFactory.getLogger(RBFMetrics.class);
+   102	
+   103	  /** Format for a date. */
+   104	  private static final String DATE_FORMAT = "yyyy/MM/dd HH:mm:ss";
+   105	
+   106	  /** Prevent holding the page from load too long. */
+   107	  private final long timeOut;
+   108	
+   109	
+   110	  /** Router interface. */
+   111	  private final Router router;
+   112	
+   113	  /** FederationState JMX bean. */
+   114	  private ObjectName routerBeanName;
+   115	  private ObjectName federationBeanName;
+   116	
+   117	  /** Resolve the namenode for each namespace. */
+   118	  private final ActiveNamenodeResolver namenodeResolver;
+   119	
+   120	  /** State store. */
+   121	  private final StateStoreService stateStore;
+   122	  /** Membership state store. */
+   123	  private MembershipStore membershipStore;
+   124	  /** Mount table store. */
+   125	  private MountTableStore mountTableStore;
+   126	  /** Router state store. */
+   127	  private RouterStore routerStore;
+   128	  /** The number of top token owners reported in metrics. */
+   129	  private int topTokenRealOwners;
+   130	
+   131	  public RBFMetrics(Router router) throws IOException {
+   132	    this.router = router;
+   133	
+   134	    try {
+   135	      StandardMBean bean = new StandardMBean(this, RouterMBean.class);
+   136	      this.routerBeanName = MBeans.register("Router", "Router", bean);
+   137	      LOG.info("Registered Router MBean: {}", this.routerBeanName);
+   138	    } catch (NotCompliantMBeanException e) {
+   139	      throw new RuntimeException("Bad Router MBean setup", e);
+   140	    }
+   141	
+   142	    try {
+   143	      StandardMBean bean = new StandardMBean(this, FederationMBean.class);
+   144	      this.federationBeanName = MBeans.register("Router", "FederationState",
+   145	          bean);
+   146	      LOG.info("Registered FederationState MBean: {}", this.federationBeanName);
+   147	    } catch (NotCompliantMBeanException e) {
+   148	      throw new RuntimeException("Bad FederationState MBean setup", e);
+   149	    }
+   150	
+   151	    // Resolve namenode for each nameservice
+   152	    this.namenodeResolver = this.router.getNamenodeResolver();
+   153	
+   154	    // State store interfaces
+   155	    this.stateStore = this.router.getStateStore();
+   156	    if (this.stateStore == null) {
+   157	      LOG.error("State store not available");
+   158	    } else {
+   159	      this.membershipStore = stateStore.getRegisteredRecordStore(
+   160	          MembershipStore.class);
+   161	      this.mountTableStore = stateStore.getRegisteredRecordStore(
+   162	          MountTableStore.class);
+   163	      this.routerStore = stateStore.getRegisteredRecordStore(
+   164	          RouterStore.class);
+   165	    }
+   166	
+   167	    // Initialize the cache for the DN reports
+   168	    Configuration conf = router.getConfig();
+   169	    this.timeOut = conf.getTimeDuration(RBFConfigKeys.DN_REPORT_TIME_OUT,
+   170	        RBFConfigKeys.DN_REPORT_TIME_OUT_MS_DEFAULT, TimeUnit.MILLISECONDS);
+   171	    this.topTokenRealOwners = conf.getInt(
+   172	        RBFConfigKeys.DFS_ROUTER_METRICS_TOP_NUM_TOKEN_OWNERS_KEY,
+   173	        RBFConfigKeys.DFS_ROUTER_METRICS_TOP_NUM_TOKEN_OWNERS_KEY_DEFAULT);
+   174	  }
+   175	
+   176	  /**
+   177	   * Unregister the JMX beans.
+   178	   */
+   179	  public void close() {
+   180	    if (this.routerBeanName != null) {
+   181	      MBeans.unregister(routerBeanName);
+   182	    }
+   183	    if (this.federationBeanName != null) {
+   184	      MBeans.unregister(federationBeanName);
+   185	    }
+   186	  }
+   187	
+   188	  @Override
+   189	  public String getNamenodes() {
+   190	    final Map<String, Map<String, Object>> info = new LinkedHashMap<>();
+   191	    if (membershipStore == null) {
+   192	      return "{}";
+   193	    }
+   194	
+   195	    try {
+   196	      // Get the values from the store
+   197	      GetNamenodeRegistrationsRequest request =
+   198	          GetNamenodeRegistrationsRequest.newInstance();
+   199	      GetNamenodeRegistrationsResponse response =
+   200	          membershipStore.getNamenodeRegistrations(request);
+   201	
+   202	      // Order the namenodes
+   203	      final List<MembershipState> namenodes = response.getNamenodeMemberships();
+   204	      if (namenodes == null || namenodes.size() == 0) {
+   205	        return JSON.toString(info);
+   206	      }
+   207	      List<MembershipState> namenodesOrder = new ArrayList<>(namenodes);
+   208	      Collections.sort(namenodesOrder, MembershipState.NAME_COMPARATOR);
+   209	
+   210	      // Dump namenodes information into JSON
+   211	      for (MembershipState namenode : namenodesOrder) {
+   212	        Map<String, Object> innerInfo = new HashMap<>();
+   213	        Map<String, Object> map = getJson(namenode);
+   214	        innerInfo.putAll(map);
+   215	        long dateModified = namenode.getDateModified();
+   216	        long lastHeartbeat = getSecondsSince(dateModified);
+   217	        innerInfo.put("lastHeartbeat", lastHeartbeat);
+   218	        MembershipStats stats = namenode.getStats();
+   219	        long used = stats.getTotalSpace() - stats.getAvailableSpace();
+   220	        innerInfo.put("used", used);
+   221	        info.put(namenode.getNamenodeKey(),
+   222	            Collections.unmodifiableMap(innerInfo));
+   223	      }
+   224	    } catch (IOException e) {
+   225	      LOG.error("Enable to fetch json representation of namenodes {}",
+   226	          e.getMessage());
+   227	      return "{}";
+   228	    }
+   229	    return JSON.toString(info);
+   230	  }
+   231	
+   232	  @Override
+   233	  public String getNameservices() {
+   234	    final Map<String, Map<String, Object>> info = new LinkedHashMap<>();
+   235	    try {
+   236	      final List<MembershipState> namenodes = getActiveNamenodeRegistrations();
+   237	      List<MembershipState> namenodesOrder = new ArrayList<>(namenodes);
+   238	      Collections.sort(namenodesOrder, MembershipState.NAME_COMPARATOR);
+   239	
+   240	      // Dump namenodes information into JSON
+   241	      for (MembershipState namenode : namenodesOrder) {
+   242	        Map<String, Object> innerInfo = new HashMap<>();
+   243	        Map<String, Object> map = getJson(namenode);
+   244	        innerInfo.putAll(map);
+   245	        long dateModified = namenode.getDateModified();
+   246	        long lastHeartbeat = getSecondsSince(dateModified);
+   247	        innerInfo.put("lastHeartbeat", lastHeartbeat);
+   248	        MembershipStats stats = namenode.getStats();
+   249	        long used = stats.getTotalSpace() - stats.getAvailableSpace();
+   250	        innerInfo.put("used", used);
+   251	        info.put(namenode.getNamenodeKey(),
+   252	            Collections.unmodifiableMap(innerInfo));
+   253	      }
+   254	    } catch (IOException e) {
+   255	      LOG.error("Cannot retrieve nameservices for JMX: {}", e.getMessage());
+   256	      return "{}";
+   257	    }
+   258	    return JSON.toString(info);
+   259	  }
+   260	
+   261	  @Override
+   262	  public String getMountTable() {
+   263	    final List<Map<String, Object>> info = new LinkedList<>();
+   264	    if (mountTableStore == null) {
+   265	      return "[]";
+   266	    }
+   267	
+   268	    try {
+   269	      // Get all the mount points in order
+   270	      GetMountTableEntriesRequest request =
+   271	          GetMountTableEntriesRequest.newInstance("/");
+   272	      GetMountTableEntriesResponse response =
+   273	          mountTableStore.getMountTableEntries(request);
+   274	      final List<MountTable> mounts = response.getEntries();
+   275	      List<MountTable> orderedMounts = new ArrayList<>(mounts);
+   276	      Collections.sort(orderedMounts, MountTable.SOURCE_COMPARATOR);
+   277	
+   278	      // Dump mount table entries information into JSON
+   279	      for (MountTable entry : orderedMounts) {
+   280	        // Sumarize destinations
+   281	        Set<String> nameservices = new LinkedHashSet<>();
+   282	        Set<String> paths = new LinkedHashSet<>();
+   283	        for (RemoteLocation location : entry.getDestinations()) {
+   284	          nameservices.add(location.getNameserviceId());
+   285	          paths.add(location.getDest());
+   286	        }
+   287	
+   288	        Map<String, Object> map = getJson(entry);
+   289	        // We add some values with a cleaner format
+   290	        map.put("dateCreated", getDateString(entry.getDateCreated()));
+   291	        map.put("dateModified", getDateString(entry.getDateModified()));
+   292	
+   293	        Map<String, Object> innerInfo = new HashMap<>();
+   294	        innerInfo.putAll(map);
+   295	        innerInfo.put("nameserviceId", StringUtils.join(",", nameservices));
+   296	        innerInfo.put("path", StringUtils.join(",", paths));
+   297	        if (nameservices.size() > 1) {
+   298	          innerInfo.put("order", entry.getDestOrder().toString());
+   299	        } else {
+   300	          innerInfo.put("order", "");
+   301	        }
+   302	        innerInfo.put("readonly", entry.isReadOnly());
+   303	        innerInfo.put("faulttolerant", entry.isFaultTolerant());
+   304	        info.add(Collections.unmodifiableMap(innerInfo));
+   305	      }
+   306	    } catch (IOException e) {
+   307	      LOG.error(
+   308	          "Cannot generate JSON of mount table from store: {}", e.getMessage());
+   309	      return "[]";
+   310	    }
+   311	    return JSON.toString(info);
+   312	  }
+   313	
+   314	  @Override
+   315	  public String getRouters() {
+   316	    final Map<String, Map<String, Object>> info = new LinkedHashMap<>();
+   317	    if (routerStore == null) {
+   318	      return "{}";
+   319	    }
+   320	    try {
+   321	      // Get all the routers in order
+   322	      GetRouterRegistrationsRequest request =
+   323	          GetRouterRegistrationsRequest.newInstance();
+   324	      GetRouterRegistrationsResponse response =
+   325	          routerStore.getRouterRegistrations(request);
+   326	      final List<RouterState> routers = response.getRouters();
+   327	      List<RouterState> routersOrder = new ArrayList<>(routers);
+   328	      Collections.sort(routersOrder);
+   329	
+   330	      // Dump router information into JSON
+   331	      for (RouterState record : routersOrder) {
+   332	        Map<String, Object> innerInfo = new HashMap<>();
+   333	        Map<String, Object> map = getJson(record);
+   334	        innerInfo.putAll(map);
+   335	        long dateModified = record.getDateModified();
+   336	        long lastHeartbeat = getSecondsSince(dateModified);
+   337	        innerInfo.put("lastHeartbeat", lastHeartbeat);
+   338	
+   339	        StateStoreVersion stateStoreVersion = record.getStateStoreVersion();
+   340	        if (stateStoreVersion == null) {
+   341	          LOG.error("Cannot get State Store versions");
+   342	        } else {
+   343	          setStateStoreVersions(innerInfo, stateStoreVersion);
+   344	        }
+   345	
+   346	        info.put(record.getPrimaryKey(),
+   347	            Collections.unmodifiableMap(innerInfo));
+   348	      }
+   349	    } catch (IOException e) {
+   350	      LOG.error("Cannot get Routers JSON from the State Store", e);
+   351	      return "{}";
+   352	    }
+   353	    return JSON.toString(info);
+   354	  }
+   355	
+   356	  /**
+   357	   * Populate the map with the State Store versions.
+   358	   *
+   359	   * @param map Map with the information.
+   360	   * @param version State Store versions.
+   361	   */
+   362	  private static void setStateStoreVersions(
+   363	      Map<String, Object> map, StateStoreVersion version) {
+   364	
+   365	    long membershipVersion = version.getMembershipVersion();
+   366	    String lastMembershipUpdate = getDateString(membershipVersion);
+   367	    map.put("lastMembershipUpdate", lastMembershipUpdate);
+   368	
+   369	    long mountTableVersion = version.getMountTableVersion();
+   370	    String lastMountTableDate = getDateString(mountTableVersion);
+   371	    map.put("lastMountTableUpdate", lastMountTableDate);
+   372	  }
+   373	
+   374	  @Override
+   375	  public long getTotalCapacity() {
+   376	    return getNameserviceAggregatedLong(MembershipStats::getTotalSpace);
+   377	  }
+   378	
+   379	  @Override
+   380	  public long getRemainingCapacity() {
+   381	    return getNameserviceAggregatedLong(MembershipStats::getAvailableSpace);
+   382	  }
+   383	
+   384	  @Override
+   385	  public long getUsedCapacity() {
+   386	    return getTotalCapacity() - getRemainingCapacity();
+   387	  }
+   388	
+   389	  @Override
+   390	  public BigInteger getTotalCapacityBigInt() {
+   391	    return getNameserviceAggregatedBigInt(MembershipStats::getTotalSpace);
+   392	  }
+   393	
+   394	  @Override
+   395	  public BigInteger getRemainingCapacityBigInt() {
+   396	    return getNameserviceAggregatedBigInt(MembershipStats::getAvailableSpace);
+   397	  }
+   398	
+   399	  @Override
+   400	  public long getProvidedSpace() {
+   401	    return getNameserviceAggregatedLong(MembershipStats::getProvidedSpace);
+   402	  }
+   403	
+   404	  @Override
+   405	  public BigInteger getUsedCapacityBigInt() {
+   406	    return getTotalCapacityBigInt().subtract(getRemainingCapacityBigInt());
+   407	  }
+   408	
+   409	  @Override
+   410	  public int getNumNameservices() {
+   411	    try {
+   412	      Set<FederationNamespaceInfo> nss = namenodeResolver.getNamespaces();
+   413	      return nss.size();
+   414	    } catch (IOException e) {
+   415	      LOG.error(
+   416	          "Cannot fetch number of expired registrations from the store: {}",
+   417	          e.getMessage());
+   418	      return 0;
+   419	    }
+   420	  }
+   421	
+   422	  @Override
+   423	  public int getNumNamenodes() {
+   424	    if (membershipStore == null) {
+   425	      return 0;
+   426	    }
+   427	    try {
+   428	      GetNamenodeRegistrationsRequest request =
+   429	          GetNamenodeRegistrationsRequest.newInstance();
+   430	      GetNamenodeRegistrationsResponse response =
+   431	          membershipStore.getNamenodeRegistrations(request);
+   432	      List<MembershipState> memberships = response.getNamenodeMemberships();
+   433	      return memberships.size();
+   434	    } catch (IOException e) {
+   435	      LOG.error("Cannot retrieve numNamenodes for JMX: {}", e.getMessage());
+   436	      return 0;
+   437	    }
+   438	  }
+   439	
+   440	  @Override
+   441	  public int getNumExpiredNamenodes() {
+   442	    if (membershipStore == null) {
+   443	      return 0;
+   444	    }
+   445	    try {
+   446	      GetNamenodeRegistrationsRequest request =
+   447	          GetNamenodeRegistrationsRequest.newInstance();
+   448	      GetNamenodeRegistrationsResponse response =
+   449	          membershipStore.getExpiredNamenodeRegistrations(request);
+   450	      List<MembershipState> expiredMemberships =
+   451	          response.getNamenodeMemberships();
+   452	      return expiredMemberships.size();
+   453	    } catch (IOException e) {
+   454	      LOG.error(
+   455	          "Cannot retrieve numExpiredNamenodes for JMX: {}", e.getMessage());
+   456	      return 0;
+   457	    }
+   458	  }
+   459	
+   460	  @Override
+   461	  public int getNumLiveNodes() {
+   462	    return getNameserviceAggregatedInt(
+   463	        MembershipStats::getNumOfActiveDatanodes);
+   464	  }
+   465	
+   466	  @Override
+   467	  public int getNumDeadNodes() {
+   468	    return getNameserviceAggregatedInt(MembershipStats::getNumOfDeadDatanodes);
+   469	  }
+   470	
+   471	  @Override
+   472	  public int getNumStaleNodes() {
+   473	    return getNameserviceAggregatedInt(
+   474	        MembershipStats::getNumOfStaleDatanodes);
+   475	  }
+   476	
+   477	  @Override
+   478	  public int getNumDecommissioningNodes() {
+   479	    return getNameserviceAggregatedInt(
+   480	        MembershipStats::getNumOfDecommissioningDatanodes);
+   481	  }
+   482	
+   483	  @Override
+   484	  public int getNumDecomLiveNodes() {
+   485	    return getNameserviceAggregatedInt(
+   486	        MembershipStats::getNumOfDecomActiveDatanodes);
+   487	  }
+   488	
+   489	  @Override
+   490	  public int getNumDecomDeadNodes() {
+   491	    return getNameserviceAggregatedInt(
+   492	        MembershipStats::getNumOfDecomDeadDatanodes);
+   493	  }
+   494	
+   495	  @Override
+   496	  public int getNumInMaintenanceLiveDataNodes() {
+   497	    return getNameserviceAggregatedInt(
+   498	        MembershipStats::getNumOfInMaintenanceLiveDataNodes);
+   499	  }
+   500	
+   501	  @Override
+   502	  public int getNumInMaintenanceDeadDataNodes() {
+   503	    return getNameserviceAggregatedInt(
+   504	        MembershipStats::getNumOfInMaintenanceDeadDataNodes);
+   505	  }
+   506	
+   507	  @Override
+   508	  public int getNumEnteringMaintenanceDataNodes() {
+   509	    return getNameserviceAggregatedInt(
+   510	        MembershipStats::getNumOfEnteringMaintenanceDataNodes);
+   511	  }
+   512	
+   513	  @Override // NameNodeMXBean
+   514	  public String getNodeUsage() {
+   515	    float median = 0;
+   516	    float max = 0;
+   517	    float min = 0;
+   518	    float dev = 0;
+   519	
+   520	    final Map<String, Map<String, Object>> info = new HashMap<>();
+   521	    try {
+   522	      RouterRpcServer rpcServer = this.router.getRpcServer();
+   523	      DatanodeInfo[] live = rpcServer.getDatanodeReport(
+   524	          DatanodeReportType.LIVE, false, timeOut);
+   525	
+   526	      if (live.length > 0) {
+   527	        float totalDfsUsed = 0;
+   528	        float[] usages = new float[live.length];
+   529	        int i = 0;
+   530	        for (DatanodeInfo dn : live) {
+   531	          usages[i++] = dn.getDfsUsedPercent();
+   532	          totalDfsUsed += dn.getDfsUsedPercent();
+   533	        }
+   534	        totalDfsUsed /= live.length;
+   535	        Arrays.sort(usages);
+   536	        median = usages[usages.length / 2];
+   537	        max = usages[usages.length - 1];
+   538	        min = usages[0];
+   539	
+   540	        for (i = 0; i < usages.length; i++) {
+   541	          dev += (usages[i] - totalDfsUsed) * (usages[i] - totalDfsUsed);
+   542	        }
+   543	        dev = (float) Math.sqrt(dev / usages.length);
+   544	      }
+   545	    } catch (IOException e) {
+   546	      LOG.error("Cannot get the live nodes: {}", e.getMessage());
+   547	    }
+   548	
+   549	    final Map<String, Object> innerInfo = new HashMap<>();
+   550	    innerInfo.put("min", StringUtils.format("%.2f%%", min));
+   551	    innerInfo.put("median", StringUtils.format("%.2f%%", median));
+   552	    innerInfo.put("max", StringUtils.format("%.2f%%", max));
+   553	    innerInfo.put("stdDev", StringUtils.format("%.2f%%", dev));
+   554	    info.put("nodeUsage", innerInfo);
+   555	
+   556	    return JSON.toString(info);
+   557	  }
+   558	
+   559	  @Override
+   560	  public long getNumBlocks() {
+   561	    return getNameserviceAggregatedLong(MembershipStats::getNumOfBlocks);
+   562	  }
+   563	
+   564	  @Override
+   565	  public long getNumOfMissingBlocks() {
+   566	    return getNameserviceAggregatedLong(MembershipStats::getNumOfBlocksMissing);
+   567	  }
+   568	
+   569	  @Override
+   570	  public long getNumOfBlocksPendingReplication() {
+   571	    return getNameserviceAggregatedLong(
+   572	        MembershipStats::getNumOfBlocksPendingReplication);
+   573	  }
+   574	
+   575	  @Override
+   576	  public long getNumOfBlocksUnderReplicated() {
+   577	    return getNameserviceAggregatedLong(
+   578	        MembershipStats::getNumOfBlocksUnderReplicated);
+   579	  }
+   580	
+   581	  @Override
+   582	  public long getNumOfBlocksPendingDeletion() {
+   583	    return getNameserviceAggregatedLong(
+   584	        MembershipStats::getNumOfBlocksPendingDeletion);
+   585	  }
+   586	
+   587	  @Override
+   588	  public long getNumFiles() {
+   589	    return getNameserviceAggregatedLong(MembershipStats::getNumOfFiles);
+   590	  }
+   591	
+   592	  @Override
+   593	  public String getRouterStarted() {
+   594	    long startTime = this.router.getStartTime();
+   595	    return new Date(startTime).toString();
+   596	  }
+   597	
+   598	  @Override
+   599	  public String getVersion() {
+   600	    return VersionInfo.getVersion() + ", r" + VersionInfo.getRevision();
+   601	  }
+   602	
+   603	  @Override
+   604	  public String getCompiledDate() {
+   605	    return VersionInfo.getDate();
+   606	  }
+   607	
+   608	  @Override
+   609	  public String getCompileInfo() {
+   610	    return VersionInfo.getDate() + " by " + VersionInfo.getUser() + " from "
+   611	        + VersionInfo.getBranch();
+   612	  }
+   613	
+   614	  @Override
+   615	  public String getHostAndPort() {
+   616	    InetSocketAddress address = this.router.getRpcServerAddress();
+   617	    if (address != null) {
+   618	      try {
+   619	        String hostname = InetAddress.getLocalHost().getHostName();
+   620	        int port = address.getPort();
+   621	        return hostname + ":" + port;
+   622	      } catch (UnknownHostException ignored) { }
+   623	    }
+   624	    return "Unknown";
+   625	  }
+   626	
+   627	  @Override
+   628	  public String getRouterId() {
+   629	    return this.router.getRouterId();
+   630	  }
+   631	
+   632	  @Override
+   633	  public String getClusterId() {
+   634	    try {
+   635	      Collection<String> clusterIds =
+   636	          getNamespaceInfo(FederationNamespaceInfo::getClusterId);
+   637	      return clusterIds.toString();
+   638	    } catch (IOException e) {
+   639	      LOG.error("Cannot fetch cluster ID metrics: {}", e.getMessage());
+   640	      return "";
+   641	    }
+   642	  }
+   643	
+   644	  @Override
+   645	  public String getBlockPoolId() {
+   646	    try {
+   647	      Collection<String> blockpoolIds =
+   648	          getNamespaceInfo(FederationNamespaceInfo::getBlockPoolId);
+   649	      return blockpoolIds.toString();
+   650	    } catch (IOException e) {
+   651	      LOG.error("Cannot fetch block pool ID metrics: {}", e.getMessage());
+   652	      return "";
+   653	    }
+   654	  }
+   655	
+   656	  @Override
+   657	  public String getRouterStatus() {
+   658	    return this.router.getRouterState().toString();
+   659	  }
+   660	
+   661	  @Override
+   662	  public long getCurrentTokensCount() {
+   663	    RouterSecurityManager mgr =
+   664	        this.router.getRpcServer().getRouterSecurityManager();
+   665	    if (mgr != null && mgr.getSecretManager() != null) {
+   666	      return mgr.getSecretManager().getCurrentTokensSize();
+   667	    }
+   668	    return -1;
+   669	  }
+   670	
+   671	  @Override
+   672	  public String getTopTokenRealOwners() {
+   673	    RouterSecurityManager mgr =
+   674	        this.router.getRpcServer().getRouterSecurityManager();
+   675	    if (mgr != null && mgr.getSecretManager() != null) {
+   676	      return JSON.toString(mgr.getSecretManager()
+   677	          .getTopTokenRealOwners(this.topTokenRealOwners));
+   678	    }
+   679	    return "";
+   680	  }
+   681	
+   682	  @Override
+   683	  public boolean isSecurityEnabled() {
+   684	    return UserGroupInformation.isSecurityEnabled();
+   685	  }
+   686	
+   687	  @Override
+   688	  public int getCorruptFilesCount() {
+   689	    return getNameserviceAggregatedInt(MembershipStats::getCorruptFilesCount);
+   690	  }
+   691	
+   692	  @Override
+   693	  public long getScheduledReplicationBlocks() {
+   694	    return getNameserviceAggregatedLong(
+   695	        MembershipStats::getScheduledReplicationBlocks);
+   696	  }
+   697	
+   698	  @Override
+   699	  public long getNumberOfMissingBlocksWithReplicationFactorOne() {
+   700	    return getNameserviceAggregatedLong(
+   701	        MembershipStats::getNumberOfMissingBlocksWithReplicationFactorOne);
+   702	  }
+   703	
+   704	  @Override
+   705	  public long getHighestPriorityLowRedundancyReplicatedBlocks() {
+   706	    return getNameserviceAggregatedLong(
+   707	        MembershipStats::getHighestPriorityLowRedundancyReplicatedBlocks);
+   708	  }
+   709	
+   710	  @Override
+   711	  public long getHighestPriorityLowRedundancyECBlocks() {
+   712	    return getNameserviceAggregatedLong(
+   713	        MembershipStats::getHighestPriorityLowRedundancyECBlocks);
+   714	  }
+   715	
+   716	  @Override
+   717	  public int getRouterFederationRenameCount() {
+   718	    return this.router.getRpcServer().getRouterFederationRenameCount();
+   719	  }
+   720	
+   721	  @Override
+   722	  public int getSchedulerJobCount() {
+   723	    return this.router.getRpcServer().getSchedulerJobCount();
+   724	  }
+   725	
+   726	  @Override
+   727	  public String getSafemode() {
+   728	    if (this.router.isRouterState(RouterServiceState.SAFEMODE)) {
+   729	      return "Safe mode is ON. " + this.getSafeModeTip();
+   730	    } else {
+   731	      return "";
+   732	    }
+   733	  }
+   734	
+   735	  private String getSafeModeTip() {
+   736	    String cmd = "Use \"hdfs dfsrouteradmin -safemode leave\" "
+   737	        + "to turn safe mode off.";
+   738	    if (this.router.isRouterState(RouterServiceState.INITIALIZING)
+   739	        || this.router.isRouterState(RouterServiceState.UNINITIALIZED)) {
+   740	      return "Router is in" + this.router.getRouterState()
+   741	          + "mode, the router will immediately return to "
+   742	          + "normal mode after some time. " + cmd;
+   743	    } else if (this.router.isRouterState(RouterServiceState.SAFEMODE)) {
+   744	      return "It was turned on manually. " + cmd;
+   745	    }
+   746	    return "";
+   747	  }
+   748	
+   749	  /**
+   750	   * Build a set of unique values found in all namespaces.
+   751	   *
+   752	   * @param f Method reference of the appropriate FederationNamespaceInfo
+   753	   *          getter function
+   754	   * @return Set of unique string values found in all discovered namespaces.
+   755	   * @throws IOException if the query could not be executed.
+   756	   */
+   757	  private Collection<String> getNamespaceInfo(
+   758	      Function<FederationNamespaceInfo, String> f) throws IOException {
+   759	    if (membershipStore == null) {
+   760	      return new HashSet<>();
+   761	    }
+   762	    GetNamespaceInfoRequest request = GetNamespaceInfoRequest.newInstance();
+   763	    GetNamespaceInfoResponse response =
+   764	        membershipStore.getNamespaceInfo(request);
+   765	    return response.getNamespaceInfo().stream()
+   766	      .map(f)
+   767	      .collect(Collectors.toSet());
+   768	  }
+   769	
+   770	  /**
+   771	   * Get the aggregated value for a method for all nameservices.
+   772	   * @param f Method reference
+   773	   * @return Aggregated integer.
+   774	   */
+   775	  private int getNameserviceAggregatedInt(ToIntFunction<MembershipStats> f) {
+   776	    try {
+   777	      return getActiveNamenodeRegistrations().stream()
+   778	               .map(MembershipState::getStats)
+   779	               .collect(Collectors.summingInt(f));
+   780	    } catch (IOException e) {
+   781	      LOG.error("Unable to extract metrics: {}", e.getMessage());
+   782	      return 0;
+   783	    }
+   784	  }
+   785	
+   786	  /**
+   787	   * Get the aggregated value for a method for all nameservices.
+   788	   * @param f Method reference
+   789	   * @return Aggregated long.
+   790	   */
+   791	  private long getNameserviceAggregatedLong(ToLongFunction<MembershipStats> f) {
+   792	    try {
+   793	      return getActiveNamenodeRegistrations().stream()
+   794	               .map(MembershipState::getStats)
+   795	               .collect(Collectors.summingLong(f));
+   796	    } catch (IOException e) {
+   797	      LOG.error("Unable to extract metrics: {}", e.getMessage());
+   798	      return 0;
+   799	    }
+   800	  }
+   801	
+   802	  private BigInteger getNameserviceAggregatedBigInt(
+   803	      ToLongFunction<MembershipStats> f) {
+   804	    try {
+   805	      List<MembershipState> states = getActiveNamenodeRegistrations();
+   806	      BigInteger sum = BigInteger.valueOf(0);
+   807	      for (MembershipState state : states) {
+   808	        long lvalue = f.applyAsLong(state.getStats());
+   809	        sum = sum.add(BigInteger.valueOf(lvalue));
+   810	      }
+   811	      return sum;
+   812	    } catch (IOException e) {
+   813	      LOG.error("Unable to extract metrics: {}", e.getMessage());
+   814	      return new BigInteger("0");
+   815	    }
+   816	  }
+   817	
+   818	  /**
+   819	   * Fetches the most active namenode memberships for all known nameservices.
+   820	   * The fetched membership may not or may not be active. Excludes expired
+   821	   * memberships.
+   822	   * @throws IOException if the query could not be performed.
+   823	   * @return List of the most active NNs from each known nameservice.
+   824	   */
+   825	  private List<MembershipState> getActiveNamenodeRegistrations()
+   826	      throws IOException {
+   827	    List<MembershipState> resultList = new ArrayList<>();
+   828	    if (membershipStore == null) {
+   829	      return resultList;
+   830	    }
+   831	
+   832	    GetNamespaceInfoRequest request = GetNamespaceInfoRequest.newInstance();
+   833	    GetNamespaceInfoResponse response =
+   834	        membershipStore.getNamespaceInfo(request);
+   835	    for (FederationNamespaceInfo nsInfo : response.getNamespaceInfo()) {
+   836	      // Fetch the most recent namenode registration
+   837	      String nsId = nsInfo.getNameserviceId();
+   838	      List<? extends FederationNamenodeContext> nns =
+   839	          namenodeResolver.getNamenodesForNameserviceId(nsId);
+   840	      if (nns != null) {
+   841	        FederationNamenodeContext nn = nns.get(0);
+   842	        if (nn instanceof MembershipState) {
+   843	          resultList.add((MembershipState) nn);
+   844	        }
+   845	      }
+   846	    }
+   847	    return resultList;
+   848	  }
+   849	
+   850	  /**
+   851	   * Get time as a date string.
+   852	   * @param time Seconds since 1970.
+   853	   * @return String representing the date.
+   854	   */
+   855	  @VisibleForTesting
+   856	  static String getDateString(long time) {
+   857	    if (time <= 0) {
+   858	      return "-";
+   859	    }
+   860	    Date date = new Date(time);
+   861	
+   862	    SimpleDateFormat sdf = new SimpleDateFormat(DATE_FORMAT);
+   863	    return sdf.format(date);
+   864	  }
+   865	
+   866	  /**
+   867	   * Get the number of seconds passed since a date.
+   868	   *
+   869	   * @param timeMs to use as a reference.
+   870	   * @return Seconds since the date.
+   871	   */
+   872	  private static long getSecondsSince(long timeMs) {
+   873	    if (timeMs < 0) {
+   874	      return -1;
+   875	    }
+   876	    return (now() - timeMs) / 1000;
+   877	  }
+   878	
+   879	  /**
+   880	   * Get JSON for this record.
+   881	   *
+   882	   * @return Map representing the data for the JSON representation.
+   883	   */
+   884	  private static Map<String, Object> getJson(BaseRecord record) {
+   885	    Map<String, Object> json = new HashMap<>();
+   886	    Map<String, Class<?>> fields = getFields(record);
+   887	
+   888	    for (String fieldName : fields.keySet()) {
+   889	      if (!fieldName.equalsIgnoreCase("proto")) {
+   890	        try {
+   891	          Object value = getField(record, fieldName);
+   892	          if (value instanceof BaseRecord) {
+   893	            BaseRecord recordField = (BaseRecord) value;
+   894	            json.putAll(getJson(recordField));
+   895	          } else {
+   896	            json.put(fieldName, value == null ? JSONObject.NULL : value);
+   897	          }
+   898	        } catch (Exception e) {
+   899	          throw new IllegalArgumentException(
+   900	              "Cannot serialize field " + fieldName + " into JSON");
+   901	        }
+   902	      }
+   903	    }
+   904	    return json;
+   905	  }
+   906	
+   907	  /**
+   908	   * Returns all serializable fields in the object.
+   909	   *
+   910	   * @return Map with the fields.
+   911	   */
+   912	  private static Map<String, Class<?>> getFields(BaseRecord record) {
+   913	    Map<String, Class<?>> getters = new HashMap<>();
+   914	    for (Method m : record.getClass().getDeclaredMethods()) {
+   915	      if (m.getName().startsWith("get")) {
+   916	        try {
+   917	          Class<?> type = m.getReturnType();
+   918	          char[] c = m.getName().substring(3).toCharArray();
+   919	          c[0] = Character.toLowerCase(c[0]);
+   920	          String key = new String(c);
+   921	          getters.put(key, type);
+   922	        } catch (Exception e) {
+   923	          LOG.error("Cannot execute getter {} on {}", m.getName(), record);
+   924	        }
+   925	      }
+   926	    }
+   927	    return getters;
+   928	  }
+   929	
+   930	  /**
+   931	   * Fetches the value for a field name.
+   932	   *
+   933	   * @param fieldName the legacy name of the field.
+   934	   * @return The field data or null if not found.
+   935	   */
+   936	  private static Object getField(BaseRecord record, String fieldName) {
+   937	    Object result = null;
+   938	    Method m = locateGetter(record, fieldName);
+   939	    if (m != null) {
+   940	      try {
+   941	        result = m.invoke(record);
+   942	      } catch (Exception e) {
+   943	        LOG.error("Cannot get field {} on {}", fieldName, record);
+   944	      }
+   945	    }
+   946	    return result;
+   947	  }
+   948	
+   949	  /**
+   950	   * Finds the appropriate getter for a field name.
+   951	   *
+   952	   * @param fieldName The legacy name of the field.
+   953	   * @return The matching getter or null if not found.
+   954	   */
+   955	  private static Method locateGetter(BaseRecord record, String fieldName) {
+   956	    for (Method m : record.getClass().getMethods()) {
+   957	      if (m.getName().equalsIgnoreCase("get" + fieldName)) {
+   958	        return m;
+   959	      }
+   960	    }
+   961	    return null;
+   962	  }
+   963	}

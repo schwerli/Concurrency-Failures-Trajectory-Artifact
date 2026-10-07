@@ -1,0 +1,112 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index c1a76584f0..7bf93b796b 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -863,6 +863,11 @@ class ExpressionWrapper(Expression):
+     def get_source_expressions(self):
+         return [self.expression]
+ 
++    def get_group_by_cols(self, alias=None):
++        expression = self.expression.copy()
++        expression.output_field = self.output_field
++        return expression.get_group_by_cols(alias=alias)
++
+     def as_sql(self, compiler, connection):
+         return self.expression.as_sql(compiler, connection)
+ 
+diff --git a/tests/aggregation/tests.py b/tests/aggregation/tests.py
+index a8377c9a26..2564c7789f 100644
+--- a/tests/aggregation/tests.py
++++ b/tests/aggregation/tests.py
+@@ -6,8 +6,9 @@ from unittest import skipIf
+ from django.core.exceptions import FieldError
+ from django.db import connection
+ from django.db.models import (
+-    Avg, Case, Count, DecimalField, DurationField, Exists, F, FloatField, Func,
+-    IntegerField, Max, Min, OuterRef, Subquery, Sum, Value, When,
++    Avg, Case, Count, DecimalField, DurationField, Exists, ExpressionWrapper,
++    F, FloatField, Func, IntegerField, Max, Min, OuterRef, Subquery, Sum,
++    Value, When,
+ )
+ from django.db.models.functions import Coalesce
+ from django.test import TestCase
+@@ -438,6 +439,48 @@ class AggregateTestCase(TestCase):
+             ]
+         )
+ 
++    def test_wrapped_constant_annotation_not_in_group_by(self):
++        """
++        A constant expression wrapped in ExpressionWrapper() is excluded from
++        the GROUP BY clause, just like an unwrapped one.
++        """
++        for expression in (
++            Value(3, output_field=IntegerField()),
++            ExpressionWrapper(Value(3), output_field=IntegerField()),
++            ExpressionWrapper(Value(3, output_field=IntegerField()), output_field=IntegerField()),
++        ):
++            with self.subTest(expression=expression):
++                qs = (
++                    Book.objects.annotate(expr_res=expression)
++                    .values('expr_res', 'rating')
++                    .annotate(sum=Sum('pages')).order_by('rating')
++                )
++                sql = str(qs.query)
++                self.assertNotIn('3', sql[sql.index('GROUP BY'):])
++                self.assertEqual(
++                    list(qs), [
++                        {'expr_res': 3, 'rating': 3.0, 'sum': 447},
++                        {'expr_res': 3, 'rating': 4.0, 'sum': 1176},
++                        {'expr_res': 3, 'rating': 4.5, 'sum': 447},
++                        {'expr_res': 3, 'rating': 5.0, 'sum': 1015},
++                    ]
++                )
++
++    def test_wrapped_mixed_type_annotation_in_group_by(self):
++        """
++        ExpressionWrapper() around an expression that can't resolve its own
++        output_field is still usable in the GROUP BY clause.
++        """
++        qs = (
++            Book.objects.annotate(
++                combined=ExpressionWrapper(F('pages') + F('rating'), output_field=IntegerField()),
++            ).values('combined').annotate(count=Count('id')).order_by('combined')
++        )
++        self.assertEqual(
++            [row['count'] for row in qs],
++            [1, 1, 1, 1, 1, 1],
++        )
++
+     def test_fkey_aggregate(self):
+         explicit = list(Author.objects.annotate(Count('book__id')))
+         implicit = list(Author.objects.annotate(Count('book')))
+diff --git a/tests/annotations/tests.py b/tests/annotations/tests.py
+index 142c23ead6..667e07a52a 100644
+--- a/tests/annotations/tests.py
++++ b/tests/annotations/tests.py
+@@ -160,6 +160,26 @@ class NonAggregateAnnotationTestCase(TestCase):
+         self.assertEqual(len(books), Book.objects.count())
+         self.assertTrue(all(not book.selected for book in books))
+ 
++    def test_full_expression_annotation(self):
++        books = Book.objects.annotate(
++            selected=ExpressionWrapper(~Q(pk__in=[]), output_field=BooleanField()),
++        )
++        self.assertEqual(len(books), Book.objects.count())
++        self.assertTrue(all(book.selected for book in books))
++
++    def test_full_expression_annotation_with_aggregation(self):
++        qs = Book.objects.filter(isbn='159059725').annotate(
++            selected=ExpressionWrapper(~Q(pk__in=[]), output_field=BooleanField()),
++            rating_count=Count('rating'),
++        )
++        self.assertEqual([book.rating_count for book in qs], [1])
++
++    def test_aggregate_over_full_expression_annotation(self):
++        qs = Book.objects.annotate(
++            selected=ExpressionWrapper(~Q(pk__in=[]), output_field=BooleanField()),
++        ).aggregate(Sum('selected'))
++        self.assertEqual(qs['selected__sum'], Book.objects.count())
++
+     def test_annotate_with_aggregation(self):
+         books = Book.objects.annotate(
+             is_book=Value(1, output_field=IntegerField()),

@@ -1,0 +1,1390 @@
+All 30 differential cases match the executable exactly (stdout, stderr, exit code). Here is the code.
+
+## Architecture
+
+```
+/output
+├── lib/
+│   ├── errors.mjs      exception hierarchy (ScheduleError → ScheduleValueError → IntervalError, CancelJob)
+│   ├── pytime.mjs      datetime/timedelta primitives ported from Python
+│   ├── pytypes.mjs     int()/float()/repr() builtins used by arg parsing
+│   ├── job.mjs         Job: fluent unit getters, tag/at/to/until/do, next-run computation
+│   ├── scheduler.mjs   Scheduler: job store, run/clear/cancel/filter
+│   ├── schedule.mjs    default-scheduler module API (the `import schedule` analogue)
+│   └── argparse.mjs    ArgumentParser: usage/help layout, error wording, exit code 2
+└── test11.mjs          entry point
+```
+
+---
+
+### `/output/lib/errors.mjs`
+
+```javascript
+/**
+ * Exception types used by the scheduling library.
+ *
+ * Mirrors the hierarchy of the original Python package:
+ *
+ *   ScheduleError
+ *    └── ScheduleValueError
+ *         └── IntervalError
+ */
+
+/** Base scheduling exception. */
+export class ScheduleError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ScheduleError';
+  }
+}
+
+/** Base class for value errors during scheduling. */
+export class ScheduleValueError extends ScheduleError {
+  constructor(message) {
+    super(message);
+    this.name = 'ScheduleValueError';
+  }
+}
+
+/** An improper interval was used. */
+export class IntervalError extends ScheduleValueError {
+  constructor(message) {
+    super(message);
+    this.name = 'IntervalError';
+  }
+}
+
+/**
+ * Sentinel. Can be returned from a job to unschedule itself, mirroring the
+ * Python `CancelJob` class object that is compared by identity.
+ */
+export class CancelJob {}
+```
+
+### `/output/lib/pytime.mjs`
+
+```javascript
+/**
+ * Minimal re-implementation of the pieces of Python's `datetime` module that
+ * the scheduler relies on: `timedelta`, `datetime.now()`, `datetime.replace()`,
+ * `datetime.weekday()` and `datetime.time` comparisons.
+ *
+ * Instants are plain JS `Date` objects (local time, millisecond resolution);
+ * durations are `TimeDelta` instances.
+ */
+
+const MS_PER_SECOND = 1000;
+const MS_PER_MINUTE = 60 * MS_PER_SECOND;
+const MS_PER_HOUR = 60 * MS_PER_MINUTE;
+const MS_PER_DAY = 24 * MS_PER_HOUR;
+const MS_PER_WEEK = 7 * MS_PER_DAY;
+
+/** Duration between two instants, stored internally as milliseconds. */
+export class TimeDelta {
+  constructor({
+    weeks = 0,
+    days = 0,
+    hours = 0,
+    minutes = 0,
+    seconds = 0,
+    milliseconds = 0,
+    microseconds = 0,
+  } = {}) {
+    this.milliseconds =
+      weeks * MS_PER_WEEK +
+      days * MS_PER_DAY +
+      hours * MS_PER_HOUR +
+      minutes * MS_PER_MINUTE +
+      seconds * MS_PER_SECOND +
+      milliseconds +
+      microseconds / 1000;
+  }
+
+  /** Whole days, floored towards negative infinity (like Python). */
+  get days() {
+    return Math.floor(this.milliseconds / MS_PER_DAY);
+  }
+
+  /** Seconds remaining after the whole days have been removed. */
+  get seconds() {
+    const rest = this.milliseconds - this.days * MS_PER_DAY;
+    return Math.floor(rest / MS_PER_SECOND);
+  }
+
+  totalSeconds() {
+    return this.milliseconds / MS_PER_SECOND;
+  }
+
+  /** Build a delta from a unit name such as 'seconds' or 'weeks'. */
+  static fromUnit(unit, interval) {
+    return new TimeDelta({ [unit]: interval });
+  }
+
+  toString() {
+    return formatTimeDelta(this);
+  }
+}
+
+/** Current local time, equivalent to `datetime.datetime.now()`. */
+export function now() {
+  return new Date();
+}
+
+/** `date + delta` */
+export function addDelta(date, delta) {
+  return new Date(date.getTime() + delta.milliseconds);
+}
+
+/** `date - delta` */
+export function subDelta(date, delta) {
+  return new Date(date.getTime() - delta.milliseconds);
+}
+
+/** `a - b` as a TimeDelta. */
+export function diff(a, b) {
+  return new TimeDelta({ milliseconds: a.getTime() - b.getTime() });
+}
+
+/** Monday is 0 and Sunday is 6, matching `datetime.weekday()`. */
+export function weekday(date) {
+  return (date.getDay() + 6) % 7;
+}
+
+/** Immutable field replacement, equivalent to `datetime.replace()`. */
+export function replace(date, fields) {
+  const copy = new Date(date.getTime());
+  if (fields.year !== undefined) copy.setFullYear(fields.year);
+  if (fields.month !== undefined) copy.setMonth(fields.month - 1);
+  if (fields.day !== undefined) copy.setDate(fields.day);
+  if (fields.hour !== undefined) copy.setHours(fields.hour);
+  if (fields.minute !== undefined) copy.setMinutes(fields.minute);
+  if (fields.second !== undefined) copy.setSeconds(fields.second);
+  if (fields.microsecond !== undefined) {
+    copy.setMilliseconds(Math.floor(fields.microsecond / 1000));
+  }
+  return copy;
+}
+
+/** Wall-clock time of day, the analogue of `datetime.time`. */
+export class Time {
+  constructor(hour = 0, minute = 0, second = 0, microsecond = 0) {
+    this.hour = hour;
+    this.minute = minute;
+    this.second = second;
+    this.microsecond = microsecond;
+  }
+
+  /** Number of microseconds since midnight; used for ordering comparisons. */
+  valueOf() {
+    return (
+      ((this.hour * 60 + this.minute) * 60 + this.second) * 1e6 + this.microsecond
+    );
+  }
+
+  toString() {
+    const base = `${pad(this.hour, 2)}:${pad(this.minute, 2)}:${pad(this.second, 2)}`;
+    return this.microsecond ? `${base}.${pad(this.microsecond, 6)}` : base;
+  }
+}
+
+/** Time-of-day portion of an instant, equivalent to `datetime.time()`. */
+export function timeOf(date) {
+  return new Time(
+    date.getHours(),
+    date.getMinutes(),
+    date.getSeconds(),
+    date.getMilliseconds() * 1000
+  );
+}
+
+/** `str(datetime)` — "YYYY-MM-DD HH:MM:SS[.ffffff]". */
+export function formatDatetime(date) {
+  const base =
+    `${pad(date.getFullYear(), 4)}-${pad(date.getMonth() + 1, 2)}-${pad(date.getDate(), 2)} ` +
+    `${pad(date.getHours(), 2)}:${pad(date.getMinutes(), 2)}:${pad(date.getSeconds(), 2)}`;
+  const micro = date.getMilliseconds() * 1000;
+  return micro ? `${base}.${pad(micro, 6)}` : base;
+}
+
+/** `str(timedelta)` — "[D day[s], ]H:MM:SS[.ffffff]". */
+export function formatTimeDelta(delta) {
+  const days = delta.days;
+  let rest = delta.milliseconds - days * MS_PER_DAY;
+  const hours = Math.floor(rest / MS_PER_HOUR);
+  rest -= hours * MS_PER_HOUR;
+  const minutes = Math.floor(rest / MS_PER_MINUTE);
+  rest -= minutes * MS_PER_MINUTE;
+  const seconds = Math.floor(rest / MS_PER_SECOND);
+  const micro = Math.round((rest - seconds * MS_PER_SECOND) * 1000);
+
+  let out = '';
+  if (days !== 0) out += `${days} day${Math.abs(days) === 1 ? '' : 's'}, `;
+  out += `${hours}:${pad(minutes, 2)}:${pad(seconds, 2)}`;
+  if (micro) out += `.${pad(micro, 6)}`;
+  return out;
+}
+
+/** Blocking sleep, the analogue of `time.sleep()` inside `run_all()`. */
+export function sleepSeconds(seconds) {
+  if (!(seconds > 0)) return;
+  const buffer = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(buffer, 0, 0, seconds * 1000);
+}
+
+function pad(value, width) {
+  return String(value).padStart(width, '0');
+}
+```
+
+### `/output/lib/pytypes.mjs`
+
+```javascript
+/**
+ * Faithful JS equivalents of the Python builtins that command line parsing
+ * depends on: `int()`, `float()` and `repr()` for strings.
+ */
+
+/**
+ * Python's `int(str)`: surrounding whitespace is ignored, an optional sign is
+ * allowed and single underscores may separate digits ("1_0" is 10). Leading
+ * zeros are fine ("010" is 10). Anything else raises.
+ */
+export function pyInt(text) {
+  const stripped = String(text).trim();
+  if (!/^[+-]?\d(_?\d)*$/.test(stripped)) {
+    throw new ValueError(`invalid literal for int() with base 10: ${pyRepr(text)}`);
+  }
+  return Number(stripped.replace(/_/g, ''));
+}
+
+/** Python's `float(str)`. */
+export function pyFloat(text) {
+  const stripped = String(text).trim();
+  const normalized = stripped.replace(/_/g, '');
+  if (
+    !/^[+-]?(\d(_?\d)*(\.(\d(_?\d)*)?)?|\.\d(_?\d)*)(e[+-]?\d(_?\d)*)?$/i.test(stripped) &&
+    !/^[+-]?(inf(inity)?|nan)$/i.test(stripped)
+  ) {
+    throw new ValueError(`could not convert string to float: ${pyRepr(text)}`);
+  }
+  return Number(normalized);
+}
+
+/** Python's `repr()` for strings, used inside error messages. */
+export function pyRepr(value) {
+  const text = String(value);
+  const quote = text.includes("'") && !text.includes('"') ? '"' : "'";
+  let out = quote;
+  for (const char of text) {
+    if (char === '\\') out += '\\\\';
+    else if (char === quote) out += '\\' + quote;
+    else if (char === '\n') out += '\\n';
+    else if (char === '\r') out += '\\r';
+    else if (char === '\t') out += '\\t';
+    else if (char < ' ' || char === '\x7f') {
+      out += '\\x' + char.charCodeAt(0).toString(16).padStart(2, '0');
+    } else out += char;
+  }
+  return out + quote;
+}
+
+/** Raised by the converters above; carries no argparse specific state. */
+export class ValueError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ValueError';
+  }
+}
+```
+
+### `/output/lib/job.mjs`
+
+```javascript
+/**
+ * A periodic job, as returned by `every()`.
+ *
+ * Units are selected through property getters (`.seconds`, `.minutes`, ...)
+ * so that the fluent chain reads exactly like the Python original:
+ *
+ *   every(1).seconds.tag('group1').do(fn)
+ */
+
+import {
+  ScheduleError,
+  ScheduleValueError,
+  IntervalError,
+  CancelJob,
+} from './errors.mjs';
+import {
+  TimeDelta,
+  Time,
+  now,
+  addDelta,
+  subDelta,
+  diff,
+  weekday,
+  replace,
+  timeOf,
+  formatDatetime,
+} from './pytime.mjs';
+
+const VALID_UNITS = ['seconds', 'minutes', 'hours', 'days', 'weeks'];
+
+const WEEKDAYS = [
+  'monday',
+  'tuesday',
+  'wednesday',
+  'thursday',
+  'friday',
+  'saturday',
+  'sunday',
+];
+
+export class Job {
+  constructor(interval, scheduler = null) {
+    /** Quantity of the unit of time between runs. */
+    this.interval = interval;
+    /** Upper bound of a randomised interval, set through `to()`. */
+    this.latest = null;
+    /** The function to run when the job is due. */
+    this.jobFunc = null;
+    /** Time unit, one of VALID_UNITS. */
+    this.unit = null;
+    /** Optional time at which this job runs. */
+    this.atTime = null;
+    /** Timestamp of the last run, or null. */
+    this.lastRun = null;
+    /** Timestamp of the next run. */
+    this.nextRun = null;
+    /** Duration between two runs. */
+    this.period = null;
+    /** Weekday on which a weekly job starts. */
+    this.startDay = null;
+    /** Deadline after which the job is unscheduled, set through `until()`. */
+    this.cancelAfter = null;
+    /** Set of string tags. */
+    this.tags = new Set();
+    /** Scheduler this job belongs to. */
+    this.scheduler = scheduler;
+  }
+
+  // --- unit selection -----------------------------------------------------
+
+  get second() {
+    assertSingular(this.interval, 'seconds');
+    return this.seconds;
+  }
+
+  get seconds() {
+    this.unit = 'seconds';
+    return this;
+  }
+
+  get minute() {
+    assertSingular(this.interval, 'minutes');
+    return this.minutes;
+  }
+
+  get minutes() {
+    this.unit = 'minutes';
+    return this;
+  }
+
+  get hour() {
+    assertSingular(this.interval, 'hours');
+    return this.hours;
+  }
+
+  get hours() {
+    this.unit = 'hours';
+    return this;
+  }
+
+  get day() {
+    assertSingular(this.interval, 'days');
+    return this.days;
+  }
+
+  get days() {
+    this.unit = 'days';
+    return this;
+  }
+
+  get week() {
+    assertSingular(this.interval, 'weeks');
+    return this.weeks;
+  }
+
+  get weeks() {
+    this.unit = 'weeks';
+    return this;
+  }
+
+  get monday() {
+    return this._startOn('monday');
+  }
+
+  get tuesday() {
+    return this._startOn('tuesday');
+  }
+
+  get wednesday() {
+    return this._startOn('wednesday');
+  }
+
+  get thursday() {
+    return this._startOn('thursday');
+  }
+
+  get friday() {
+    return this._startOn('friday');
+  }
+
+  get saturday() {
+    return this._startOn('saturday');
+  }
+
+  get sunday() {
+    return this._startOn('sunday');
+  }
+
+  _startOn(day) {
+    if (this.interval !== 1) {
+      throw new IntervalError(
+        `Scheduling .${day}() jobs is only allowed for weekly jobs. ` +
+          `Using .${day}() on a job scheduled to run every 2 or more weeks ` +
+          'is not supported.'
+      );
+    }
+    this.startDay = day;
+    return this.weeks;
+  }
+
+  // --- configuration ------------------------------------------------------
+
+  /** Tag the job with one or more unique identifiers. */
+  tag(...tags) {
+    for (const tag of tags) {
+      if (typeof tag !== 'string' && typeof tag !== 'number') {
+        throw new TypeError('Tags must be hashable');
+      }
+    }
+    for (const tag of tags) this.tags.add(tag);
+    return this;
+  }
+
+  /** Schedule the job at a specific time of day, e.g. "10:30" or ":15". */
+  at(timeStr) {
+    if (!VALID_AT_UNITS.includes(this.unit) && !this.startDay) {
+      throw new ScheduleValueError(
+        'Invalid unit (valid units are `days`, `hours`, and `minutes`)'
+      );
+    }
+    if (typeof timeStr !== 'string') {
+      throw new TypeError('at() should be passed a string');
+    }
+    if (this.unit === 'days' || this.startDay) {
+      if (!/^[0-2]\d:[0-5]\d(:[0-5]\d)?$/.test(timeStr)) {
+        throw new ScheduleValueError(
+          'Invalid time format for a daily job (valid format is HH:MM(:SS)?)'
+        );
+      }
+    }
+    if (this.unit === 'hours') {
+      if (!/^([0-5]\d)?:[0-5]\d$/.test(timeStr)) {
+        throw new ScheduleValueError(
+          'Invalid time format for an hourly job (valid format is (MM)?:SS)'
+        );
+      }
+    }
+    if (this.unit === 'minutes') {
+      if (!/^:[0-5]\d$/.test(timeStr)) {
+        throw new ScheduleValueError(
+          'Invalid time format for a minutely job (valid format is :SS)'
+        );
+      }
+    }
+
+    const parts = timeStr.split(':');
+    let hour = 0;
+    let minute = 0;
+    let second = 0;
+    if (this.unit === 'days' || this.startDay) {
+      hour = parseInt(parts[0], 10);
+      minute = parseInt(parts[1], 10);
+      second = parts.length === 3 ? parseInt(parts[2], 10) : 0;
+      if (hour > 23) {
+        throw new ScheduleValueError(
+          'Invalid number of hours (`hour` must be between 0 and 23)'
+        );
+      }
+    } else if (this.unit === 'hours') {
+      minute = parts[0] === '' ? 0 : parseInt(parts[0], 10);
+      second = parseInt(parts[1], 10);
+    } else if (this.unit === 'minutes') {
+      second = parseInt(parts[1], 10);
+    }
+
+    this.atTime = new Time(hour, minute, second);
+    return this;
+  }
+
+  /** Randomise the interval to somewhere between `interval` and `latest`. */
+  to(latest) {
+    this.latest = latest;
+    return this;
+  }
+
+  /** Unschedule the job once `deadline` has passed. */
+  until(deadline) {
+    if (deadline instanceof Date) {
+      this.cancelAfter = deadline;
+    } else if (deadline instanceof TimeDelta) {
+      this.cancelAfter = addDelta(now(), deadline);
+    } else if (deadline instanceof Time) {
+      const today = now();
+      this.cancelAfter = replace(today, {
+        hour: deadline.hour,
+        minute: deadline.minute,
+        second: deadline.second,
+        microsecond: deadline.microsecond,
+      });
+    } else {
+      throw new TypeError(
+        'until() takes a string, datetime.datetime, datetime.timedelta, ' +
+          'datetime.time parameter'
+      );
+    }
+    if (this.cancelAfter.getTime() < now().getTime()) {
+      throw new ScheduleValueError(
+        'Cannot schedule a job to run until a time in the past'
+      );
+    }
+    return this;
+  }
+
+  /** Attach the callable and register the job with its scheduler. */
+  do(jobFunc, ...args) {
+    this.jobFunc = () => jobFunc(...args);
+    this.jobFunc.funcName = jobFunc.name || '<lambda>';
+    this._scheduleNextRun();
+
+    if (this.scheduler === null) {
+      throw new ScheduleError(
+        'Unable to a add job to schedule. Job is not associated with an scheduler'
+      );
+    }
+    this.scheduler.jobs.push(this);
+    return this;
+  }
+
+  // --- runtime state ------------------------------------------------------
+
+  /** True when the job is due to run. */
+  get shouldRun() {
+    return this.nextRun !== null && now().getTime() >= this.nextRun.getTime();
+  }
+
+  /** Run the job and reschedule it. */
+  run() {
+    if (this._isOverdue(now())) {
+      return CancelJob;
+    }
+    const ret = this.jobFunc();
+    this.lastRun = now();
+    this._scheduleNextRun();
+
+    if (this._isOverdue(this.nextRun)) {
+      return CancelJob;
+    }
+    return ret;
+  }
+
+  /** Compute the instant at which this job should run next. */
+  _scheduleNextRun() {
+    if (!VALID_UNITS.includes(this.unit)) {
+      throw new ScheduleValueError(
+        `Invalid unit (valid units are ${VALID_UNITS.map((u) => `\`${u}\``).join(', ')})`
+      );
+    }
+
+    let interval;
+    if (this.latest !== null) {
+      if (!(this.latest >= this.interval)) {
+        throw new ScheduleError('`latest` is greater than `interval`');
+      }
+      interval = randInt(this.interval, this.latest);
+    } else {
+      interval = this.interval;
+    }
+
+    this.period = TimeDelta.fromUnit(this.unit, interval);
+    this.nextRun = addDelta(now(), this.period);
+
+    if (this.startDay !== null) {
+      if (this.unit !== 'weeks') {
+        throw new ScheduleValueError('`unit` should be \'weeks\'');
+      }
+      if (!WEEKDAYS.includes(this.startDay)) {
+        throw new ScheduleValueError(
+          `Invalid start day (valid start days are ${WEEKDAYS.join(', ')})`
+        );
+      }
+      const target = WEEKDAYS.indexOf(this.startDay);
+      let daysAhead = target - weekday(this.nextRun);
+      if (daysAhead <= 0) daysAhead += 7;
+      this.nextRun = subDelta(
+        addDelta(this.nextRun, new TimeDelta({ days: daysAhead })),
+        this.period
+      );
+    }
+
+    if (this.atTime !== null) {
+      if (!VALID_AT_UNITS.includes(this.unit) && this.startDay === null) {
+        throw new ScheduleValueError('Invalid unit without specifying start day');
+      }
+      const fields = { second: this.atTime.second, microsecond: 0 };
+      if (this.unit === 'days' || this.startDay !== null) {
+        fields.hour = this.atTime.hour;
+      }
+      if (this.unit === 'days' || this.unit === 'hours' || this.startDay !== null) {
+        fields.minute = this.atTime.minute;
+      }
+      this.nextRun = replace(this.nextRun, fields);
+
+      // Make sure we run at the specified time *today* (or *this hour*) too.
+      if (
+        this.lastRun === null ||
+        diff(this.nextRun, this.lastRun).milliseconds > this.period.milliseconds
+      ) {
+        const current = now();
+        const nowTime = timeOf(current);
+        if (
+          this.unit === 'days' &&
+          this.atTime.valueOf() > nowTime.valueOf() &&
+          this.interval === 1
+        ) {
+          this.nextRun = subDelta(this.nextRun, new TimeDelta({ days: 1 }));
+        } else if (
+          this.unit === 'hours' &&
+          (this.atTime.minute > current.getMinutes() ||
+            (this.atTime.minute === current.getMinutes() &&
+              this.atTime.second > current.getSeconds()))
+        ) {
+          this.nextRun = subDelta(this.nextRun, new TimeDelta({ hours: 1 }));
+        } else if (
+          this.unit === 'minutes' &&
+          this.atTime.second > current.getSeconds()
+        ) {
+          this.nextRun = subDelta(this.nextRun, new TimeDelta({ minutes: 1 }));
+        }
+      }
+    }
+
+    if (this.startDay !== null && this.atTime !== null) {
+      // Will we still make that time this week?
+      if (diff(this.nextRun, now()).days >= 7) {
+        this.nextRun = subDelta(this.nextRun, this.period);
+      }
+    }
+  }
+
+  /** True when `when` is past the `until()` deadline. */
+  _isOverdue(when) {
+    return this.cancelAfter !== null && when.getTime() > this.cancelAfter.getTime();
+  }
+
+  /** Ordering helper: jobs sort by their next run time. */
+  static compare(a, b) {
+    return a.nextRun.getTime() - b.nextRun.getTime();
+  }
+
+  toString() {
+    const funcName =
+      this.jobFunc && this.jobFunc.funcName ? this.jobFunc.funcName : '[None]';
+    const timestats =
+      `(last run: ${this.lastRun !== null ? formatDatetime(this.lastRun) : '[never]'}, ` +
+      `next run: ${this.nextRun !== null ? formatDatetime(this.nextRun) : '[never]'})`;
+    const unit = this.interval === 1 ? this.unit.replace(/s$/, '') : this.unit;
+    if (this.atTime !== null) {
+      return `Every ${this.interval} ${this.startDay || unit} at ${this.atTime} do ${funcName}() ${timestats}`;
+    }
+    return `Every ${this.interval} ${unit} do ${funcName}() ${timestats}`;
+  }
+}
+
+const VALID_AT_UNITS = ['days', 'hours', 'minutes'];
+
+function assertSingular(interval, plural) {
+  if (interval !== 1) {
+    throw new IntervalError(`Use ${plural} instead of ${plural.replace(/s$/, '')}`);
+  }
+}
+
+/** Inclusive random integer, equivalent to `random.randint(a, b)`. */
+function randInt(a, b) {
+  return a + Math.floor(Math.random() * (b - a + 1));
+}
+```
+
+### `/output/lib/scheduler.mjs`
+
+```javascript
+/**
+ * Job container and executor.
+ *
+ * `Scheduler.jobs` is mutated in place (never reassigned) so that any alias
+ * held elsewhere — such as the module level `jobs` export — stays valid across
+ * `clear()` calls, exactly like `del self.jobs[:]` in the Python original.
+ */
+
+import { Job } from './job.mjs';
+import { CancelJob } from './errors.mjs';
+import { diff, now, sleepSeconds } from './pytime.mjs';
+
+export class Scheduler {
+  constructor() {
+    this.jobs = [];
+  }
+
+  /** Run every job that is due to run at this moment. */
+  runPending() {
+    const runnable = this.jobs.filter((job) => job.shouldRun);
+    runnable.sort(Job.compare);
+    for (const job of runnable) {
+      this._runJob(job);
+    }
+  }
+
+  /** Run all jobs regardless of their schedule, pausing between each. */
+  runAll(delaySeconds = 0) {
+    for (const job of this.jobs.slice()) {
+      this._runJob(job);
+      sleepSeconds(delaySeconds);
+    }
+  }
+
+  /** Jobs, optionally filtered by tag. */
+  getJobs(tag = null) {
+    if (tag === null || tag === undefined) {
+      return this.jobs.slice();
+    }
+    return this.jobs.filter((job) => job.tags.has(tag));
+  }
+
+  /** Delete all jobs, or only those carrying `tag`. */
+  clear(tag = null) {
+    if (tag === null || tag === undefined) {
+      this.jobs.length = 0;
+    } else {
+      const kept = this.jobs.filter((job) => !job.tags.has(tag));
+      this.jobs.splice(0, this.jobs.length, ...kept);
+    }
+  }
+
+  /** Remove a single job; missing jobs are ignored. */
+  cancelJob(job) {
+    const index = this.jobs.indexOf(job);
+    if (index !== -1) {
+      this.jobs.splice(index, 1);
+    }
+  }
+
+  /** Schedule a new periodic job. */
+  every(interval = 1) {
+    return new Job(interval, this);
+  }
+
+  /** Instant of the next scheduled run, or null when there are no jobs. */
+  get nextRun() {
+    if (this.jobs.length === 0) {
+      return null;
+    }
+    return this.jobs.slice().sort(Job.compare)[0].nextRun;
+  }
+
+  /** Seconds until the next scheduled run, or null when there are no jobs. */
+  get idleSeconds() {
+    const next = this.nextRun;
+    if (next === null) {
+      return null;
+    }
+    return diff(next, now()).totalSeconds();
+  }
+
+  _runJob(job) {
+    const ret = job.run();
+    if (ret === CancelJob || ret instanceof CancelJob) {
+      this.cancelJob(job);
+    }
+  }
+}
+```
+
+### `/output/lib/schedule.mjs`
+
+```javascript
+/**
+ * Module level API backed by a shared default scheduler — the direct analogue
+ * of `import schedule` in Python.
+ *
+ *   import * as schedule from './lib/schedule.mjs';
+ *   schedule.every(1).seconds.tag('group1').do(fn);
+ */
+
+import { Scheduler } from './scheduler.mjs';
+import { Job } from './job.mjs';
+import {
+  ScheduleError,
+  ScheduleValueError,
+  IntervalError,
+  CancelJob,
+} from './errors.mjs';
+
+/** The scheduler used by every module level helper below. */
+export const defaultScheduler = new Scheduler();
+
+/** Live view of the default scheduler's job list. */
+export const jobs = defaultScheduler.jobs;
+
+/** Schedule a new periodic job on the default scheduler. */
+export function every(interval = 1) {
+  return defaultScheduler.every(interval);
+}
+
+/** Run all jobs that are due on the default scheduler. */
+export function runPending() {
+  defaultScheduler.runPending();
+}
+
+/** Run all jobs on the default scheduler, regardless of their schedule. */
+export function runAll(delaySeconds = 0) {
+  defaultScheduler.runAll(delaySeconds);
+}
+
+/** Jobs on the default scheduler, optionally filtered by tag. */
+export function getJobs(tag = null) {
+  return defaultScheduler.getJobs(tag);
+}
+
+/** Delete jobs from the default scheduler, optionally only those with `tag`. */
+export function clear(tag = null) {
+  defaultScheduler.clear(tag);
+}
+
+/** Remove one job from the default scheduler. */
+export function cancelJob(job) {
+  defaultScheduler.cancelJob(job);
+}
+
+/** Instant of the next run on the default scheduler. */
+export function nextRun() {
+  return defaultScheduler.nextRun;
+}
+
+/** Seconds until the next run on the default scheduler. */
+export function idleSeconds() {
+  return defaultScheduler.idleSeconds;
+}
+
+/** Decorator-style helper: attach `func` to an already configured job. */
+export function repeat(job, ...args) {
+  return (func) => {
+    job.do(func, ...args);
+    return func;
+  };
+}
+
+export { Scheduler, Job, ScheduleError, ScheduleValueError, IntervalError, CancelJob };
+```
+
+### `/output/lib/argparse.mjs`
+
+```javascript
+/**
+ * A dependency-free port of the subset of Python's `argparse` that this
+ * program uses: optional arguments with `type`, `required`, `default`,
+ * `choices` and the automatic `-h/--help` flag.
+ *
+ * Usage lines, help layout, error wording and the exit status of 2 all match
+ * CPython's `argparse` byte for byte.
+ */
+
+import { basename } from 'node:path';
+import { pyInt, pyFloat, pyRepr } from './pytypes.mjs';
+
+const NEGATIVE_NUMBER = /^-\d+$|^-\d*\.\d+$/;
+const MAX_HELP_POSITION = 24;
+const INDENT = 2;
+
+/** Named type converters, so `type: 'int'` reads like `type=int`. */
+const TYPES = {
+  int: { name: 'int', convert: pyInt },
+  float: { name: 'float', convert: pyFloat },
+  str: { name: 'str', convert: (value) => value },
+};
+
+/** Thrown instead of exiting when `exitOnError` is disabled. */
+export class ArgumentError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ArgumentError';
+  }
+}
+
+export class ArgumentParser {
+  constructor({
+    prog = null,
+    description = null,
+    epilog = null,
+    addHelp = true,
+    exitOnError = true,
+  } = {}) {
+    this.prog = prog !== null ? prog : defaultProg();
+    this.description = description;
+    this.epilog = epilog;
+    this.exitOnError = exitOnError;
+    this.actions = [];
+    this.optionStringActions = new Map();
+
+    if (addHelp) {
+      this.addArgument(['-h', '--help'], {
+        action: 'help',
+        default: undefined,
+        help: 'show this help message and exit',
+      });
+    }
+  }
+
+  /**
+   * Register an argument. `nameOrFlags` is a flag string such as '--a', an
+   * array of flag strings, or a bare name for a positional argument.
+   */
+  addArgument(nameOrFlags, options = {}) {
+    const flags = Array.isArray(nameOrFlags) ? nameOrFlags : [nameOrFlags];
+    const optionStrings = flags.filter((flag) => flag.startsWith('-'));
+    const isPositional = optionStrings.length === 0;
+
+    const action = {
+      optionStrings,
+      action: options.action || 'store',
+      dest: options.dest || deriveDest(flags, isPositional),
+      type: resolveType(options.type),
+      required: isPositional ? true : Boolean(options.required),
+      default: 'default' in options ? options.default : null,
+      choices: options.choices || null,
+      help: options.help || null,
+      metavar: options.metavar || null,
+      const: 'const' in options ? options.const : null,
+      positional: isPositional,
+    };
+
+    if (action.action === 'store_true') {
+      action.default = 'default' in options ? options.default : false;
+    } else if (action.action === 'store_false') {
+      action.default = 'default' in options ? options.default : true;
+    } else if (action.action === 'count') {
+      action.default = 'default' in options ? options.default : null;
+    }
+
+    this.actions.push(action);
+    for (const optionString of optionStrings) {
+      this.optionStringActions.set(optionString, action);
+    }
+    return action;
+  }
+
+  /** Parse arguments, erroring on anything left over. */
+  parseArgs(argv = process.argv.slice(2)) {
+    const [namespace, extras] = this.parseKnownArgs(argv);
+    if (extras.length > 0) {
+      this.error(`unrecognized arguments: ${extras.join(' ')}`);
+    }
+    return namespace;
+  }
+
+  /** Parse arguments, returning unconsumed tokens instead of erroring. */
+  parseKnownArgs(argv = process.argv.slice(2)) {
+    const namespace = Object.create(null);
+    for (const action of this.actions) {
+      if (action.action !== 'help' && action.default !== undefined) {
+        namespace[action.dest] = action.default;
+      }
+    }
+
+    const extras = [];
+    const seen = new Set();
+    let onlyPositionals = false;
+    let index = 0;
+
+    while (index < argv.length) {
+      const arg = argv[index];
+
+      if (!onlyPositionals && arg === '--') {
+        onlyPositionals = true;
+        index += 1;
+        continue;
+      }
+
+      const optionTuple = onlyPositionals ? null : this._parseOptional(arg);
+      if (optionTuple === null) {
+        extras.push(arg);
+        index += 1;
+        continue;
+      }
+
+      const [action, optionString, explicitArg] = optionTuple;
+      if (action === null) {
+        extras.push(arg);
+        index += 1;
+        continue;
+      }
+
+      seen.add(action);
+      index += 1;
+
+      if (takesNoValue(action)) {
+        if (explicitArg !== null) {
+          this.error(
+            `argument ${actionName(action)}: ignored explicit argument ${pyRepr(explicitArg)}`
+          );
+        }
+        this._takeAction(namespace, action, null, optionString);
+        continue;
+      }
+
+      let value;
+      if (explicitArg !== null) {
+        value = explicitArg;
+      } else if (index < argv.length && this._parseOptional(argv[index]) === null) {
+        value = argv[index];
+        index += 1;
+      } else {
+        this.error(`argument ${actionName(action)}: expected one argument`);
+        return [namespace, extras];
+      }
+      this._takeAction(namespace, action, value, optionString);
+    }
+
+    const missing = this.actions.filter(
+      (action) => action.required && !seen.has(action)
+    );
+    if (missing.length > 0) {
+      this.error(
+        `the following arguments are required: ${missing.map(actionName).join(', ')}`
+      );
+    }
+
+    return [namespace, extras];
+  }
+
+  /** Decide whether `argString` names an option, a value, or nothing known. */
+  _parseOptional(argString) {
+    if (!argString.startsWith('-')) return null;
+    if (this.optionStringActions.has(argString)) {
+      return [this.optionStringActions.get(argString), argString, null];
+    }
+    if (argString.length === 1) return null;
+
+    if (argString.includes('=')) {
+      const splitAt = argString.indexOf('=');
+      const prefix = argString.slice(0, splitAt);
+      const explicitArg = argString.slice(splitAt + 1);
+      if (this.optionStringActions.has(prefix)) {
+        return [this.optionStringActions.get(prefix), prefix, explicitArg];
+      }
+    }
+
+    const matches = this._getOptionTuples(argString);
+    if (matches.length > 1) {
+      const options = matches.map((match) => match[1]).join(', ');
+      this.error(`ambiguous option: ${argString} could match ${options}`);
+    } else if (matches.length === 1) {
+      return matches[0];
+    }
+
+    // A bare negative number is a value unless an option looks like one.
+    if (NEGATIVE_NUMBER.test(argString) && !this._hasNegativeNumberOptions()) {
+      return null;
+    }
+    if (argString.includes(' ')) return null;
+
+    return [null, argString, null];
+  }
+
+  /** Long-option abbreviation matching, e.g. '--ver' for '--verbose'. */
+  _getOptionTuples(argString) {
+    const result = [];
+    if (argString.startsWith('--')) {
+      let prefix = argString;
+      let explicitArg = null;
+      if (argString.includes('=')) {
+        const splitAt = argString.indexOf('=');
+        prefix = argString.slice(0, splitAt);
+        explicitArg = argString.slice(splitAt + 1);
+      }
+      for (const [optionString, action] of this.optionStringActions) {
+        if (optionString.startsWith(prefix)) {
+          result.push([action, optionString, explicitArg]);
+        }
+      }
+    } else {
+      const shortPrefix = argString.slice(0, 2);
+      const shortExplicit = argString.slice(2);
+      for (const [optionString, action] of this.optionStringActions) {
+        if (optionString === shortPrefix) {
+          result.push([action, optionString, shortExplicit]);
+        } else if (optionString.startsWith(argString)) {
+          result.push([action, optionString, null]);
+        }
+      }
+    }
+    return result;
+  }
+
+  _hasNegativeNumberOptions() {
+    for (const optionString of this.optionStringActions.keys()) {
+      if (NEGATIVE_NUMBER.test(optionString)) return true;
+    }
+    return false;
+  }
+
+  _takeAction(namespace, action, value, optionString) {
+    switch (action.action) {
+      case 'help':
+        this.printHelp();
+        process.exit(0);
+        return;
+      case 'store_true':
+        namespace[action.dest] = true;
+        return;
+      case 'store_false':
+        namespace[action.dest] = false;
+        return;
+      case 'store_const':
+        namespace[action.dest] = action.const;
+        return;
+      case 'count':
+        namespace[action.dest] = (namespace[action.dest] || 0) + 1;
+        return;
+      case 'append':
+        if (!Array.isArray(namespace[action.dest])) namespace[action.dest] = [];
+        namespace[action.dest].push(this._convert(action, value));
+        return;
+      default:
+        namespace[action.dest] = this._convert(action, value);
+    }
+  }
+
+  _convert(action, value) {
+    let converted = value;
+    if (action.type) {
+      try {
+        converted = action.type.convert(value);
+      } catch (err) {
+        this.error(
+          `argument ${actionName(action)}: invalid ${action.type.name} value: ${pyRepr(value)}`
+        );
+      }
+    }
+    if (action.choices && !action.choices.includes(converted)) {
+      const choices = action.choices.map((choice) => pyRepr(choice)).join(', ');
+      this.error(
+        `argument ${actionName(action)}: invalid choice: ${pyRepr(converted)} (choose from ${choices})`
+      );
+    }
+    return converted;
+  }
+
+  // --- message formatting -------------------------------------------------
+
+  /** "usage: prog [-h] --a A --b B" */
+  formatUsage() {
+    const parts = this.actions
+      .filter((action) => !action.positional)
+      .map((action) => {
+        const flag = action.optionStrings[0];
+        const part = takesNoValue(action) ? flag : `${flag} ${metavarFor(action)}`;
+        return action.required ? part : `[${part}]`;
+      });
+    const positionals = this.actions
+      .filter((action) => action.positional)
+      .map((action) => metavarFor(action));
+    const all = [...parts, ...positionals];
+    return `usage: ${this.prog}${all.length ? ' ' + all.join(' ') : ''}\n`;
+  }
+
+  formatHelp() {
+    let out = this.formatUsage();
+    if (this.description) out += `\n${this.description}\n`;
+
+    const optionals = this.actions.filter((action) => !action.positional);
+    const positionals = this.actions.filter((action) => action.positional);
+
+    const invocations = new Map();
+    for (const action of this.actions) {
+      invocations.set(action, formatInvocation(action));
+    }
+    const maxLength = Math.max(
+      0,
+      ...[...invocations.values()].map((text) => text.length + INDENT)
+    );
+    const helpPosition = Math.min(maxLength + 2, MAX_HELP_POSITION);
+
+    const section = (title, group) => {
+      if (group.length === 0) return '';
+      let text = `\n${title}:\n`;
+      for (const action of group) {
+        text += formatActionHelp(invocations.get(action), action.help, helpPosition);
+      }
+      return text;
+    };
+
+    out += section('positional arguments', positionals);
+    out += section('options', optionals);
+    if (this.epilog) out += `\n${this.epilog}\n`;
+    return out;
+  }
+
+  printUsage(stream = process.stdout) {
+    stream.write(this.formatUsage());
+  }
+
+  printHelp(stream = process.stdout) {
+    stream.write(this.formatHelp());
+  }
+
+  /** Print usage plus the message to stderr and exit with status 2. */
+  error(message) {
+    if (!this.exitOnError) {
+      throw new ArgumentError(message);
+    }
+    process.stderr.write(this.formatUsage());
+    process.stderr.write(`${this.prog}: error: ${message}\n`);
+    process.exit(2);
+  }
+}
+
+function defaultProg() {
+  const script = process.argv[1];
+  return script ? basename(script) : 'program';
+}
+
+function resolveType(type) {
+  if (!type) return null;
+  if (typeof type === 'string') {
+    if (!TYPES[type]) throw new Error(`unknown type: ${type}`);
+    return TYPES[type];
+  }
+  if (typeof type === 'function') {
+    return { name: type.name || 'value', convert: type };
+  }
+  return type;
+}
+
+function deriveDest(flags, isPositional) {
+  if (isPositional) return flags[0].replace(/-/g, '_');
+  const long = flags.find((flag) => flag.startsWith('--'));
+  const chosen = long || flags[0];
+  return chosen.replace(/^--?/, '').replace(/-/g, '_');
+}
+
+function takesNoValue(action) {
+  return ['help', 'store_true', 'store_false', 'store_const', 'count'].includes(
+    action.action
+  );
+}
+
+function actionName(action) {
+  if (action.optionStrings.length > 0) return action.optionStrings.join('/');
+  return action.metavar || action.dest;
+}
+
+function metavarFor(action) {
+  if (action.metavar) return action.metavar;
+  if (action.positional) return action.dest;
+  return action.dest.toUpperCase();
+}
+
+function formatInvocation(action) {
+  if (action.positional) return metavarFor(action);
+  if (takesNoValue(action)) return action.optionStrings.join(', ');
+  const metavar = metavarFor(action);
+  return action.optionStrings.map((flag) => `${flag} ${metavar}`).join(', ');
+}
+
+function formatActionHelp(invocation, help, helpPosition) {
+  const header = ' '.repeat(INDENT) + invocation;
+  if (!help) return `${header}\n`;
+  if (header.length >= helpPosition) {
+    return `${header}\n${' '.repeat(helpPosition)}${help}\n`;
+  }
+  return `${header.padEnd(helpPosition, ' ')}${help}\n`;
+}
+```
+
+---
+
+### `/output/test11.mjs` (entry point)
+
+```javascript
+/**
+ * Port of dataset/schedule/test11.py — job tagging and tag based filtering.
+ */
+
+import { ArgumentParser } from './lib/argparse.mjs';
+import * as schedule from './lib/schedule.mjs';
+
+const parser = new ArgumentParser();
+parser.addArgument('--a', { type: 'int', required: true });
+parser.addArgument('--b', { type: 'int', required: true });
+const args = parser.parseArgs();
+
+// 创建多个作业并测试标签过滤
+let jobsCreated = 0;
+for (let i = 0; i < args.a; i++) {
+  schedule.every(1).seconds.tag('group1').do(() => null); // 创建group1标签作业
+  jobsCreated += 1;
+}
+console.log(jobsCreated);
+
+for (let i = 0; i < args.b; i++) {
+  schedule.every(1).minutes.tag('group2').do(() => null); // 创建group2标签作业
+  jobsCreated += 1;
+}
+console.log(jobsCreated);
+
+const group1Jobs = schedule.getJobs('group1'); // 获取group1作业
+console.log(group1Jobs.length);
+
+const group2Jobs = schedule.getJobs('group2'); // 获取group2作业
+console.log(group2Jobs.length);
+
+const allJobs = schedule.getJobs(); // 获取所有作业
+console.log(allJobs.length);
+
+schedule.clear('group1'); // 清除group1作业
+console.log(schedule.getJobs().length);
+
+schedule.clear('group2'); // 清除group2作业
+console.log(schedule.getJobs().length);
+
+for (let i = 0; i < args.a + args.b; i++) {
+  // 重新创建作业
+  schedule.every(1).seconds.do(() => null);
+}
+console.log(schedule.getJobs().length);
+```
+
+## Verification
+
+`node /output/test11.mjs --a 3 --b 2` → `3 5 3 2 5 2 0 5`, matching the executable. Differential harness (`/workspace/difftest.sh`) — **26/26 pass**, plus 4 extra option-consumption cases and a 60-case random fuzz over `a,b ∈ [-5, 35]` with **0 mismatches**. Compared stdout, stderr, and exit code on each.
+
+Behaviors confirmed against the executable rather than assumed:
+- `range(n)` with negative `n` yields zero iterations (`--a -2` prints `0 1 0 1 1 1 0 0`).
+- Python `int()` accepts `+3`, `1_0` → 10, `010` → 10, and `" 4"`, but rejects `3.5` and `''` — `pyInt` reproduces exactly this, including the `invalid int value: 'x'` message with Python `repr` quoting.
+- `-2` after `--a` is consumed as a value, not an option (argparse's negative-number rule, since no option looks like a negative number).
+- Missing-required errors take precedence over unrecognized-argument errors; both exit 2 with usage on stderr.
+- `--help` output is byte-identical after normalizing the program name (the one legitimate difference: argparse derives `prog` from `argv[0]`, so it is `test11.mjs` instead of `test11_executable`).
+
+Two notes on the library: `clear()` mutates `jobs` in place rather than reassigning, so the module-level `jobs` export stays a live alias exactly as `del self.jobs[:]` does in Python; and unit selection uses property getters, so `every(1).seconds` sets state on access just like the Python `@property`. Only `node:path` is imported from outside the local tree — every other import is a local `.mjs` file, no `require`/`module.exports` anywhere.

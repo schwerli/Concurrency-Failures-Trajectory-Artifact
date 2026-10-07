@@ -1,0 +1,113 @@
+diff --git a/lib/matplotlib/mlab.py b/lib/matplotlib/mlab.py
+index 3552904c3d..6d0d7f5237 100644
+--- a/lib/matplotlib/mlab.py
++++ b/lib/matplotlib/mlab.py
+@@ -375,9 +375,11 @@ def _spectral_helper(x, y=None, NFFT=None, Fs=None, detrend_func=None,
+ 
+     if not np.iterable(window):
+         window = window(np.ones(NFFT, x.dtype))
++    window = np.asarray(window)
+     if len(window) != NFFT:
+         raise ValueError(
+             "The window length must match the data's first dimension")
++    window_cg = np.abs(window.sum())
+ 
+     result = _stride_windows(x, NFFT, noverlap)
+     result = detrend(result, detrend_func, axis=0)
+@@ -395,12 +397,12 @@ def _spectral_helper(x, y=None, NFFT=None, Fs=None, detrend_func=None,
+     elif mode == 'psd':
+         result = np.conj(result) * result
+     elif mode == 'magnitude':
+-        result = np.abs(result) / np.abs(window).sum()
++        result = np.abs(result) / window_cg
+     elif mode == 'angle' or mode == 'phase':
+         # we unwrap the phase later to handle the onesided vs. twosided case
+         result = np.angle(result)
+     elif mode == 'complex':
+-        result /= np.abs(window).sum()
++        result /= window_cg
+ 
+     if mode == 'psd':
+ 
+@@ -427,7 +429,7 @@ def _spectral_helper(x, y=None, NFFT=None, Fs=None, detrend_func=None,
+             result /= (np.abs(window)**2).sum()
+         else:
+             # In this case, preserve power in the segment, not amplitude
+-            result /= np.abs(window).sum()**2
++            result /= window_cg**2
+ 
+     t = np.arange(NFFT/2, len(x) - NFFT/2 + 1, NFFT - noverlap)/Fs
+ 
+diff --git a/lib/matplotlib/tests/test_mlab.py b/lib/matplotlib/tests/test_mlab.py
+index 86beb5c8c8..47460cd415 100644
+--- a/lib/matplotlib/tests/test_mlab.py
++++ b/lib/matplotlib/tests/test_mlab.py
+@@ -849,6 +849,68 @@ class TestSpectral:
+         assert_allclose(speca, specb, atol=1e-08)
+ 
+ 
++def test_psd_windowarray_scale_by_freq_signed_window():
++    Fs = 100.
++    x = np.arange(0, 10, 1 / Fs)
++    y = np.sin(25 * x * np.pi * 2)
++    NFFT = 256
++    noverlap = NFFT // 2
++    win = np.hanning(NFFT) - 0.25
++
++    assert np.any(win < 0)
++
++    spec_s, fsp_s = mlab.psd(
++        x=y, NFFT=NFFT, Fs=Fs, noverlap=noverlap, window=win,
++        scale_by_freq=True)
++    spec_n, fsp_n = mlab.psd(
++        x=y, NFFT=NFFT, Fs=Fs, noverlap=noverlap, window=win,
++        scale_by_freq=False)
++
++    assert_array_equal(fsp_s, fsp_n)
++    assert_allclose(spec_s * (win**2).sum(),
++                    spec_n / Fs * win.sum()**2,
++                    atol=1e-08)
++
++
++def test_complex_spectrum_signed_window_coherent_gain():
++    Fs = 100.
++    x = np.arange(0, 10, 1 / Fs)
++    y = np.sin(25 * x * np.pi * 2)
++    win = np.hanning(len(y)) - 0.25
++
++    spec_c, freqs_c = mlab.complex_spectrum(y, Fs=Fs, window=win)
++    spec_m, freqs_m = mlab.magnitude_spectrum(y, Fs=Fs, window=win)
++    expected = np.fft.fft(y * win)[:len(spec_c)] / np.abs(win.sum())
++
++    assert_array_equal(freqs_c, freqs_m)
++    assert_allclose(spec_c, expected, atol=1e-12)
++    assert_allclose(spec_m, np.abs(expected), atol=1e-12)
++
++
++@pytest.mark.parametrize(
++    "mode, conv", [
++        ("magnitude", np.abs),
++        ("angle", np.angle),
++        ("phase", lambda x: np.unwrap(np.angle(x), axis=0)),
++    ])
++def test_specgram_complex_equivalent_signed_window(mode, conv):
++    Fs = 100.
++    x = np.arange(0, 10, 1 / Fs)
++    y = np.sin(25 * x * np.pi * 2)
++    NFFT = 256
++    noverlap = NFFT // 2
++    win = np.hanning(NFFT) - 0.25
++
++    specc, freqspecc, tc = mlab.specgram(
++        x=y, NFFT=NFFT, Fs=Fs, noverlap=noverlap, window=win, mode='complex')
++    specm, freqspecm, tm = mlab.specgram(
++        x=y, NFFT=NFFT, Fs=Fs, noverlap=noverlap, window=win, mode=mode)
++
++    assert_array_equal(freqspecc, freqspecm)
++    assert_array_equal(tc, tm)
++    assert_allclose(conv(specc), specm, atol=1e-06)
++
++
+ # extra test for cohere...
+ def test_cohere():
+     N = 1024

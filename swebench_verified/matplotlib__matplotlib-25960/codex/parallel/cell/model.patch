@@ -1,0 +1,91 @@
+diff --git a/lib/matplotlib/figure.py b/lib/matplotlib/figure.py
+index dab2bc4a5a..544bb6e10e 100644
+--- a/lib/matplotlib/figure.py
++++ b/lib/matplotlib/figure.py
+@@ -2274,17 +2274,58 @@ class SubFigure(FigureBase):
+             return
+         # need to figure out *where* this subplotspec is.
+         gs = self._subplotspec.get_gridspec()
++        subplot_params = gs.get_subplot_params(self._parent)
++
++        if isinstance(gs, GridSpec):
++            # SubFigure grids fill their parent by default, but still honor
++            # explicitly provided GridSpec extents.
++            left = 0 if gs.left is None else subplot_params.left
++            right = 1 if gs.right is None else subplot_params.right
++            bottom = 0 if gs.bottom is None else subplot_params.bottom
++            top = 1 if gs.top is None else subplot_params.top
++            wspace = 0 if gs.wspace is None else subplot_params.wspace
++            hspace = 0 if gs.hspace is None else subplot_params.hspace
++        else:
++            left = subplot_params.left
++            right = subplot_params.right
++            bottom = subplot_params.bottom
++            top = subplot_params.top
++            wspace = (0 if getattr(gs, "_wspace", None) is None
++                      else subplot_params.wspace)
++            hspace = (0 if getattr(gs, "_hspace", None) is None
++                      else subplot_params.hspace)
++
++        nrows, ncols = gs.get_geometry()
++        tot_width = right - left
++        tot_height = top - bottom
+         wr = np.asarray(gs.get_width_ratios())
+         hr = np.asarray(gs.get_height_ratios())
+-        dx = wr[self._subplotspec.colspan].sum() / wr.sum()
+-        dy = hr[self._subplotspec.rowspan].sum() / hr.sum()
+-        x0 = wr[:self._subplotspec.colspan.start].sum() / wr.sum()
+-        y0 = 1 - hr[:self._subplotspec.rowspan.stop].sum() / hr.sum()
++
++        cell_h = tot_height / (nrows + hspace * (nrows - 1))
++        sep_h = hspace * cell_h
++        norm = cell_h * nrows / hr.sum()
++        cell_heights = hr * norm
++        sep_heights = [0] + ([sep_h] * (nrows - 1))
++        cell_hs = np.cumsum(np.column_stack([sep_heights, cell_heights]).flat)
++
++        cell_w = tot_width / (ncols + wspace * (ncols - 1))
++        sep_w = wspace * cell_w
++        norm = cell_w * ncols / wr.sum()
++        cell_widths = wr * norm
++        sep_widths = [0] + ([sep_w] * (ncols - 1))
++        cell_ws = np.cumsum(np.column_stack([sep_widths, cell_widths]).flat)
++
++        fig_tops, fig_bottoms = (top - cell_hs).reshape((-1, 2)).T
++        fig_lefts, fig_rights = (left + cell_ws).reshape((-1, 2)).T
++        x0 = fig_lefts[self._subplotspec.colspan].min()
++        x1 = fig_rights[self._subplotspec.colspan].max()
++        y0 = fig_bottoms[self._subplotspec.rowspan].min()
++        y1 = fig_tops[self._subplotspec.rowspan].max()
+         if self.bbox_relative is None:
+-            self.bbox_relative = Bbox.from_bounds(x0, y0, dx, dy)
++            self.bbox_relative = Bbox.from_extents(x0, y0, x1, y1)
+         else:
+             self.bbox_relative.p0 = (x0, y0)
+-            self.bbox_relative.p1 = (x0 + dx, y0 + dy)
++            self.bbox_relative.p1 = (x1, y1)
+ 
+     def get_constrained_layout(self):
+         """
+diff --git a/lib/matplotlib/tests/test_figure.py b/lib/matplotlib/tests/test_figure.py
+index 474331bf91..b20b7ffdd9 100644
+--- a/lib/matplotlib/tests/test_figure.py
++++ b/lib/matplotlib/tests/test_figure.py
+@@ -1394,6 +1394,17 @@ def test_subfigure_spanning():
+     fig.draw_without_rendering()
+ 
+ 
++def test_subfigure_spacing():
++    fig = plt.figure()
++    subfigs = fig.subfigures(2, 2, wspace=0.5, hspace=0.25)
++
++    assert subfigs[0, 0].bbox_relative.x1 < subfigs[0, 1].bbox_relative.x0
++    assert subfigs[1, 0].bbox_relative.y1 < subfigs[0, 0].bbox_relative.y0
++
++    nested = subfigs[0, 0].subfigures(1, 2, wspace=0.5)
++    assert nested[0].bbox_relative.x1 < nested[1].bbox_relative.x0
++
++
+ @mpl.style.context('mpl20')
+ def test_subfigure_ticks():
+     # This tests a tick-spacing error that only seems applicable

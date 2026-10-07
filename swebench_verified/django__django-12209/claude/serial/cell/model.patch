@@ -1,0 +1,139 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index e3b14a41a0..893caf0013 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -849,10 +849,11 @@ class Model(metaclass=ModelBase):
+         updated = False
+         # Skip an UPDATE when adding an instance and primary key has a default.
+         if (
++            not raw and
+             not force_insert and
+             self._state.adding and
+-            self._meta.pk.default and
+-            self._meta.pk.default is not NOT_PROVIDED
++            meta.pk.default and
++            meta.pk.default is not NOT_PROVIDED
+         ):
+             force_insert = True
+         # If possible, try an UPDATE. If that doesn't update anything, do an INSERT.
+diff --git a/docs/releases/3.0.txt b/docs/releases/3.0.txt
+index 435755f732..d57b29dd2a 100644
+--- a/docs/releases/3.0.txt
++++ b/docs/releases/3.0.txt
+@@ -480,6 +480,36 @@ Django 3.0, we're removing these APIs at this time.
+ 
+ * ``django.utils.safestring.SafeBytes`` - Unused since Django 2.0.
+ 
++``Model.save()`` when providing a default for the primary key
++-------------------------------------------------------------
++
++:meth:`Model.save() <django.db.models.Model.save>` no longer attempts to find a
++row when saving a new ``Model`` instance and a default value for the primary
++key is provided, and always performs a single ``INSERT`` query. In older Django
++versions, ``Model.save()`` performed either an ``INSERT`` or an ``UPDATE`` based
++on whether or not the row exists.
++
++As a consequence, saving a new instance with an explicit primary key value that
++already exists in the database now raises an :exc:`~django.db.IntegrityError`
++instead of overwriting the existing row::
++
++    obj = MyModel.objects.create()  # MyModel.pk has a default, e.g. uuid.uuid4
++    MyModel(pk=obj.pk, name='Test').save()  # raises IntegrityError
++
++If you need to update an existing row, either use
++:meth:`~django.db.models.query.QuerySet.update`::
++
++    MyModel.objects.filter(pk=obj.pk).update(name='Test')
++
++or fetch the instance before modifying and saving it::
++
++    obj = MyModel.objects.get(pk=obj.pk)
++    obj.name = 'Test'
++    obj.save()
++
++Fixture loading isn't affected: :djadmin:`loaddata` still overwrites existing
++rows.
++
+ New default value for the ``FILE_UPLOAD_PERMISSIONS`` setting
+ -------------------------------------------------------------
+ 
+diff --git a/tests/basic/models.py b/tests/basic/models.py
+index 7b2b1aee54..6dcdfa90c0 100644
+--- a/tests/basic/models.py
++++ b/tests/basic/models.py
+@@ -46,3 +46,7 @@ class SelfRef(models.Model):
+ 
+ class PrimaryKeyWithDefault(models.Model):
+     uuid = models.UUIDField(primary_key=True, default=uuid.uuid4)
++
++
++class ChildPrimaryKeyWithDefault(PrimaryKeyWithDefault):
++    pass
+diff --git a/tests/basic/tests.py b/tests/basic/tests.py
+index 5eada343e1..66751ee154 100644
+--- a/tests/basic/tests.py
++++ b/tests/basic/tests.py
+@@ -12,8 +12,8 @@ from django.test import (
+ from django.utils.translation import gettext_lazy
+ 
+ from .models import (
+-    Article, ArticleSelectOnSave, FeaturedArticle, PrimaryKeyWithDefault,
+-    SelfRef,
++    Article, ArticleSelectOnSave, ChildPrimaryKeyWithDefault, FeaturedArticle,
++    PrimaryKeyWithDefault, SelfRef,
+ )
+ 
+ 
+@@ -139,6 +139,20 @@ class ModelInstanceCreationTests(TestCase):
+         with self.assertNumQueries(1):
+             PrimaryKeyWithDefault().save()
+ 
++    def test_save_parent_primary_with_default(self):
++        # An UPDATE attempt is skipped when an inherited primary key has
++        # default.
++        with self.assertNumQueries(2):
++            ChildPrimaryKeyWithDefault().save()
++
++    def test_save_raw_primary_with_default(self):
++        # An UPDATE is attempted in raw saves (used by loaddata) even if a
++        # primary key has a default, so that existing rows are overwritten.
++        obj = PrimaryKeyWithDefault.objects.create()
++        with self.assertNumQueries(1):
++            PrimaryKeyWithDefault(uuid=obj.pk).save_base(raw=True)
++        self.assertEqual(PrimaryKeyWithDefault.objects.count(), 1)
++
+ 
+ class ModelTest(TestCase):
+     def test_objects_attribute_is_only_available_on_the_class_itself(self):
+diff --git a/tests/fixtures/fixtures/fixture_with_uuid_pk.json b/tests/fixtures/fixtures/fixture_with_uuid_pk.json
+new file mode 100644
+index 0000000000..a2c446f36c
+--- /dev/null
++++ b/tests/fixtures/fixtures/fixture_with_uuid_pk.json
+@@ -0,0 +1,7 @@
++[
++    {
++        "pk": "9f2b6d5f-4bff-4dbe-b0e4-2c0ea4a5c11a",
++        "model": "fixtures.primarykeyuuidmodel",
++        "fields": {}
++    }
++]
+diff --git a/tests/fixtures/tests.py b/tests/fixtures/tests.py
+index 02dd38e635..6f454a6e41 100644
+--- a/tests/fixtures/tests.py
++++ b/tests/fixtures/tests.py
+@@ -457,6 +457,14 @@ class FixtureLoadingTests(DumpDataAssertMixin, TestCase):
+         self.assertIn('"pk": "%s"' % m1.id, result)
+         self.assertIn('"pk": "%s"' % m2.id, result)
+ 
++    def test_loaddata_with_uuid_pks_twice(self):
++        # Loading a fixture with explicit primary keys for a model whose
++        # primary key has a default overwrites existing rows instead of
++        # trying to insert them again.
++        for _ in range(2):
++            management.call_command('loaddata', 'fixture_with_uuid_pk.json', verbosity=0)
++        self.assertEqual(PrimaryKeyUUIDModel.objects.count(), 1)
++
+     def test_dumpdata_with_file_output(self):
+         management.call_command('loaddata', 'fixture1.json', verbosity=0)
+         self._dumpdata_assert(

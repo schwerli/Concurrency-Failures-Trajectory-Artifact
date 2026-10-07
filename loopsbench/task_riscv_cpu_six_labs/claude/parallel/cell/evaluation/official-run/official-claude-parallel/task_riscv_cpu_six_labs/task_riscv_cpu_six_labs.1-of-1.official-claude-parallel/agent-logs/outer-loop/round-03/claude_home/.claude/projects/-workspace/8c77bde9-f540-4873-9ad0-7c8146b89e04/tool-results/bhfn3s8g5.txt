@@ -1,0 +1,859 @@
+=========== core/RV32core.v ===========
+     1	`timescale 1ns / 1ps
+     2	
+     3	module  RV32core(
+     4	        input debug_en,  // debug enable
+     5	        input debug_step,  // debug step clock
+     6	        input [6:0] debug_addr,  // debug address
+     7	        output[31:0] debug_data,  // debug data
+     8	        output[31:0] wb_addr,
+     9	        output[31:0] wb_data,
+    10	        output reg [31:0] clk_counter,
+    11	        input clk,  // main clock
+    12	        input rst,  // synchronous reset
+    13	        input interrupter  // interrupt source, for future use
+    14	    );
+    15	
+    16	    wire debug_clk;
+    17	    wire[31:0] debug_regs;
+    18	    reg[31:0] Test_signal;
+    19		assign debug_data = debug_addr[5] ? Test_signal : debug_regs;
+    20	
+    21	    debug_clk clock(.clk(clk),.debug_en(debug_en),.debug_step(debug_step),.debug_clk(debug_clk));
+    22	
+    23	    wire PC_EN_IF, IS_EN, FU_ALU_EN, FU_mem_EN, FU_mul_EN, FU_div_EN, FU_jump_EN;
+    24	    wire RegWrite_ctrl, ALUSrcA_ctrl, ALUSrcB_ctrl, mem_w_ctrl;
+    25	    wire[2:0] ImmSel_ctrl, bhw_ctrl, DatatoReg_ctrl;
+    26	    wire[3:0] ALUControl_ctrl;
+    27	    wire[4:0] Jump_ctrl;
+    28	    wire[4:0] rs1_addr_ctrl, rs2_addr_ctrl, rd_ctrl;
+    29	    wire[31:0] PC_ctrl, imm_ctrl;
+    30	
+    31	
+    32	    wire [31:0] PC_IF, next_PC_IF, PC_4_IF, inst_IF;
+    33	
+    34	    wire[31:0]inst_IS, PC_IS, Imm_out_IS;
+    35	
+    36	    wire[31:0]rs1_data_RO, rs2_data_RO, ALUA_RO, ALUB_RO;
+    37	
+    38	    wire FU_ALU_finish, FU_mem_finish, FU_mul_finish, FU_div_finish, FU_jump_finish, is_jump_FU;
+    39	    wire[31:0]ALUout_FU, mem_data_FU, mulres_FU, divres_FU, PC_jump_FU, PC_wb_FU;
+    40	
+    41	    wire[31:0]ALUout_WB, mem_data_WB, mulres_WB, divres_WB, PC_wb_WB, wt_data_WB;
+    42	
+    43	
+    44	    // IF
+    45	    assign PC_EN_IF = IS_EN | FU_jump_finish & is_jump_FU;
+    46	
+    47	    REG32 REG_PC(.clk(debug_clk),.rst(rst),.CE(PC_EN_IF),.D(next_PC_IF),.Q(PC_IF));
+    48	    
+    49	    add_32 add_IF(.a(PC_IF),.b(32'd4),.c(PC_4_IF));
+    50	
+    51	    MUX2T1_32 mux_IF(.I0(PC_4_IF),.I1(PC_jump_FU),.s(FU_jump_finish & is_jump_FU),.o(next_PC_IF));
+    52	
+    53	    ROM_D inst_rom(.a(PC_IF[8:2]),.spo(inst_IF));
+    54	
+    55	
+    56	    //Issue
+    57	    REG_IF_IS reg_IF_IS(.clk(debug_clk),.rst(rst),.EN(IS_EN),
+    58	        .flush(1'b0),.PCOUT(PC_IF),.IR(inst_IF),
+    59	
+    60	        .IR_IS(inst_IS),.PCurrent_IS(PC_IS));
+    61	    
+    62	    ImmGen imm_gen(.ImmSel(ImmSel_ctrl),.inst_field(inst_IS),.Imm_out(Imm_out_IS));
+    63	
+    64	    CtrlUnit ctrl(.clk(debug_clk),.rst(rst),.PC(PC_IS),.inst(inst_IS),.imm(Imm_out_IS),
+    65	        .ALU_done(FU_ALU_finish),.MEM_done(FU_mem_finish),.MUL_done(FU_mul_finish),.DIV_done(FU_div_finish),.JUMP_done(FU_jump_finish),.is_jump(is_jump_FU),
+    66	        .IS_en(IS_EN),.ImmSel(ImmSel_ctrl),.ALU_en(FU_ALU_EN),
+    67	        .MEM_en(FU_mem_EN),.MUL_en(FU_mul_EN),.DIV_en(FU_div_EN),.JUMP_en(FU_jump_EN),
+    68	        .PC_ctrl(PC_ctrl),.imm_ctrl(imm_ctrl),.rs1_ctrl(rs1_addr_ctrl),.rs2_ctrl(rs2_addr_ctrl),
+    69	        .JUMP_op(Jump_ctrl),.ALU_op(ALUControl_ctrl),.ALU_use_PC(ALUSrcA_ctrl),.ALU_use_imm(ALUSrcB_ctrl),
+    70	        .MEM_we(mem_w_ctrl),.MEM_bhw(bhw_ctrl),.MUL_op(),.DIV_op(),
+    71	        .write_sel(DatatoReg_ctrl),.reg_write(RegWrite_ctrl),.rd_ctrl(rd_ctrl)    
+    72	    );
+    73	
+    74	
+    75	    // RO
+    76	    Regs register(.clk(debug_clk),.rst(rst),
+    77	        .R_addr_A(rs1_addr_ctrl),.rdata_A(rs1_data_RO),
+    78	        .R_addr_B(rs2_addr_ctrl),.rdata_B(rs2_data_RO),
+    79	        .L_S(RegWrite_ctrl),.Wt_addr(rd_ctrl),.Wt_data(wt_data_WB),
+    80	        .Debug_addr(debug_addr[4:0]),.Debug_regs(debug_regs));
+    81	
+    82	    MUX2T1_32 mux_imm_ALU_RO_A(.I0(rs1_data_RO),.I1(PC_ctrl),.s(ALUSrcA_ctrl),.o(ALUA_RO));
+    83	
+    84	    MUX2T1_32 mux_imm_ALU_RO_B(.I0(rs2_data_RO),.I1(imm_ctrl),.s(ALUSrcB_ctrl),.o(ALUB_RO));
+    85	
+    86	
+    87	    // FU
+    88	    FU_ALU alu(.clk(debug_clk),.EN(FU_ALU_EN),.finish(FU_ALU_finish),
+    89	        .ALUControl(ALUControl_ctrl),.ALUA(ALUA_RO),.ALUB(ALUB_RO),.res(ALUout_FU),
+    90	        .zero(),.overflow());
+    91	
+    92	    FU_mem mem(.clk(debug_clk),.EN(FU_mem_EN),.finish(FU_mem_finish),
+    93	        .mem_w(mem_w_ctrl),.bhw(bhw_ctrl),.rs1_data(rs1_data_RO),.rs2_data(rs2_data_RO),
+    94	        .imm(imm_ctrl),.mem_data(mem_data_FU));
+    95	
+    96	    FU_mul mu(.clk(debug_clk),.EN(FU_mul_EN),.finish(FU_mul_finish),
+    97	        .A(rs1_data_RO),.B(rs2_data_RO),.res(mulres_FU));
+    98	
+    99	    FU_div du(.clk(debug_clk),.EN(FU_div_EN),.finish(FU_div_finish),
+   100	        .A(rs1_data_RO),.B(rs2_data_RO),.res(divres_FU));
+   101	
+   102	    FU_jump ju(.clk(debug_clk),.EN(FU_jump_EN),.finish(FU_jump_finish),
+   103	        .JALR(Jump_ctrl[4]),.cmp_ctrl(Jump_ctrl[3:0]),.rs1_data(rs1_data_RO),.rs2_data(rs2_data_RO),
+   104	        .imm(imm_ctrl),.PC(PC_ctrl),.PC_jump(PC_jump_FU),.PC_wb(PC_wb_FU),.is_jump(is_jump_FU));
+   105	
+   106	
+   107	    // WB
+   108	    REG32 reg_WB_ALU(.clk(debug_clk),.rst(rst),.CE(FU_ALU_finish),.D(ALUout_FU),.Q(ALUout_WB));
+   109	
+   110	    REG32 reg_WB_mem(.clk(debug_clk),.rst(rst),.CE(FU_mem_finish),.D(mem_data_FU),.Q(mem_data_WB));
+   111	
+   112	    REG32 reg_WB_mul(.clk(debug_clk),.rst(rst),.CE(FU_mul_finish),.D(mulres_FU),.Q(mulres_WB));
+   113	
+   114	    REG32 reg_WB_div(.clk(debug_clk),.rst(rst),.CE(FU_div_finish),.D(divres_FU),.Q(divres_WB));
+   115	    
+   116	    REG32 reg_WB_jump(.clk(debug_clk),.rst(rst),.CE(FU_jump_finish),.D(PC_wb_FU),.Q(PC_wb_WB));
+   117	
+   118	    MUX8T1_32 mux_DtR(.s(DatatoReg_ctrl),.I0(ALUout_WB),.I1(mem_data_WB),.I2(mulres_WB),.I3(divres_WB),
+   119	        .I4(PC_wb_WB),.I5(32'd0),.I6(32'd0),.I7(32'd0),.o(wt_data_WB));
+   120	
+   121	    assign wb_addr = rd_ctrl;
+   122	    assign wb_data = wt_data_WB;
+   123	
+   124	    always @(posedge debug_clk) begin
+   125	        if (rst) begin
+   126	            clk_counter <= 0;
+   127	        end else begin
+   128	            clk_counter <= clk_counter + 32'd1;
+   129	        end
+   130	    end
+   131	
+   132	    always @* begin
+   133	        case (debug_addr[4:0])
+   134	            0:  Test_signal = PC_IF;
+   135	            1:  Test_signal = inst_IF;
+   136	            2:  Test_signal = PC_IS;  
+   137	            3:  Test_signal = inst_IS;
+   138	
+   139	            4:  Test_signal = rs1_addr_ctrl;
+   140	            5:  Test_signal = rs1_data_RO;
+   141	            6:  Test_signal = rs2_addr_ctrl;
+   142	            7:  Test_signal = rs2_data_RO;
+   143	
+   144	            8:  Test_signal = ImmSel_ctrl;
+   145	            9:  Test_signal = imm_ctrl;
+   146	            10: Test_signal = ALUout_FU;
+   147	            11: Test_signal = PC_EN_IF;
+   148	
+   149	            12: Test_signal = {15'b0, FU_ALU_EN, 15'b0, FU_ALU_finish};
+   150	            13: Test_signal = ALUControl_ctrl;
+   151	            14: Test_signal = ALUA_RO;
+   152	            15: Test_signal = ALUB_RO;
+   153	
+   154	            16: Test_signal = {15'b0, FU_mem_EN, 15'b0, FU_mem_finish};
+   155	            17: Test_signal = mem_w_ctrl;
+   156	            18: Test_signal = bhw_ctrl;
+   157	            19: Test_signal = mem_data_FU;
+   158	
+   159	            20: Test_signal = {15'b0, FU_mul_EN, 15'b0, FU_mul_finish};
+   160	            21: Test_signal = mulres_FU;
+   161	            22: Test_signal = {15'b0, FU_div_EN, 15'b0, FU_div_finish};
+   162	            23: Test_signal = divres_FU;
+   163	
+   164	            24: Test_signal = {15'b0, FU_jump_EN, 15'b0, FU_jump_finish};
+   165	            25: Test_signal = Jump_ctrl;
+   166	            26: Test_signal = PC_jump_FU;
+   167	            27: Test_signal = PC_wb_FU;
+   168	
+   169	            28: Test_signal = RegWrite_ctrl;
+   170	            29: Test_signal = rd_ctrl;
+   171	            30: Test_signal = DatatoReg_ctrl;
+   172	            31: Test_signal = wt_data_WB;
+   173	            
+   174	            default: Test_signal = 32'hAA55_AA55;
+   175	        endcase
+   176	    end
+   177	
+   178	endmodule=========== core/CtrlUnit.v ===========
+     1	`timescale 1ns / 1ps
+     2	`include "CtrlDefine.vh"
+     3	
+     4	module CtrlUnit(
+     5	    input clk,
+     6	    input rst,
+     7	
+     8	    input[31:0] PC,
+     9	    input[31:0] inst,
+    10	    input[31:0] imm,
+    11	    
+    12	    input ALU_done,
+    13	    input MEM_done,
+    14	    input MUL_done,
+    15	    input DIV_done,
+    16	    input JUMP_done,
+    17	    input is_jump,
+    18	
+    19	    // IF
+    20	    output IS_en,
+    21	
+    22	    // IS
+    23	    output[2:0] ImmSel,
+    24	
+    25	    // RO/FU
+    26	    output reg ALU_en, MEM_en, MUL_en, DIV_en, JUMP_en,
+    27	    output reg[31:0] PC_ctrl,
+    28	    output reg[31:0] imm_ctrl,
+    29	    output reg[4:0] rs1_ctrl, rs2_ctrl, 
+    30	    
+    31	    // FU
+    32	    output reg[4:0] JUMP_op,
+    33	    output reg[3:0] ALU_op,
+    34	    output reg ALU_use_PC,
+    35	    output reg ALU_use_imm,
+    36	    output reg MEM_we,
+    37	    output reg[2:0] MEM_bhw,
+    38	    output reg[2:0] MUL_op,
+    39	    output reg[1:0] DIV_op,
+    40	    
+    41	    // WB
+    42	    output reg[2:0] write_sel,
+    43	    output reg reg_write,
+    44	    output reg[4:0] rd_ctrl
+    45	);
+    46	    // used in for loop
+    47	    integer i;
+    48	
+    49	    // Function Unit Status
+    50	    // fields of FUS are defined at CtrlDefine.vh
+    51	    reg[31:0] FUS[1:5];
+    52	    reg[31:0] IMM[1:5];
+    53	
+    54	    // Register Status
+    55	    // records which FU will write corresponding reg at WB
+    56	    reg[2:0] RRS[0:31];
+    57	
+    58	    // sometimes an instruction needs PC to execute
+    59	    // pc record
+    60	    reg[31:0] PCR[1:5];
+    61	
+    62	    wire RO_en;
+    63	    wire normal_stall;
+    64	    reg ctrl_stall = 0, IS_flush = 0;
+    65	
+    66	    // a jump (JAL/JALR/BXX) instr has issued,
+    67	    // stop issuing until result is known
+    68	    wire jump_stall;
+    69	
+    70	    // instruction field
+    71	    wire[6:0] funct7 = inst[31:25];
+    72	    wire[2:0] funct3 = inst[14:12];
+    73	    wire[6:0] opcode = inst[6:0];
+    74	    wire[4:0] rd = inst[11:7];
+    75	    wire[4:0] rs1 = inst[19:15];
+    76	    wire[4:0] rs2 = inst[24:20];
+    77	
+    78	    // type specification
+    79	    wire Rop = opcode == 7'b0110011;
+    80	    wire Iop = opcode == 7'b0010011;
+    81	    wire Bop = opcode == 7'b1100011;
+    82	    wire Lop = opcode == 7'b0000011;
+    83	    wire Sop = opcode == 7'b0100011;
+    84	
+    85	    wire funct7_0  = funct7 == 7'h0;
+    86	    wire funct7_1  = funct7 == 7'h1;
+    87	    wire funct7_32 = funct7 == 7'h20;
+    88	
+    89	    wire funct3_0 = funct3 == 3'h0;
+    90	    wire funct3_1 = funct3 == 3'h1;
+    91	    wire funct3_2 = funct3 == 3'h2;
+    92	    wire funct3_3 = funct3 == 3'h3;
+    93	    wire funct3_4 = funct3 == 3'h4;
+    94	    wire funct3_5 = funct3 == 3'h5;
+    95	    wire funct3_6 = funct3 == 3'h6;
+    96	    wire funct3_7 = funct3 == 3'h7;
+    97	
+    98	    wire ADD  = Rop & funct3_0 & funct7_0;
+    99	    wire SUB  = Rop & funct3_0 & funct7_32;
+   100	    wire SLL  = Rop & funct3_1 & funct7_0;
+   101	    wire SLT  = Rop & funct3_2 & funct7_0;
+   102	    wire SLTU = Rop & funct3_3 & funct7_0;
+   103	    wire XOR  = Rop & funct3_4 & funct7_0;
+   104	    wire SRL  = Rop & funct3_5 & funct7_0;
+   105	    wire SRA  = Rop & funct3_5 & funct7_32;
+   106	    wire OR   = Rop & funct3_6 & funct7_0;
+   107	    wire AND  = Rop & funct3_7 & funct7_0;
+   108	
+   109	    wire MUL    = Rop & funct3_0 & funct7_1;
+   110	    wire MULH   = Rop & funct3_1 & funct7_1;
+   111	    wire MULHSU = Rop & funct3_2 & funct7_1;
+   112	    wire MULHU  = Rop & funct3_3 & funct7_1;
+   113	    wire DIV    = Rop & funct3_4 & funct7_1;
+   114	    wire DIVU   = Rop & funct3_5 & funct7_1;
+   115	    wire REM    = Rop & funct3_6 & funct7_1;
+   116	    wire REMU    = Rop & funct3_7 & funct7_1;
+   117	
+   118	    wire ADDI  = Iop & funct3_0;	
+   119	    wire SLTI  = Iop & funct3_2;
+   120	    wire SLTIU = Iop & funct3_3;
+   121	    wire XORI  = Iop & funct3_4;
+   122	    wire ORI   = Iop & funct3_6;
+   123	    wire ANDI  = Iop & funct3_7;
+   124	    wire SLLI  = Iop & funct3_1 & funct7_0;
+   125	    wire SRLI  = Iop & funct3_5 & funct7_0;
+   126	    wire SRAI  = Iop & funct3_5 & funct7_32;
+   127	
+   128	    wire BEQ = Bop & funct3_0;
+   129	    wire BNE = Bop & funct3_1;
+   130	    wire BLT = Bop & funct3_4;
+   131	    wire BGE = Bop & funct3_5;
+   132	    wire BLTU = Bop & funct3_6;
+   133	    wire BGEU = Bop & funct3_7;
+   134	
+   135	    wire LB =  Lop & funct3_0;
+   136	    wire LH =  Lop & funct3_1;
+   137	    wire LW =  Lop & funct3_2;
+   138	    wire LBU = Lop & funct3_4;
+   139	    wire LHU = Lop & funct3_5;
+   140	
+   141	    wire SB = Sop & funct3_0;
+   142	    wire SH = Sop & funct3_1;
+   143	    wire SW = Sop & funct3_2;
+   144	
+   145	    wire LUI   = opcode == 7'b0110111;
+   146	    wire AUIPC = opcode == 7'b0010111;
+   147	
+   148	    wire JAL  =  opcode == 7'b1101111;
+   149	    wire JALR = (opcode == 7'b1100111) && funct3_0;
+   150	
+   151	    wire R_valid = AND | OR | ADD | XOR | SLL | SRL | SRA | SUB | SLT | SLTU 
+   152	        | MUL | MULH | MULHSU | MULHU | DIV | DIVU | REM | REMU;
+   153	    wire I_valid = ANDI | ORI | ADDI | XORI | SLLI | SRLI | SRAI | SLTI | SLTIU;
+   154	    wire B_valid = BEQ | BNE | BLT | BGE | BLTU | BGEU;
+   155	    wire L_valid = LW | LH | LB | LHU | LBU;
+   156	    wire S_valid = SW | SH | SB;
+   157	
+   158	    // function unit specification
+   159	    wire use_ALU = AND | OR | ADD | XOR | SLL | SRL | SRA | SUB | SLT | SLTU
+   160	        | I_valid | LUI | AUIPC;
+   161	    wire use_MEM = L_valid | S_valid;
+   162	    wire use_MUL = MUL | MULH | MULHSU | MULHU;
+   163	    wire use_DIV = DIV | DIVU | REM | REMU;
+   164	    wire use_JUMP = B_valid | JAL | JALR;
+   165	
+   166	    wire[2:0] use_FU = {3{use_ALU}}  & `FU_ALU  |
+   167	                       {3{use_MEM}}  & `FU_MEM  |
+   168	                       {3{use_MUL}}  & `FU_MUL  |
+   169	                       {3{use_DIV}}  & `FU_DIV  |
+   170	                       {3{use_JUMP}} & `FU_JUMP ;
+   171	
+   172	    // registers to be used
+   173	    wire[4:0] dst = {5{R_valid | I_valid | L_valid | LUI | AUIPC | JAL | JALR}} & rd;
+   174	    wire[4:0] src1 = {5{R_valid | I_valid | S_valid | L_valid | B_valid | JALR}} & rs1;
+   175	    wire[4:0] src2 = {5{R_valid | S_valid | B_valid}} & rs2;
+   176	    // initial values of some FUS fields
+   177	    wire[2:0] fu1 = RRS[src1];
+   178	    wire[2:0] fu2 = RRS[src2];
+   179	    wire rdy1 = ~|fu1;
+   180	    wire rdy2 = ~|fu2;
+   181	
+   182	    // normal stall: structural hazard or WAW
+   183	    assign normal_stall = ...;           //fill sth. here
+   184	
+   185	    assign IS_en = IS_flush | ~normal_stall & ~ctrl_stall;
+   186	    assign RO_en = ~IS_flush & ~normal_stall & ~ctrl_stall;
+   187	
+   188	    always @ (posedge clk or posedge rst) begin
+   189	        if (rst) begin
+   190	            ctrl_stall <= 0;
+   191	        end
+   192	        else begin
+   193	            // IS
+   194	            if (RO_en & (use_FU == `FU_JUMP)) begin
+   195	                ctrl_stall <= 1;
+   196	            end
+   197	            else if (JUMP_done) begin
+   198	                ctrl_stall <= 0;
+   199	            end
+   200	        end
+   201	    end
+   202	
+   203	    always @ (posedge clk or posedge rst) begin
+   204	        if (rst) begin
+   205	            IS_flush <= 0;
+   206	        end
+   207	        else if (JUMP_done & is_jump) begin
+   208	            IS_flush <= 1;
+   209	        end
+   210	        else begin
+   211	            IS_flush <= 0;
+   212	        end
+   213	    end
+   214	
+   215	    assign jump_stall = FUS[`FU_JUMP][`BUSY] & (~JUMP_done);
+   216	
+   217	    wire[4:0] op = {5{ADD}}          & `ALU_ADD    |
+   218	                   {5{SUB}}          & `ALU_SUB    |
+   219	                   {5{AND}}          & `ALU_AND    |
+   220	                   {5{OR}}           & `ALU_OR     |
+   221	                   {5{XOR}}          & `ALU_XOR    |
+   222	                   {5{SLL}}          & `ALU_SLL    |
+   223	                   {5{SRL}}          & `ALU_SRL    |
+   224	                   {5{SLT}}          & `ALU_SLT    |
+   225	                   {5{SLTU}}         & `ALU_SLTU   |
+   226	                   {5{SRA}}          & `ALU_SRA    |
+   227	                   {5{LUI}}          & `ALU_LUI    |
+   228	                   {5{AUIPC}}        & `ALU_AUIPC  |
+   229	                   {5{ADDI}}         & `ALU_ADDI   |
+   230	                   {5{ANDI}}         & `ALU_ANDI   |
+   231	                   {5{ORI}}          & `ALU_ORI    |
+   232	                   {5{XORI}}         & `ALU_XORI   |
+   233	                   {5{SLLI}}         & `ALU_SLLI   |
+   234	                   {5{SRLI}}         & `ALU_SRLI   |
+   235	                   {5{SLTI}}         & `ALU_SLTI   |
+   236	                   {5{SLTIU}}        & `ALU_SLTIU  |
+   237	                   {5{SRAI}}         & `ALU_SRAI   |
+   238	                   {5{LB}}           & `MEM_LB     |
+   239	                   {5{LH}}           & `MEM_LH     |
+   240	                   {5{LW}}           & `MEM_LW     |
+   241	                   {5{LBU}}          & `MEM_LBU    |
+   242	                   {5{LHU}}          & `MEM_LHU    |
+   243	                   {5{SB}}           & `MEM_SB     |
+   244	                   {5{SH}}           & `MEM_SH     |
+   245	                   {5{SW}}           & `MEM_SW     |
+   246	                   {5{MUL}}          & `MUL_MUL    |
+   247	                   {5{MULH}}         & `MUL_MULH   |
+   248	                   {5{MULHSU}}       & `MUL_MULHU  |
+   249	                   {5{MULHU}}        & `MUL_MULHSU |
+   250	                   {5{DIV}}          & `DIV_DIV    |
+   251	                   {5{DIVU}}         & `DIV_DIVU   |
+   252	                   {5{REM}}          & `DIV_REM    |
+   253	                   {5{REMU}}         & `DIV_REMU   |
+   254	                   {5{BEQ}}          & `JUMP_BEQ   |
+   255	                   {5{BNE}}          & `JUMP_BNE   |
+   256	                   {5{BLT}}          & `JUMP_BLT   |
+   257	                   {5{BGE}}          & `JUMP_BGE   |
+   258	                   {5{BLTU}}         & `JUMP_BLTU  |
+   259	                   {5{BGEU}}         & `JUMP_BGEU  |
+   260	                   {5{JAL}}          & `JUMP_JAL   |
+   261	                   {5{JALR}}         & `JUMP_JALR  ;
+   262	
+   263	    
+   264	    assign ImmSel = {3{JALR | L_valid | I_valid}} & `Imm_type_I |
+   265	                    {3{B_valid}}                  & `Imm_type_B |
+   266	                    {3{JAL}}                      & `Imm_type_J |
+   267	                    {3{S_valid}}                  & `Imm_type_S |
+   268	                    {3{LUI | AUIPC}}              & `Imm_type_U ;
+   269	
+   270	    // ensure WAR:
+   271	    // An FU should not write its results to dst if 
+   272	    // a previous inst hasn't read that register.
+   273	    // *_WAR should be driven high when the FU is allowed to write.
+   274	    // i.e. there is no WAR or when WAR clears
+   275	    wire ALU_WAR = (
+   276	        (FUS[`FU_MEM][`SRC1_H:`SRC1_L]  != ... | ...)  &    //fill sth. here
+   277	        (FUS[`FU_MEM][`SRC2_H:`SRC2_L]  != ... | ...)  &    //fill sth. here
+   278	        (FUS[`FU_MUL][`SRC1_H:`SRC1_L]  != ... | ...)  &    //fill sth. here
+   279	        (FUS[`FU_MUL][`SRC2_H:`SRC2_L]  != ... | ...)  &    //fill sth. here
+   280	        (FUS[`FU_DIV][`SRC1_H:`SRC1_L]  != ... | ...)  &    //fill sth. here
+   281	        (FUS[`FU_DIV][`SRC2_H:`SRC2_L]  != ... | ...)  &    //fill sth. here
+   282	        (FUS[`FU_JUMP][`SRC1_H:`SRC1_L] != ... | ...)  &    //fill sth. here
+   283	        (FUS[`FU_JUMP][`SRC2_H:`SRC2_L] != ... | ...)       //fill sth. here
+   284	    );
+   285	
+   286	    wire MEM_WAR = (
+   287	        (FUS[`FU_ALU][`SRC1_H:`SRC1_L]  != ... | ...) &    //fill sth. here
+   288	        (FUS[`FU_ALU][`SRC2_H:`SRC2_L]  != ... | ...) &    //fill sth. here
+   289	        (FUS[`FU_MUL][`SRC1_H:`SRC1_L]  != ... | ...) &    //fill sth. here
+   290	        (FUS[`FU_MUL][`SRC2_H:`SRC2_L]  != ... | ...) &    //fill sth. here
+   291	        (FUS[`FU_DIV][`SRC1_H:`SRC1_L]  != ... | ...) &    //fill sth. here
+   292	        (FUS[`FU_DIV][`SRC2_H:`SRC2_L]  != ... | ...) &    //fill sth. here
+   293	        (FUS[`FU_JUMP][`SRC1_H:`SRC1_L] != ... | ...) &    //fill sth. here
+   294	        (FUS[`FU_JUMP][`SRC2_H:`SRC2_L] != ... | ...)      //fill sth. here
+   295	    );
+   296	
+   297	    wire MUL_WAR = (
+   298	        (FUS[`FU_ALU][`SRC1_H:`SRC1_L] != ... | ...) &     //fill sth. here
+   299	        (FUS[`FU_ALU][`SRC2_H:`SRC2_L] != ... | ...) &     //fill sth. here
+   300	        (FUS[`FU_MEM][`SRC1_H:`SRC1_L] != ... | ...) &     //fill sth. here
+   301	        (FUS[`FU_MEM][`SRC2_H:`SRC2_L] != ... | ...) &     //fill sth. here
+   302	        (FUS[`FU_DIV][`SRC1_H:`SRC1_L] != ... | ...) &     //fill sth. here
+   303	        (FUS[`FU_DIV][`SRC2_H:`SRC2_L] != ... | ...) &     //fill sth. here
+   304	        (FUS[`FU_JUMP][`SRC1_H:`SRC1_L]!= ... | ...) &     //fill sth. here
+   305	        (FUS[`FU_JUMP][`SRC2_H:`SRC2_L]!= ... | ...)       //fill sth. here
+   306	    );
+   307	
+   308	    wire DIV_WAR = (
+   309	        (FUS[`FU_ALU][`SRC1_H:`SRC1_L] != ... | ...) &      //fill sth. here
+   310	        (FUS[`FU_ALU][`SRC2_H:`SRC2_L] != ... | ...) &      //fill sth. here
+   311	        (FUS[`FU_MEM][`SRC1_H:`SRC1_L] != ... | ...) &      //fill sth. here
+   312	        (FUS[`FU_MEM][`SRC2_H:`SRC2_L] != ... | ...) &      //fill sth. here
+   313	        (FUS[`FU_MUL][`SRC1_H:`SRC1_L] != ... | ...) &      //fill sth. here
+   314	        (FUS[`FU_MUL][`SRC2_H:`SRC2_L] != ... | ...) &      //fill sth. here
+   315	        (FUS[`FU_JUMP][`SRC1_H:`SRC1_L]!= ... | ...) &      //fill sth. here
+   316	        (FUS[`FU_JUMP][`SRC2_H:`SRC2_L]!= ... | ...)        //fill sth. here
+   317	    );
+   318	
+   319	    wire JUMP_WAR = (
+   320	        (FUS[`FU_ALU][`SRC1_H:`SRC1_L] != ... | ...) &      //fill sth. here
+   321	        (FUS[`FU_ALU][`SRC2_H:`SRC2_L] != ... | ...) &      //fill sth. here
+   322	        (FUS[`FU_MEM][`SRC1_H:`SRC1_L] != ... | ...) &      //fill sth. here
+   323	        (FUS[`FU_MEM][`SRC2_H:`SRC2_L] != ... | ...) &      //fill sth. here
+   324	        (FUS[`FU_MUL][`SRC1_H:`SRC1_L] != ... | ...) &      //fill sth. here
+   325	        (FUS[`FU_MUL][`SRC2_H:`SRC2_L] != ... | ...) &      //fill sth. here
+   326	        (FUS[`FU_DIV][`SRC1_H:`SRC1_L] != ... | ...) &      //fill sth. here
+   327	        (FUS[`FU_DIV][`SRC2_H:`SRC2_L] != ... | ...)        //fill sth. here
+   328	    );
+   329	
+   330	    // maintain the table
+   331	    always @ (posedge clk or posedge rst) begin
+   332	        if (rst) begin
+   333	            // reset the scoreboard
+   334	            for (i = 0; i < 32; i = i + 1) begin
+   335	                RRS[i] <= 3'b0;
+   336	            end
+   337	
+   338	            for (i = 1; i <= 5; i = i + 1) begin
+   339	                FUS[i] <= 32'b0;
+   340	                IMM[i] <= 32'b0;
+   341	            end
+   342	        end
+   343	
+   344	        else begin
+   345	            // IS
+   346	            if (RO_en) begin
+   347	                // not busy, no WAW, write info to FUS and RRS
+   348	                if (|dst) RRS[dst] <= use_FU;
+   349	                FUS[use_FU][`BUSY] <= 1'b1;
+   350	                ...                             //fill sth. here.
+   351	                
+   352	                IMM[use_FU] <= imm;
+   353	                PCR[use_FU] <= PC;
+   354	            end
+   355	
+   356	            // RO
+   357	            if (FUS[`FU_JUMP][`RDY1] & FUS[`FU_JUMP][`RDY2]) begin
+   358	                // JUMP
+   359	                FUS[`FU_JUMP][`RDY1] <= 1'b0;
+   360	                FUS[`FU_JUMP][`RDY2] <= 1'b0;
+   361	                FUS[`FU_JUMP][`FU1_H:`FU1_L] <= 3'b0;
+   362	                FUS[`FU_JUMP][`FU2_H:`FU2_L] <= 3'b0;
+   363	            end
+   364	            else if (...) begin             //fill sth. here.
+   365	                // ALU
+   366	                ...                         //fill sth. here.
+   367	            end
+   368	            else if (..) begin             //fill sth. here.
+   369	                // MEM
+   370	                ...                         //fill sth. here.
+   371	            end
+   372	            else if (...) begin             //fill sth. here.
+   373	                // MUL
+   374	                ...                         //fill sth. here.
+   375	            end
+   376	            else if (..) begin             //fill sth. here.
+   377	                // DIV
+   378	                ...                         //fill sth. here.
+   379	            end
+   380	
+   381	            // EX
+   382	            FUS[`FU_ALU][`FU_DONE] <= ...   //fill sth. here
+   383	            ...                             //fill sth. here
+   384	
+   385	            // WB
+   386	            if (FUS[`FU_JUMP][`FU_DONE] & JUMP_WAR) begin
+   387	                FUS[`FU_JUMP] <= 32'b0;
+   388	                RRS[FUS[`FU_JUMP][`DST_H:`DST_L]] <= 3'b0;
+   389	
+   390	                // ensure RAW
+   391	                if (FUS[`FU_ALU][`FU1_H:`FU1_L] == `FU_JUMP) ...;           //fill sth. here
+   392	                if (FUS[`FU_MEM][`FU1_H:`FU1_L] == `FU_JUMP) ...;           //fill sth. here
+   393	                if (FUS[`FU_MUL][`FU1_H:`FU1_L] == `FU_JUMP) ...;           //fill sth. here
+   394	                if (FUS[`FU_DIV][`FU1_H:`FU1_L] == `FU_JUMP) ...;           //fill sth. here
+   395	
+   396	                if (FUS[`FU_ALU][`FU2_H:`FU2_L] == `FU_JUMP) ...;           //fill sth. here
+   397	                if (FUS[`FU_MEM][`FU2_H:`FU2_L] == `FU_JUMP) ...;           //fill sth. here
+   398	                if (FUS[`FU_MUL][`FU2_H:`FU2_L] == `FU_JUMP) ...;           //fill sth. here
+   399	                if (FUS[`FU_DIV][`FU2_H:`FU2_L] == `FU_JUMP)...;           //fill sth. here
+   400	            end
+   401	            // ALU
+   402	                ...;           //fill sth. here
+   403	            // MEM
+   404	                ...;           //fill sth. here
+   405	            // MUL
+   406	                ...;           //fill sth. here
+   407	            // DIV
+   408	                ...;           //fill sth. here
+   409	        end
+   410	    end
+   411	
+   412	    // ctrl signals should be combinational logic
+   413	    // RO
+   414	    always @ (*) begin
+   415	        ALU_en = 0;
+   416	        MEM_en = 0;
+   417	        MUL_en = 0;
+   418	        DIV_en = 0;
+   419	        JUMP_en = 0;
+   420	
+   421	        rs1_ctrl = 0;
+   422	        rs2_ctrl = 0;
+   423	        PC_ctrl = 0;
+   424	        imm_ctrl = 0;
+   425	        JUMP_op = 0;
+   426	        ALU_op = 0;
+   427	        ALU_use_PC = 0;
+   428	        ALU_use_imm = 0;
+   429	        MEM_we = 0;
+   430	        MEM_bhw = 0;
+   431	        MUL_op = 0;
+   432	        DIV_op = 0;
+   433	
+   434	        // JUMP
+   435	        if (FUS[`FU_JUMP][`RDY1] & FUS[`FU_JUMP][`RDY2]) begin
+   436	            ALU_en = 1'b0;
+   437	            MEM_en = 1'b0;
+   438	            MUL_en = 1'b0;
+   439	            DIV_en = 1'b0;
+   440	            JUMP_en = 1'b1;
+   441	
+   442	            JUMP_op = FUS[`FU_JUMP][`OP_H:`OP_L];
+   443	            rs1_ctrl = FUS[`FU_JUMP][`SRC1_H:`SRC1_L];
+   444	            rs2_ctrl = FUS[`FU_JUMP][`SRC2_H:`SRC2_L];
+   445	            PC_ctrl = PCR[`FU_JUMP];
+   446	            imm_ctrl = IMM[`FU_JUMP];
+   447	        end
+   448	        // ALU
+   449	        else if (FUS[`FU_ALU][`RDY1] & FUS[`FU_ALU][`RDY2]) begin
+   450	            ALU_en = 1'b1;
+   451	            MEM_en = 1'b0;
+   452	            MUL_en = 1'b0;
+   453	            DIV_en = 1'b0;
+   454	            JUMP_en = 1'b0;
+   455	
+   456	            ALU_op = FUS[`FU_ALU][`OP_H:`OP_L] == `ALU_AUIPC ? 
+   457	                      4'b0001 : FUS[`FU_ALU][`OP_L+3:`OP_L];
+   458	            rs1_ctrl = FUS[`FU_ALU][`SRC1_H:`SRC1_L];
+   459	            rs2_ctrl = FUS[`FU_ALU][`SRC2_H:`SRC2_L];
+   460	            ALU_use_PC = FUS[`FU_ALU][`OP_H:`OP_L] == `ALU_AUIPC;
+   461	            ALU_use_imm = FUS[`FU_ALU][`OP_H];
+   462	            PC_ctrl = PCR[`FU_ALU];
+   463	            imm_ctrl = IMM[`FU_ALU];
+   464	        end
+   465	        // MEM
+   466	        else if (FUS[`FU_MEM][`RDY1] & FUS[`FU_MEM][`RDY2]) begin
+   467	            ALU_en = 1'b0;
+   468	            MEM_en = 1'b1;
+   469	            MUL_en = 1'b0;
+   470	            DIV_en = 1'b0;
+   471	            JUMP_en = 1'b0;
+   472	
+   473	            MEM_we = FUS[`FU_MEM][`OP_L];
+   474	            MEM_bhw = FUS[`FU_MEM][`OP_L+3:`OP_L+1];
+   475	            rs1_ctrl = FUS[`FU_MEM][`SRC1_H:`SRC1_L];
+   476	            rs2_ctrl = FUS[`FU_MEM][`SRC2_H:`SRC2_L];   // if store
+   477	            imm_ctrl = IMM[`FU_MEM];
+   478	        end
+   479	        // MUL
+   480	        else if (FUS[`FU_MUL][`RDY1] & FUS[`FU_MUL][`RDY2]) begin
+   481	            ALU_en = 1'b0;
+   482	            MEM_en = 1'b0;
+   483	            MUL_en = 1'b1;
+   484	            DIV_en = 1'b0;
+   485	            JUMP_en = 1'b0;
+   486	
+   487	            MUL_op = FUS[`FU_MUL][`OP_L+2:`OP_L];
+   488	            rs1_ctrl = FUS[`FU_MUL][`SRC1_H:`SRC1_L];
+   489	            rs2_ctrl = FUS[`FU_MUL][`SRC2_H:`SRC2_L];
+   490	        end
+   491	        else if (FUS[`FU_DIV][`RDY1] & FUS[`FU_DIV][`RDY2]) begin
+   492	            ALU_en = 1'b0;
+   493	            MEM_en = 1'b0;
+   494	            MUL_en = 1'b0;
+   495	            DIV_en = 1'b1;
+   496	            JUMP_en = 1'b0;
+   497	            
+   498	            DIV_op = FUS[`FU_DIV][`OP_L+1:`OP_L];
+   499	            rs1_ctrl = FUS[`FU_DIV][`SRC1_H:`SRC1_L];
+   500	            rs2_ctrl = FUS[`FU_DIV][`SRC2_H:`SRC2_L];
+   501	        end
+   502	    end
+   503	
+   504	    // WB
+   505	    always @ (*) begin
+   506	        write_sel = 0;
+   507	        reg_write = 0;
+   508	        rd_ctrl = 0;
+   509	
+   510	        if (FUS[`FU_JUMP][`FU_DONE] & JUMP_WAR) begin
+   511	            write_sel = 3'd4;
+   512	            reg_write = 1'b1;
+   513	            rd_ctrl = FUS[`FU_JUMP][`DST_H:`DST_L];
+   514	        end
+   515	        else if (FUS[`FU_ALU][`FU_DONE] & ALU_WAR) begin
+   516	            write_sel = 3'd0;
+   517	            reg_write = 1'b1;
+   518	            rd_ctrl = FUS[`FU_ALU][`DST_H:`DST_L];
+   519	        end
+   520	        else if (FUS[`FU_MEM][`FU_DONE] & MEM_WAR) begin
+   521	            write_sel = 3'd1;
+   522	            reg_write = 1'b1;
+   523	            rd_ctrl = FUS[`FU_MEM][`DST_H:`DST_L];
+   524	        end
+   525	        else if (FUS[`FU_MUL][`FU_DONE] & MUL_WAR) begin
+   526	            write_sel = 3'd2;
+   527	            reg_write = 1'b1;
+   528	            rd_ctrl = FUS[`FU_MUL][`DST_H:`DST_L];
+   529	        end
+   530	        else if (FUS[`FU_DIV][`FU_DONE] & DIV_WAR) begin
+   531	            write_sel = 3'd3;
+   532	            reg_write = 1'b1;
+   533	            rd_ctrl = FUS[`FU_DIV][`DST_H:`DST_L];
+   534	        end
+   535	    end
+   536	endmodule=========== core/Regs.v ===========
+     1	`timescale 1ns / 1ps
+     2	//////////////////////////////////////////////////////////////////////////////////
+     3	// Company: 
+     4	// Engineer: 
+     5	// 
+     6	// Create Date:    21:34:44 03/12/2012 
+     7	// Design Name: 
+     8	// Module Name:    Regs 
+     9	// Project Name: 
+    10	// Target Devices: 
+    11	// Tool versions: 
+    12	// Description: 
+    13	//
+    14	// Dependencies: 
+    15	//
+    16	// Revision: 
+    17	// Revision 0.01 - File Created
+    18	// Additional Comments: 
+    19	//
+    20	//////////////////////////////////////////////////////////////////////////////////
+    21	
+    22	module     Regs(input clk,
+    23					input rst,
+    24					input [4:0] R_addr_A, 
+    25					input [4:0] R_addr_B, 
+    26					input [4:0] Wt_addr, 
+    27					input [31:0]Wt_data, 
+    28					input L_S, 
+    29					output [31:0] rdata_A, 
+    30					output [31:0] rdata_B,
+    31					input [4:0] Debug_addr,         // debug address
+    32					output[31:0] Debug_regs        // debug data
+    33				  );
+    34	
+    35	reg [31:0] register [1:31]; 				// r1 - r31
+    36	integer i;
+    37	
+    38		assign rdata_A = (R_addr_A == 0)? 0 : register[R_addr_A]; 	 // read
+    39		assign rdata_B = (R_addr_B == 0)? 0 : register[R_addr_B];    // read
+    40		
+    41		always @(negedge clk or posedge rst) 
+    42	      begin
+    43			if (rst) 	 begin 			// reset
+    44			    for (i=1; i<32; i=i+1)
+    45			    register[i] <= 0;	//i;
+    46			end 
+    47			else begin
+    48			     if ((Wt_addr != 0) && (L_S == 1)) 	// write
+    49			     register[Wt_addr] <= Wt_data;
+    50			end
+    51		end
+    52	    	
+    53	    assign Debug_regs = (Debug_addr == 0) ? 0 : register[Debug_addr];               //TEST
+    54	
+    55	endmodule
+    56	
+    57	
+=========== core/RAM_B.v ===========
+     1	`timescale 1ns / 1ps
+     2	
+     3	module RAM_B(
+     4	    input [31:0] addra,
+     5	    input clka,      // normal clock
+     6	    input[31:0] dina,
+     7	    input wea, 
+     8	    output[31:0] douta,
+     9	    input[2:0] mem_u_b_h_w
+    10	);
+    11	
+    12	    reg[7:0] data[0:127];
+    13	
+    14	    initial	begin
+    15	        $readmemh("ram.mem", data);
+    16	    end
+    17	
+    18	    always @ (negedge clka) begin
+    19	        if (wea & ~|addra[31:7]) begin
+    20	            data[addra[6:0]] <= dina[7:0];
+    21	            if(mem_u_b_h_w[0] | mem_u_b_h_w[1])
+    22	                data[addra[6:0] + 1] <= dina[15:8];
+    23	            if(mem_u_b_h_w[1]) begin
+    24	                data[addra[6:0] + 2] <= dina[23:16];
+    25	                data[addra[6:0] + 3] <= dina[31:24];
+    26	            end
+    27	        end
+    28	    end
+    29	
+    30	    
+    31	    assign douta = addra[31:7] ? 32'b0 :
+    32	        mem_u_b_h_w[1] ? {data[addra[6:0] + 3], data[addra[6:0] + 2],
+    33	                    data[addra[6:0] + 1], data[addra[6:0]]} :
+    34	        mem_u_b_h_w[0] ? {mem_u_b_h_w[2] ? 16'b0 : {16{data[addra[6:0] + 1][7]}},
+    35	                    data[addra[6:0] + 1], data[addra[6:0]]} :
+    36	        {mem_u_b_h_w[2] ? 24'b0 : {24{data[addra[6:0]][7]}}, data[addra[6:0]]};
+    37	
+    38	endmodule=========== core/ImmGen.v ===========
+     1	`timescale 1ns / 1ps
+     2	
+     3	module ImmGen(
+     4	            input  wire [2:0] ImmSel,
+     5	            input  wire [31:0] inst_field,
+     6	            output[31:0] Imm_out
+     7	    );
+     8	    parameter Imm_type_I = 3'b001;
+     9	    parameter Imm_type_B = 3'b010;
+    10	    parameter Imm_type_J = 3'b011;
+    11	    parameter Imm_type_S = 3'b100;
+    12	    parameter Imm_type_U = 3'b101;
+    13	
+    14	    wire I = ImmSel == Imm_type_I;
+    15	    wire B = ImmSel == Imm_type_B;
+    16	    wire J = ImmSel == Imm_type_J;
+    17	    wire S = ImmSel == Imm_type_S;
+    18	    wire U = ImmSel == Imm_type_U;
+    19	
+    20	    wire[31:0] Imm_I = {{20{inst_field[31]}}, inst_field[31:20]};
+    21	    wire[31:0] Imm_B = {{20{inst_field[31]}}, inst_field[7], inst_field[30:25], inst_field[11:8], 1'b0};
+    22	    wire[31:0] Imm_J = {{12{inst_field[31]}}, inst_field[19:12], inst_field[20], inst_field[30:21],1'b0};
+    23	    wire[31:0] Imm_S = {{20{inst_field[31]}}, inst_field[31:25], inst_field[11:7]};
+    24	    wire[31:0] Imm_U = {inst_field[31:12], 12'b0};
+    25	
+    26	    assign Imm_out = {32{I}} & Imm_I |
+    27	                     {32{B}} & Imm_B |
+    28	                     {32{J}} & Imm_J |
+    29	                     {32{S}} & Imm_S |
+    30	                     {32{U}} & Imm_U ;
+    31	endmodule
+=========== core/ROM_D.v ===========
+     1	`timescale 1ns / 1ps
+     2	
+     3	module ROM_D(
+     4	    input[6:0] a,
+     5	    output[31:0] spo
+     6	);
+     7	
+     8	    reg[31:0] inst_data[0:127];
+     9	
+    10	    initial	begin
+    11	        $readmemh("rom.mem", inst_data);
+    12	    end
+    13	
+    14	    assign spo = inst_data[a];
+    15	
+    16	endmodule

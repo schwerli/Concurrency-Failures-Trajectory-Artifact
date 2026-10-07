@@ -1,0 +1,37 @@
+Fixed.
+
+## Root cause
+
+`HuberRegressor.fit` called `check_X_y` without a `dtype` argument. `check_array`'s default is `dtype="numeric"`, which only converts *object* arrays to float — a `bool` array is already a recognized numpy dtype, so it passed through untouched.
+
+The boolean `X` then reached `_huber_loss_and_gradient`, which does unary negation on a slice of it at `sklearn/linear_model/huber.py:93`:
+
+```python
+X_non_outliers = -axis0_safe_slice(X, ~outliers_mask, n_non_outliers)
+```
+
+numpy forbids unary `-` on boolean arrays, hence the `TypeError`. `LinearRegression` doesn't hit this because it explicitly passes `dtype=[np.float64, np.float32]`.
+
+## The change
+
+`sklearn/linear_model/huber.py:253` — pin the accepted dtypes, matching what the other linear models do:
+
+```python
+X, y = check_X_y(
+    X, y, copy=False, accept_sparse=['csr'], y_numeric=True,
+    dtype=[np.float64, np.float32])
+```
+
+Listing `float32` second means genuine `float32` input is preserved rather than upcast; anything else (bool, int) converts to `float64`.
+
+## Verification
+
+- Reproduced the exact reported `TypeError` on the unpatched tree, and confirmed it's gone with the patch.
+- `fit(X_bool, y)` now returns coefficients matching `fit(X_bool_as_float, y)` to full float precision — the documented expected behavior. Integer input agrees too, and sparse CSR still works.
+- Added `test_huber_bool` regression test; `sklearn/linear_model/tests/test_huber.py` passes 10/10.
+- `check_estimator(HuberRegressor)` passes.
+
+Two caveats worth stating plainly rather than burying:
+
+- The full `sklearn/linear_model/` suite reports **2 failed, 691 passed**. Both failures (`test_least_angle.py::test_rank_deficient_design` and the `HuberRegressor` docstring doctest) reproduce identically on the clean tree with my change stashed, so they're pre-existing and unrelated. The doctest is last-digit float noise (`...573` expected vs `...569` got) — and that got-value is byte-identical before and after my patch, which is useful evidence that existing float code paths are numerically untouched.
+- `coef_.dtype` is `float64` even for `float32` input, because `optimize.fmin_l_bfgs_b` works in double precision. That's unchanged from before and out of scope here.

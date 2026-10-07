@@ -1,0 +1,1259 @@
+########## pnf.py ##########
+     1	"""PNF (Perses Normal Form / Prioritized Normal Form) grammar normalization.
+     2	
+     3	Perses requires the grammar to be in a normal form before it can drive
+     4	syntax-guided reduction.  In PNF:
+     5	
+     6	1. Every quantified sub-expression (``*``, ``+``, ``?``) is factored out into
+     7	   its own named *quantified rule* -- these named rules are exactly the places
+     8	   where the reducer is allowed to delete children.
+     9	2. No rule contains an inline (anonymous) sub-rule; alternation rules only
+    10	   reference named symbols.
+    11	3. Rules with a single alternative are inlined away -- they carry no choice and
+    12	   therefore no reduction opportunity.
+    13	4. Direct left/right recursion is replaced by Kleene quantifiers, because a
+    14	   recursive chain ``expr: expr '+' term | term`` offers no deletable position
+    15	   while the equivalent ``expr: term ('+' term)*`` does.
+    16	5. Rules that are unreachable from the start symbol are dropped.
+    17	
+    18	The entry point is :class:`PNFNormalizer`; :func:`to_pnf` is a convenience
+    19	wrapper and :func:`python_pnf_grammar` returns the PNF form of the bundled
+    20	simplified Python grammar used by the experiments.
+    21	"""
+    22	
+    23	from __future__ import annotations
+    24	
+    25	import copy
+    26	from dataclasses import dataclass, field
+    27	from typing import Dict, List, Set, Union
+    28	
+    29	from reduction.grammar import Grammar, GrammarRule, RuleType
+    30	
+    31	
+    32	#: Suffix used when a quantified expression is factored out into its own rule.
+    33	QUANTIFIER_SUFFIX = {
+    34	    RuleType.KLEENE_STAR: "_star",
+    35	    RuleType.KLEENE_PLUS: "_plus",
+    36	    RuleType.OPTIONAL: "_opt",
+    37	}
+    38	
+    39	#: Rule types that represent a quantified (deletable) position.
+    40	QUANTIFIED_TYPES = (RuleType.KLEENE_STAR, RuleType.KLEENE_PLUS, RuleType.OPTIONAL)
+    41	
+    42	
+    43	@dataclass
+    44	class PNFStats:
+    45	    """Bookkeeping for the transformations applied during normalization.
+    46	
+    47	    Attributes:
+    48	        factored_quantifiers: Names of rules created for inline quantifiers.
+    49	        quantified_repetitions: Names of rules created for repeated symbols.
+    50	        recursion_eliminated: Names of rules whose recursion was removed.
+    51	        inlined_rules: Names of single-alternative rules that were inlined.
+    52	        removed_unreachable: Names of rules unreachable from the start symbol.
+    53	    """
+    54	
+    55	    factored_quantifiers: List[str] = field(default_factory=list)
+    56	    quantified_repetitions: List[str] = field(default_factory=list)
+    57	    recursion_eliminated: List[str] = field(default_factory=list)
+    58	    inlined_rules: List[str] = field(default_factory=list)
+    59	    removed_unreachable: List[str] = field(default_factory=list)
+    60	
+    61	    def as_dict(self) -> Dict[str, List[str]]:
+    62	        """Return the statistics as a plain dictionary."""
+    63	        return {
+    64	            'factored_quantifiers': list(self.factored_quantifiers),
+    65	            'quantified_repetitions': list(self.quantified_repetitions),
+    66	            'recursion_eliminated': list(self.recursion_eliminated),
+    67	            'inlined_rules': list(self.inlined_rules),
+    68	            'removed_unreachable': list(self.removed_unreachable),
+    69	        }
+    70	
+    71	    def total_changes(self) -> int:
+    72	        """Total number of individual transformations that were applied."""
+    73	        return (len(self.factored_quantifiers) + len(self.quantified_repetitions)
+    74	                + len(self.recursion_eliminated) + len(self.inlined_rules)
+    75	                + len(self.removed_unreachable))
+    76	
+    77	
+    78	class PNFNormalizer:
+    79	    """Normalizes a :class:`Grammar` into Perses Normal Form.
+    80	
+    81	    The normalizer never mutates the input grammar; :meth:`normalize` works on
+    82	    a deep copy and returns the new grammar.  Statistics describing what was
+    83	    changed are available through :attr:`stats`.
+    84	    """
+    85	
+    86	    def __init__(self, grammar: Grammar | None = None):
+    87	        """Initialize the normalizer.
+    88	
+    89	        Args:
+    90	            grammar: Default grammar to normalize.  May also be supplied to
+    91	                :meth:`normalize` instead.
+    92	        """
+    93	        self.grammar = grammar
+    94	        self.stats = PNFStats()
+    95	
+    96	    # ------------------------------------------------------------------ API
+    97	
+    98	    def normalize(self, grammar: Grammar | None = None) -> Grammar:
+    99	        """Normalize a grammar into PNF.
+   100	
+   101	        The transformations are applied in dependency order: inline
+   102	        quantifiers are factored out first (so later passes only ever see
+   103	        named symbols), repetitions become Kleene rules, recursion is removed
+   104	        (which introduces further Kleene rules), single-alternative rules are
+   105	        inlined, and finally unreachable rules are dropped.
+   106	
+   107	        Args:
+   108	            grammar: Grammar to normalize.  Defaults to the grammar passed to
+   109	                the constructor.
+   110	
+   111	        Returns:
+   112	            A new :class:`Grammar` in Perses Normal Form.
+   113	
+   114	        Raises:
+   115	            ValueError: If no grammar was supplied.
+   116	        """
+   117	        source = grammar if grammar is not None else self.grammar
+   118	        if source is None:
+   119	            raise ValueError("PNFNormalizer.normalize requires a grammar")
+   120	
+   121	        self.stats = PNFStats()
+   122	        g = copy.deepcopy(source)
+   123	
+   124	        self._factor_inline_rules(g)
+   125	        self._quantify_repetitions(g)
+   126	        self._eliminate_recursion(g)
+   127	        self._inline_single_alternatives(g)
+   128	        self._remove_unreachable(g)
+   129	
+   130	        return g
+   131	
+   132	    def validate(self, grammar: Grammar) -> List[str]:
+   133	        """Check PNF conformance and return a list of human-readable problems.
+   134	
+   135	        Args:
+   136	            grammar: Grammar to inspect.
+   137	
+   138	        Returns:
+   139	            Empty list when the grammar is in PNF, otherwise one message per
+   140	            violation.
+   141	        """
+   142	        problems: List[str] = []
+   143	        for name, rule in grammar.rules.items():
+   144	            for sym in rule.symbols:
+   145	                if isinstance(sym, GrammarRule):
+   146	                    problems.append(
+   147	                        f"rule {name!r} contains inline sub-rule {sym.name!r}")
+   148	            if rule.rule_type == RuleType.ALTERNATION and len(rule.symbols) < 2:
+   149	                problems.append(
+   150	                    f"alternation rule {name!r} has fewer than two alternatives")
+   151	            if rule.is_quantified() and len(rule.symbols) != 1:
+   152	                problems.append(
+   153	                    f"quantified rule {name!r} must have exactly one symbol")
+   154	            if self._is_directly_recursive(grammar, name):
+   155	                problems.append(f"rule {name!r} is directly recursive")
+   156	        return problems
+   157	
+   158	    # -------------------------------------------------- step 1: inline rules
+   159	
+   160	    def _factor_inline_rules(self, g: Grammar) -> None:
+   161	        """Factor anonymous inline sub-rules out into named rules.
+   162	
+   163	        Walks every rule; any symbol that is itself a :class:`GrammarRule` is
+   164	        given a name, registered in the grammar and replaced by a reference.
+   165	        Nested inline rules are handled bottom-up, so the result never contains
+   166	        an inline rule.
+   167	        """
+   168	        worklist = list(g.rules.values())
+   169	        while worklist:
+   170	            rule = worklist.pop()
+   171	            for i, sym in enumerate(list(rule.symbols)):
+   172	                if not isinstance(sym, GrammarRule):
+   173	                    continue
+   174	                # Recurse first so the extracted rule itself is clean.
+   175	                self._factor_rule_symbols(g, sym, worklist)
+   176	                new_name = self._register(g, sym, parent=rule.name, index=i)
+   177	                rule.symbols[i] = new_name
+   178	                if sym.is_quantified():
+   179	                    self.stats.factored_quantifiers.append(new_name)
+   180	
+   181	    def _factor_rule_symbols(self, g: Grammar, rule: GrammarRule,
+   182	                             worklist: List[GrammarRule]) -> None:
+   183	        """Recursively factor inline sub-rules of a single (inline) rule."""
+   184	        for i, sym in enumerate(list(rule.symbols)):
+   185	            if isinstance(sym, GrammarRule):
+   186	                self._factor_rule_symbols(g, sym, worklist)
+   187	                new_name = self._register(g, sym, parent=rule.name, index=i)
+   188	                rule.symbols[i] = new_name
+   189	                if sym.is_quantified():
+   190	                    self.stats.factored_quantifiers.append(new_name)
+   191	
+   192	    def _register(self, g: Grammar, rule: GrammarRule, parent: str,
+   193	                  index: int) -> str:
+   194	        """Give an inline rule a unique name and add it to the grammar.
+   195	
+   196	        Args:
+   197	            g: Grammar being normalized.
+   198	            rule: The inline rule to register.
+   199	            parent: Name of the rule that contained it.
+   200	            index: Position inside the parent's symbol list.
+   201	
+   202	        Returns:
+   203	            The name under which the rule was registered.
+   204	        """
+   205	        base = rule.name
+   206	        if not base:
+   207	            if rule.is_quantified() and len(rule.symbols) == 1 and isinstance(rule.symbols[0], str):
+   208	                base = str(rule.symbols[0]) + QUANTIFIER_SUFFIX[rule.rule_type]
+   209	            else:
+   210	                suffix = (QUANTIFIER_SUFFIX[rule.rule_type]
+   211	                          if rule.is_quantified() else f"_sub{index}")
+   212	                base = f"{parent}{suffix}"
+   213	        elif rule.is_quantified() and not base.endswith(QUANTIFIER_SUFFIX[rule.rule_type]):
+   214	            base = base + QUANTIFIER_SUFFIX[rule.rule_type]
+   215	
+   216	        name = base
+   217	        counter = 2
+   218	        while name in g.rules and g.rules[name] is not rule:
+   219	            existing = g.rules[name]
+   220	            if (existing.rule_type == rule.rule_type
+   221	                    and existing.symbols == rule.symbols):
+   222	                return name  # identical rule already present - reuse it
+   223	            name = f"{base}{counter}"
+   224	            counter += 1
+   225	
+   226	        rule.name = name
+   227	        g.rules[name] = rule
+   228	        return name
+   229	
+   230	    # ------------------------------------------- step 2: quantify repetitions
+   231	
+   232	    def _quantify_repetitions(self, g: Grammar) -> None:
+   233	        """Replace runs of repeated symbols in a sequence with Kleene rules.
+   234	
+   235	        ``args: arg arg arg`` becomes ``args: arg_plus`` together with a new
+   236	        rule ``arg_plus: arg+``, which gives the reducer a deletable position.
+   237	        """
+   238	        for rule in list(g.rules.values()):
+   239	            if rule.rule_type != RuleType.SEQUENCE:
+   240	                continue
+   241	            if any(isinstance(s, GrammarRule) for s in rule.symbols):
+   242	                continue
+   243	            new_symbols: List[Union[str, GrammarRule]] = []
+   244	            i = 0
+   245	            symbols = [str(s) for s in rule.symbols]
+   246	            while i < len(symbols):
+   247	                j = i
+   248	                while j + 1 < len(symbols) and symbols[j + 1] == symbols[i]:
+   249	                    j += 1
+   250	                run = j - i + 1
+   251	                if run > 1:
+   252	                    plus_name = self._ensure_quantified_rule(
+   253	                        g, symbols[i], RuleType.KLEENE_PLUS)
+   254	                    new_symbols.append(plus_name)
+   255	                    self.stats.quantified_repetitions.append(plus_name)
+   256	                else:
+   257	                    new_symbols.append(symbols[i])
+   258	                i = j + 1
+   259	            rule.symbols = new_symbols
+   260	
+   261	    def _ensure_quantified_rule(self, g: Grammar, symbol: str,
+   262	                                rule_type: RuleType) -> str:
+   263	        """Return the name of a quantified rule over ``symbol``, creating it."""
+   264	        name = f"{symbol}{QUANTIFIER_SUFFIX[rule_type]}"
+   265	        existing = g.rules.get(name)
+   266	        if existing is not None:
+   267	            if existing.rule_type == rule_type and existing.symbols == [symbol]:
+   268	                return name
+   269	            counter = 2
+   270	            while f"{name}{counter}" in g.rules:
+   271	                counter += 1
+   272	            name = f"{name}{counter}"
+   273	        g.add_rule(GrammarRule(name=name, rule_type=rule_type, symbols=[symbol]))
+   274	        return name
+   275	
+   276	    # ------------------------------------------- step 3: recursion removal
+   277	
+   278	    def _eliminate_recursion(self, g: Grammar) -> None:
+   279	        """Rewrite directly left/right recursive rules using Kleene closure.
+   280	
+   281	        Two shapes are handled:
+   282	
+   283	        * ``A: A tail`` / ``A: head A`` (sequence self-recursion) becomes a
+   284	          Kleene rule over ``tail`` / ``head``.
+   285	        * ``A: A tail | base`` (alternation with recursive alternatives)
+   286	          becomes ``A: base tail_star`` (left recursion) or
+   287	          ``A: head_star base`` (right recursion).
+   288	
+   289	        Indirect recursion between different rules (for example
+   290	        ``statement -> if_stmt -> block -> statement``) expresses legitimate
+   291	        nesting and is deliberately left untouched.
+   292	        """
+   293	        for name in list(g.rules.keys()):
+   294	            rule = g.rules.get(name)
+   295	            if rule is None:
+   296	                continue
+   297	            if rule.rule_type == RuleType.SEQUENCE:
+   298	                self._eliminate_sequence_recursion(g, rule)
+   299	            elif rule.rule_type == RuleType.ALTERNATION:
+   300	                self._eliminate_alternation_recursion(g, rule)
+   301	
+   302	    def _eliminate_sequence_recursion(self, g: Grammar, rule: GrammarRule) -> None:
+   303	        """Handle ``A: A tail`` and ``A: head A`` sequence self-recursion."""
+   304	        symbols = [s for s in rule.symbols if isinstance(s, str)]
+   305	        if len(symbols) != len(rule.symbols) or len(symbols) < 2:
+   306	            return
+   307	        if symbols[0] == rule.name:
+   308	            tail = symbols[1:]
+   309	            element = self._as_single_symbol(g, tail, f"{rule.name}_tail")
+   310	            star = self._ensure_quantified_rule(g, element, RuleType.KLEENE_STAR)
+   311	            rule.rule_type = RuleType.SEQUENCE
+   312	            rule.symbols = [star]
+   313	            self.stats.recursion_eliminated.append(rule.name)
+   314	        elif symbols[-1] == rule.name:
+   315	            head = symbols[:-1]
+   316	            element = self._as_single_symbol(g, head, f"{rule.name}_head")
+   317	            star = self._ensure_quantified_rule(g, element, RuleType.KLEENE_STAR)
+   318	            rule.rule_type = RuleType.SEQUENCE
+   319	            rule.symbols = [star]
+   320	            self.stats.recursion_eliminated.append(rule.name)
+   321	
+   322	    def _eliminate_alternation_recursion(self, g: Grammar,
+   323	                                         rule: GrammarRule) -> None:
+   324	        """Handle ``A: A tail | head A | base`` alternation recursion."""
+   325	        name = rule.name
+   326	        left_tails: List[str] = []
+   327	        right_heads: List[str] = []
+   328	        base_alts: List[str] = []
+   329	        recursive = False
+   330	
+   331	        for sym in rule.symbols:
+   332	            if not isinstance(sym, str):
+   333	                return  # not normalized yet; nothing to do
+   334	            if sym == name:
+   335	                recursive = True  # A: ... | A -> the alternative is redundant
+   336	                continue
+   337	            alt = g.rules.get(sym)
+   338	            if alt is not None and alt.rule_type == RuleType.SEQUENCE:
+   339	                alt_symbols = [s for s in alt.symbols if isinstance(s, str)]
+   340	                if len(alt_symbols) == len(alt.symbols) and len(alt_symbols) >= 2:
+   341	                    if alt_symbols[0] == name:
+   342	                        recursive = True
+   343	                        left_tails.append(self._as_single_symbol(
+   344	                            g, alt_symbols[1:], f"{sym}_tail"))
+   345	                        continue
+   346	                    if alt_symbols[-1] == name:
+   347	                        recursive = True
+   348	                        right_heads.append(self._as_single_symbol(
+   349	                            g, alt_symbols[:-1], f"{sym}_head"))
+   350	                        continue
+   351	            base_alts.append(sym)
+   352	
+   353	        if not recursive:
+   354	            return
+   355	        if not base_alts:
+   356	            # Nothing productive left; drop the recursion but keep the rule
+   357	            # referencing whatever remains so the grammar stays well-formed.
+   358	            self.stats.recursion_eliminated.append(name)
+   359	            rule.rule_type = RuleType.KLEENE_STAR
+   360	            elements = left_tails + right_heads
+   361	            rule.symbols = [elements[0]] if elements else []
+   362	            return
+   363	
+   364	        base = self._as_single_symbol(g, base_alts, f"{name}_base",
+   365	                                      rule_type=RuleType.ALTERNATION)
+   366	        new_symbols: List[Union[str, GrammarRule]] = []
+   367	        for head in right_heads:
+   368	            new_symbols.append(
+   369	                self._ensure_quantified_rule(g, head, RuleType.KLEENE_STAR))
+   370	        new_symbols.append(base)
+   371	        for tail in left_tails:
+   372	            new_symbols.append(
+   373	                self._ensure_quantified_rule(g, tail, RuleType.KLEENE_STAR))
+   374	
+   375	        rule.rule_type = RuleType.SEQUENCE
+   376	        rule.symbols = new_symbols
+   377	        self.stats.recursion_eliminated.append(name)
+   378	
+   379	    def _as_single_symbol(self, g: Grammar, symbols: List[str], new_name: str,
+   380	                          rule_type: RuleType = RuleType.SEQUENCE) -> str:
+   381	        """Collapse a symbol list into a single symbol, creating a rule if needed."""
+   382	        if len(symbols) == 1:
+   383	            return symbols[0]
+   384	        name = new_name
+   385	        counter = 2
+   386	        while name in g.rules:
+   387	            existing = g.rules[name]
+   388	            if existing.rule_type == rule_type and existing.symbols == symbols:
+   389	                return name
+   390	            name = f"{new_name}{counter}"
+   391	            counter += 1
+   392	        g.add_rule(GrammarRule(name=name, rule_type=rule_type,
+   393	                               symbols=list(symbols)))
+   394	        return name
+   395	
+   396	    # ------------------------------------------ step 4: single-alternative
+   397	
+   398	    def _inline_single_alternatives(self, g: Grammar) -> None:
+   399	        """Inline rules that offer a single alternative with a single symbol.
+   400	
+   401	        Such rules (``expr_stmt: expression``) contain no choice, so keeping
+   402	        them only makes the tree deeper without creating any reduction
+   403	        opportunity.  Quantified rules and the start symbol are never inlined.
+   404	        """
+   405	        changed = True
+   406	        while changed:
+   407	            changed = False
+   408	            for name in list(g.rules.keys()):
+   409	                rule = g.rules.get(name)
+   410	                if rule is None or name == g.start_symbol:
+   411	                    continue
+   412	                if rule.is_quantified() or len(rule.symbols) != 1:
+   413	                    continue
+   414	                target = rule.symbols[0]
+   415	                if not isinstance(target, str) or target == name:
+   416	                    continue
+   417	                del g.rules[name]
+   418	                self._replace_symbol(g, name, target)
+   419	                self.stats.inlined_rules.append(name)
+   420	                changed = True
+   421	
+   422	    def _replace_symbol(self, g: Grammar, old: str, new: str) -> None:
+   423	        """Replace every reference to ``old`` with ``new`` in all rules."""
+   424	        for rule in g.rules.values():
+   425	            for i, sym in enumerate(rule.symbols):
+   426	                if isinstance(sym, str) and sym == old:
+   427	                    rule.symbols[i] = new
+   428	            if rule.rule_type == RuleType.ALTERNATION:
+   429	                # Keep alternations duplicate-free after substitution.
+   430	                seen: Set[str] = set()
+   431	                unique: List[Union[str, GrammarRule]] = []
+   432	                for sym in rule.symbols:
+   433	                    key = sym if isinstance(sym, str) else id(sym)
+   434	                    if key in seen:
+   435	                        continue
+   436	                    seen.add(key)
+   437	                    unique.append(sym)
+   438	                rule.symbols = unique
+   439	
+   440	    # -------------------------------------------- step 5: unreachable rules
+   441	
+   442	    def _remove_unreachable(self, g: Grammar) -> None:
+   443	        """Delete rules that cannot be reached from the start symbol."""
+   444	        reachable = reachable_rules(g)
+   445	        for name in list(g.rules.keys()):
+   446	            if name not in reachable:
+   447	                del g.rules[name]
+   448	                self.stats.removed_unreachable.append(name)
+   449	
+   450	    # --------------------------------------------------------- helpers
+   451	
+   452	    @staticmethod
+   453	    def _is_directly_recursive(g: Grammar, name: str) -> bool:
+   454	        """Check whether ``name`` directly references itself in a bad position."""
+   455	        rule = g.rules.get(name)
+   456	        if rule is None:
+   457	            return False
+   458	        if rule.is_quantified():
+   459	            return False
+   460	        symbols = [s for s in rule.symbols if isinstance(s, str)]
+   461	        if rule.rule_type == RuleType.SEQUENCE and len(symbols) >= 2:
+   462	            return symbols[0] == name or symbols[-1] == name
+   463	        if rule.rule_type == RuleType.ALTERNATION:
+   464	            for sym in symbols:
+   465	                if sym == name:
+   466	                    return True
+   467	                alt = g.rules.get(sym)
+   468	                if alt is not None and alt.rule_type == RuleType.SEQUENCE:
+   469	                    alt_syms = [s for s in alt.symbols if isinstance(s, str)]
+   470	                    if len(alt_syms) >= 2 and (alt_syms[0] == name
+   471	                                               or alt_syms[-1] == name):
+   472	                        return True
+   473	        return False
+   474	
+   475	
+   476	def reachable_rules(grammar: Grammar) -> Set[str]:
+   477	    """Compute the set of rule names reachable from the start symbol.
+   478	
+   479	    Args:
+   480	        grammar: Grammar to analyze.
+   481	
+   482	    Returns:
+   483	        Set of reachable rule names (always includes the start symbol when it
+   484	        is defined).
+   485	    """
+   486	    reachable: Set[str] = set()
+   487	    stack = [grammar.start_symbol]
+   488	    while stack:
+   489	        name = stack.pop()
+   490	        if name in reachable:
+   491	            continue
+   492	        rule = grammar.rules.get(name)
+   493	        if rule is None:
+   494	            continue  # terminal symbol
+   495	        reachable.add(name)
+   496	        for sym in rule.symbols:
+   497	            if isinstance(sym, str):
+   498	                stack.append(sym)
+   499	            elif isinstance(sym, GrammarRule):
+   500	                for inner in sym.symbols:
+   501	                    if isinstance(inner, str):
+   502	                        stack.append(inner)
+   503	    return reachable
+   504	
+   505	
+   506	def find_recursive_rules(grammar: Grammar) -> Dict[str, List[str]]:
+   507	    """Find rules that participate in a recursive cycle.
+   508	
+   509	    Args:
+   510	        grammar: Grammar to analyze.
+   511	
+   512	    Returns:
+   513	        Mapping from rule name to the cycle (list of rule names) that was
+   514	        found starting from that rule.  Useful for reporting indirect
+   515	        recursion, which PNF keeps (it models legitimate nesting).
+   516	    """
+   517	    cycles: Dict[str, List[str]] = {}
+   518	
+   519	    def walk(name: str, path: List[str], seen: Set[str]) -> None:
+   520	        rule = grammar.rules.get(name)
+   521	        if rule is None:
+   522	            return
+   523	        for sym in rule.symbols:
+   524	            if not isinstance(sym, str):
+   525	                continue
+   526	            if sym in path:
+   527	                start = path.index(sym)
+   528	                cycles.setdefault(path[start], path[start:] + [sym])
+   529	                continue
+   530	            if sym in seen:
+   531	                continue
+   532	            seen.add(sym)
+   533	            walk(sym, path + [sym], seen)
+   534	
+   535	    for name in grammar.rules:
+   536	        walk(name, [name], {name})
+   537	    return cycles
+   538	
+   539	
+   540	def to_pnf(grammar: Grammar) -> Grammar:
+   541	    """Normalize ``grammar`` into PNF (convenience wrapper).
+   542	
+   543	    Args:
+   544	        grammar: Grammar to normalize.
+   545	
+   546	    Returns:
+   547	        A new grammar in Perses Normal Form.
+   548	    """
+   549	    return PNFNormalizer(grammar).normalize()
+   550	
+   551	
+   552	def python_pnf_grammar() -> Grammar:
+   553	    """Return the PNF form of the bundled simplified Python grammar."""
+   554	    return to_pnf(Grammar.python_simplified())
+########## perses_reducer.py ##########
+     1	"""Perses: syntax-guided program reduction over the SparTree.
+     2	
+     3	This module provides the base Perses reduction algorithm together with the
+     4	reusable SparTree editing machinery that the later reducers (Vulcan, LPR,
+     5	Sivand, PPR) build on:
+     6	
+     7	* :func:`snapshot_deletions` / :func:`restore_deletions` -- exact undo of
+     8	  deletion edits (a plain ``undelete()`` would resurrect nodes that an earlier
+     9	  successful reduction had removed).
+    10	* :class:`NodePriorityQueue` -- the standard "largest subtree first" ordering.
+    11	* :class:`SparTreeReducer` -- candidate generation/validation helpers shared by
+    12	  all tree reducers.
+    13	* :class:`PersesReducer` -- the actual Perses algorithm: a priority queue over
+    14	  the tree, ddmin-style partition removal on the children of Kleene nodes, and
+    15	  replacement of a node by a smaller grammar-compatible descendant.
+    16	"""
+    17	
+    18	from __future__ import annotations
+    19	
+    20	import heapq
+    21	from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+    22	
+    23	from reduction.config import Config
+    24	from reduction.grammar import Grammar, GrammarRule, RuleType
+    25	from reduction.property_test import PropertyTester
+    26	from reduction.reducer import AbstractReducer
+    27	from reduction.tree import NodeType, SparTreeNode
+    28	
+    29	
+    30	# Rule-name suffixes that denote a continuation clause rather than a statement.
+    31	CLAUSE_SUFFIXES = ('_header', '_clause', '_clauses')
+    32	
+    33	# Rule names that behave like statements even when the grammar does not list
+    34	# them (the simplified parser emits these directly).
+    35	STATEMENT_RULE_NAMES = frozenset({
+    36	    'statement', 'simple_stmt', 'compound_stmt', 'func_def', 'class_def',
+    37	})
+    38	
+    39	
+    40	# --------------------------------------------------------------------------
+    41	# Tree helpers (shared by every reducer in the framework)
+    42	# --------------------------------------------------------------------------
+    43	
+    44	def iter_all_nodes(node: SparTreeNode) -> List[SparTreeNode]:
+    45	    """Return every node in the subtree, including deleted ones, in pre-order.
+    46	
+    47	    ``SparTreeNode.all_nodes`` skips deleted subtrees, which makes it unusable
+    48	    for snapshot/restore bookkeeping.
+    49	
+    50	    Args:
+    51	        node: Subtree root.
+    52	
+    53	    Returns:
+    54	        Pre-order list of all nodes.
+    55	    """
+    56	    result: List[SparTreeNode] = []
+    57	    stack = [node]
+    58	    while stack:
+    59	        current = stack.pop()
+    60	        result.append(current)
+    61	        stack.extend(reversed(current.children))
+    62	    return result
+    63	
+    64	
+    65	def snapshot_deletions(node: SparTreeNode) -> List[bool]:
+    66	    """Capture the ``deleted`` flag of every node in the subtree.
+    67	
+    68	    Args:
+    69	        node: Subtree root.
+    70	
+    71	    Returns:
+    72	        List of flags in the pre-order defined by :func:`iter_all_nodes`.
+    73	    """
+    74	    return [n.deleted for n in iter_all_nodes(node)]
+    75	
+    76	
+    77	def restore_deletions(node: SparTreeNode, snapshot: Sequence[bool]) -> None:
+    78	    """Restore ``deleted`` flags captured by :func:`snapshot_deletions`.
+    79	
+    80	    Args:
+    81	        node: Subtree root the snapshot was taken from.
+    82	        snapshot: Flags to restore.
+    83	
+    84	    Raises:
+    85	        ValueError: If the tree shape changed since the snapshot was taken.
+    86	    """
+    87	    nodes = iter_all_nodes(node)
+    88	    if len(nodes) != len(snapshot):
+    89	        raise ValueError("tree shape changed since snapshot was taken")
+    90	    for n, flag in zip(nodes, snapshot):
+    91	        n.deleted = flag
+    92	
+    93	
+    94	def token_nodes(node: SparTreeNode) -> List[SparTreeNode]:
+    95	    """Return the live token (leaf) nodes of a subtree in source order.
+    96	
+    97	    Args:
+    98	        node: Subtree root.
+    99	
+   100	    Returns:
+   101	        List of non-deleted nodes with ``NodeType.TOKEN``.
+   102	    """
+   103	    return [n for n in node.all_nodes() if n.node_type == NodeType.TOKEN]
+   104	
+   105	
+   106	def parent_map(root: SparTreeNode) -> Dict[int, SparTreeNode]:
+   107	    """Build a mapping from ``id(child)`` to its parent node.
+   108	
+   109	    Args:
+   110	        root: Tree root.
+   111	
+   112	    Returns:
+   113	        Dictionary keyed by ``id(node)``; the root itself is absent.
+   114	    """
+   115	    parents: Dict[int, SparTreeNode] = {}
+   116	    for node in iter_all_nodes(root):
+   117	        for child in node.children:
+   118	            parents[id(child)] = node
+   119	    return parents
+   120	
+   121	
+   122	def is_ancestor(candidate: SparTreeNode, node: SparTreeNode,
+   123	                parents: Dict[int, SparTreeNode]) -> bool:
+   124	    """Check whether ``candidate`` is an ancestor of ``node``.
+   125	
+   126	    Args:
+   127	        candidate: Possible ancestor.
+   128	        node: Node to test.
+   129	        parents: Mapping produced by :func:`parent_map`.
+   130	
+   131	    Returns:
+   132	        True if ``candidate`` is a (strict) ancestor of ``node``.
+   133	    """
+   134	    current = parents.get(id(node))
+   135	    while current is not None:
+   136	        if current is candidate:
+   137	            return True
+   138	        current = parents.get(id(current))
+   139	    return False
+   140	
+   141	
+   142	# --------------------------------------------------------------------------
+   143	# Priority queue
+   144	# --------------------------------------------------------------------------
+   145	
+   146	class NodePriorityQueue:
+   147	    """Priority queue over SparTree nodes, largest subtree first.
+   148	
+   149	    Perses processes big subtrees before small ones so that a single
+   150	    successful deletion removes as many tokens as possible.  Sub-classes may
+   151	    override :meth:`priority` to change the ordering (see
+   152	    ``reduction.sivand.attention_priority.AttentionPriorityQueue``).
+   153	    """
+   154	
+   155	    def __init__(self, nodes: Iterable[SparTreeNode] = ()):
+   156	        """Initialize the queue, optionally pushing an initial node set."""
+   157	        self._heap: List[Tuple[tuple, int, SparTreeNode]] = []
+   158	        self._counter = 0
+   159	        self.push_all(nodes)
+   160	
+   161	    def priority(self, node: SparTreeNode) -> tuple:
+   162	        """Return the sort key for a node (smaller keys are popped first).
+   163	
+   164	        Args:
+   165	            node: Node to rank.
+   166	
+   167	        Returns:
+   168	            Tuple key; the default ranks larger subtrees first.
+   169	        """
+   170	        return (-node.token_count(),)
+   171	
+   172	    def push(self, node: SparTreeNode) -> None:
+   173	        """Add a node to the queue."""
+   174	        heapq.heappush(self._heap, (self.priority(node), self._counter, node))
+   175	        self._counter += 1
+   176	
+   177	    def push_all(self, nodes: Iterable[SparTreeNode]) -> None:
+   178	        """Add several nodes to the queue."""
+   179	        for node in nodes:
+   180	            self.push(node)
+   181	
+   182	    def pop(self) -> SparTreeNode:
+   183	        """Remove and return the highest-priority node.
+   184	
+   185	        Raises:
+   186	            IndexError: If the queue is empty.
+   187	        """
+   188	        if not self._heap:
+   189	            raise IndexError("pop from an empty NodePriorityQueue")
+   190	        return heapq.heappop(self._heap)[2]
+   191	
+   192	    def is_empty(self) -> bool:
+   193	        """True when no nodes remain."""
+   194	        return not self._heap
+   195	
+   196	    def __len__(self) -> int:
+   197	        return len(self._heap)
+   198	
+   199	    def __bool__(self) -> bool:
+   200	        return bool(self._heap)
+   201	
+   202	
+   203	# --------------------------------------------------------------------------
+   204	# Shared reducer machinery
+   205	# --------------------------------------------------------------------------
+   206	
+   207	class SparTreeReducer(AbstractReducer):
+   208	    """Base class with the candidate-testing machinery for tree reducers.
+   209	
+   210	    Sub-classes implement :meth:`reduce`; this class provides validated tree
+   211	    edits: every edit is applied, checked with the property tester, and undone
+   212	    when the property no longer holds.
+   213	    """
+   214	
+   215	    def __init__(self, grammar: Grammar | None = None,
+   216	                 config: Config | None = None):
+   217	        """Initialize the reducer.
+   218	
+   219	        Args:
+   220	            grammar: Grammar used for compatibility decisions (optional).
+   221	            config: Framework configuration.
+   222	        """
+   223	        self.grammar = grammar
+   224	        self.config = config or Config()
+   225	        self.tests_used = 0
+   226	        self.successful_edits = 0
+   227	
+   228	    @property
+   229	    def name(self) -> str:  # pragma: no cover - overridden by sub-classes
+   230	        """Name of the reduction algorithm."""
+   231	        return type(self).__name__
+   232	
+   233	    def reduce(self, tree: SparTreeNode, tester: PropertyTester) -> SparTreeNode:
+   234	        """Reduce the tree (implemented by sub-classes)."""
+   235	        raise NotImplementedError
+   236	
+   237	    # ----------------------------------------------------------- candidates
+   238	
+   239	    def _check(self, tree: SparTreeNode, tester: PropertyTester) -> bool:
+   240	        """Run the property test on the current state of the tree.
+   241	
+   242	        Args:
+   243	            tree: Tree root (its rendered source is tested).
+   244	            tester: Property tester.
+   245	
+   246	        Returns:
+   247	            True if the property still holds.
+   248	        """
+   249	        self.tests_used += 1
+   250	        return tester.test(tree.to_source())
+   251	
+   252	    def _try_delete(self, tree: SparTreeNode, nodes: Sequence[SparTreeNode],
+   253	                    tester: PropertyTester) -> bool:
+   254	        """Try deleting a set of nodes, keeping the change only if valid.
+   255	
+   256	        Args:
+   257	            tree: Tree root.
+   258	            nodes: Nodes to delete together.
+   259	            tester: Property tester.
+   260	
+   261	        Returns:
+   262	            True if the deletion was kept.
+   263	        """
+   264	        live = [n for n in nodes if not n.deleted and n.token_count() > 0]
+   265	        if not live:
+   266	            return False
+   267	        snapshot = snapshot_deletions(tree)
+   268	        before = tree.token_count()
+   269	        for node in live:
+   270	            node.delete()
+   271	        if tree.token_count() >= before:
+   272	            restore_deletions(tree, snapshot)
+   273	            return False
+   274	        if self._check(tree, tester):
+   275	            self.successful_edits += 1
+   276	            return True
+   277	        restore_deletions(tree, snapshot)
+   278	        return False
+   279	
+   280	    def _try_replace(self, tree: SparTreeNode, node: SparTreeNode,
+   281	                     replacement: SparTreeNode, tester: PropertyTester) -> bool:
+   282	        """Try replacing ``node``'s content with a copy of ``replacement``.
+   283	
+   284	        The node object itself is reused (its fields are overwritten) so no
+   285	        parent bookkeeping is required.
+   286	
+   287	        Args:
+   288	            tree: Tree root.
+   289	            node: Node to overwrite.
+   290	            replacement: Node whose content is copied in.
+   291	            tester: Property tester.
+   292	
+   293	        Returns:
+   294	            True if the replacement was kept.
+   295	        """
+   296	        if node is replacement:
+   297	            return False
+   298	        undo = replace_node_content(node, replacement)
+   299	        if tree.token_count() == 0 or not self._check(tree, tester):
+   300	            undo()
+   301	            return False
+   302	        self.successful_edits += 1
+   303	        return True
+   304	
+   305	    # -------------------------------------------------------------- helpers
+   306	
+   307	    @staticmethod
+   308	    def _split(items: Sequence[SparTreeNode], n: int) -> List[List[SparTreeNode]]:
+   309	        """Split a list into ``n`` roughly equal, contiguous partitions."""
+   310	        k = len(items)
+   311	        if n <= 0:
+   312	            return [list(items)]
+   313	        n = min(n, k) if k else 0
+   314	        partitions: List[List[SparTreeNode]] = []
+   315	        if n == 0:
+   316	            return partitions
+   317	        size, remainder = divmod(k, n)
+   318	        start = 0
+   319	        for i in range(n):
+   320	            end = start + size + (1 if i < remainder else 0)
+   321	            partitions.append(list(items[start:end]))
+   322	            start = end
+   323	        return partitions
+   324	
+   325	    def _ddmin_nodes(self, tree: SparTreeNode, elements: Sequence[SparTreeNode],
+   326	                     min_keep: int, tester: PropertyTester) -> bool:
+   327	        """Run ddmin-style partition removal over a list of sibling nodes.
+   328	
+   329	        Implements the two ddmin directions on the element list: remove one
+   330	        partition at a time, and (when that fails) keep a single partition.
+   331	        Granularity doubles when neither direction succeeds.
+   332	
+   333	        Args:
+   334	            tree: Tree root.
+   335	            elements: Sibling nodes forming a (Kleene) list.
+   336	            min_keep: Minimum number of elements that must survive.
+   337	            tester: Property tester.
+   338	
+   339	        Returns:
+   340	            True if at least one element was deleted.
+   341	        """
+   342	        remaining = [e for e in elements if not e.deleted]
+   343	        changed = False
+   344	        n = 2
+   345	        while len(remaining) > max(min_keep, 1):
+   346	            k = min(n, len(remaining))
+   347	            partitions = [p for p in self._split(remaining, k) if p]
+   348	            if len(partitions) < 2:
+   349	                break
+   350	
+   351	            progressed = False
+   352	            # Direction 1: remove a single partition.
+   353	            for part in partitions:
+   354	                if len(remaining) - len(part) < min_keep:
+   355	                    continue
+   356	                if self._try_delete(tree, part, tester):
+   357	                    remaining = [e for e in remaining if e not in part]
+   358	                    changed = True
+   359	                    progressed = True
+   360	                    n = max(n - 1, 2)
+   361	                    break
+   362	            if progressed:
+   363	                continue
+   364	
+   365	            # Direction 2: keep a single partition, delete everything else.
+   366	            for part in partitions:
+   367	                if len(part) < min_keep:
+   368	                    continue
+   369	                complement = [e for e in remaining if e not in part]
+   370	                if not complement:
+   371	                    continue
+   372	                if self._try_delete(tree, complement, tester):
+   373	                    remaining = list(part)
+   374	                    changed = True
+   375	                    progressed = True
+   376	                    n = 2
+   377	                    break
+   378	            if progressed:
+   379	                continue
+   380	
+   381	            if k >= len(remaining):
+   382	                break
+   383	            n = min(n * 2, len(remaining))
+   384	        return changed
+   385	
+   386	
+   387	def replace_node_content(node: SparTreeNode,
+   388	                         replacement: SparTreeNode) -> Callable[[], None]:
+   389	    """Overwrite ``node`` with a deep copy of ``replacement``.
+   390	
+   391	    Args:
+   392	        node: Node to overwrite in place.
+   393	        replacement: Source of the new content.
+   394	
+   395	    Returns:
+   396	        A callable that restores the node to its previous content.
+   397	    """
+   398	    saved = (node.rule_name, node.node_type, node.children, node.token,
+   399	             node.deleted)
+   400	    clone = replacement.clone()
+   401	    node.rule_name = clone.rule_name
+   402	    node.node_type = clone.node_type
+   403	    node.children = clone.children
+   404	    node.token = clone.token
+   405	    node.deleted = clone.deleted
+   406	
+   407	    def undo() -> None:
+   408	        (node.rule_name, node.node_type, node.children, node.token,
+   409	         node.deleted) = saved
+   410	
+   411	    return undo
+   412	
+   413	
+   414	# --------------------------------------------------------------------------
+   415	# Perses
+   416	# --------------------------------------------------------------------------
+   417	
+   418	class PersesReducer(SparTreeReducer):
+   419	    """The Perses syntax-guided reduction algorithm.
+   420	
+   421	    The tree is traversed with a priority queue that yields the largest
+   422	    subtrees first.  For every node:
+   423	
+   424	    * Kleene nodes (``*`` / ``+`` lists): ddmin-style partition removal over
+   425	      the children, honouring the "at least one" constraint of ``+``.
+   426	    * Regular nodes: delete grammar-deletable children (optional/Kleene
+   427	      positions) and try replacing the node with a smaller
+   428	      grammar-compatible descendant.
+   429	
+   430	    Only grammar-compatible edits are attempted, so candidate programs stay
+   431	    syntactically plausible; the property test is the final arbiter.
+   432	    """
+   433	
+   434	    def __init__(
+   435	        self,
+   436	        grammar: Grammar | None = None,
+   437	        config: Config | None = None,
+   438	        max_replacement_candidates: int = 6,
+   439	        min_replacement_tokens: int = 2,
+   440	        token_level: bool = False,
+   441	        queue_factory: Optional[Callable[[], NodePriorityQueue]] = None,
+   442	    ):
+   443	        """Initialize the Perses reducer.
+   444	
+   445	        Args:
+   446	            grammar: Grammar (ideally PNF-normalized) used to decide which
+   447	                replacements are compatible.
+   448	            config: Framework configuration.
+   449	            max_replacement_candidates: Upper bound on replacement candidates
+   450	                tried per node (keeps the test budget sane).
+   451	            min_replacement_tokens: Nodes with at most this many tokens are not
+   452	                considered for replacement.
+   453	            token_level: When True, also apply ddmin to the token children of
+   454	                regular nodes.  Off for plain Perses (statement-level
+   455	                reduction); used by Sivand where the oracle does not require
+   456	                syntactically valid programs.
+   457	            queue_factory: Factory for the traversal queue.  Defaults to
+   458	                :class:`NodePriorityQueue`.
+   459	        """
+   460	        super().__init__(grammar=grammar, config=config)
+   461	        self.max_replacement_candidates = max_replacement_candidates
+   462	        self.min_replacement_tokens = min_replacement_tokens
+   463	        self.token_level = token_level
+   464	        self.queue_factory = queue_factory or NodePriorityQueue
+   465	        self._alternative_cache: Dict[str, Set[str]] = {}
+   466	        self._statement_closure: Set[str] | None = None
+   467	
+   468	    @property
+   469	    def name(self) -> str:
+   470	        """Name of the reduction algorithm."""
+   471	        return "Perses"
+   472	
+   473	    # ------------------------------------------------------------------ main
+   474	
+   475	    def reduce(self, tree: SparTreeNode, tester: PropertyTester) -> SparTreeNode:
+   476	        """Reduce the tree with the Perses algorithm.
+   477	
+   478	        Args:
+   479	            tree: SparTree to reduce (mutated in place).
+   480	            tester: Property tester validating each candidate.
+   481	
+   482	        Returns:
+   483	            The reduced tree.
+   484	        """
+   485	        if tree.token_count() == 0:
+   486	            return tree
+   487	
+   488	        queue = self.make_queue(tree)
+   489	        queue.push(tree)
+   490	        while not queue.is_empty():
+   491	            node = queue.pop()
+   492	            if node.deleted or node.token_count() == 0:
+   493	                continue
+   494	
+   495	            if node.node_type in (NodeType.KLEENE_STAR, NodeType.KLEENE_PLUS):
+   496	                self._reduce_kleene_node(tree, node, tester)
+   497	            elif node.node_type != NodeType.TOKEN:
+   498	                self._delete_deletable_children(tree, node, tester)
+   499	                if node is not tree:
+   500	                    self._replace_with_compatible_descendant(tree, node, tester)
+   501	                if self.token_level:
+   502	                    self._reduce_token_children(tree, node, tester)
+   503	
+   504	            if node.deleted:
+   505	                continue
+   506	            for child in node.children:
+   507	                if not child.deleted and child.token_count() > 0:
+   508	                    queue.push(child)
+   509	
+   510	        return tree
+   511	
+   512	    def make_queue(self, tree: SparTreeNode) -> NodePriorityQueue:
+   513	        """Create the traversal queue for a reduction run.
+   514	
+   515	        Args:
+   516	            tree: Tree about to be reduced (available to sub-classes that need
+   517	                whole-tree context, e.g. attention weights).
+   518	
+   519	        Returns:
+   520	            An empty :class:`NodePriorityQueue` (or sub-class instance).
+   521	        """
+   522	        return self.queue_factory()
+   523	
+   524	    # ------------------------------------------------------------- strategies
+   525	
+   526	    def _reduce_kleene_node(self, tree: SparTreeNode, node: SparTreeNode,
+   527	                            tester: PropertyTester) -> bool:
+   528	        """Apply ddmin partition removal to the children of a Kleene node.
+   529	
+   530	        Args:
+   531	            tree: Tree root.
+   532	            node: Kleene (``*`` or ``+``) node.
+   533	            tester: Property tester.
+   534	
+   535	        Returns:
+   536	            True if any child was deleted.
+   537	        """
+   538	        elements = [c for c in node.children if not c.deleted and c.token_count() > 0]
+   539	        if not elements:
+   540	            return False
+   541	
+   542	        min_keep = 1 if node.node_type == NodeType.KLEENE_PLUS else 0
+   543	        # A '*' list may become empty, so try dropping it wholesale first.
+   544	        if min_keep == 0 and self._try_delete(tree, elements, tester):
+   545	            return True
+   546	        return self._ddmin_nodes(tree, elements, min_keep, tester)
+   547	
+   548	    def _delete_deletable_children(self, tree: SparTreeNode, node: SparTreeNode,
+   549	                                  tester: PropertyTester) -> bool:
+   550	        """Delete children that the grammar marks as optional/repeatable.
+   551	
+   552	        Args:
+   553	            tree: Tree root.
+   554	            node: Parent node.
+   555	            tester: Property tester.
+   556	
+   557	        Returns:
+   558	            True if any child was deleted.
+   559	        """
+   560	        changed = False
+   561	        for child in list(node.children):
+   562	            if child.deleted or child.token_count() == 0:
+   563	                continue
+   564	            if not child.is_deletable():
+   565	                continue
+   566	            if self._try_delete(tree, [child], tester):
+   567	                changed = True
+   568	        return changed
+   569	
+   570	    def _replace_with_compatible_descendant(self, tree: SparTreeNode,
+   571	                                            node: SparTreeNode,
+   572	                                            tester: PropertyTester) -> bool:
+   573	        """Try replacing a node with a smaller grammar-compatible descendant.
+   574	
+   575	        Args:
+   576	            tree: Tree root.
+   577	            node: Node to shrink.
+   578	            tester: Property tester.
+   579	
+   580	        Returns:
+   581	            True if a replacement was accepted.
+   582	        """
+   583	        size = node.token_count()
+   584	        if size <= self.min_replacement_tokens:
+   585	            return False
+   586	
+   587	        candidates: List[Tuple[int, SparTreeNode]] = []
+   588	        for descendant in node.all_nodes()[1:]:
+   589	            if descendant.deleted or descendant.node_type == NodeType.TOKEN:
+   590	                continue
+   591	            count = descendant.token_count()
+   592	            if count == 0 or count >= size:
+   593	                continue
+   594	            if not self.compatible(node, descendant):
+   595	                continue
+   596	            candidates.append((count, descendant))
+   597	
+   598	        # Smallest first: the largest reduction is tried before smaller wins.
+   599	        candidates.sort(key=lambda pair: pair[0])
+   600	        for _, descendant in candidates[:self.max_replacement_candidates]:
+   601	            if self._try_replace(tree, node, descendant, tester):
+   602	                return True
+   603	        return False
+   604	
+   605	    def _reduce_token_children(self, tree: SparTreeNode, node: SparTreeNode,
+   606	                               tester: PropertyTester) -> bool:
+   607	        """Apply ddmin to the token children of a node (token-level mode).
+   608	
+   609	        Args:
+   610	            tree: Tree root.
+   611	            node: Node whose token children are considered.
+   612	            tester: Property tester.
+   613	
+   614	        Returns:
+   615	            True if any token was deleted.
+   616	        """
+   617	        tokens = [c for c in node.children
+   618	                  if c.node_type == NodeType.TOKEN and not c.deleted]
+   619	        if not tokens:
+   620	            return False
+   621	        return self._ddmin_nodes(tree, tokens, 0, tester)
+   622	
+   623	    # -------------------------------------------------------- compatibility
+   624	
+   625	    def compatible(self, target: SparTreeNode, candidate: SparTreeNode) -> bool:
+   626	        """Check whether ``candidate`` may syntactically replace ``target``.
+   627	
+   628	        A candidate is compatible when it derives from the same rule, when the
+   629	        grammar lists its rule as an alternative of the target's rule, or when
+   630	        both nodes are statements (any statement may appear where a statement
+   631	        is expected).
+   632	
+   633	        Args:
+   634	            target: Node that would be replaced.
+   635	            candidate: Node that would take its place.
+   636	
+   637	        Returns:
+   638	            True if the replacement is grammar-compatible.
+   639	        """
+   640	        if target.node_type == NodeType.TOKEN or candidate.node_type == NodeType.TOKEN:
+   641	            return target.rule_name == candidate.rule_name
+   642	        if target.rule_name == candidate.rule_name:
+   643	            return True
+   644	        if candidate.rule_name in self.alternatives_of(target.rule_name):
+   645	            return True
+   646	        return (self.statement_like(target.rule_name)
+   647	                and self.statement_like(candidate.rule_name))
+   648	
+   649	    def alternatives_of(self, rule_name: str) -> Set[str]:
+   650	        """Return every rule name reachable through alternation from a rule.
+   651	
+   652	        Args:
+   653	            rule_name: Rule to expand.
+   654	
+   655	        Returns:
+   656	            Set of alternative rule names (transitive closure, excluding the
+   657	            rule itself).
+   658	        """
+   659	        cached = self._alternative_cache.get(rule_name)
+   660	        if cached is not None:
+   661	            return cached
+   662	
+   663	        result: Set[str] = set()
+   664	        if self.grammar is not None:
+   665	            stack = [rule_name]
+   666	            seen = {rule_name}
+   667	            while stack:
+   668	                current = stack.pop()
+   669	                rule = self.grammar.rules.get(current)
+   670	                if rule is None or rule.rule_type != RuleType.ALTERNATION:
+   671	                    continue
+   672	                for sym in rule.symbols:
+   673	                    name = sym.name if isinstance(sym, GrammarRule) else sym
+   674	                    if name in seen:
+   675	                        continue
+   676	                    seen.add(name)
+   677	                    result.add(name)
+   678	                    stack.append(name)
+   679	        self._alternative_cache[rule_name] = result
+   680	        return result
+   681	
+   682	    def statement_like(self, rule_name: str) -> bool:
+   683	        """Check whether a rule name denotes a stand-alone statement.
+   684	
+   685	        Args:
+   686	            rule_name: Rule name from a tree node.
+   687	
+   688	        Returns:
+   689	            True when a node with this rule name can appear wherever a
+   690	            statement is allowed.
+   691	        """
+   692	        if rule_name.endswith(CLAUSE_SUFFIXES):
+   693	            return False
+   694	        if rule_name.endswith('_stmt') or rule_name in STATEMENT_RULE_NAMES:
+   695	            return True
+   696	        if self._statement_closure is None:
+   697	            closure: Set[str] = set()
+   698	            for base in ('statement', 'simple_stmt', 'compound_stmt'):
+   699	                closure |= self.alternatives_of(base)
+   700	            self._statement_closure = {
+   701	                name for name in closure if not name.endswith(CLAUSE_SUFFIXES)
+   702	            }
+   703	        return rule_name in self._statement_closure

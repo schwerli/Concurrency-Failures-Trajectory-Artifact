@@ -1,0 +1,29 @@
+Migration complete and verified byte-for-byte against the C++ binary.
+
+## What's in `/output`
+
+| File | Role |
+|---|---|
+| `test17.rs` | Entry point in package root; mirrors the C++ `main` |
+| `src/url_parser/mod.rs` | Module root, re-exports `url_encode` / `url_decode` / `URL` |
+| `src/url_parser/encoding.rs` | Percent-encode / decode |
+| `src/url_parser/url.rs` | `URL` splitter + `query_params()` |
+| `test17` | Compiled executable |
+
+Builds cleanly (no warnings) both ways: `rustc --edition 2021 -O test17.rs -o test17` and `cargo build --release`. Std-only, zero dependencies.
+
+## Behavior recovered black-box from the binary
+
+- **`url_encode`** — byte-wise; unreserved set is `[A-Za-z0-9-_.~]`, everything else becomes `%` + **lowercase** hex. UTF-8 is escaped one octet at a time (`é` → `%c3%a9`).
+- **`url_decode`** — byte-wise; `+` → space, `%XX` accepts either hex case. A malformed escape is **not** an error: the `%` is emitted verbatim and scanning advances one byte, so `%zz`→`%zz`, `%4`→`%4`, and `%%41`→`%A`.
+- **`query_params`** returns keys/values **already percent-decoded**, while `query()` returns the raw string.
+
+## Two findings worth flagging
+
+**1. The double-decode.** My first version returned query params still encoded, which passed all five documented examples — those inputs are decode-idempotent, so the bug was invisible there. The differential test caught 12 failures that all pinpointed the same cause: the test's own `url_decode(kv.first)` is a *second* decode. Input `%C3%A9` → encode `%25C3%25A9` → decode once `%C3%A9` → decode twice `é`, which is what C++ printed. The five given examples were not sufficient to validate this port.
+
+**2. Output cannot be a `String`.** Decoding produces arbitrary bytes — `%ff` emits a bare `0xff`, which is invalid UTF-8. So the library speaks `[u8]`/`Vec<u8>` throughout, `query_params()` returns `Vec<(Vec<u8>, Vec<u8>)>`, and `main` writes raw bytes via `write_all` rather than `println!`. Using `String` would have panicked on that input.
+
+Verification: 66 hand-picked edge cases plus 2000 randomized inputs (drawn from a token pool of delimiters, partial escapes, and multi-byte UTF-8), compared as hex dumps including exit codes — zero mismatches. Exit code 1 with no output when args are missing, and extra args ignored, both match.
+
+One deliberate deviation from the brief: `std::env::args()` panics on non-UTF-8 argv, where the C++ accepts raw bytes. I kept `args()` as instructed since the harness passes text; `args_os()` + `OsStrExt::as_bytes()` would close that gap if you ever need it.

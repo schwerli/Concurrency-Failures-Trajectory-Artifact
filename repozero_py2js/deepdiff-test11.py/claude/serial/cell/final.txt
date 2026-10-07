@@ -1,0 +1,35 @@
+Done. The port is in `/output`, pure ESM `.mjs`, zero dependencies (only `node:fs` / `node:path`).
+
+## Structure
+
+```
+/output/test11.mjs                  entry point — mirrors test11.py line for line
+/output/lib/pyprim/                 CPython primitive semantics
+   bytes.mjs      UTF-8 codec with surrogateescape (both directions)
+   pystr.mjs      splitlines(), Py_UNICODE_ISSPACE strip, Unicode decimal digits
+   pyvalue.mjs    PyDict / list / int(BigInt) / str value model + type(x)
+   pyrepr.mjs     repr()/str(): quote selection, Py_UNICODE_ISPRINTABLE escapes
+   pyint.mjs      int(str): sign, underscores, arbitrary precision
+   pyio.mjs       print/stderr as raw bytes; sys.argv via /proc/self/cmdline
+/output/lib/stdlib/
+   argparse.mjs   ArgumentParser subset: usage/help/errors, exit 2
+   difflib.mjs    SequenceMatcher (incl. autojunk) + unified_diff
+/output/lib/deepdiff/
+   model.mjs      path formatting + deepdiff's canonical category order
+   diff.mjs       recursive DeepDiff engine
+   path.mjs       extract("root['users'][0]['name']")
+   index.mjs      public surface
+```
+
+## Behaviours reverse-engineered from the executable
+
+- **`values_changed` carries a `diff`** when either string contains `\n` — a `difflib.unified_diff(splitlines(), lineterm='')` payload. This required porting `SequenceMatcher` including the autojunk rule *and* its asymmetry (popular elements leave the index but still extend a match) — verified against a 300-identical-line input, where a naive port would emit a full-replace diff instead of `@@ -298,3 +298,4 @@`.
+- **`repr` details**: quote preference (`"it's"` vs `'a\'b"c'`), `\x`/`\u`/`\U` escaping driven by Unicode category (`\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}` minus space).
+- **`--b` is arbitrary precision** (BigInt), accepts `1_0`, `+7`, surrounding Unicode whitespace, and non-ASCII digits (`١٢` → 12).
+- **Invalid UTF-8 in `--a`** survives as lone surrogates (`'\udcff'` in repr) and is written back as the original bytes — so argv comes from `/proc/self/cmdline` and output goes out as `writeSync` buffers.
+
+## Verification
+
+68 differential cases (valid runs, all argparse error paths, multiline/CR/VT/NEL/LS separators, unicode, emoji, empty, huge ints, byte-invalid input) — **68 pass, 0 fail**, with three cases additionally `cmp`-checked byte-for-byte, including the 9177-byte autojunk output.
+
+One intentional difference: the program name in usage/error text is derived from the script name (`test11.mjs`) as CPython's argparse does, rather than hardcoding the compiled binary's `test11_executable`; the diff suite normalizes that token. Stdout for all valid inputs is identical.

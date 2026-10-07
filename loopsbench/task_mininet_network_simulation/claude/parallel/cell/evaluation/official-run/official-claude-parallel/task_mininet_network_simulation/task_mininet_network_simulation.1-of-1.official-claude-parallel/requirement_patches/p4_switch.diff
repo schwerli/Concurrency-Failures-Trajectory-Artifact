@@ -1,0 +1,976 @@
+diff --git a/agent_tests/test_p4.py b/agent_tests/test_p4.py
+new file mode 100644
+index 0000000..5855a1f
+--- /dev/null
++++ b/agent_tests/test_p4.py
+@@ -0,0 +1,154 @@
++"""Regression tests for the P4 programmable data plane layer of netsim."""
++
++import subprocess
++import sys
++
++from netsim.net import Mininet
++from netsim.node import Switch
++from netsim.p4_switch import (P4Counter, P4Deparser, P4MatchActionTable,
++                              P4MulticastGroup, P4Parser, P4Switch,
++                              P4Topology)
++from netsim.topo import Topo
++
++HEADER_DEFS = {"dst_ip": (0, 4), "src_ip": (4, 4), "proto": (8, 1)}
++
++
++def test_match_action_table_rules():
++    t = P4MatchActionTable("ipv4_lpm", ["dst_ip"], max_size=3)
++    assert t.size() == 0 and t.match_fields == ["dst_ip"]
++    assert t.add_rule({"dst_ip": "10.0.0.1"}, "fwd", {"port": 1}) is not None
++    assert t.add_rule({"dst_ip": "10.0.0.2"}, "fwd", {"port": 2}) is not None
++    assert t.size() == 2
++    # re-adding the same match modifies rather than duplicates
++    t.add_rule({"dst_ip": "10.0.0.1"}, "fwd", {"port": 9})
++    assert t.size() == 2
++    assert t.lookup({"dst_ip": "10.0.0.1"}).action_params["port"] == 9
++    assert t.lookup({"dst_ip": "10.0.0.9"}) is None
++    # capacity is enforced
++    t.add_rule({"dst_ip": "10.0.0.3"}, "fwd", {"port": 3})
++    assert t.is_full()
++    assert t.add_rule({"dst_ip": "10.0.0.4"}, "fwd", {"port": 4}) is None
++    assert t.size() == 3
++    assert t.delete_rule({"dst_ip": "10.0.0.2"}) is not None
++    assert t.delete_rule({"dst_ip": "10.0.0.2"}) is None
++    assert t.size() == 2
++    t.clear()
++    assert t.size() == 0 and t.utilization() == 0.0
++
++
++def test_lookup_prefers_highest_priority():
++    t = P4MatchActionTable("acl", ["dst_ip", "proto"])
++    t.add_rule({"dst_ip": None}, "fwd", {"port": 1}, priority=0)
++    t.add_rule({"dst_ip": "10.0.0.1"}, "fwd", {"port": 2}, priority=10)
++    assert t.lookup({"dst_ip": "10.0.0.1"}).priority == 10
++    # the wildcard rule still catches everything else
++    assert t.lookup({"dst_ip": "10.0.0.7"}).action_params["port"] == 1
++
++
++def test_parser_and_deparser_round_trip():
++    parser, deparser = P4Parser(HEADER_DEFS), P4Deparser(HEADER_DEFS)
++    assert parser.header_size == 9
++    assert not parser.is_valid(b"\x00" * 8)
++    assert parser.is_valid(b"\x00" * 9)
++    assert parser.parse(b"\x00" * 8) == {}
++    packet = bytes([10, 0, 0, 2]) + bytes([10, 0, 0, 1]) + b"\x06" + b"payload"
++    headers = parser.parse(packet)
++    assert headers["dst_ip"] == 0x0A000002
++    assert headers["src_ip"] == 0x0A000001
++    assert headers["proto"] == 6
++    assert parser.payload(packet) == b"payload"
++    assert deparser.deparse(headers, parser.payload(packet)) == packet
++    # a rewritten field survives the round trip
++    headers["dst_ip"] = 0x0A000009
++    assert deparser.deparse(headers, b"")[:4] == bytes([10, 0, 0, 9])
++
++
++def test_counter_array():
++    c = P4Counter("ingress", 4)
++    assert len(c) == 4 and c.read(0) == (0, 0)
++    for i in range(8):
++        c.increment(i, 100)
++    assert c.read(0) == (2, 200)
++    assert c.total_packets() == 8 and c.total_bytes() == 800
++    c.reset(0)
++    assert c.read(0) == (0, 0) and c.total_packets() == 6
++    c.reset()
++    assert c.total_packets() == 0 and c.total_bytes() == 0
++    # indices wrap around the array
++    c.increment(9, 50)
++    assert c.read(1) == (1, 50)
++
++
++def test_multicast_group():
++    g = P4MulticastGroup(1, [1, 2, 3])
++    copies = g.replicate(b"abc")
++    assert copies == [(1, b"abc"), (2, b"abc"), (3, b"abc")]
++    assert g.num_copies == 3
++    g.add_port(4)
++    g.add_port(4)
++    assert g.ports == [1, 2, 3, 4] and len(g.replicate(b"x")) == 4
++    g.remove_port(1)
++    assert g.ports == [2, 3, 4]
++    g.remove_port(99)
++    assert g.ports == [2, 3, 4]
++
++
++def test_p4_switch_pipeline():
++    assert issubclass(P4Switch, Switch)
++    sw = P4Switch("s1", program="simple_router.p4")
++    assert sw.program == "simple_router.p4"
++    assert sw.pipeline_latency_us == 0.0
++    sw.set_parser(P4Parser(HEADER_DEFS))
++    sw.set_deparser(P4Deparser(HEADER_DEFS))
++    table = P4MatchActionTable("ipv4_lpm", ["dst_ip"])
++    table.add_rule({"dst_ip": 0x0A000002}, "ipv4_forward", {"port": 7})
++    sw.add_table(table)
++    sw.add_counter(P4Counter("ingress", 8))
++    assert sw.get_table("ipv4_lpm") is table
++    assert sw.get_counter("ingress") is not None
++    assert sw.get_table("nope") is None and sw.get_counter("nope") is None
++    assert sw.pipeline_latency_us == 0.5
++
++    packet = bytes([10, 0, 0, 2]) + bytes([10, 0, 0, 1]) + b"\x06" + b"data"
++    result = sw.process_packet(packet)
++    assert result.egress_port == 7 and not result.dropped
++    assert result.packet == packet and result.headers["proto"] == 6
++    assert sw.get_counter("ingress").total_packets() == 1
++    assert sw.get_counter("ingress").total_bytes() == len(packet)
++
++    # a truncated packet fails the parser and never reaches the tables
++    bad = sw.process_packet(b"\x00\x00")
++    assert bad.valid is False and bad.dropped is True
++    assert sw.packets_processed == 1
++
++    # a drop action discards the packet but still counts it
++    table.add_rule({"dst_ip": 0x0A000003}, "drop", priority=5)
++    dropped = sw.process_packet(bytes([10, 0, 0, 3]) + b"\x00" * 5)
++    assert dropped.dropped and dropped.packet is None
++    assert sw.packets_dropped == 1 and sw.packets_processed == 2
++
++
++def test_p4_topology_builds_a_chain():
++    assert issubclass(P4Topology, Topo)
++    topo = P4Topology(4, 1, bw=1000, delay=1.0)
++    assert len(topo.switches()) == 4 and len(topo.hosts()) == 4
++    assert topo.p4SwitchNames() == ["s1", "s2", "s3", "s4"]
++    # 4 host links + 3 switch-to-switch links
++    assert len(topo.links()) == 7
++    net = Mininet(topo=topo)
++    net.start()
++    assert all(isinstance(s, P4Switch) for s in net.switches)
++    assert net.path("h1", "h4") == ["h1", "s1", "s2", "s3", "s4", "h4"]
++    assert abs(net.iperf([net.hosts[0], net.hosts[-1]])
++               - 1000 * 0.98 ** 4) < 1e-9
++
++
++def test_experiment_output():
++    out = subprocess.run([sys.executable, "-m", "netsim.experiments.p4_exp"],
++                         capture_output=True, text=True, check=True).stdout
++    v = dict(line.split(": ", 1) for line in out.strip().splitlines())
++    assert v["P4_TABLE_ENTRIES"] == "16"
++    assert abs(float(v["P4_FORWARDING_RATE"]) - 922.37) < 0.01
++    assert abs(float(v["P4_COUNTER_ACCURACY"]) - 1.0) < 1e-9
++    assert abs(float(v["P4_PIPELINE_LATENCY"]) - 1.50) < 0.01
++    assert v["P4_MULTICAST_GROUPS"] == "6"
+diff --git a/netsim/__pycache__/p4_switch.cpython-312.pyc b/netsim/__pycache__/p4_switch.cpython-312.pyc
+new file mode 100644
+index 0000000..27a63b5
+Binary files /dev/null and b/netsim/__pycache__/p4_switch.cpython-312.pyc differ
+diff --git a/netsim/experiments/__pycache__/p4_exp.cpython-312.pyc b/netsim/experiments/__pycache__/p4_exp.cpython-312.pyc
+new file mode 100644
+index 0000000..3a62aef
+Binary files /dev/null and b/netsim/experiments/__pycache__/p4_exp.cpython-312.pyc differ
+diff --git a/netsim/experiments/p4_exp.py b/netsim/experiments/p4_exp.py
+new file mode 100644
+index 0000000..b819f50
+--- /dev/null
++++ b/netsim/experiments/p4_exp.py
+@@ -0,0 +1,133 @@
++"""P4 data-plane experiments: table population, forwarding rate, counters,
++pipeline latency and multicast replication."""
++
++from ..net import Mininet
++from ..p4_switch import (P4Counter, P4Deparser, P4MatchActionTable,
++                         P4MulticastGroup, P4Parser, P4Switch, P4Topology)
++from ..targets.configs import P4_EXPERIMENTS
++from . import print_result
++
++#: Header layout used by the pipeline experiments (offset, length) in bytes.
++HEADER_DEFS = {"dst_ip": (0, 4), "src_ip": (4, 4), "proto": (8, 1)}
++
++
++def build_p4_net():
++    """Instantiate the configured chain of P4 switches."""
++    cfg = P4_EXPERIMENTS["topology"]
++    topo = P4Topology(cfg["num_switches"], cfg["num_hosts_per_switch"],
++                      bw=cfg["link_bw"], delay=cfg["link_delay"])
++    net = Mininet(topo=topo, switch=P4Switch)
++    net.start()
++    return net, cfg
++
++
++def populate_forwarding_tables(net, cfg):
++    """Give every P4 switch one ``ipv4_lpm`` rule per destination host.
++
++    The action port is the switch port facing the next hop on the shortest path
++    to that host, so the installed rules really do forward the packet.
++    """
++    switches = [s for s in net.switches if isinstance(s, P4Switch)]
++    for switch in switches:
++        table = P4MatchActionTable(cfg["table_name"], cfg["match_fields"])
++        table.set_default_action("drop")
++        switch.add_table(table)
++    for switch in switches:
++        table = switch.get_table(cfg["table_name"])
++        for host in net.hosts:
++            path = net.path(switch, host)
++            if not path or len(path) < 2:
++                continue
++            port = switch.portTo(path[1])
++            table.add_rule({"dst_ip": host.ip}, "ipv4_forward",
++                           {"port": port}, priority=1)
++    return switches
++
++
++def table_entries():
++    """Total rules installed across every table of the P4 topology."""
++    net, cfg = build_p4_net()
++    switches = populate_forwarding_tables(net, cfg)
++    return sum(switch.table_entries() for switch in switches)
++
++
++def forwarding_rate():
++    """Effective end-to-end rate (Mbps) across the chain of P4 switches.
++
++    Every P4 switch on the path costs ``Switch.FORWARDING_OVERHEAD`` (2%) of
++    throughput, so four switches deliver ``1000 * 0.98 ** 4`` Mbps.
++    """
++    net, cfg = build_p4_net()
++    populate_forwarding_tables(net, cfg)
++    return net.iperf([net.hosts[0], net.hosts[-1]])
++
++
++def build_counting_switch():
++    """A one-table P4 switch with a parser, a deparser and a counter array."""
++    cfg = P4_EXPERIMENTS["counter"]
++    switch = P4Switch("s1", program="counter.p4")
++    switch.set_parser(P4Parser(HEADER_DEFS))
++    switch.set_deparser(P4Deparser(HEADER_DEFS))
++    table = P4MatchActionTable("ipv4_lpm", ["dst_ip"])
++    table.add_rule({"dst_ip": None}, "ipv4_forward", {"port": 1}, priority=0)
++    switch.add_table(table)
++    switch.add_counter(P4Counter("ingress_packets", cfg["counter_size"]))
++    return switch, cfg
++
++
++def make_packet(index, size_bytes):
++    """A well-formed test packet whose headers vary with ``index``."""
++    header = (index + 1).to_bytes(4, "big") + b"\x0a\x00\x00\x01" + b"\x06"
++    return header + bytes(max(0, size_bytes - len(header)))
++
++
++def counter_accuracy():
++    """Counted packets divided by packets sent (a correct counter gives 1.0)."""
++    switch, cfg = build_counting_switch()
++    for i in range(cfg["num_packets"]):
++        switch.process_packet(make_packet(i, cfg["packet_bytes"]))
++    counter = switch.get_counter("ingress_packets")
++    if cfg["num_packets"] == 0:
++        return 0.0
++    return counter.total_packets() / float(cfg["num_packets"])
++
++
++def pipeline_latency_us():
++    """Pipeline latency (us) of a switch carrying the configured table count."""
++    cfg = P4_EXPERIMENTS["pipeline"]
++    switch = P4Switch("s1", program="pipeline.p4")
++    switch.LATENCY_PER_TABLE_US = cfg["latency_per_table_us"]
++    for i in range(1, cfg["num_tables"] + 1):
++        switch.add_table(P4MatchActionTable("table%d" % i, ["dst_ip"]))
++    return switch.pipeline_latency_us
++
++
++def multicast_copies():
++    """Replicated copies produced by one packet in each multicast group."""
++    cfg = P4_EXPERIMENTS["multicast"]
++    switch = P4Switch("s1", program="multicast.p4")
++    for spec in cfg["groups"]:
++        switch.add_multicast_group(P4MulticastGroup(spec["group_id"],
++                                                   spec["ports"]))
++    total = 0
++    for spec in cfg["groups"]:
++        total += len(switch.multicast(spec["group_id"], b"\x00" * 64))
++    return total
++
++
++def run_p4_experiments():
++    """Run every P4 experiment and print its result."""
++    results = {
++        "P4_TABLE_ENTRIES": table_entries(),
++        "P4_FORWARDING_RATE": forwarding_rate(),
++        "P4_COUNTER_ACCURACY": counter_accuracy(),
++        "P4_PIPELINE_LATENCY": pipeline_latency_us(),
++        "P4_MULTICAST_GROUPS": multicast_copies(),
++    }
++    for key, value in results.items():
++        print_result(key, value)
++    return results
++
++
++if __name__ == "__main__":
++    run_p4_experiments()
+diff --git a/netsim/p4_switch.py b/netsim/p4_switch.py
+new file mode 100644
+index 0000000..26070a3
+--- /dev/null
++++ b/netsim/p4_switch.py
+@@ -0,0 +1,654 @@
++"""P4 programmable data plane.
++
++P4 (Bosshart et al., CCR 2014) describes a packet processor as a *pipeline*: a
++parser turns wire bytes into named header fields, a sequence of match-action
++tables rewrites those fields and decides where the packet goes, and a deparser
++serialises the result back onto the wire.  This module models that pipeline on
++top of :class:`netsim.node.Switch` so a P4 switch can be dropped into any
++topology the Mininet core builds.
++"""
++
++from .node import Switch
++from .topo import Topo
++
++
++# ----------------------------------------------------------------------
++# match-action tables
++# ----------------------------------------------------------------------
++class P4TableEntry:
++    """One rule of a :class:`P4MatchActionTable`.
++
++    Attributes
++    ----------
++    match_fields : dict
++        Field values the rule matches on.  ``None`` or ``"*"`` is a wildcard.
++    action_name : str
++        Name of the action to execute on a hit (``ipv4_forward``, ``drop``, ...).
++    action_params : dict
++        Parameters handed to the action (``{"port": 2}``).
++    priority : int
++        Higher priority wins when several rules match.
++    hits : int
++        Number of packets that matched this rule.
++    """
++
++    def __init__(self, match_fields, action_name, action_params=None,
++                 priority=0):
++        self.match_fields = dict(match_fields or {})
++        self.action_name = action_name
++        self.action_params = dict(action_params or {})
++        self.priority = int(priority)
++        self.hits = 0
++
++    #: Aliases matching the vocabulary used elsewhere in the codebase.
++    @property
++    def match(self):
++        return self.match_fields
++
++    @property
++    def action(self):
++        return self.action_name
++
++    @property
++    def specificity(self):
++        """Number of non-wildcard fields; breaks ties between equal priorities."""
++        return sum(1 for v in self.match_fields.values()
++                   if v is not None and v != "*")
++
++    def matches(self, packet_headers):
++        """True when every non-wildcard field of the rule equals the header."""
++        for field, expected in self.match_fields.items():
++            if expected is None or expected == "*":
++                continue
++            if packet_headers.get(field) != expected:
++                return False
++        return True
++
++    def key(self):
++        """Hashable identity of the rule (its match fields)."""
++        return tuple(sorted(self.match_fields.items(), key=lambda kv: str(kv[0])))
++
++    def __repr__(self):
++        return "<P4TableEntry %s -> %s%s prio=%d>" % (
++            self.match_fields, self.action_name, self.action_params,
++            self.priority)
++
++
++class P4MatchActionTable:
++    """A P4 match-action table.
++
++    Parameters
++    ----------
++    name : str
++        Table name as it appears in the P4 program (``ipv4_lpm``).
++    match_fields : list of str
++        Header fields the table keys on.
++    max_size : int
++        Maximum number of rules the table can hold.
++    """
++
++    def __init__(self, name, match_fields, max_size=1024):
++        self.name = name
++        self.match_fields = list(match_fields or [])
++        self.max_size = int(max_size)
++        self.entries = []
++        self.hit_count = 0
++        self.miss_count = 0
++        self.default_action = None
++        self.default_action_params = {}
++
++    # ------------------------------------------------------------------
++    # rule management
++    # ------------------------------------------------------------------
++    def add_rule(self, match_dict, action_name, action_params=None,
++                 priority=0):
++        """Install a rule and return it, or ``None`` when the table is full.
++
++        Installing a rule whose match fields already exist replaces the old rule,
++        exactly as a P4Runtime ``modify`` would.
++        """
++        entry = P4TableEntry(match_dict, action_name, action_params, priority)
++        existing = self._find(entry.key())
++        if existing is not None:
++            self.entries[self.entries.index(existing)] = entry
++            return entry
++        if len(self.entries) >= self.max_size:
++            return None
++        self.entries.append(entry)
++        return entry
++
++    def delete_rule(self, match_dict):
++        """Remove the rule with these match fields; returns it, or None."""
++        key = P4TableEntry(match_dict, None).key()
++        entry = self._find(key)
++        if entry is None:
++            return None
++        self.entries.remove(entry)
++        return entry
++
++    def set_default_action(self, action_name, action_params=None):
++        """Action applied on a table miss (P4's ``default_action``)."""
++        self.default_action = action_name
++        self.default_action_params = dict(action_params or {})
++        return self.default_action
++
++    def clear(self):
++        """Remove every rule from the table."""
++        self.entries = []
++        return 0
++
++    def size(self):
++        """Number of rules currently installed."""
++        return len(self.entries)
++
++    def is_full(self):
++        return len(self.entries) >= self.max_size
++
++    def utilization(self):
++        """Fraction of the table's capacity in use."""
++        if self.max_size <= 0:
++            return 0.0
++        return len(self.entries) / float(self.max_size)
++
++    # ------------------------------------------------------------------
++    # lookup
++    # ------------------------------------------------------------------
++    def lookup(self, packet_headers):
++        """Best-matching rule for ``packet_headers``, or ``None`` on a miss.
++
++        Highest priority wins; equal priorities are resolved in favour of the
++        more specific rule (fewer wildcards), then by installation order.
++        """
++        headers = packet_headers or {}
++        best = None
++        best_rank = None
++        for index, entry in enumerate(self.entries):
++            if not entry.matches(headers):
++                continue
++            rank = (entry.priority, entry.specificity, -index)
++            if best_rank is None or rank > best_rank:
++                best, best_rank = entry, rank
++        if best is None:
++            self.miss_count += 1
++            return None
++        self.hit_count += 1
++        best.hits += 1
++        return best
++
++    def _find(self, key):
++        for entry in self.entries:
++            if entry.key() == key:
++                return entry
++        return None
++
++    def __len__(self):
++        return len(self.entries)
++
++    def __iter__(self):
++        return iter(self.entries)
++
++    def __repr__(self):
++        return "<P4MatchActionTable %s keys=%s rules=%d/%d>" % (
++            self.name, self.match_fields, len(self.entries), self.max_size)
++
++
++# ----------------------------------------------------------------------
++# parser / deparser
++# ----------------------------------------------------------------------
++class P4Parser:
++    """Extracts named header fields from raw packet bytes.
++
++    Parameters
++    ----------
++    header_defs : dict
++        ``{field_name: (offset, length)}`` in bytes, as a P4 ``header`` layout.
++    """
++
++    def __init__(self, header_defs):
++        self.header_defs = dict(header_defs or {})
++
++    @property
++    def header_size(self):
++        """Bytes a packet must carry for every field to be present."""
++        if not self.header_defs:
++            return 0
++        return max(offset + length
++                   for offset, length in self.header_defs.values())
++
++    #: Alias: the parser's minimum accepted packet length.
++    min_length = header_size
++
++    def is_valid(self, packet_data):
++        """True when ``packet_data`` is long enough to hold all headers."""
++        if packet_data is None:
++            return False
++        return len(packet_data) >= self.header_size
++
++    def parse(self, packet_data):
++        """Return ``{field: int_value}`` for every defined header field.
++
++        Field bytes are interpreted big-endian, matching P4's bit-string
++        semantics.  An invalid (too short) packet parses to an empty dict.
++        """
++        if not self.is_valid(packet_data):
++            return {}
++        data = _as_bytes(packet_data)
++        headers = {}
++        for field, (offset, length) in self.header_defs.items():
++            headers[field] = int.from_bytes(data[offset:offset + length],
++                                            "big")
++        return headers
++
++    def payload(self, packet_data):
++        """Everything after the parsed headers."""
++        data = _as_bytes(packet_data)
++        return data[self.header_size:]
++
++    def __repr__(self):
++        return "<P4Parser fields=%d size=%dB>" % (len(self.header_defs),
++                                                  self.header_size)
++
++
++class P4Deparser:
++    """Reassembles packet bytes from (possibly rewritten) header fields."""
++
++    def __init__(self, header_defs):
++        self.header_defs = dict(header_defs or {})
++
++    @property
++    def header_size(self):
++        if not self.header_defs:
++            return 0
++        return max(offset + length
++                   for offset, length in self.header_defs.values())
++
++    def deparse(self, headers, payload=b""):
++        """Serialise ``headers`` back into bytes and append ``payload``."""
++        buf = bytearray(self.header_size)
++        for field, (offset, length) in self.header_defs.items():
++            if field not in (headers or {}):
++                continue
++            buf[offset:offset + length] = _to_field_bytes(headers[field],
++                                                          length)
++        return bytes(buf) + _as_bytes(payload or b"")
++
++    def __repr__(self):
++        return "<P4Deparser fields=%d size=%dB>" % (len(self.header_defs),
++                                                    self.header_size)
++
++
++def _as_bytes(value):
++    """Coerce str/bytearray/bytes to bytes."""
++    if isinstance(value, bytes):
++        return value
++    if isinstance(value, bytearray):
++        return bytes(value)
++    if isinstance(value, str):
++        return value.encode("latin-1")
++    return bytes(value)
++
++
++def _to_field_bytes(value, length):
++    """Render a header field value as ``length`` big-endian bytes."""
++    if isinstance(value, (bytes, bytearray)):
++        raw = bytes(value)[:length]
++        return raw.rjust(length, b"\x00")
++    if isinstance(value, str):
++        raw = value.encode("latin-1")[:length]
++        return raw.rjust(length, b"\x00")
++    return int(value).to_bytes(length, "big")
++
++
++# ----------------------------------------------------------------------
++# counters
++# ----------------------------------------------------------------------
++class P4Counter:
++    """A P4 counter array counting packets and bytes per index."""
++
++    def __init__(self, name, size):
++        self.name = name
++        self.size = int(size)
++        self.packets = [0] * self.size
++        self.bytes = [0] * self.size
++
++    def increment(self, index, packet_bytes=0):
++        """Count one packet of ``packet_bytes`` bytes at ``index``."""
++        if self.size <= 0:
++            return None
++        index = int(index) % self.size
++        self.packets[index] += 1
++        self.bytes[index] += int(packet_bytes)
++        return (self.packets[index], self.bytes[index])
++
++    def read(self, index):
++        """Return ``(packets, bytes)`` counted at ``index``."""
++        if self.size <= 0:
++            return (0, 0)
++        index = int(index) % self.size
++        return (self.packets[index], self.bytes[index])
++
++    def reset(self, index=None):
++        """Zero one counter cell, or the whole array when ``index`` is None."""
++        if index is None:
++            self.packets = [0] * self.size
++            self.bytes = [0] * self.size
++            return None
++        index = int(index) % self.size
++        self.packets[index] = 0
++        self.bytes[index] = 0
++        return (0, 0)
++
++    def total_packets(self):
++        """Packets counted across every index."""
++        return sum(self.packets)
++
++    def total_bytes(self):
++        """Bytes counted across every index."""
++        return sum(self.bytes)
++
++    def __len__(self):
++        return self.size
++
++    def __repr__(self):
++        return "<P4Counter %s size=%d packets=%d bytes=%d>" % (
++            self.name, self.size, self.total_packets(), self.total_bytes())
++
++
++# ----------------------------------------------------------------------
++# multicast
++# ----------------------------------------------------------------------
++class P4MulticastGroup:
++    """A multicast group: one ingress copy becomes one copy per member port."""
++
++    def __init__(self, group_id, ports=None):
++        self.group_id = group_id
++        self.ports = list(ports or [])
++
++    def add_port(self, port):
++        """Add a member port (idempotent); returns the member list."""
++        if port not in self.ports:
++            self.ports.append(port)
++        return self.ports
++
++    def remove_port(self, port):
++        """Remove a member port if present; returns the member list."""
++        if port in self.ports:
++            self.ports.remove(port)
++        return self.ports
++
++    def replicate(self, packet_data):
++        """Return one ``(port, packet_data)`` copy per member port."""
++        return [(port, packet_data) for port in self.ports]
++
++    @property
++    def num_copies(self):
++        """Copies a single packet produces in this group."""
++        return len(self.ports)
++
++    def __len__(self):
++        return len(self.ports)
++
++    def __repr__(self):
++        return "<P4MulticastGroup %s ports=%s>" % (self.group_id, self.ports)
++
++
++# ----------------------------------------------------------------------
++# pipeline result
++# ----------------------------------------------------------------------
++class P4PipelineResult:
++    """Outcome of one packet traversing a :class:`P4Switch` pipeline."""
++
++    def __init__(self, packet=None, headers=None, egress_port=None,
++                 dropped=False, valid=True, hits=0, latency_us=0.0):
++        self.packet = packet
++        self.headers = dict(headers or {})
++        self.egress_port = egress_port
++        self.dropped = dropped
++        self.valid = valid
++        self.hits = hits
++        self.latency_us = latency_us
++
++    @property
++    def forwarded(self):
++        return self.valid and not self.dropped
++
++    def __getitem__(self, key):
++        return getattr(self, key)
++
++    def __bool__(self):
++        return bool(self.forwarded)
++
++    def __repr__(self):
++        return "<P4PipelineResult port=%s hits=%d dropped=%s valid=%s>" % (
++            self.egress_port, self.hits, self.dropped, self.valid)
++
++
++# ----------------------------------------------------------------------
++# the switch
++# ----------------------------------------------------------------------
++class P4Switch(Switch):
++    """A switch whose forwarding behaviour is a programmable P4 pipeline.
++
++    Parameters
++    ----------
++    name : str
++        Switch name.
++    program : str or None
++        Name of the P4 program loaded onto the switch.
++    """
++
++    #: Microseconds a packet spends in one match-action table.
++    LATENCY_PER_TABLE_US = 0.5
++
++    #: Marks nodes with a programmable data plane.
++    is_programmable = True
++
++    def __init__(self, name, program=None, **params):
++        Switch.__init__(self, name, **params)
++        self.program = program
++        self.tables = []
++        self.counters = []
++        self.multicast_groups = {}
++        self.parser = None
++        self.deparser = None
++        self.packets_processed = 0
++        self.packets_dropped = 0
++
++    # ------------------------------------------------------------------
++    # pipeline construction
++    # ------------------------------------------------------------------
++    def add_table(self, table):
++        """Append a match-action table to the pipeline and return it."""
++        self.tables.append(table)
++        return table
++
++    def add_counter(self, counter):
++        """Register a counter array and return it."""
++        self.counters.append(counter)
++        return counter
++
++    def add_multicast_group(self, group):
++        """Register a :class:`P4MulticastGroup` and return it."""
++        self.multicast_groups[group.group_id] = group
++        return group
++
++    def set_parser(self, parser):
++        """Install the parser stage."""
++        self.parser = parser
++        return parser
++
++    def set_deparser(self, deparser):
++        """Install the deparser stage."""
++        self.deparser = deparser
++        return deparser
++
++    def get_table(self, name):
++        """Return the table called ``name``, or None."""
++        for table in self.tables:
++            if table.name == name:
++                return table
++        return None
++
++    def get_counter(self, name):
++        """Return the counter called ``name``, or None."""
++        for counter in self.counters:
++            if counter.name == name:
++                return counter
++        return None
++
++    def get_multicast_group(self, group_id):
++        return self.multicast_groups.get(group_id)
++
++    def table_entries(self):
++        """Total number of rules installed across every table on the switch."""
++        return sum(table.size() for table in self.tables)
++
++    # ------------------------------------------------------------------
++    # pipeline timing
++    # ------------------------------------------------------------------
++    @property
++    def pipeline_latency_us(self):
++        """Pipeline latency in microseconds: 0.5 us per match-action table."""
++        return self.LATENCY_PER_TABLE_US * len(self.tables)
++
++    @property
++    def pipeline_latency_ms(self):
++        return self.pipeline_latency_us / 1000.0
++
++    # ------------------------------------------------------------------
++    # packet processing
++    # ------------------------------------------------------------------
++    def process_packet(self, packet_data):
++        """Run the full pipeline over ``packet_data``.
++
++        parse -> every match-action table in order -> deparse.  Each table hit
++        applies its action to the header set: ``drop`` discards the packet,
++        anything carrying a ``port``/``egress_port`` parameter sets the egress
++        port, and remaining parameters named after a header field rewrite it.
++        Registered counters are incremented once per accepted packet.
++        """
++        if self.parser is not None and not self.parser.is_valid(packet_data):
++            return P4PipelineResult(packet=None, valid=False, dropped=True,
++                                    latency_us=self.pipeline_latency_us)
++
++        if self.parser is not None:
++            headers = self.parser.parse(packet_data)
++            payload = self.parser.payload(packet_data)
++        else:
++            headers = {}
++            payload = _as_bytes(packet_data or b"")
++
++        self.packets_processed += 1
++        packet_bytes = len(packet_data) if packet_data is not None else 0
++        counter_index = None
++        egress_port = None
++        dropped = False
++        hits = 0
++
++        for table in self.tables:
++            entry = table.lookup(headers)
++            if entry is None:
++                if table.default_action == "drop":
++                    dropped = True
++                continue
++            hits += 1
++            port, drop, index = self._apply_action(entry, headers)
++            if port is not None:
++                egress_port = port
++            if drop:
++                dropped = True
++            if index is not None:
++                counter_index = index
++
++        if counter_index is None:
++            counter_index = self.packets_processed - 1
++        for counter in self.counters:
++            counter.increment(counter_index, packet_bytes)
++
++        if dropped:
++            self.packets_dropped += 1
++            return P4PipelineResult(packet=None, headers=headers,
++                                    egress_port=None, dropped=True,
++                                    hits=hits,
++                                    latency_us=self.pipeline_latency_us)
++
++        if self.deparser is not None:
++            out = self.deparser.deparse(headers, payload)
++        else:
++            out = _as_bytes(packet_data or b"")
++        return P4PipelineResult(packet=out, headers=headers,
++                                egress_port=egress_port, hits=hits,
++                                latency_us=self.pipeline_latency_us)
++
++    @staticmethod
++    def _apply_action(entry, headers):
++        """Apply one action; returns ``(egress_port, drop, counter_index)``."""
++        if entry.action_name in ("drop", "_drop", "mark_to_drop"):
++            return (None, True, entry.action_params.get("counter_index"))
++        port = None
++        index = None
++        for key, value in entry.action_params.items():
++            if key in ("port", "egress_port", "egress_spec"):
++                port = value
++            elif key == "counter_index":
++                index = value
++            elif key.startswith("set_"):
++                headers[key[4:]] = value
++            else:
++                headers[key] = value
++        return (port, False, index)
++
++    def multicast(self, group_id, packet_data):
++        """Replicate a packet into a registered multicast group."""
++        group = self.multicast_groups.get(group_id)
++        if group is None:
++            return []
++        return group.replicate(packet_data)
++
++    def __repr__(self):
++        return "<P4Switch %s program=%s tables=%d rules=%d>" % (
++            self.name, self.program, len(self.tables), self.table_entries())
++
++
++# ----------------------------------------------------------------------
++# topology
++# ----------------------------------------------------------------------
++class P4Topology(Topo):
++    """A linear chain of P4 switches, each carrying ``num_hosts_per_switch`` hosts.
++
++    ``P4Topology(4, 1, bw=1000, delay=1.0)`` yields ``h1-s1-s2-s3-s4-h4`` with
++    every switch instantiated as a :class:`P4Switch`.
++    """
++
++    def __init__(self, num_switches=2, num_hosts_per_switch=1, **link_params):
++        Topo.__init__(self, num_switches, num_hosts_per_switch, **link_params)
++
++    def build(self, num_switches=2, num_hosts_per_switch=1, program=None,
++              **link_params):
++        self.num_switches = int(num_switches)
++        self.num_hosts_per_switch = int(num_hosts_per_switch)
++        self.program = program
++        self.p4_switches = []
++        last = None
++        for i in range(1, self.num_switches + 1):
++            switch = self.addP4Switch("s%d" % i, program=program)
++            for j in range(self.num_hosts_per_switch):
++                host_num = (i - 1) * self.num_hosts_per_switch + j + 1
++                self.addLink(self.addHost("h%d" % host_num), switch,
++                             **link_params)
++            if last is not None:
++                self.addLink(last, switch, **link_params)
++            last = switch
++
++    def addP4Switch(self, name, **params):
++        """Add a switch that the network will instantiate as a P4 switch."""
++        params.setdefault("cls", P4Switch)
++        params.setdefault("isP4", True)
++        self.addSwitch(name, **params)
++        if name not in self.p4_switches:
++            self.p4_switches.append(name)
++        return name
++
++    def p4SwitchNames(self):
++        """Names of the switches registered as P4-capable."""
++        return list(self.p4_switches)
+diff --git a/run.sh b/run.sh
+index d1068c2..507df12 100755
+--- a/run.sh
++++ b/run.sh
+@@ -5,3 +5,4 @@ cd "$(dirname "$0")"
+ python3 -m netsim.experiments.mininet_exp
+ python3 -m netsim.experiments.wifi_exp
+ python3 -m netsim.experiments.containernet_exp
++python3 -m netsim.experiments.p4_exp

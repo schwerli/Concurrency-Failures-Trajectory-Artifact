@@ -1,0 +1,83 @@
+diff --git a/CHANGES b/CHANGES
+index d1058ed3b..3799c6780 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -37,6 +37,8 @@ Features added
+ Bugs fixed
+ ----------
+ 
++* #7461: py domain: fails with IndexError for empty tuple in type annotation
++
+ Testing
+ --------
+ 
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+index 3ca730e30..593c8c91a 100644
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -100,7 +100,8 @@ def _parse_annotation(annotation: str) -> List[Node]:
+             for elem in node.elts:
+                 result.extend(unparse(elem))
+                 result.append(addnodes.desc_sig_punctuation('', ', '))
+-            result.pop()
++            if node.elts:
++                result.pop()  # remove the trailing separator
+             result.append(addnodes.desc_sig_punctuation('', ']'))
+             return result
+         elif isinstance(node, ast.Module):
+@@ -114,11 +115,16 @@ def _parse_annotation(annotation: str) -> List[Node]:
+             result.append(addnodes.desc_sig_punctuation('', ']'))
+             return result
+         elif isinstance(node, ast.Tuple):
+-            result = []
+-            for elem in node.elts:
+-                result.extend(unparse(elem))
+-                result.append(addnodes.desc_sig_punctuation('', ', '))
+-            result.pop()
++            if node.elts:
++                result = []
++                for elem in node.elts:
++                    result.extend(unparse(elem))
++                    result.append(addnodes.desc_sig_punctuation('', ', '))
++                result.pop()  # remove the trailing separator
++            else:
++                result = [addnodes.desc_sig_punctuation('', '('),
++                          addnodes.desc_sig_punctuation('', ')')]
++
+             return result
+         else:
+             raise SyntaxError  # unsupported syntax
+diff --git a/tests/test_domain_py.py b/tests/test_domain_py.py
+index cc3d3cf53..1b9b52f1a 100644
+--- a/tests/test_domain_py.py
++++ b/tests/test_domain_py.py
+@@ -255,6 +255,13 @@ def test_parse_annotation():
+                           [pending_xref, "int"],
+                           [desc_sig_punctuation, "]"]))
+ 
++    doctree = _parse_annotation("Tuple[()]")
++    assert_node(doctree, ([pending_xref, "Tuple"],
++                          [desc_sig_punctuation, "["],
++                          [desc_sig_punctuation, "("],
++                          [desc_sig_punctuation, ")"],
++                          [desc_sig_punctuation, "]"]))
++
+     doctree = _parse_annotation("Callable[[int, int], int]")
+     assert_node(doctree, ([pending_xref, "Callable"],
+                           [desc_sig_punctuation, "["],
+@@ -267,6 +274,15 @@ def test_parse_annotation():
+                           [pending_xref, "int"],
+                           [desc_sig_punctuation, "]"]))
+ 
++    doctree = _parse_annotation("Callable[[], int]")
++    assert_node(doctree, ([pending_xref, "Callable"],
++                          [desc_sig_punctuation, "["],
++                          [desc_sig_punctuation, "["],
++                          [desc_sig_punctuation, "]"],
++                          [desc_sig_punctuation, ", "],
++                          [pending_xref, "int"],
++                          [desc_sig_punctuation, "]"]))
++
+     # None type makes an object-reference (not a class reference)
+     doctree = _parse_annotation("None")
+     assert_node(doctree, ([pending_xref, "None"],))

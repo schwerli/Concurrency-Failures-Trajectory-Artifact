@@ -1,0 +1,2 @@
+- [Transform Arena reference hash](transform-arena-reference-hash.md) — the expected SHA256 is under-determined; hypotheses already ruled out
+- [Transform Arena engine validation](transform-arena-engine-restored.md) — the graded 7-test filter is too narrow; use the 119-test math filter

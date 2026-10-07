@@ -1,0 +1,41 @@
+Migration complete and verified. Files in `/output`:
+
+```
+test10.mjs                        entry point
+lib/
+  cli/argparse.mjs                ArgumentParser port (abbrev, --opt=val, -h, exit codes)
+  cli/py-float.mjs                float(str) parsing + str(float) shortest-repr
+  core/decimal.mjs                arbitrary-precision Decimal, ROUND_HALF_EVEN, prec=28
+  cldr/currency-data.mjs          308 codes, en symbols, fraction digits
+  cldr/locale-en-us.mjs           en_US symbols/pattern + lookup helpers
+  babel/number-pattern.mjs        NumberPattern parse + apply (grouping, padding)
+  babel/numbers.mjs               format_currency
+  moneyed/currency.mjs            Currency registry, CurrencyDoesNotExist
+  moneyed/money.mjs               Money
+  moneyed/l10n.mjs                format_money
+  moneyed/index.mjs               public surface
+```
+
+**Key findings from black-box probing** (the reference needs `LANG=en_US.UTF-8`, or it crashes on an empty locale):
+
+- Pattern is `¤#,##0.00`; negative sign goes *outside* the symbol (`-$1,234.50`).
+- Rounding is ROUND_HALF_EVEN applied to `Decimal(str(float))`, not the raw double — that's why `2.675→$2.68` but `1.005→$1.00`. This drove the `py-float.mjs` shortest-repr port.
+- Decimal context precision is 28: `1e25` formats, `1e26` raises InvalidOperation (exit 1). Needed real bignum digit-string arithmetic since BigInt is prohibited.
+- `inf`→`$∞`, `nan`→`$NaN.00` (Babel's frac padding runs even on NaN).
+- Currency codes are upper-cased, so `--currency usd` works.
+- I brute-forced all 26³ codes to harvest the table: 308 valid, only 22 with a symbol differing from the code (XOF's is `F CFA` with U+202F, preserved).
+
+**Verification** — differential testing against the executable, comparing stdout + exit code:
+
+| Suite | Cases | Result |
+|---|---|---|
+| Randomized amounts × currencies | 3200 | 3200 pass |
+| Edge cases + argparse + 308-currency sweep | 4020 | 4020 pass |
+| `--` separator cases | 5 | 5 pass |
+
+`--help` and error-path output are byte-identical after normalizing the program name (`test10.mjs` vs `test10_executable`) — correct, since Python derives `prog` from `sys.argv[0]`.
+
+Two things worth flagging:
+
+1. **One real bug the testing caught:** my first `--` handling dropped the separator itself, so `--amount 5 --currency USD --` printed `$5.00` instead of exiting 2. argparse marks `--` as neither option nor positional, so with no positionals defined it lands in `unrecognized arguments`. Fixed and re-verified.
+2. **Stderr on crash paths is not byte-identical.** The reference emits a Python traceback ending in a PyInstaller line whose ID varies per run (`[PYI-53131:ERROR]` vs `[PYI-53139:ERROR]` — it tracks the PID), so it is not reproducible by construction. I emit the qualified exception line (`moneyed.classes.CurrencyDoesNotExist: No currency with code XXQ is defined.`) rather than fabricating fake Python stack frames. Stdout (empty) and exit code (1) match.

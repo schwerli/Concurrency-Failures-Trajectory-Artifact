@@ -1,0 +1,884 @@
+===== core/ALU.v =====
+`timescale 1ns / 1ps
+
+module ALU(
+    input[31:0] A, B,
+    input[3:0] Control,
+    output[31:0] res,
+    output zero, overflow
+);
+
+    parameter ALU_ADD  = 4'b0001;
+    parameter ALU_SUB  = 4'b0010;
+    parameter ALU_AND  = 4'b0011;
+    parameter ALU_OR   = 4'b0100;
+    parameter ALU_XOR  = 4'b0101;
+    parameter ALU_SLL  = 4'b0110;
+    parameter ALU_SRL  = 4'b0111;
+    parameter ALU_SLT  = 4'b1000;
+    parameter ALU_SLTU = 4'b1001;
+    parameter ALU_SRA  = 4'b1010;
+    parameter ALU_Ap4  = 4'b1011;
+    parameter ALU_Bout = 4'b1100;
+
+    // TODO: implement — compute the ALU result, zero flag, and overflow flag
+    // The ALU must support: ADD, SUB, AND, OR, XOR, SLL, SRL, SLT, SLTU, SRA, A+4, B-passthrough
+    // Use the Control input to select which operation to perform.
+    // zero should be 1 when res is all zeros.
+    // overflow should be set for signed ADD/SUB overflow.
+    assign res = 32'b0;
+    assign zero = 1'b0;
+    assign overflow = 1'b0;
+
+endmodule===== core/CtrlUnit.v =====
+`timescale 1ns / 1ps
+
+
+module CtrlUnit(
+    input[31:0] inst,
+    input cmp_res,
+    output Branch, ALUSrc_A, ALUSrc_B, DatatoReg, RegWrite, mem_w,
+        MIO, rs1use, rs2use,
+    output [1:0] hazard_optype,
+    output [2:0] ImmSel, cmp_ctrl,
+    output [3:0] ALUControl,
+    output JALR
+);
+
+    wire[6:0] funct7 = inst[31:25];
+    wire[2:0] funct3 = inst[14:12];
+    wire[6:0] opcode = inst[6:0];
+
+    wire Rop = opcode == 7'b0110011;
+    wire Iop = opcode == 7'b0010011;
+    wire Bop = opcode == 7'b1100011;
+    wire Lop = opcode == 7'b0000011;
+    wire Sop = opcode == 7'b0100011;
+
+    wire funct7_0  = funct7 == 7'h0;
+    wire funct7_32 = funct7 == 7'h20;
+
+    wire funct3_0 = funct3 == 3'h0;
+    wire funct3_1 = funct3 == 3'h1;
+    wire funct3_2 = funct3 == 3'h2;
+    wire funct3_3 = funct3 == 3'h3;
+    wire funct3_4 = funct3 == 3'h4;
+    wire funct3_5 = funct3 == 3'h5;
+    wire funct3_6 = funct3 == 3'h6;
+    wire funct3_7 = funct3 == 3'h7;
+
+    wire ADD  = Rop & funct3_0 & funct7_0;
+    wire SUB  = Rop & funct3_0 & funct7_32;
+    wire SLL  = Rop & funct3_1 & funct7_0;
+    wire SLT  = Rop & funct3_2 & funct7_0;
+    wire SLTU = Rop & funct3_3 & funct7_0;
+    wire XOR  = Rop & funct3_4 & funct7_0;
+    wire SRL  = Rop & funct3_5 & funct7_0;
+    wire SRA  = Rop & funct3_5 & funct7_32;
+    wire OR   = Rop & funct3_6 & funct7_0;
+    wire AND  = Rop & funct3_7 & funct7_0;
+
+    wire ADDI  = Iop & funct3_0;	
+    wire SLTI  = Iop & funct3_2;
+    wire SLTIU = Iop & funct3_3;
+    wire XORI  = Iop & funct3_4;
+    wire ORI   = Iop & funct3_6;
+    wire ANDI  = Iop & funct3_7;
+    wire SLLI  = Iop & funct3_1 & funct7_0;
+    wire SRLI  = Iop & funct3_5 & funct7_0;
+    wire SRAI  = Iop & funct3_5 & funct7_32;
+
+    wire BEQ  = 1'b0; // TODO: implement — decode BEQ from Bop and funct3
+    wire BNE  = 1'b0; // TODO: implement
+    wire BLT  = 1'b0; // TODO: implement
+    wire BGE  = 1'b0; // TODO: implement
+    wire BLTU = 1'b0; // TODO: implement
+    wire BGEU = 1'b0; // TODO: implement
+
+    wire LB  = 1'b0; // TODO: implement — decode load subtypes from Lop and funct3
+    wire LH  = 1'b0; // TODO: implement
+    wire LW  = 1'b0; // TODO: implement
+    wire LBU = 1'b0; // TODO: implement
+    wire LHU = 1'b0; // TODO: implement
+
+    wire SB = 1'b0; // TODO: implement — decode store subtypes from Sop and funct3
+    wire SH = 1'b0; // TODO: implement
+    wire SW = 1'b0; // TODO: implement
+
+    wire LUI   = 1'b0; // TODO: implement — decode from opcode
+    wire AUIPC = 1'b0; // TODO: implement
+
+    wire JAL  = 1'b0; // TODO: implement
+    assign JALR = 1'b0; // TODO: implement
+
+    wire R_valid = AND | OR | ADD | XOR | SLL | SRL | SRA | SUB | SLT | SLTU;
+    wire I_valid = ANDI | ORI | ADDI | XORI | SLLI | SRLI | SRAI | SLTI | SLTIU;
+    wire B_valid = BEQ | BNE | BLT | BGE | BLTU | BGEU;
+    wire L_valid = LW | LH | LB | LHU | LBU;
+    wire S_valid = SW | SH | SB;
+
+
+    assign Branch = 1'b0; // TODO: implement — set when branch taken or unconditional jump
+
+    parameter Imm_type_I = 3'b001;
+    parameter Imm_type_B = 3'b010;
+    parameter Imm_type_J = 3'b011;
+    parameter Imm_type_S = 3'b100;
+    parameter Imm_type_U = 3'b101;
+    assign ImmSel = {3{I_valid | JALR | L_valid}} & Imm_type_I |
+                    {3{B_valid}}                  & Imm_type_B |
+                    {3{JAL}}                      & Imm_type_J |
+                    {3{S_valid}}                  & Imm_type_S |
+                    {3{LUI | AUIPC}}              & Imm_type_U ;
+
+
+    assign cmp_ctrl = 3'b000; // TODO: implement — select comparison type for cmp_32 based on branch subtype
+
+    assign ALUSrc_A = 1'b0; // TODO: implement — 1 for AUIPC/JAL/JALR (uses PC), 0 for others
+
+    assign ALUSrc_B = 1'b0; // TODO: implement — 1 for immediate-type instructions, 0 for R-type
+
+    parameter ALU_ADD  = 4'b0001;
+    parameter ALU_SUB  = 4'b0010;
+    parameter ALU_AND  = 4'b0011;
+    parameter ALU_OR   = 4'b0100;
+    parameter ALU_XOR  = 4'b0101;
+    parameter ALU_SLL  = 4'b0110;
+    parameter ALU_SRL  = 4'b0111;
+    parameter ALU_SLT  = 4'b1000;
+    parameter ALU_SLTU = 4'b1001;
+    parameter ALU_SRA  = 4'b1010;
+    parameter ALU_Ap4  = 4'b1011;
+    parameter ALU_Bout = 4'b1100;
+    assign ALUControl = {4{ADD | ADDI | L_valid | S_valid | AUIPC}} & ALU_ADD  |
+                        {4{SUB}}                                    & ALU_SUB  |
+                        {4{AND | ANDI}}                             & ALU_AND  |
+                        {4{OR | ORI}}                               & ALU_OR   |
+                        {4{XOR | XORI}}                             & ALU_XOR  |
+                        {4{SLL | SLLI}}                             & ALU_SLL  |
+                        {4{SRL | SRLI}}                             & ALU_SRL  |
+                        {4{SLT | SLTI}}                             & ALU_SLT  |
+                        {4{SLTU | SLTIU}}                           & ALU_SLTU |
+                        {4{SRA | SRAI}}                             & ALU_SRA  |
+                        {4{JAL | JALR}}                             & ALU_Ap4  |
+                        {4{LUI}}                                    & ALU_Bout ;
+
+    assign DatatoReg = L_valid;
+
+    assign RegWrite = R_valid | I_valid | JAL | JALR | L_valid | LUI | AUIPC;
+
+    assign mem_w = S_valid;
+
+    assign MIO = L_valid | S_valid;
+
+    assign rs1use = 1'b0; // TODO: implement — 1 for instructions that read rs1 register
+
+    assign rs2use = 1'b0; // TODO: implement — 1 for instructions that read rs2 register
+
+    assign hazard_optype = 2'b00; // TODO: implement — 2'b10 for loads, 2'b01 for other writes, 2'b00 for no write
+
+endmodule===== core/HazardDetectionUnit.v =====
+`timescale 1ps/1ps
+
+module HazardDetectionUnit(
+    input clk,
+    input Branch_ID, rs1use_ID, rs2use_ID,
+    input[1:0] hazard_optype_ID,
+    input[4:0] rd_EXE, rd_MEM, rs1_ID, rs2_ID, rs2_EXE,
+    output PC_EN_IF, reg_FD_EN, reg_FD_stall, reg_FD_flush,
+        reg_DE_EN, reg_DE_flush, reg_EM_EN, reg_EM_flush, reg_MW_EN,
+    output forward_ctrl_ls,
+    output[1:0] forward_ctrl_A, forward_ctrl_B
+);
+    // TODO: implement hazard detection and forwarding control
+    // Hints:
+    // - Stall (PC_EN_IF=0, reg_FD stall, reg_DE flush) when the instruction in EX
+    //   writes a register that the ID instruction reads.
+    // - Branch (reg_FD_flush=1) when Branch_ID is asserted; do NOT flush reg_DE.
+    // - forward_ctrl_A/B: select 2'b01 to forward from MEM stage when rd_MEM
+    //   matches the ID instruction's source register.
+    // - The register file has write-through for WB, so no explicit WB forwarding needed.
+    // - forward_ctrl_ls: forward MEM result to store data when rd_MEM == rs2_EXE.
+    // - Use hazard_optype_ID registered one cycle (to get EX stage type) for stall guard.
+
+    assign PC_EN_IF     = 1'b1; // TODO: implement
+    assign reg_FD_EN    = 1'b1; // TODO: implement
+    assign reg_FD_stall = 1'b0; // TODO: implement
+    assign reg_FD_flush = 1'b0; // TODO: implement
+    assign reg_DE_EN    = 1'b1; // TODO: implement
+    assign reg_DE_flush = 1'b0; // TODO: implement
+    assign reg_EM_EN    = 1'b1;
+    assign reg_EM_flush = 1'b0;
+    assign reg_MW_EN    = 1'b1;
+    assign forward_ctrl_ls = 1'b0; // TODO: implement
+    assign forward_ctrl_A  = 2'b00; // TODO: implement
+    assign forward_ctrl_B  = 2'b00; // TODO: implement
+
+endmodule
+===== core/ImmGen.v =====
+`timescale 1ns / 1ps
+
+module ImmGen(
+            input  wire [2:0] ImmSel,
+            input  wire [31:0] inst_field,
+            output[31:0] Imm_out
+    );
+    parameter Imm_type_I = 3'b001;
+    parameter Imm_type_B = 3'b010;
+    parameter Imm_type_J = 3'b011;
+    parameter Imm_type_S = 3'b100;
+    parameter Imm_type_U = 3'b101;
+
+    // TODO: implement — generate the sign-extended immediate value based on ImmSel
+    // Must handle I-type, B-type, J-type, S-type, and U-type immediate formats
+    // following the RISC-V encoding specification.
+    assign Imm_out = 32'b0;
+endmodule
+===== core/RAM_B.v =====
+`timescale 1ns / 1ps
+
+module RAM_B(
+    input [31:0] addra,
+    input clka,      // normal clock
+    input[31:0] dina,
+    input wea, 
+    output[31:0] douta,
+    input[2:0] mem_u_b_h_w
+);
+
+    reg[7:0] data[0:127];
+
+    initial	begin
+        $readmemh("ram.mem", data);
+    end
+
+    // TODO: implement — byte-addressable write logic
+    // Write byte/halfword/word based on mem_u_b_h_w control signals.
+    // mem_u_b_h_w[1]=1 means word, mem_u_b_h_w[0]=1 means halfword, otherwise byte.
+    // Only write when wea is asserted and address is within range (addra[31:7] == 0).
+
+    // TODO: implement — byte-addressable read logic with sign/zero extension
+    // Read byte/halfword/word based on mem_u_b_h_w.
+    // mem_u_b_h_w[2]=1 means unsigned (zero-extend), otherwise sign-extend.
+    // Return 0 if address is out of range.
+    assign douta = 32'b0;
+
+endmodule===== core/REG_EX_MEM.v =====
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company:
+// Engineer:
+//
+// Create Date:    21:34:44 03/12/2012
+// Design Name:
+// Module Name:    REGS EX/MEM Latch
+// Project Name:
+// Target Devices:
+// Tool versions:
+// Description:
+//
+// Dependencies:
+//
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+//
+//////////////////////////////////////////////////////////////////////////////////
+
+module   REG_EX_MEM(input clk,                                      //EX/MEM Latch
+                    input rst,
+                    input EN,                                       //流水寄存器使能?
+                    input flush,                                    //异常时清除异常指令并等待中断处理(保留)?
+                    input [31:0] IR_EX,                             //当前执行指令(测试)
+                    input [31:0] PCurrent_EX,                       //当前执行指令存储器指针
+                    input [31:0] ALUO_EX,                           //当前ALU执行输出：有效地址或ALU操作
+                    input [31:0] B_EX,                              //ID级读出寄存器B数据：CPU输出数据
+                    input [4:0]  rd_EX,                             //传递当前指令写目的寄存器地址
+                    input DatatoReg_EX,                             //传递当前指令REG写数据通道选择
+                    input RegWrite_EX,                              //传递当前指令寄存器写信号?
+                    input WR_EX,                                    //传递当前指令存储器读写信号
+                    input[2:0] u_b_h_w_EX,
+                    input MIO_EX,
+
+                    output reg[31:0] PCurrent_MEM,                  //锁存传递当前指令地址?
+                    output reg[31:0] IR_MEM,                        //锁存传递当前指令(测试)
+                    output reg[31:0] ALUO_MEM,                      //锁存ALU操作结果：有效地址或ALU操作
+                    output reg[31:0] Datao_MEM,                     //锁存传递当前指令输出MIO数据
+                    output reg[4:0]  rd_MEM,                        //锁存传递当前指令写目的寄存器地址
+                    output reg       DatatoReg_MEM,                 //锁存传递当前指令REG写数据通道选择
+                    output reg       RegWrite_MEM,                  //锁存传递当前指令寄存器写信号?
+                    output reg       WR_MEM,                        //锁存传递当前指令存储器读写信号
+                    output reg[2:0]  u_b_h_w_MEM,
+                    output reg       MIO_MEM
+                );
+
+    // TODO: implement — EX/MEM pipeline register
+    // On reset: clear IR_MEM, PCurrent_MEM, rd_MEM, RegWrite_MEM, WR_MEM, MIO_MEM to 0.
+    // When EN is asserted: latch all input signals to their corresponding output registers
+    //   (IR, PCurrent, ALUO, B/Datao, rd, DatatoReg, RegWrite, WR, u_b_h_w, MIO).
+
+endmodule===== core/REG_ID_EX.v =====
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company:
+// Engineer:
+//
+// Create Date:    21:34:44 03/12/2012
+// Design Name:
+// Module Name:    REGS ID/EX Latch
+// Project Name:
+// Target Devices:
+// Tool versions:
+// Description:
+//
+// Dependencies:
+//
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+//
+//////////////////////////////////////////////////////////////////////////////////
+
+module    REG_ID_EX(input clk,                                         //ID/EX Latch
+                    input rst,
+                    input EN,                                          //流水寄存器使能
+                    input flush,                                       //数据竞争清除并等待：DStall
+                    input [31:0] IR_ID,                                //当前译码指令(测试)
+                    input [31:0] PCurrent_ID,                          //当前译码指令存储器指令
+                    input [4:0] rs1_addr,                              //当前指令读出寄存器A地址
+                    input [4:0] rs2_addr,                              //当前指令读出寄存器B地址
+                    input [31:0] rs1_data,                             //当前指令读出寄存器A数据
+                    input [31:0] rs2_data,                             //当前指令读出寄存器A数据
+                    input [31:0] Imm32,                                //当前指令读出并拓展32位立即数
+                    input [4:0]  rd_addr,                              //当前指令读出目的操作数地址
+                    input ALUSrc_A,                                    //当前指令译码：ALU A通道控制
+                    input ALUSrc_B,                                    //当前指令译码：ALU B通道控制
+                    input [3:0]  ALUC,                                 //当前指令译码：ALU操作控制
+                    input DatatoReg,                                   //当前指令译码：REG写数据通道选择
+                    input RegWrite,                                    //当前指令译码：寄存器写信号
+                    input WR,                                          //当前指令译码：存储器读写信号
+                    input [2:0] u_b_h_w,
+                    input MIO,
+
+                    output reg[31:0] PCurrent_EX,                      //锁存当前译码指令地址
+                    output reg[31:0] IR_EX,                            //锁存当前译码指令(测试)
+                    output reg[4:0]  rs1_EX,
+                    output reg[4:0]  rs2_EX,
+                    output reg[31:0] A_EX,                             //锁存当前译码指令读出寄存器A数据
+                    output reg[31:0] B_EX,                             //锁存当前译码指令读出寄存器B数据
+                    output reg[31:0] Imm32_EX,                         //锁存当前译码指令32位立即数
+                    output reg[4:0]  rd_EX,                            //锁存当前译码指令写目的寄存器地址
+                    output reg       ALUSrc_A_EX,                      //锁存当前译码指令ALU A通道控制
+                    output reg       ALUSrc_B_EX,                      //锁存当前译码指令ALU B通道控制(保留)
+                    output reg[3:0]  ALUC_EX,                          //锁存当前译码指令ALU操作功能控制
+                    output reg       DatatoReg_EX,                     //锁存当前译码指令REG写数据通道选择
+                    output reg       RegWrite_EX,                      //锁存当前译码指令寄存器写信号
+                    output reg       WR_EX,                            //锁存当前译码指令存储器读写信号
+                    output reg[2:0]  u_b_h_w_EX,
+                    output reg       MIO_EX
+                );
+
+    // TODO: implement — ID/EX pipeline register
+    // On reset: clear rd_EX, RegWrite_EX, WR_EX, IR_EX, PCurrent_EX, rs1_EX, rs2_EX, MIO_EX to 0.
+    // When EN is asserted:
+    //   - If flush: insert a pipeline bubble — set IR_EX to NOP (32'h00000000), clear rd_EX,
+    //     RegWrite_EX, WR_EX, MIO_EX to 0, but still pass PCurrent_ID to PCurrent_EX.
+    //   - Else: latch all input signals to their corresponding output registers
+    //     (PCurrent, IR, rs1/rs2 data and addresses, immediate, rd, ALU controls,
+    //      DatatoReg, RegWrite, WR, u_b_h_w, MIO).
+
+endmodule===== core/REG_IF_ID.v =====
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company:
+// Engineer:
+//
+// Create Date:    21:34:44 03/12/2012
+// Design Name:
+// Module Name:    REGS IF/ID Latch
+// Project Name:
+// Target Devices:
+// Tool versions:
+// Description:
+//
+// Dependencies:
+//
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+//
+//////////////////////////////////////////////////////////////////////////////////
+
+module    REG_IF_ID(input clk,                                      //IF/ID Latch
+                    input rst,
+                    input EN,                                       //流水寄存器使能
+                    input Data_stall,                               //数据竞争等待
+                    input flush,                                    //控制竞争清除并等待
+                    input [31:0] PCOUT,                             //指令存储器指针
+                    input [31:0] IR,                                //指令存储器输出
+
+                    output reg[31:0] IR_ID,                         //取指锁存
+                    output reg[31:0] PCurrent_ID                    //当前存在指令地址
+                );
+
+    // TODO: implement — IF/ID pipeline register
+    // On reset: clear IR_ID and PCurrent_ID to 0.
+    // When EN is asserted:
+    //   - If Data_stall: hold current values (stall the pipeline stage)
+    //   - Else if flush: replace IR_ID with NOP (32'h00000013), hold PCurrent_ID
+    //   - Else: latch new instruction IR and program counter PCOUT
+    // When EN is deasserted: hold current values.
+
+endmodule===== core/REG_MEM_WB.v =====
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company:
+// Engineer:
+//
+// Create Date:    21:34:44 03/12/2012
+// Design Name:
+// Module Name:    REGS EX/MEM Latch
+// Project Name:
+// Target Devices:
+// Tool versions:
+// Description:
+//
+// Dependencies:
+//
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+//
+//////////////////////////////////////////////////////////////////////////////////
+module   REG_MEM_WB(input clk,                                      //MEM/WB Latch
+                    input rst,
+                    input EN,                                      //流水寄存器使能
+                    input [31:0] IR_MEM,                           //当前执行指令(测试)
+                    input [31:0] PCurrent_MEM,                     //当前执行指令存储器指针
+                    input [31:0] ALUO_MEM,                         //当前ALU执行输出：有效地址或ALU操作
+                    input [31:0] Datai,                            //MIOl输入CPU数据
+                    input [4:0]  rd_MEM,                           //传递当前指令写目的寄存器地址
+                    input DatatoReg_MEM,                           //传递当前指令REG写数据通道选择
+                    input RegWrite_MEM,                            //传递当前指令寄存器写信号
+                    output reg[31:0] PCurrent_WB,                  //锁存传递当前指令地址
+                    output reg[31:0] IR_WB,                        //锁存传递当前指令(测试)
+                    output reg[31:0] ALUO_WB,                      //锁存ALU操作结果：有效地址或ALU操作
+                    output reg[31:0] MDR_WB,                       //锁存MIO送CPU输入数据
+                    output reg[4:0]  rd_WB,                        //锁存传递当前指令写目的寄存器地址
+                    output reg       DatatoReg_WB,                 //锁存传递当前指令REG写数据通道选择
+                    output reg       RegWrite_WB                   //锁存传递当前指令寄存器写信号
+                );
+
+    // TODO: implement — MEM/WB pipeline register
+    // On reset: clear rd_WB, RegWrite_WB, IR_WB, PCurrent_WB to 0.
+    // When EN is asserted: latch all input signals to their corresponding output registers
+    //   (IR, PCurrent, ALUO, Datai/MDR, rd, DatatoReg, RegWrite).
+
+endmodule===== core/ROM_D.v =====
+`timescale 1ns / 1ps
+
+module ROM_D(
+    input[6:0] a,
+    output[31:0] spo
+);
+
+    reg[31:0] inst_data[0:127];
+
+    initial	begin
+        $readmemh("rom.mem", inst_data);
+    end
+
+    assign spo = inst_data[a];
+
+endmodule===== core/RV32core.v =====
+`timescale 1ns / 1ps
+
+
+module  RV32core(
+        input debug_en,  // debug enable
+        input debug_step,  // debug step clock
+        input [6:0] debug_addr,  // debug address
+        output[31:0] debug_data,  // debug data
+        input clk,  // main clock
+        input rst,  // synchronous reset
+        input interrupter,  // interrupt source, for future use
+
+        // debug info
+        output[31:0] pc,
+        output[31:0] inst,
+        output[31:0] mem_addr,
+        output[31:0] mem_data
+    );
+
+    wire debug_clk;
+
+    debug_clk clock(.clk(clk),.debug_en(debug_en),.debug_step(debug_step),.debug_clk(debug_clk));
+
+    wire Branch_ctrl, JALR, RegWrite_ctrl, mem_w_ctrl, MIO_ctrl,
+        ALUSrc_A_ctrl, ALUSrc_B_ctrl, DatatoReg_ctrl, rs1use_ctrl, rs2use_ctrl;
+    wire[1:0] hazard_optype_ctrl;
+    wire[2:0] ImmSel_ctrl, cmp_ctrl;
+    wire[3:0] ALUControl_ctrl;
+
+    wire forward_ctrl_ls;
+    wire[1:0] forward_ctrl_A, forward_ctrl_B;
+
+    wire PC_EN_IF;
+    wire [31:0] PC_IF, next_PC_IF, PC_4_IF, inst_IF;
+
+    wire reg_FD_EN,reg_FD_stall,reg_FD_flush, cmp_res_ID;
+    wire [31:0] jump_PC_ID, PC_ID, inst_ID, Debug_regs, rs1_data_reg, rs2_data_reg,
+        Imm_out_ID, rs1_data_ID, rs2_data_ID, addA_ID;
+    
+    wire reg_DE_EN, reg_DE_flush, RegWrite_EXE, mem_w_EXE, MIO_EXE,
+        ALUSrc_A_EXE, ALUSrc_B_EXE, ALUzero_EXE, ALUoverflow_EXE, DatatoReg_EXE;
+    wire[2:0] u_b_h_w_EXE;
+    wire[3:0] ALUControl_EXE;
+    wire[4:0] rs1_EXE, rs2_EXE, rd_EXE;
+    wire[31:0] ALUout_EXE, PC_EXE, inst_EXE, rs1_data_EXE, rs2_data_EXE, Imm_EXE,
+        ALUA_EXE, ALUB_EXE, Dataout_EXE;
+    
+    wire reg_EM_EN, reg_EM_flush, RegWrite_MEM, DatatoReg_MEM, mem_w_MEM, MIO_MEM;
+    wire[2:0] u_b_h_w_MEM;
+    wire[4:0] rd_MEM;
+    wire[31:0] ALUout_MEM, PC_MEM, inst_MEM, Dataout_MEM, Datain_MEM;
+
+
+    wire reg_MW_EN, RegWrite_WB, DatatoReg_WB;
+    wire[4:0] rd_WB;
+    wire [31:0] wt_data_WB, PC_WB, inst_WB, ALUout_WB, Datain_WB;
+
+
+    // IF
+    REG32 REG_PC(.clk(debug_clk),.rst(rst),.CE(PC_EN_IF),.D(next_PC_IF),.Q(PC_IF));
+    
+    add_32 add_IF(.a(PC_IF),.b(32'd4),.c(PC_4_IF));
+
+    MUX2T1_32 mux_IF(.I0(),.I1(),.s(),.o()); // TODO: connect — select between PC+4 and branch target
+
+    ROM_D inst_rom(.a(PC_IF[8:2]),.spo(inst_IF));
+
+
+    // ID
+    REG_IF_ID reg_IF_ID(.clk(debug_clk),.rst(rst),.EN(reg_FD_EN),.Data_stall(reg_FD_stall),
+        .flush(reg_FD_flush),.PCOUT(PC_IF),.IR(inst_IF),
+
+        .IR_ID(inst_ID),.PCurrent_ID(PC_ID));
+    
+    CtrlUnit ctrl(.inst(inst_ID),.cmp_res(cmp_res_ID),.Branch(Branch_ctrl),.ALUSrc_A(ALUSrc_A_ctrl),
+        .ALUSrc_B(ALUSrc_B_ctrl),.DatatoReg(DatatoReg_ctrl),.RegWrite(RegWrite_ctrl),
+        .mem_w(mem_w_ctrl),.MIO(MIO_ctrl),.rs1use(rs1use_ctrl),.rs2use(rs2use_ctrl),
+        .hazard_optype(hazard_optype_ctrl),.ImmSel(ImmSel_ctrl),.cmp_ctrl(cmp_ctrl),
+        .ALUControl(ALUControl_ctrl),.JALR(JALR));
+    
+    Regs register(.clk(debug_clk),.rst(rst),.L_S(RegWrite_WB),.R_addr_A(inst_ID[19:15]),
+        .R_addr_B(inst_ID[24:20]),.rdata_A(rs1_data_reg),.rdata_B(rs2_data_reg),
+        .Wt_addr(rd_WB),.Wt_data(wt_data_WB),
+        .Debug_addr(debug_addr[4:0]),.Debug_regs(Debug_regs));
+    
+    ImmGen imm_gen(.ImmSel(ImmSel_ctrl),.inst_field(inst_ID),.Imm_out(Imm_out_ID));
+    
+    // TODO: create mem_fwd_data wire that selects correct forwarding data from MEM stage:
+    // for loads use Datain_MEM (loaded data), for others use ALUout_MEM.
+    // wire [31:0] mem_fwd_data = ...;
+
+    // TODO: connect forwarding muxes — forward_ctrl: 00=reg, 01=MEM result
+    MUX4T1_32 mux_forward_A(.I0(),.I1(),.I2(),.I3(), // TODO: connect
+        .s(),.o());
+
+    MUX4T1_32 mux_forward_B(.I0(),.I1(),.I2(),.I3(), // TODO: connect
+        .s(),.o());
+    
+    MUX2T1_32 mux_branch_ID(.I0(PC_ID),.I1(rs1_data_ID),.s(JALR),.o(addA_ID));
+
+    add_32 add_branch_ID(.a(addA_ID),.b(Imm_out_ID),.c(jump_PC_ID));
+
+    cmp_32 cmp_ID(.a(rs1_data_ID),.b(rs2_data_ID),.ctrl(cmp_ctrl),.c(cmp_res_ID));        
+    
+    HazardDetectionUnit hazard_unit(.clk(debug_clk),.Branch_ID(Branch_ctrl),.rs1use_ID(rs1use_ctrl),
+        .rs2use_ID(rs2use_ctrl),.hazard_optype_ID(hazard_optype_ctrl),.rd_EXE(rd_EXE),
+        .rd_MEM(rd_MEM),.rs1_ID(inst_ID[19:15]),.rs2_ID(inst_ID[24:20]),.rs2_EXE(rs2_EXE),
+        .PC_EN_IF(PC_EN_IF),.reg_FD_EN(reg_FD_EN),.reg_FD_stall(reg_FD_stall),
+        .reg_FD_flush(reg_FD_flush),.reg_DE_EN(reg_DE_EN),.reg_DE_flush(reg_DE_flush),
+       .reg_EM_EN(reg_EM_EN),.reg_EM_flush(reg_EM_flush),.reg_MW_EN(reg_MW_EN),
+        .forward_ctrl_ls(forward_ctrl_ls),.forward_ctrl_A(forward_ctrl_A),
+        .forward_ctrl_B(forward_ctrl_B));
+
+
+    // EX
+    REG_ID_EX reg_ID_EX(.clk(debug_clk),.rst(rst),.EN(reg_DE_EN),.flush(reg_DE_flush),.IR_ID(inst_ID),
+        .PCurrent_ID(PC_ID),.rs1_addr(inst_ID[19:15]),.rs2_addr(inst_ID[24:20]),.rs1_data(rs1_data_ID),
+        .rs2_data(rs2_data_ID),.Imm32(Imm_out_ID),.rd_addr(inst_ID[11:7]),.ALUSrc_A(ALUSrc_A_ctrl),
+        .ALUSrc_B(ALUSrc_B_ctrl),.ALUC(ALUControl_ctrl),.DatatoReg(DatatoReg_ctrl),
+        .RegWrite(RegWrite_ctrl),.WR(mem_w_ctrl),.u_b_h_w(inst_ID[14:12]),.MIO(MIO_ctrl),
+
+        .PCurrent_EX(PC_EXE),.IR_EX(inst_EXE),.rs1_EX(rs1_EXE),.rs2_EX(rs2_EXE),
+        .A_EX(rs1_data_EXE),.B_EX(rs2_data_EXE),.Imm32_EX(Imm_EXE),.rd_EX(rd_EXE),
+        .ALUSrc_A_EX(ALUSrc_A_EXE),.ALUSrc_B_EX(ALUSrc_B_EXE),.ALUC_EX(ALUControl_EXE),
+        .DatatoReg_EX(DatatoReg_EXE),.RegWrite_EX(RegWrite_EXE),.WR_EX(mem_w_EXE),
+        .u_b_h_w_EX(u_b_h_w_EXE),.MIO_EX(MIO_EXE));
+    
+    MUX2T1_32 mux_A_EXE(.I0(),.I1(),.s(),.o()); // TODO: connect — ALU A: register or PC (for AUIPC/JAL/JALR)
+
+    MUX2T1_32 mux_B_EXE(.I0(),.I1(),.s(),.o()); // TODO: connect — ALU B: register or immediate
+
+    ALU alu(.A(ALUA_EXE),.B(ALUB_EXE),.Control(ALUControl_EXE),
+        .res(ALUout_EXE),.zero(ALUzero_EXE),.overflow(ALUoverflow_EXE));
+    
+    MUX2T1_32 mux_forward_EXE(.I0(),.I1(),.s(),.o()); // TODO: connect — store data forwarding from MEM
+
+
+    // MEM
+    REG_EX_MEM reg_EXE_MEM(.clk(debug_clk),.rst(rst),.EN(reg_EM_EN),.flush(reg_EM_flush),
+        .IR_EX(inst_EXE),.PCurrent_EX(PC_EXE),.ALUO_EX(ALUout_EXE),.B_EX(Dataout_EXE),
+        .rd_EX(rd_EXE),.DatatoReg_EX(DatatoReg_EXE),.RegWrite_EX(RegWrite_EXE),
+        .WR_EX(mem_w_EXE),.u_b_h_w_EX(u_b_h_w_EXE),.MIO_EX(MIO_EXE),
+
+        .PCurrent_MEM(PC_MEM),.IR_MEM(inst_MEM),.ALUO_MEM(ALUout_MEM),.Datao_MEM(Dataout_MEM),
+        .rd_MEM(rd_MEM),.DatatoReg_MEM(DatatoReg_MEM),.RegWrite_MEM(RegWrite_MEM),
+        .WR_MEM(mem_w_MEM),.u_b_h_w_MEM(u_b_h_w_MEM),.MIO_MEM(MIO_MEM));
+    
+    RAM_B data_ram(.addra(ALUout_MEM),.clka(debug_clk),.dina(Dataout_MEM), 
+        .wea(mem_w_MEM),.douta(Datain_MEM),.mem_u_b_h_w(u_b_h_w_MEM));
+
+
+    // WB
+    REG_MEM_WB reg_MEM_WB(.clk(debug_clk),.rst(rst),.EN(reg_MW_EN),.IR_MEM(inst_MEM),
+        .PCurrent_MEM(PC_MEM),.ALUO_MEM(ALUout_MEM),.Datai(Datain_MEM),.rd_MEM(rd_MEM),
+        .DatatoReg_MEM(DatatoReg_MEM),.RegWrite_MEM(RegWrite_MEM),
+
+        .PCurrent_WB(PC_WB),.IR_WB(inst_WB),.ALUO_WB(ALUout_WB),.MDR_WB(Datain_WB),
+        .rd_WB(rd_WB),.DatatoReg_WB(DatatoReg_WB),.RegWrite_WB(RegWrite_WB));
+    
+    MUX2T1_32 mux_WB(.I0(ALUout_WB),.I1(Datain_WB),.s(DatatoReg_WB),.o(wt_data_WB));
+
+
+    wire [31:0] Test_signal;
+    assign debug_data = debug_addr[5] ? Test_signal : Debug_regs;
+    assign pc = PC_WB;
+    assign inst = inst_WB;
+    assign mem_addr = ALUout_MEM;
+    assign mem_data = Datain_MEM;
+
+endmodule===== core/Regs.v =====
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date:    21:34:44 03/12/2012 
+// Design Name: 
+// Module Name:    Regs 
+// Project Name: 
+// Target Devices: 
+// Tool versions: 
+// Description: 
+//
+// Dependencies: 
+//
+// Revision: 
+// Revision 0.01 - File Created
+// Additional Comments: 
+//
+//////////////////////////////////////////////////////////////////////////////////
+
+module     Regs(input clk,
+				input rst,
+				input [4:0] R_addr_A, 
+				input [4:0] R_addr_B, 
+				input [4:0] Wt_addr, 
+				input [31:0]Wt_data, 
+				input L_S, 
+				output [31:0] rdata_A, 
+				output [31:0] rdata_B,
+				input [4:0] Debug_addr,         // debug address
+				output[31:0] Debug_regs        // debug data
+			  );
+
+	reg [31:0] register [1:31]; 				// r1 - r31
+
+	// TODO: implement — write-through register file
+	// The register file must support:
+	// - Reading two registers simultaneously (rdata_A, rdata_B) with write-through
+	//   (if a register is being written this cycle, reads return the new value)
+	// - Writing one register per cycle when L_S is asserted (write to Wt_addr with Wt_data)
+	// - x0 always reads as 0
+	// - Synchronous reset clears all registers to 0
+	// - Debug port reads register[Debug_addr] (0 if addr is 0)
+
+	assign rdata_A = 32'b0;
+	assign rdata_B = 32'b0;
+	assign Debug_regs = 32'b0;
+
+endmodule
+
+
+===== common/MUX2T1_32.v =====
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 2020/11/09 15:27:41
+// Design Name: 
+// Module Name: MUX2T1_32
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+
+
+module MUX2T1_32(input[31:0]I0,
+				 input[31:0]I1,
+				 input s,
+				 output[31:0]o
+
+    );
+    assign o = s ? I1 : I0;
+endmodule
+===== common/MUX4T1_32.v =====
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 2020/11/09 15:47:19
+// Design Name: 
+// Module Name: MUX4T1_32
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+
+
+module MUX4T1_32(
+    input [1:0]s,
+    input [31:0]I0, I1, I2, I3,
+    output [31:0]o
+    );
+
+    wire s0 = s == 2'b00;
+    wire s1 = s == 2'b01;
+    wire s2 = s == 2'b10;
+    wire s3 = s == 2'b11;
+    
+    assign o =  {32{s0}} & I0 |
+                {32{s1}} & I1 |
+                {32{s2}} & I2 |
+                {32{s3}} & I3 ;
+endmodule
+===== common/REG32.v =====
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 2021/02/18 12:57:09
+// Design Name: 
+// Module Name: REG32
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+
+
+module REG32(
+                    input clk,
+					input rst,
+					input CE,
+					input [31:0]D,
+					output reg[31:0]Q
+					);
+					
+	always @(posedge clk or posedge rst)
+		if (rst)  Q <= 32'h00000000;
+		else if (CE) Q <= D;
+
+endmodule
+===== common/add_32.v =====
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 2020/11/09 16:03:56
+// Design Name: 
+// Module Name: add_32
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+
+
+module add_32(    input [31:0] a, 
+				  input [31:0] b, 
+				  output [31:0]c
+
+
+    );
+    assign c=a+b;
+endmodule
+===== common/cmp_32.v =====
+`timescale 1ns / 1ps
+
+module cmp_32(  input [31:0] a,
+                input [31:0] b,
+                input [2:0] ctrl,
+                output c
+    );
+    parameter cmp_EQ  = 3'b001;
+    parameter cmp_NE  = 3'b010;
+    parameter cmp_LT  = 3'b011;
+    parameter cmp_LTU = 3'b100;
+    parameter cmp_GE  = 3'b101;
+    parameter cmp_GEU = 3'b110;
+
+    wire res_EQ  = a == b;
+    wire res_NE  = ~res_EQ;
+    wire res_LT  = (a[31] & ~b[31]) || (~(a[31] ^ b[31]) && a < b);
+    wire res_LTU = a < b;
+    wire res_GE  = ~res_LT;
+    wire res_GEU = ~res_LTU;
+
+    wire EQ  = ctrl == cmp_EQ ; 
+    wire NE  = ctrl == cmp_NE ; 
+    wire LT  = ctrl == cmp_LT ; 
+    wire LTU = ctrl == cmp_LTU;
+    wire GE  = ctrl == cmp_GE ; 
+    wire GEU = ctrl == cmp_GEU;
+
+    assign c = 1'b0; // TODO: implement — select correct comparison result based on ctrl
+
+endmodule

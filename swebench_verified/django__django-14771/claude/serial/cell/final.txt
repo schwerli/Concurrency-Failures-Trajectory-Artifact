@@ -1,0 +1,16 @@
+Fixed. `get_child_arguments()` in `django/utils/autoreload.py:223` now forwards `-X` options to the reloaded child process, alongside the existing `-W` handling:
+
+```python
+args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions]
+if sys.implementation.name == 'cpython':
+    args.extend(
+        f'-X{key}' if value is True else f'-X{key}={value}'
+        for key, value in sys._xoptions.items()
+    )
+```
+
+`sys._xoptions` is CPython-specific (and the ticket scopes the request to CPython), so it's guarded by `sys.implementation.name`. Bare options like `-X utf8` (value `True`) are re-emitted as `-Xutf8`; valued ones as `-Xkey=value`.
+
+Verification:
+- End-to-end: ran a script under `python -X utf8 -X dev=1` that calls `get_child_arguments()` — with the fix the child argv is `[python, -Wdefault, -Xutf8, -Xdev=1, script]`; with the fix stashed the `-X` flags were dropped (reproducing the reported bug). Also drove `run_with_reloader()` through an actual restart cycle: the reloaded child reported `sys._xoptions == {'utf8': True, 'dev': '1'}` and `open(...).encoding == UTF-8`, i.e. no more `cp936`-style fallback after reload.
+- Tests: added `test_xoptions`, and patched `sys._xoptions` in the existing `TestChildArguments`/`RestartWithReloaderTests` cases so they don't inherit the test runner's own `-X` flags. `utils_tests.test_autoreload` passes (81 tests, 20 skipped on this platform).

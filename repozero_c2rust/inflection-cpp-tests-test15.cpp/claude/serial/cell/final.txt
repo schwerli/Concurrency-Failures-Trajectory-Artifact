@@ -1,0 +1,23 @@
+Done. Warning-free build, and the port is byte-for-byte identical to the C++ binary across ~24,000 differential test cases.
+
+## What the black-box probing uncovered
+
+The library is much more naive than its Rails-inspired API suggests, and it has two genuine bugs that I reproduced rather than fixed:
+
+- **`demodulize` is off by one.** `Module::cat` → `at`, not `cat`. The decisive probe was arg `a:b`: the C++ prints an *empty* line, which only `substr(rfind(':') + 2)` produces — `rfind("::") + 3` would have yielded `":b"`. Consequently a string ending in `::` indexes one byte past the end and throws `std::out_of_range`.
+- **Empty input aborts.** `test15 ""` prints 4 lines, then dies with SIGABRT (exit 134). I replicate stdout, the exact libstdc++ `terminate` diagnostic (including the computed `__pos`/`size` values), and the abort.
+
+- **`pluralize`** is just `+ "s"` — `box`→`boxs`, `child`→`childs` — except for exactly Rails' 10 uncountables and the empty string.
+- **`camelize`/`underscore`** are byte-wise with no acronym handling: `HTTP_request`→`HTTPRequest`, but `HTTPRequest`→`h_t_t_p_request`.
+- **`isPlural`** was the hard part. It tests whether a word *matches* a singular-rule pattern, not whether singularizing changes it — which is why `class`, `bus`, `status` and `octopus` all report plural. The matching is **case-sensitive and unanchored**, giving these tells: `Police`→1 but `police`→0 (uncountable check wins first), `mice`→1 but `Mice`→0 and `dice`→0, `data`/`Data`→1 but `DATA`→0. `news` is the one suffix that overrides back to singular (`renews`→0, but `News`→1).
+
+## Two deliberate deviations, both for fidelity
+
+1. **`args_os()` instead of `args()`.** `std::env::args()` panics on non-UTF-8 argv, and the C++ handles raw bytes — I verified `$'\xff\xfeAB_cd'` works there. The whole pipeline is `&[u8]` rather than `String` because `demodulize` slices mid-codepoint and legitimately emits invalid UTF-8 (`üñî` → `\xb1ñî`), which `String` cannot represent.
+2. **The abort path is reproduced, not corrected.**
+
+## Layout
+
+`/output/test15.rs` (entry) · `inflection/{mod,inflector,rules}.rs` · `Cargo.toml`. Builds both ways — `rustc --edition 2021 -O test15.rs -o test15` and `cargo build --release`. Zero dependencies.
+
+The harness I used is at `/workspace/difftest.rs` (outside the deliverable); it compares stdout, stderr, and exit status over a 4.7k-word corpus of curated words, systematic prefix×suffix×case permutations, and random byte strings, plus multi-arg combinations that exercise the even-index `underscore` calls and the `i <= 5` truncation.

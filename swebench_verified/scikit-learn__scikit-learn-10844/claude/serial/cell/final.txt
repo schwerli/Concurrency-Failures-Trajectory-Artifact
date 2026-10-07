@@ -1,0 +1,28 @@
+Fixed in `sklearn/metrics/cluster/supervised.py:859`, using the reformulation you proposed.
+
+**The change**
+
+```python
+-    return tk / np.sqrt(pk * qk) if tk != 0. else 0.
++    return np.sqrt(tk / pk) * np.sqrt(tk / qk) if tk != 0. else 0.
+```
+
+`pk` and `qk` are integer scalars (int32 on Windows, int64 on Linux), so `pk * qk` overflows *before* `np.sqrt` gets a chance to promote to float, and `nan` propagates out. Dividing first keeps each intermediate a float, and it's algebraically identical since `tk`, `pk`, `qk` are all non-negative and `tk != 0` guards the degenerate branch.
+
+**Verification**
+
+I reproduced the overflow before fixing rather than trusting the reasoning. With 200k samples over 3 clusters, `pk = 13333779326`, `qk = 13333152406`, so the exact product `1.78e20` exceeds int64:
+
+| | result |
+|---|---|
+| old expression | `RuntimeWarning: overflow encountered in long_scalars` → `nan` |
+| new expression | `0.3333381224278465` |
+| exact float reference | `0.3333381224278464` |
+
+I also fuzzed 300 random small clusterings against the old formula: max absolute difference `1.1e-16`, i.e. one ulp, so no behavior change on inputs that never overflowed. Degenerate and perfect-match cases still give `0.0` and `1.0`.
+
+**Regression test** — `test_fowlkes_mallows_score_big_values` in `sklearn/metrics/cluster/tests/test_supervised.py`. It uses `assert_no_warnings`, since the failure mode is a warning plus `nan` rather than an exception. I confirmed it fails on the pre-fix line with exactly the warning from your report, and passes after.
+
+Full `sklearn/metrics/` suite: 250 passed, 9 xfailed. Doctests in the touched module pass. (flake8 isn't installed in this env, so I eyeballed line lengths instead — both edits are under 79 chars.)
+
+One note beyond your report: `tk` is computed via `np.dot(c.data, c.data)`, which can overflow the same way for a single very large contingency cell. That path is untouched here since it's a separate concern, but worth knowing if you hit `nan` again at larger scale.

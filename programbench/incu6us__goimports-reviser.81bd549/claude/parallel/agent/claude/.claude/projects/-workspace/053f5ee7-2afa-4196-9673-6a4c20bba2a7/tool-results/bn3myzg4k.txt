@@ -1,0 +1,830 @@
+     1	# CLI surface, flag parsing, version, exit codes
+     2	
+     3	Binary: `/workspace/executable` (goimports-reviser v3, `3.0.0-20260303205914-9926ea38658f`, built go1.26.0).
+     4	All probes run from `/tmp/probe/cli-flags`. Raw run artifacts (stdout/stderr/exit per run) live in
+     5	`/tmp/probe/cli-flags/runs/<label>/{out,err,exit}`.
+     6	
+     7	**RENDERING WARNING:** the log timestamp separator is a **SLASH**, not a dash. `cat -A` in this
+     8	environment renders `2026/08/10` as `2026-08-10`. `od -c` proves the real bytes:
+     9	
+    10	```
+    11	0000000   2   0   2   6   /   0   8   /   1   0       1   4   :   1   4
+    12	0000020   :   5   4       n   o       f   i   l   e   (   s   )       o
+    13	```
+    14	
+    15	Every `TS` placeholder below means exactly `YYYY/MM/DD HH:MM:SS ` (Go `log` default flags
+    16	`LstdFlags = Ldate|Ltime`, trailing single space before the message). Log output goes to **stderr**.
+    17	
+    18	---
+    19	
+    20	## Confirmed behaviors
+    21	
+    22	### Fixture projects used
+    23	
+    24	`/tmp/probe/cli-flags/proj/go.mod`:
+    25	```
+    26	module example.com/proj
+    27	
+    28	go 1.21
+    29	```
+    30	`/tmp/probe/cli-flags/proj/a.go` (77 bytes):
+    31	```go
+    32	package main
+    33	
+    34	import (
+    35		"fmt"
+    36		"os"
+    37	)
+    38	
+    39	func main() {
+    40		fmt.Println(os.Args)
+    41	}
+    42	```
+    43	`/tmp/probe/cli-flags/proj/b.go` and `c.go`:
+    44	```go
+    45	package main
+    46	import "fmt"
+    47	func main(){fmt.Print()}
+    48	```
+    49	(`b.go`/`c.go` actually contain `func main(){fmt.Print()}`; only used as second/third targets.)
+    50	`/tmp/probe/cli-flags/nomod/` contains only `a.go` (`package main\n`) and **no** `go.mod`.
+    51	
+    52	### B1. No arguments at all → usage + fatal, exit 1
+    53	
+    54	```
+    55	$ cd /tmp/probe/cli-flags/proj && /workspace/executable
+    56	```
+    57	- exit code: **1**
+    58	- stdout: empty (0 bytes)
+    59	- stderr: 2555 bytes = the 2487-byte usage block (see "Exact strings") followed by
+    60	  `TS` + `no file(s) or directory(ies) specified on input\n` (68 bytes with timestamp).
+    61	
+    62	### B2. `-h`, `--help`, `-help`, `-help=true` → usage only, exit 0
+    63	
+    64	```
+    65	$ cd /tmp/probe/cli-flags/proj && /workspace/executable -h
+    66	```
+    67	- exit code: **0**
+    68	- stdout: empty
+    69	- stderr: exactly 2487 bytes, md5 `6c8134f10bf0803d9831cfa3540d7b86` — the usage block, nothing else.
+    70	
+    71	All four spellings produce byte-identical 2487-byte stderr and exit 0. There is **no** `-h`/`-help`
+    72	flag registered; this is Go's `flag` package special case (`ErrHelp` → `os.Exit(0)`).
+    73	
+    74	### B3. Unknown flag → error line, then usage, exit 2
+    75	
+    76	```
+    77	$ cd /tmp/probe/cli-flags/proj && /workspace/executable -bogus
+    78	```
+    79	- exit code: **2**
+    80	- stdout: empty
+    81	- stderr: 2525 bytes = `flag provided but not defined: -bogus\n` (38 bytes, **no** log timestamp)
+    82	  followed by the 2487-byte usage block.
+    83	
+    84	### B4. Flag-value parse errors → exit 2 (stdlib `flag` messages, no timestamp)
+    85	
+    86	| command | exit | first stderr line (then usage) |
+    87	|---|---|---|
+    88	| `-format=bogus a.go` | 2 | `invalid boolean value "bogus" for -format: parse error` |
+    89	| `-output` (value missing at end of argv) | 2 | `flag needs an argument: -output` |
+    90	
+    91	stderr sizes 2542 and 2519 respectively (= message + 2487 usage).
+    92	
+    93	### B5. `-version` → full block on **STDOUT**, exit 0
+    94	
+    95	```
+    96	$ /workspace/executable -version
+    97	```
+    98	- exit code: **0**, stderr: **0 bytes**, stdout: **164 bytes**:
+    99	```
+   100	version: 3.0.0-20260303205914-9926ea38658f
+   101	built with: go1.26.0
+   102	tag: v3.0.0-20260303205914-9926ea38658f
+   103	commit: n/a
+   104	source: github.com/incu6us/goimports-reviser/v3
+   105	```
+   106	`--version` and `-version=true` are identical.
+   107	
+   108	### B6. `-version-only` → single line on **STDOUT**, exit 0
+   109	
+   110	```
+   111	$ /workspace/executable -version-only
+   112	```
+   113	- exit code: **0**, stderr: 0 bytes, stdout: **34 bytes**: `3.0.0-20260303205914-9926ea38658f\n`
+   114	
+   115	Note `version:` = `tag` with the leading `v` stripped.
+   116	
+   117	### B7. `-version-only` WINS over `-version` (order-independent)
+   118	
+   119	```
+   120	$ /workspace/executable -version -version-only     → stdout 34B (short form), exit 0
+   121	$ /workspace/executable -version-only -version     → stdout 34B (short form), exit 0
+   122	```
+   123	
+   124	### B8. Version flags short-circuit EVERYTHING after flag.Parse
+   125	
+   126	All of the following print the 164-byte version block to stdout, stderr **empty**, exit **0**:
+   127	
+   128	```
+   129	$ cd /tmp/probe/cli-flags/nomod && /workspace/executable -version        # no go.mod present
+   130	$ cd /tmp/probe/cli-flags/proj  && /workspace/executable -version a.go   # target present
+   131	$ cd /tmp/probe/cli-flags/proj  && /workspace/executable -version /nope/zzz.go
+   132	$ cd /tmp/probe/cli-flags/proj  && /workspace/executable -version -output bad a.go
+   133	$ cd /tmp/probe/cli-flags/proj  && /workspace/executable -version -imports-order bad a.go
+   134	```
+   135	So: no go.mod needed, no path validation, **no** `-output` validation, **no** `-imports-order`
+   136	validation, no `Paths:`/`Processing` log lines.
+   137	`-version-only` behaves the same (verified in `/tmp/probe/cli-flags/nomod`).
+   138	
+   139	`-h` still beats `-version` (`-version -h` → usage, exit 0) because `flag.Parse` exits during parsing.
+   140	
+   141	### B9. `-version` AFTER a positional arg is NOT parsed
+   142	
+   143	```
+   144	$ cd /tmp/probe/cli-flags/proj && /workspace/executable a.go -version
+   145	```
+   146	- exit **1**, stderr:
+   147	```
+   148	TS Paths: [a.go -version]
+   149	TS Processing a.go
+   150	TS Processing -version
+   151	TS Failed to fix file: open /tmp/probe/cli-flags/proj/-version: no such file or directory
+   152	```
+   153	
+   154	### B10. Target list logging — `Paths: [...]` is Go `%v` of `[]string`
+   155	
+   156	| args | `Paths:` line |
+   157	|---|---|
+   158	| `a.go` | `TS Paths: [a.go]` |
+   159	| `a.go b.go` | `TS Paths: [a.go b.go]` |
+   160	| `a.go b.go c.go` | `TS Paths: [a.go b.go c.go]` |
+   161	| `a.go a.go` | `TS Paths: [a.go a.go]` |
+   162	| `a.go a.go b.go a.go` | `TS Paths: [a.go a.go b.go a.go]` |
+   163	| `""` (empty string) | `TS Paths: []` |
+   164	| `-` (sole arg) | `TS Paths: [<standard-input>]` |
+   165	
+   166	Space-separated, square brackets, **no** quotes, **no** commas. Duplicates are **NOT** deduplicated.
+   167	
+   168	### B11. `Processing X` — one line per TARGET, in argv order, before work
+   169	
+   170	`Processing` is logged once per *command-line target*, **not** per discovered file:
+   171	
+   172	```
+   173	$ cd /tmp/probe/cli-flags/dproj && /workspace/executable -recursive .
+   174	TS Paths: [.]
+   175	TS Processing .
+   176	```
+   177	(`dproj` contains `m1.go`, `m2.go`, `sub/s1.go`; only one `Processing .` line appears.)
+   178	Same for `.` without `-recursive` and for `./...` (`TS Processing ./...`). Exit 0 in all three.
+   179	
+   180	It is printed even for targets that are then **excluded**:
+   181	```
+   182	$ cd /tmp/probe/cli-flags/proj && /workspace/executable -excludes 'a.go' a.go
+   183	TS Paths: [a.go]
+   184	TS Processing a.go
+   185	```
+   186	exit **0**, stdout empty. And it is printed for targets that then fail (see B12).
+   187	Order is deterministic = argv order; duplicates produce duplicate `Processing` lines.
+   188	
+   189	### B12. Nonexistent / non-Go targets → `Failed to fix file`, exit 1, NO usage
+   190	
+   191	```
+   192	$ cd /tmp/probe/cli-flags/proj && /workspace/executable nope.go
+   193	```
+   194	exit **1**, stderr (182 bytes):
+   195	```
+   196	TS Paths: [nope.go]
+   197	TS Processing nope.go
+   198	TS Failed to fix file: open /tmp/probe/cli-flags/proj/nope.go: no such file or directory
+   199	```
+   200	
+   201	Nonexistent directory — note the **trailing slash is stripped** in the error path:
+   202	```
+   203	$ /workspace/executable nopedir/
+   204	TS Paths: [nopedir/]
+   205	TS Processing nopedir/
+   206	TS Failed to fix file: open /tmp/probe/cli-flags/proj/nopedir: no such file or directory
+   207	```
+   208	exit **1** (184 bytes). The path in the message is absolute (cwd-joined + cleaned); the `Paths:`/
+   209	`Processing` lines keep the raw argv spelling.
+   210	
+   211	Non-`.go` file (`readme.txt` containing `hello\n`):
+   212	```
+   213	$ /workspace/executable readme.txt
+   214	TS Paths: [readme.txt]
+   215	TS Processing readme.txt
+   216	TS Failed to fix file: file has invalid Go source content, use -excludes flag to skip this file: /tmp/probe/cli-flags/proj/readme.txt:1:1: expected 'package', found hello
+   217	```
+   218	exit **1** (270 bytes). Extension is NOT checked up front — the file is parsed and fails.
+   219	
+   220	### B13. Empty-string target → `Paths: []`, then usage, then fatal, exit 1
+   221	
+   222	```
+   223	$ cd /tmp/probe/cli-flags/proj && /workspace/executable ""
+   224	```
+   225	exit **1**, stderr 2629 bytes:
+   226	```
+   227	TS Paths: []
+   228	TS Processing 
+   229	<2487-byte usage block>
+   230	TS Could not determine project name for path : path is not set
+   231	```
+   232	Note `Processing ` has a **trailing space** (empty path interpolated). The usage block is emitted
+   233	*between* the `Processing` line and the fatal line.
+   234	
+   235	### B14. `-` as the SOLE target → reads STDIN
+   236	
+   237	```
+   238	$ cd /tmp/probe/cli-flags/proj && printf 'package main\nimport (\n"os"\n"fmt"\n)\nfunc main(){fmt.Println(os.Args)}\n' | /workspace/executable -output stdout -
+   239	```
+   240	exit **0**, stderr:
+   241	```
+   242	TS Paths: [<standard-input>]
+   243	TS Processing <standard-input>
+   244	```
+   245	stdout:
+   246	```go
+   247	package main
+   248	
+   249	import (
+   250		"fmt"
+   251		"os"
+   252	)
+   253	
+   254	func main() { fmt.Println(os.Args) }
+   255	```
+   256	
+   257	With **no** `-output` flag (default `file`) the result is byte-identical — stdin mode always writes
+   258	to stdout and never creates a file (verified: `ls` of the dir unchanged).
+   259	
+   260	Empty stdin:
+   261	```
+   262	$ /workspace/executable - < /dev/null
+   263	```
+   264	exit **1**:
+   265	```
+   266	reading from stdin, press Ctrl+D when done...
+   267	TS Paths: [<standard-input>]
+   268	TS Processing <standard-input>
+   269	TS Failed to fix file: file is empty and cannot be parsed as Go source, use -excludes flag to skip this file: <standard-input>:1:1: expected 'package', found 'EOF'
+   270	```
+   271	
+   272	### B15. The stdin hint depends on the KIND of stdin
+   273	
+   274	`reading from stdin, press Ctrl+D when done...\n` → **stderr, no log timestamp**, printed *before*
+   275	the `Paths:` line.
+   276	
+   277	| stdin | hint printed? |
+   278	|---|---|
+   279	| `< /dev/null` (char device) | **YES** |
+   280	| pty (`script -qec ... /dev/null`) | **YES** |
+   281	| closed fd (`0<&-`) | **YES** |
+   282	| anonymous pipe (`printf ... \|`) | no |
+   283	| named FIFO (`< fifo`) | no |
+   284	| regular file (`< in.go`) | no |
+   285	
+   286	Consistent rule: print when `os.Stdin.Stat()` errors **or** `mode & os.ModeCharDevice != 0`.
+   287	
+   288	### B16. `-` is stdin ONLY when it is the single resolved target
+   289	
+   290	```
+   291	$ printf 'package main\n' | /workspace/executable - a.go
+   292	TS Paths: [- a.go]
+   293	TS Processing -
+   294	TS Failed to fix file: open /tmp/probe/cli-flags/proj/-: no such file or directory
+   295	```
+   296	exit **1**. Same for `a.go -` (`Paths: [a.go -]`, processes `a.go` fine then dies on `-`),
+   297	`- -` (`Paths: [- -]`), and `- -format` (`Paths: [- -format]`).
+   298	
+   299	But via the deprecated flag it *does* trigger stdin, because the check runs on the merged list:
+   300	```
+   301	$ printf 'package main\nimport "fmt"\nfunc a(){fmt.Print()}\n' | /workspace/executable -file-path -
+   302	TS Paths: [<standard-input>]
+   303	TS Processing <standard-input>
+   304	TS -file-path is deprecated. ...
+   305	TS All changes to file are applied, but command-line syntax should be fixed
+   306	```
+   307	exit **1** (because of the deprecation), stdout = formatted code.
+   308	
+   309	### B17. `--` terminates flag parsing (stdlib behavior)
+   310	
+   311	```
+   312	$ /workspace/executable -- a.go
+   313	TS Paths: [a.go]
+   314	TS Processing a.go
+   315	```
+   316	exit **0**. The `--` is consumed, not treated as a path.
+   317	
+   318	### B18. Flags AFTER the first positional arg are NOT parsed — they become targets
+   319	
+   320	```
+   321	$ cd /tmp/probe/cli-flags/proj && /workspace/executable a.go -format
+   322	TS Paths: [a.go -format]
+   323	TS Processing a.go
+   324	TS Processing -format
+   325	TS Failed to fix file: open /tmp/probe/cli-flags/proj/-format: no such file or directory
+   326	```
+   327	exit **1**.
+   328	
+   329	```
+   330	$ /workspace/executable a.go -output stdout
+   331	TS Paths: [a.go -output stdout]
+   332	TS Processing a.go
+   333	TS Processing -output
+   334	TS Failed to fix file: open /tmp/probe/cli-flags/proj/-output: no such file or directory
+   335	```
+   336	exit **1**. Note **three** paths and that `a.go` was still rewritten in place before the failure.
+   337	
+   338	Same command with flags first works: `-output stdout a.go` → exit 0, formatted code on stdout (77B).
+   339	
+   340	### B19. Flag syntax variants all accepted (stdlib)
+   341	
+   342	`--format -output stdout a.go`, `-format=false -output stdout a.go`, `-output=stdout a.go`,
+   343	`-output stdout a.go` all behave as expected (exit 0). Single- and double-dash are equivalent
+   344	for every flag. Booleans require `-flag=false` form to disable (`-flag false` would treat `false`
+   345	as a positional target).
+   346	
+   347	### B20. Deprecated `-file-path` — STILL HONORED as a target, appended AFTER positionals
+   348	
+   349	```
+   350	$ cd /tmp/probe/cli-flags/proj && /workspace/executable -file-path a.go
+   351	```
+   352	exit **1**, stderr (342 bytes):
+   353	```
+   354	TS Paths: [a.go]
+   355	TS Processing a.go
+   356	TS -file-path is deprecated. Put file name(s) as last argument to the command(Example: goimports-reviser -rm-unused -set-alias -format goimports-reviser/main.go)
+   357	TS All changes to file are applied, but command-line syntax should be fixed
+   358	```
+   359	The file **is** processed (changes applied) — only the exit code signals the complaint.
+   360	
+   361	With both a positional and `-file-path`, the positional comes FIRST:
+   362	```
+   363	$ /workspace/executable -file-path b.go a.go
+   364	TS Paths: [a.go b.go]
+   365	TS Processing a.go
+   366	TS Processing b.go
+   367	TS -file-path is deprecated. ...
+   368	TS All changes to file are applied, but command-line syntax should be fixed
+   369	```
+   370	exit **1** (383 bytes).
+   371	
+   372	`-file-path zzz.go` (nonexistent) dies before the deprecation notice:
+   373	```
+   374	TS Paths: [zzz.go]
+   375	TS Processing zzz.go
+   376	TS Failed to fix file: open /tmp/probe/cli-flags/proj/zzz.go: no such file or directory
+   377	```
+   378	exit **1** (179 bytes) — the deprecation lines are never reached.
+   379	
+   380	`-file-path ""` is treated as UNSET: `-file-path "" a.go` → exit **0**, no deprecation warning,
+   381	`Paths: [a.go]`. And `-file-path ""` alone → usage + `no file(s) or directory(ies) specified on input`, exit 1.
+   382	
+   383	### B21. Deprecated `-local` — value ignored, but triggers warning + exit 1
+   384	
+   385	```
+   386	$ cd /tmp/probe/cli-flags/proj && /workspace/executable -local github.com/x a.go
+   387	```
+   388	exit **1**, stderr (261 bytes):
+   389	```
+   390	TS Paths: [a.go]
+   391	TS Processing a.go
+   392	TS -local is deprecated and will be removed soon. Use -company-prefixes instead.
+   393	TS All changes to file are applied, but command-line syntax should be fixed
+   394	```
+   395	`-local ""` is treated as UNSET → exit **0**, no warning.
+   396	`-local github.com/x` with no target → usage + `no file(s) or directory(ies) specified on input`, exit 1
+   397	(the `-local` value does NOT become a target).
+   398	
+   399	### B22. Both deprecated flags → `-file-path` warning first, then `-local`, then the fatal
+   400	
+   401	```
+   402	$ /workspace/executable -file-path b.go -local github.com/x a.go
+   403	```
+   404	exit **1**, stderr (481 bytes):
+   405	```
+   406	TS Paths: [a.go b.go]
+   407	TS Processing a.go
+   408	TS Processing b.go
+   409	TS -file-path is deprecated. Put file name(s) as last argument to the command(Example: goimports-reviser -rm-unused -set-alias -format goimports-reviser/main.go)
+   410	TS -local is deprecated and will be removed soon. Use -company-prefixes instead.
+   411	TS All changes to file are applied, but command-line syntax should be fixed
+   412	```
+   413	Verbatim byte-check via `cut -c21- runs/dep_both/err | od -c` confirms the exact wording.
+   414	
+   415	### B23. Validation ORDER (empirically pinned)
+   416	
+   417	| command (in `proj`) | exit | what is emitted |
+   418	|---|---|---|
+   419	| `-output bad` (no target) | 1 | usage + `no file(s) or directory(ies) specified on input` |
+   420	| `-imports-order bad` (no target) | 1 | usage + `no file(s) or directory(ies) specified on input` |
+   421	| `-output bad -imports-order bad a.go` | 1 | usage + `unknown order group type: "bad"` — **no** `Paths:` line |
+   422	| `-output bad a.go` | 1 | `Paths:` + `Processing` + `invalid output "bad" specified` — **no** usage |
+   423	
+   424	So: empty-path check **before** imports-order check **before** the `Paths:` log; `-output`
+   425	validation happens **inside** per-file processing, after `Processing`.
+   426	Sizes: 2539 (`unknown order group type`, includes usage), 121 (`invalid output`, no usage).
+   427	
+   428	The stdin hint precedes imports-order validation:
+   429	```
+   430	$ /workspace/executable -imports-order bad - < /dev/null
+   431	reading from stdin, press Ctrl+D when done...
+   432	TS unknown order group type: "bad"
+   433	```
+   434	exit **1** (usage also printed, stripped from the excerpt above).
+   435	
+   436	### B24. `-output` is NOT validated in stdin mode
+   437	
+   438	```
+   439	$ printf 'package main\nimport (\n"os"\n"fmt"\n)\nfunc main(){fmt.Println(os.Args)}\n' | /workspace/executable -output bad -
+   440	```
+   441	exit **0**, stdout = correctly formatted code, stderr = only `Paths:`/`Processing`.
+   442	`-output file -` likewise writes to stdout and creates no file.
+   443	
+   444	### B25. Missing `go.mod` → usage + fatal, exit 1; `-project-name` bypasses it
+   445	
+   446	```
+   447	$ cd /tmp/probe/cli-flags/nomod && /workspace/executable a.go
+   448	```
+   449	exit **1**, stderr 2664 bytes:
+   450	```
+   451	TS Paths: [a.go]
+   452	TS Processing a.go
+   453	<2487-byte usage block>
+   454	TS Could not determine project name for path a.go: open go.mod: no such file or directory
+   455	```
+   456	```
+   457	$ cd /tmp/probe/cli-flags/nomod && /workspace/executable -project-name example.com/x a.go
+   458	TS Paths: [a.go]
+   459	TS Processing a.go
+   460	```
+   461	exit **0**. `-project-name ""` is treated as unset → same failure as above.
+   462	Stdin mode also needs a project name:
+   463	`printf '...' | /workspace/executable -` in `nomod` → exit 1,
+   464	`TS Could not determine project name for path <standard-input>: open go.mod: no such file or directory`.
+   465	
+   466	### B26. `-set-exit-status` exit codes
+   467	
+   468	Fixture `/tmp/probe/cli-flags/ses/x.go` reset to unformatted before each "needs change" run.
+   469	
+   470	| run | exit |
+   471	|---|---|
+   472	| `-set-exit-status x.go` (file needs change) | **1** |
+   473	| `-set-exit-status x.go` (already formatted, 2nd run) | **0** |
+   474	| `-set-exit-status -local foo x.go` (needs change) | **1** |
+   475	| `-set-exit-status -local foo x.go` (no change, deprecated flag still set) | **1** |
+   476	
+   477	Deprecated-flag usage forces exit 1 regardless of whether anything changed.
+   478	
+   479	### B27. `-list-diff` exit codes
+   480	
+   481	```
+   482	$ cd /tmp/probe/cli-flags/ses && /workspace/executable -list-diff x.go
+   483	```
+   484	exit **0**, stdout `/tmp/probe/cli-flags/ses/x.go\n` (30 bytes, **absolute** path), stderr = the two
+   485	log lines. The file is **not** rewritten (verified with `cat -A`: still unformatted), so a second
+   486	identical run prints the same thing and again exits 0.
+   487	`-list-diff -set-exit-status x.go` → exit **1**, same stdout.
+   488	
+   489	### B28. No subcommands; bare words are targets
+   490	
+   491	```
+   492	$ /workspace/executable version   → TS Paths: [version] / TS Processing version / TS Failed to fix file: open /tmp/probe/cli-flags/proj/version: no such file or directory   (exit 1)
+   493	$ /workspace/executable help      → ... open /tmp/probe/cli-flags/proj/help: no such file or directory   (exit 1)
+   494	```
+   495	
+   496	### B29. Idempotency
+   497	
+   498	```
+   499	$ cd /tmp/probe/cli-flags/idem && /workspace/executable y.go   # y.go unformatted
+   500	$ md5sum y.go   → 41a14d2e22b23fbdf94df21adbc3f0fd
+   501	$ /workspace/executable y.go
+   502	$ md5sum y.go   → 41a14d2e22b23fbdf94df21adbc3f0fd
+   503	```
+   504	Both runs exit 0 with identical stderr (70 bytes). Stable.
+   505	
+   506	### B30. `-output stdout` with multiple files concatenates with NO separator
+   507	
+   508	```
+   509	$ /workspace/executable -output stdout a.go b.go
+   510	```
+   511	exit 0, stdout 133 bytes = formatted `a.go` immediately followed by formatted `b.go`; no blank line,
+   512	no filename header between them.
+   513	
+   514	---
+   515	
+   516	## Exact strings / formats
+   517	
+   518	### Usage block (stderr, 2487 bytes, md5 `6c8134f10bf0803d9831cfa3540d7b86`)
+   519	
+   520	Header is `Usage of ` + **`os.Args[0]` verbatim as invoked** + `:` — NOT the basename. Proven with a
+   521	symlink `gir -> /workspace/executable`:
+   522	
+   523	| invocation | header line |
+   524	|---|---|
+   525	| `/workspace/executable -h` | `Usage of /workspace/executable:` |
+   526	| `/tmp/probe/cli-flags/gir -h` | `Usage of /tmp/probe/cli-flags/gir:` |
+   527	| `./gir -h` | `Usage of ./gir:` |
+   528	| `gir -h` (found on `PATH`) | `Usage of gir:` |
+   529	
+   530	Body is stdlib `flag.PrintDefaults()` output: flags in **lexicographic** order; each entry is
+   531	`"  -"+name` (+ `" string"` for string flags), then `"\n    \t"` + usage where **every `\n` inside the
+   532	usage string is replaced by `"\n    \t"`** (4 spaces + TAB). Verified by `od -c`.
+   533	
+   534	Full body, `»` marks a TAB, `·` marks a **trailing space** (only 4 lines have one):
+   535	
+   536	```
+   537	Usage of /workspace/executable:
+   538	  -apply-to-generated-files
+   539	    »Apply imports sorting and formatting(if the option is set) to generated files. Generated file is a file with first comment which starts with comment '// Code generated'. Optional parameter.
+   540	  -company-prefixes string
+   541	    »Company package prefixes which will be placed after 3rd-party group by default(if defined). Values should be comma-separated. Optional parameters.
+   542	  -excludes string
+   543	    »Exclude files or dirs, example: '.git/,proto/*.go'.
+   544	  -file-path string
+   545	    »Deprecated. Put file name as an argument(last item) of command line.
+   546	  -format
+   547	    »Option will perform additional formatting. Optional parameter.
+   548	  -imports-order string
+   549	    »Your imports groups can be sorted in your way.·
+   550	    »std - std import group;·
+   551	    »general - libs for general purpose;·
+   552	    »company - inter-org or your company libs(if you set '-company-prefixes'-option, then 4th group will be split separately. In other case, it will be the part of general purpose libs);·
+   553	    »project - your local project dependencies;
+   554	    »blanked - imports with "_" alias;
+   555	    »dotted - imports with "." alias.
+   556	    »Optional parameter. (default "std,general,company,project")
+   557	  -list-diff
+   558	    »Option will list files whose formatting differs from goimports-reviser. Optional parameter.
+   559	  -local string
+   560	    »Deprecated
+   561	  -output string
+   562	    »Can be "file", "write" or "stdout". Whether to write the formatted content back to the file or to stdout. When "write" together with "-list-diff" will list the file name and write back to the file. Optional parameter. (default "file")
+   563	  -project-name string
+   564	    »Your project name(ex.: github.com/incu6us/goimports-reviser). Optional parameter.
+   565	  -recursive
+   566	    »Apply rules recursively if target is a directory. In case of ./... execution will be recursively applied by default. Optional parameter.
+   567	  -rm-unused
+   568	    »Remove unused imports. Optional parameter.
+   569	  -separate-named
+   570	    »Option will separate named imports from the rest of the imports, per group. Optional parameter.
+   571	  -set-alias
+   572	    »Set alias for versioned package names, like 'github.com/go-pg/pg/v9'. In this case import will be set as 'pg "github.com/go-pg/pg/v9"'. Optional parameter.
+   573	  -set-exit-status
+   574	    »set the exit status to 1 if a change is needed/made. Optional parameter.
+   575	  -use-cache
+   576	    »Use cache to improve performance. Optional parameter.
+   577	  -version
+   578	    »Show version information
+   579	  -version-only
+   580	    »Show only the version string
+   581	```
+   582	
+   583	A ready-made copy with trailing spaces marked: `/tmp/probe/cli-flags/usage_marked.txt`.
+   584	The pristine 2487-byte artifact: `/tmp/probe/cli-flags/runs/h/err`.
+   585	
+   586	**Trailing-space lines** (exactly these 4, they are lines 13–16 of the usage output):
+   587	`Your imports groups can be sorted in your way. `, `std - std import group; `,
+   588	`general - libs for general purpose; `,
+   589	`company - inter-org or your company libs(if you set '-company-prefixes'-option, then 4th group will be split separately. In other case, it will be the part of general purpose libs); `
+   590	
+   591	**README DIVERGENCES** (the README in `/workspace/README.md` is stale — trust the binary):
+   592	- README says `-separate-named` → `Separate named imports from their group with a new line. Optional parameter.`
+   593	  Binary says `Option will separate named imports from the rest of the imports, per group. Optional parameter.`
+   594	- README says `-version` → `Show version.` Binary says `Show version information`.
+   595	- README does not list `-version-only` at all.
+   596	- README indents the `-separate-named` description with 8 spaces; the binary uses `4 spaces + TAB` like every other flag.
+   597	
+   598	### Flag table (name, type, default) — 18 flags
+   599	
+   600	```
+   601	apply-to-generated-files  bool    false
+   602	company-prefixes          string  ""
+   603	excludes                  string  ""
+   604	file-path                 string  ""        (deprecated)
+   605	format                    bool    false
+   606	imports-order             string  "std,general,company,project"
+   607	list-diff                 bool    false
+   608	local                     string  ""        (deprecated)
+   609	output                    string  "file"
+   610	project-name              string  ""
+   611	recursive                 bool    false
+   612	rm-unused                 bool    false
+   613	separate-named            bool    false
+   614	set-alias                 bool    false
+   615	set-exit-status           bool    false
+   616	use-cache                 bool    false
+   617	version                   bool    false
+   618	version-only              bool    false
+   619	```
+   620	
+   621	### Log messages (all stderr; `TS` = `YYYY/MM/DD HH:MM:SS ` from Go `log` default flags)
+   622	
+   623	```
+   624	TS Paths: %v                                  ← %v of []string, e.g. "Paths: [a.go b.go]"
+   625	TS Processing %s                              ← per target, raw argv spelling
+   626	TS no file(s) or directory(ies) specified on input
+   627	TS unknown order group type: "%s"             ← %q of the bad group token
+   628	TS invalid output "%s" specified              ← %q of the bad -output value
+   629	TS Could not determine project name for path %s: %v
+   630	TS Failed to fix file: %v
+   631	TS -file-path is deprecated. Put file name(s) as last argument to the command(Example: goimports-reviser -rm-unused -set-alias -format goimports-reviser/main.go)
+   632	TS -local is deprecated and will be removed soon. Use -company-prefixes instead.
+   633	TS All changes to file are applied, but command-line syntax should be fixed
+   634	```
+   635	
+   636	Non-log stderr lines (NO timestamp):
+   637	```
+   638	reading from stdin, press Ctrl+D when done...
+   639	flag provided but not defined: -%s
+   640	invalid boolean value "%s" for -%s: parse error
+   641	flag needs an argument: -%s
+   642	```
+   643	
+   644	Inner error texts observed for `Failed to fix file: %v`:
+   645	```
+   646	open %s: no such file or directory
+   647	file has invalid Go source content, use -excludes flag to skip this file: %s:%d:%d: %s
+   648	file is empty and cannot be parsed as Go source, use -excludes flag to skip this file: <standard-input>:1:1: expected 'package', found 'EOF'
+   649	```
+   650	Inner error texts for `Could not determine project name for path %s: %v`:
+   651	```
+   652	open go.mod: no such file or directory
+   653	path is not set                                ← when the path is the empty string
+   654	```
+   655	
+   656	### Stdout formats
+   657	
+   658	```
+   659	version:      "version: %s\nbuilt with: %s\ntag: %s\ncommit: %s\nsource: %s\n"
+   660	version-only: "%s\n"
+   661	-list-diff:   "%s\n" per differing file, ABSOLUTE path
+   662	-output stdout / stdin mode: raw formatted file bytes, concatenated with no separator
+   663	```
+   664	
+   665	### Special path token
+   666	
+   667	The literal string `<standard-input>` is used as the path for stdin mode in both the `Paths:` slice
+   668	and `Processing` line and in parser error positions.
+   669	
+   670	---
+   671	
+   672	## Algorithm inference
+   673	
+   674	```
+   675	func main() {
+   676	    // 1. Register the 18 flags (see table). No -h/-help flag is registered.
+   677	    flag.Parse()          // ExitOnError:
+   678	                          //   -h/-help/--help  -> flag.Usage() to stderr; exit 0
+   679	                          //   unknown flag     -> "flag provided but not defined: -X\n" + usage; exit 2
+   680	                          //   bad value        -> stdlib msg + usage; exit 2
+   681	                          // Parsing STOPS at the first non-flag arg (and consumes a lone "--").
+   682	
+   683	    // 2. Version short-circuits, BEFORE anything else. version-only wins.
+   684	    if *versionOnly { fmt.Fprintf(os.Stdout, "%s\n", version); os.Exit(0) }
+   685	    if *version {
+   686	        fmt.Fprintf(os.Stdout, "version: %s\nbuilt with: %s\ntag: %s\ncommit: %s\nsource: %s\n",
+   687	                    version, goVersion, tag, commit, source)
+   688	        os.Exit(0)
+   689	    }
+   690	
+   691	    // 3. Merge targets: positionals first, then the deprecated -file-path (if non-empty).
+   692	    paths := flag.Args()
+   693	    if *filePath != "" { paths = append(paths, *filePath) }
+   694	
+   695	    // 4. Empty check (this is BEFORE imports-order validation).
+   696	    if len(paths) == 0 {
+   697	        flag.Usage()                                     // -> stderr
+   698	        log.Fatal("no file(s) or directory(ies) specified on input")   // exit 1
+   699	    }
+   700	
+   701	    // 5. Stdin resolution: ONLY when exactly one target and it is "-".
+   702	    if len(paths) == 1 && paths[0] == "-" {
+   703	        if fi, err := os.Stdin.Stat(); err != nil || fi.Mode()&os.ModeCharDevice != 0 {
+   704	            fmt.Fprintln(os.Stderr, "reading from stdin, press Ctrl+D when done...")
+   705	        }
+   706	        paths[0] = "<standard-input>"     // content read from stdin; output forced to STDOUT
+   707	    }
+   708	
+   709	    // 6. Parse -imports-order (BEFORE the Paths log).
+   710	    order, err := parseOrder(*importsOrder)
+   711	    if err != nil { flag.Usage(); log.Fatalf("unknown order group type: %q", badToken) }  // exit 1
+   712	
+   713	    // 7. Log the target list.
+   714	    log.Printf("Paths: %v", paths)
+   715	
+   716	    // 8. Per target, in argv order (duplicates NOT deduped):
+   717	    for _, p := range paths {
+   718	        log.Printf("Processing %s", p)
+   719	        projName := *projectName
+   720	        if projName == "" && !stdinMode-with-projectName {
+   721	            projName, err = determineProjectName(p)      // walks up for go.mod
+   722	            if err != nil {
+   723	                flag.Usage()
+   724	                log.Fatalf("Could not determine project name for path %s: %+v", p, err)  // exit 1
+   725	            }
+   726	        }
+   727	        // -output is validated HERE (inside processing), and is SKIPPED entirely in stdin mode:
+   728	        //   not in {"file","write","stdout"} -> log.Fatalf("invalid output %q specified", out)  exit 1
+   729	        // any processing error -> log.Fatalf("Failed to fix file: %v", err)  exit 1
+   730	    }
+   731	
+   732	    // 9. Deprecation epilogue, AFTER all processing succeeded.
+   733	    deprecated := false
+   734	    if *filePath != "" {
+   735	        log.Print("-file-path is deprecated. Put file name(s) as last argument to the command(Example: goimports-reviser -rm-unused -set-alias -format goimports-reviser/main.go)")
+   736	        deprecated = true
+   737	    }
+   738	    if *local != "" {
+   739	        log.Print("-local is deprecated and will be removed soon. Use -company-prefixes instead.")
+   740	        deprecated = true
+   741	    }
+   742	    if deprecated {
+   743	        log.Fatal("All changes to file are applied, but command-line syntax should be fixed")  // exit 1
+   744	    }
+   745	
+   746	    // 10. -set-exit-status: exit 1 if any file changed (or, with -list-diff, differed).
+   747	    if *setExitStatus && anyChanged { os.Exit(1) }
+   748	    os.Exit(0)
+   749	}
+   750	```
+   751	
+   752	### Exit-code summary
+   753	
+   754	| situation | exit |
+   755	|---|---|
+   756	| success, nothing to report | 0 |
+   757	| `-h` / `--help` / `-help` | 0 |
+   758	| `-version` / `-version-only` (any other flags/targets) | 0 |
+   759	| `-list-diff` alone (even when files differ) | 0 |
+   760	| no args / no targets | 1 |
+   761	| `-output` invalid (non-stdin mode) | 1 |
+   762	| `-imports-order` invalid | 1 |
+   763	| target missing / unparseable | 1 |
+   764	| `go.mod` not found and `-project-name` unset | 1 |
+   765	| `-file-path` or `-local` non-empty (even on success) | 1 |
+   766	| `-set-exit-status` and a change was needed/made | 1 |
+   767	| unknown flag, missing flag value, bad flag value | 2 |
+   768	
+   769	---
+   770	
+   771	## Surprises / gotchas
+   772	
+   773	1. **`-` reads STDIN.** Undocumented in the README. Only when it is the *sole* resolved target
+   774	   (positional or via `-file-path`). Path token becomes `<standard-input>`; output always goes to
+   775	   stdout; no file is written; `-output` is not even validated (`-output bad -` exits 0).
+   776	2. **The stdin hint is conditional on stdin's file type** (char device / stat error → printed;
+   777	   pipe / FIFO / regular file → not). It is plain `Fprintln` to stderr with **no** log timestamp,
+   778	   and it appears *before* the `Paths:` line and even before `-imports-order` validation.
+   779	3. **Deprecated flags make a fully successful run exit 1.** `-file-path a.go` formats `a.go`
+   780	   correctly and then exits 1 with `All changes to file are applied, but command-line syntax should
+   781	   be fixed`. Same for `-local`. This will break naive CI reimplementations.
+   782	4. **`-file-path` is still a real target source**, appended *after* the positional args, so
+   783	   `-file-path b.go a.go` yields `Paths: [a.go b.go]`.
+   784	5. **Empty string values for `-file-path` / `-local` / `-project-name` are treated as unset**
+   785	   (no deprecation warning, no target added, no go.mod bypass).
+   786	6. **`flag.Usage()` is called on some fatal paths but not others.** Printed for: no-targets,
+   787	   `unknown order group type`, `Could not determine project name`. NOT printed for:
+   788	   `invalid output`, `Failed to fix file`. This ordering (usage *between* the `Processing` line and
+   789	   the fatal line) is easy to get wrong.
+   790	7. **`-version-only` beats `-version`** regardless of argv order.
+   791	8. **Version output goes to STDOUT** while everything else diagnostic goes to stderr.
+   792	9. **Usage goes to STDERR even for `-h`** (Go default), yet `-h` exits **0**.
+   793	10. **`Usage of %s:` uses `os.Args[0]` verbatim**, so the header changes with how the binary is
+   794	    invoked (`./gir`, `gir`, `/abs/path`). A reimplementation must not hardcode the program name.
+   795	11. **`Processing` is logged per command-line target, not per file.** A recursive run over a tree
+   796	    with 3 files logs exactly one `Processing .`.
+   797	12. **Duplicate targets are not deduplicated** — `a.go a.go` processes it twice and logs twice.
+   798	13. **Flags after the first positional become targets** and produce confusing
+   799	    `Failed to fix file: open .../-format: no such file or directory` errors — but files listed
+   800	    *before* them are still modified on disk first.
+   801	14. **The empty-string target** yields `Paths: []` (indistinguishable from an empty slice in the log)
+   802	    and `Processing ` with a trailing space, then a distinct error `path is not set`.
+   803	15. **`-list-diff` never writes and always exits 0**, so running it twice lists the same file twice;
+   804	    pair it with `-set-exit-status` to get exit 1.
+   805	16. **Trailing-slash on a nonexistent dir is stripped** in the error message (`nopedir/` →
+   806	    `.../nopedir`) but preserved in `Paths:`/`Processing`.
+   807	17. **Non-`.go` files are not skipped by extension**; they are parsed and produce
+   808	    `file has invalid Go source content, use -excludes flag to skip this file: ...`.
+   809	18. **`-excludes` does not suppress the `Processing` line** for an excluded target.
+   810	19. The README is stale relative to the binary for `-separate-named`, `-version`, and `-version-only`.
+   811	
+   812	---
+   813	
+   814	## Open questions
+   815	
+   816	- The exact `-list-diff` + `-output write` combination (README claims it lists *and* writes) was not
+   817	  exercised here; `-list-diff` with default `-output file` demonstrably does **not** write.
+   818	- Whether `-set-exit-status` reports "changed" based on content diff or on a write attempt, when
+   819	  combined with `-output stdout`, was not isolated.
+   820	- The precise semantics of `commit: n/a` (this build has no commit stamped); a build with a real
+   821	  commit may format that line differently.
+   822	- Whether `-use-cache` alters any of the CLI-visible logging (no difference observed incidentally,
+   823	  but not systematically probed).
+   824	- Behavior when stdin is a char device that blocks forever (a real interactive TTY) was only
+   825	  approximated with `script`; the hint text implies Ctrl+D handling.
+   826	- Whether an `os.Stdin.Stat()` error truly drives the hint, or the closed-fd case coincidentally
+   827	  reports a char-device-like mode, could not be distinguished without inspecting the binary.
+   828	- Multi-target runs where an early target fails: confirmed the process dies immediately
+   829	  (`log.Fatalf`), so later targets are never processed — but whether earlier partial writes are
+   830	  rolled back was not tested (they are not, based on B18).

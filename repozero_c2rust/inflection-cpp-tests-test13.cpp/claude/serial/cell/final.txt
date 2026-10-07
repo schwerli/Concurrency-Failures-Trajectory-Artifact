@@ -1,0 +1,38 @@
+Done. The port is byte-identical to the C++ reference.
+
+## Project at `/output`
+
+```
+Cargo.toml                       bin target -> test13.rs
+test13.rs                        entry point (13 API calls, mirrors the C++ main)
+src/inflection/mod.rs            module root, re-exports Inflector
+src/inflection/ascii.rs          byte-level <cctype> equivalents
+src/inflection/rules.rs          uncountables + ordered singular rule table
+src/inflection/inflector.rs      the 13 transformations
+```
+
+Builds both ways: `cargo build --release` and `rustc --edition 2021 -O test13.rs` (module paths use `#[path]` + `self::`, so the bare-`rustc` route works too). Zero dependencies — `std` only.
+
+## Behavior recovered black-box from the binary
+
+The C++ library is a **pruned** Rails inflector, and several of its quirks only show up under probing:
+
+- **`pluralize` has no rule table at all** — it appends `s` unless the word is empty or one of exactly 10 uncountables (`equipment information rice money species series fish sheep jeans police`), matched case-sensitively against the whole string. Hence `boxs`, `citys`, `classs`, and `Sheep` → `Sheeps`.
+- **`singularize` keeps only 11 rules.** Verified *absent*: `(shoe)s`, `(tive)s`, `(hive)s`, `(m)ovies`, `(s)eries`, `(bus)(es)?`, `(alias|status)`, `(octop|vir)`, `(cris|test)`, `(ss)$`, `^(ox)en` — which is why `shoes`→`sho`, `hives`→`hife`, `movies`→`movy`, `class`→`clas`.
+- **A real bug reproduced:** `singularize("analyses")` → **`analyasis`**, not `analysis`. The `((a)naly|(b)a|…)(sis|ses)$` rule expands to `$1$2sis` instead of `$1sis`; group 2 only participates in the `analy` branch, so that one stem picks up a stray `a`. Every sibling (`bases`→`basis`, `theses`→`thesis`) is unaffected. Documented at `src/inflection/rules.rs:139`.
+- **`titleize` splits on the space character only** — not tabs, not underscores (`a_b`→`A_b`, `a\tb`→`A\tb`) — and lower-cases word tails (`FISH`→`Fish`).
+- **`parameterize` drops non-alphanumerics** rather than collapsing them: spaces become dashes, everything else vanishes, and runs are neither collapsed nor trimmed (`The  Test`→`the--test`, `a_b`→`ab`).
+- **`classify` does not underscore first** — proven by `A B_table`→`A BTable` (underscoring first would give `A _bTable`).
+- **All character ops are byte-wise ASCII**, so UTF-8 passes through untouched (`ÉLAN` → `underscore` → `É_l_a_n`). Internals work on `&[u8]`/`Vec<u8>` to preserve this exactly.
+
+## Verification
+
+| Suite | Cases | Mismatches |
+|---|---|---|
+| Curated corpus (irregulars, uncountables, separators, UTF-8, punctuation, whitespace) | 176 | 0 |
+| Randomized + rule-targeted fuzz | 6000 | 0 |
+| No-arg, empty-arg, extra-args | 4 | 0 |
+
+Compared stdout+stderr+exit code against `test13_executable` in every case. The cargo and `rustc` binaries produce identical output.
+
+One deliberate judgment call: three Rails rules (`(m|l)ice$`, `([ti])a$`, `^(ox)en`) are **unobservable** through this harness, since `singularize` is only ever called with `word + "s"` and those patterns require a non-`s` ending. Given how many neighboring rules were verifiably pruned, I omitted them to match the inferred shape of the library rather than guessing them in. No input this program can construct reaches them either way.

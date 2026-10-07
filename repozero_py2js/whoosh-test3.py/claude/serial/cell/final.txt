@@ -1,0 +1,37 @@
+Done. Every specifier is either a relative `.mjs` local file or `node:path` (a Node built-in) — no npm packages, no `require`, no embedded Python.
+
+## Structure
+
+```
+/output
+├── test3.mjs                          entry point
+└── lib
+    ├── pycompat.mjs                   repr() / str() / print() / Python sort
+    ├── cli/argparse.mjs               ArgumentParser subset
+    └── whoosh
+        ├── errors.mjs                 FieldConfigurationError, UnknownFieldError
+        ├── fields.mjs                 FieldType, TEXT, ID, KEYWORD, …, Schema
+        ├── formats.mjs                Existence / Frequency / Positions / Characters
+        ├── lang
+        │   ├── porter.mjs             Porter stemming algorithm
+        │   └── stopwords.mjs          default English stop list
+        └── analysis
+            ├── index.mjs              package barrel
+            ├── acore.mjs              Token, Composable, CompositeAnalyzer
+            ├── tokenizers.mjs         RegexTokenizer, IDTokenizer, …
+            ├── filters.mjs            Lowercase, Stop, Strip, …
+            ├── morph.mjs              StemFilter + LRU cache
+            └── analyzers.mjs          StandardAnalyzer, StemmingAnalyzer, …
+```
+
+## Verification
+
+**Differential test against the executable — 16/16 pass** on stdout, stderr, *and* exit code: basic, `--a=x`, empty value, `-5` value, repeated flag, unicode, no args, unknown flag, missing value, extra positional, `--` separator, `--help`, `-h`, `-h` after `--a`, and `-a x`. Three streams also confirmed **byte-identical** via `od -c` diff.
+
+Two behaviors worth noting, both discovered by probing rather than assumed:
+- `--b x` reports *"the following arguments are required: --a"*, not "unrecognized arguments" — argparse runs the required-check before rejecting extras, so my parser collects extras and defers that error.
+- `--a -5` succeeds but `--a -- x` fails — a lone `-5` is a value (no negative-number-like options are declared) while `--` terminates option parsing and starves `--a`.
+
+**Library internals**, which the one-line output doesn't exercise: the Porter stemmer matches **75/75** words of the classic reference vocabulary (`ponies→poni`, `sensibiliti→sensibl`, `controll→control`), the chain lowercases → drops stop words → stems with correct position renumbering (`"the cats are running and running"` → `cat`@[0], `run`@[1,2]), and the schema guards reject underscore-prefixed and duplicate field names.
+
+One caveat on fidelity: the tokenizer's default pattern needed translating, not copying. Python's `\w` under `re.UNICODE` covers all Unicode word characters, whereas JavaScript's `\w` is ASCII-only — I spelled it out as `[\p{L}\p{M}\p{Nd}\p{Nl}\p{No}\p{Pc}]` with the `u` flag so non-ASCII text tokenizes the same way. Since the schema repr never surfaces analyzer behavior, that equivalence rests on documented semantics rather than on observed output from the binary.

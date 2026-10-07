@@ -1,0 +1,18 @@
+Fixed.
+
+## Root cause
+
+The regression came from `3e6fe92b7` ("skipping: refactor skipif/xfail mark evaluation"), which replaced the old `MarkEvaluator` class with plain functions. That refactor changed *when* xfail marks get evaluated:
+
+- **pytest 5.x** stored a lazy `MarkEvaluator` on the item; `pytest_runtest_makereport` called `evalxfail.istrue()` *after* the test body ran, so a marker added mid-test was picked up.
+- **pytest 6.0** eagerly evaluates into `item._store[xfailed_key]` during `pytest_runtest_setup` / before the `yield` in `pytest_runtest_call`. A test with no static xfail mark caches `None`, and `pytest_runtest_makereport` reads that stale `None` — so the dynamically added marker was silently ignored and the failure reported as a plain `F`.
+
+## The fix
+
+`src/_pytest/skipping.py:259` — re-evaluate the xfail marks after the test body completes. The post-`yield` half of the `pytest_runtest_call` hookwrapper runs before `pytest_runtest_makereport` (the runner wraps the whole hook call in `CallInfo.from_call`), so the report hook now sees the mark. The `if xfailed is None` guard means a statically-marked test keeps its original cached evaluation rather than being re-evaluated.
+
+## Verification
+
+The reproducer from the issue now gives `1 xfailed` / `XFAIL test_foo.py::test_xfail_test`, matching the 5.4.3 output in the report. I also checked the adjacent cases, which all behave correctly: dynamic xfail on a passing test → `XPASS`; with `strict=True` → `[XPASS(strict)]` failure; `raises=` mismatch → real failure; `raises=` match → `XFAIL`; and `--runxfail` still reports everything as unmarked.
+
+Added two regression tests to `TestXFail` (failing and strict-passing cases) — `testing/test_skipping.py` passes 81/81. Full suite is unchanged: the 75 failures/errors are byte-for-byte identical with and without the patch, all from missing env deps (`pkg_resources`, `xmlschema`, `hypothesis`) — I confirmed this by diffing a stashed run rather than assuming. Also added `changelog/7486.bugfix.rst`.

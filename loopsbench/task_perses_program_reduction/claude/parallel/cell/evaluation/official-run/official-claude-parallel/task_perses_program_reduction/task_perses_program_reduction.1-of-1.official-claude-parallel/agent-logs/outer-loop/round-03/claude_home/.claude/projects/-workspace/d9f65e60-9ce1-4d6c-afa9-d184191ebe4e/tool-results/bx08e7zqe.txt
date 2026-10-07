@@ -1,0 +1,1504 @@
+=== run.sh ===
+#!/bin/bash
+# Experiment runner - extended by each paper's patch
+echo "No experiments configured yet"
+=============== reduction/__init__.py ===============
+"""
+Perses Program Reduction Framework - Simplified Python Implementation.
+
+This package provides infrastructure for syntax-aware program reduction,
+including tokenization, parse tree construction, property testing,
+and reduction drivers.
+"""
+
+from reduction.token import Token, Tokenizer
+from reduction.tree import SparTreeNode, NodeType
+from reduction.grammar import Grammar, GrammarRule, RuleType
+from reduction.parser import Parser
+from reduction.property_test import PropertyTester
+from reduction.dd import DeltaDebugging
+from reduction.reducer import AbstractReducer
+from reduction.driver import ReductionDriver, ReductionResult
+from reduction.config import Config
+=============== reduction/config.py ===============
+"""Configuration and settings for the reduction framework."""
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Config:
+    """Configuration settings for program reduction.
+
+    Attributes:
+        fixpoint: If True, apply reducers repeatedly until no progress.
+        max_iterations: Maximum fixpoint iterations before stopping.
+        timeout_per_test: Timeout in seconds for each property test execution.
+        enable_dd_baseline: If True, include Delta Debugging as a baseline reducer.
+    """
+    fixpoint: bool = True
+    max_iterations: int = 100
+    timeout_per_test: int = 10
+    enable_dd_baseline: bool = True
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'Config':
+        """Create a Config from a dictionary, ignoring unknown keys.
+
+        Args:
+            d: Dictionary with config values.
+
+        Returns:
+            Config instance.
+        """
+        known_fields = {'fixpoint', 'max_iterations', 'timeout_per_test',
+                        'enable_dd_baseline'}
+        filtered = {k: v for k, v in d.items() if k in known_fields}
+        return cls(**filtered)
+=============== reduction/dd.py ===============
+"""Delta Debugging (ddmin) implementation - the baseline reducer.
+
+Implements the classic ddmin algorithm that operates at token level,
+without syntax awareness. This serves as a baseline to compare against
+syntax-aware reducers like Perses.
+"""
+
+from __future__ import annotations
+from typing import List
+
+from reduction.token import Token
+from reduction.property_test import PropertyTester
+
+
+class DeltaDebugging:
+    """Classic Delta Debugging (ddmin) algorithm for program reduction.
+
+    Operates directly on token lists without considering syntax structure.
+    This is the baseline approach - it can produce syntactically invalid
+    programs during intermediate steps, requiring more test executions.
+    """
+
+    def __init__(self, property_tester: PropertyTester):
+        """Initialize with a property tester.
+
+        Args:
+            property_tester: Tester that checks if the property holds.
+        """
+        self.tester = property_tester
+
+    def reduce(self, tokens: List[Token]) -> List[Token]:
+        """Apply ddmin to reduce the token list while preserving the property.
+
+        Implements the standard ddmin algorithm:
+        1. Try removing each of n partitions
+        2. Try keeping each of n partitions (complement)
+        3. If removing a partition works, recurse with n
+        4. If complement works, recurse with n-1
+        5. Otherwise, increase granularity (n *= 2)
+        6. Stop when n >= len(tokens)
+
+        Args:
+            tokens: The initial list of tokens to reduce.
+
+        Returns:
+            A 1-minimal token list that still satisfies the property.
+        """
+        if not tokens:
+            return tokens
+
+        # Verify initial tokens satisfy the property
+        source = self._tokens_to_source(tokens)
+        if not self.tester.test(source):
+            return tokens
+
+        return self._ddmin(tokens, 2)
+
+    def _ddmin(self, tokens: List[Token], n: int) -> List[Token]:
+        """Core ddmin recursive algorithm.
+
+        Args:
+            tokens: Current token list.
+            n: Current granularity (number of partitions).
+
+        Returns:
+            Reduced token list.
+        """
+        if len(tokens) == 1:
+            return tokens
+
+        # Partition tokens into n roughly equal parts
+        partitions = self._split(tokens, n)
+
+        # Try removing each partition (test complement)
+        for i, partition in enumerate(partitions):
+            complement = []
+            for j, p in enumerate(partitions):
+                if j != i:
+                    complement.extend(p)
+
+            if complement:
+                source = self._tokens_to_source(complement)
+                if self.tester.test(source):
+                    # Removing partition i preserves property
+                    # Recurse with max(n-1, 2) on the complement
+                    return self._ddmin(complement, max(n - 1, 2))
+
+        # Try keeping each partition alone
+        for partition in partitions:
+            if partition:
+                source = self._tokens_to_source(partition)
+                if self.tester.test(source):
+                    # This partition alone preserves property
+                    if len(partition) < len(tokens):
+                        return self._ddmin(partition, 2)
+
+        # Increase granularity
+        if n < len(tokens):
+            return self._ddmin(tokens, min(n * 2, len(tokens)))
+
+        # 1-minimal
+        return tokens
+
+    def _split(self, tokens: List[Token], n: int) -> List[List[Token]]:
+        """Split tokens into n roughly equal partitions.
+
+        Args:
+            tokens: Token list to split.
+            n: Number of partitions.
+
+        Returns:
+            List of n partitions (some may be empty if n > len(tokens)).
+        """
+        k = len(tokens)
+        if n > k:
+            n = k
+        partitions = []
+        size = k // n
+        remainder = k % n
+        start = 0
+        for i in range(n):
+            end = start + size + (1 if i < remainder else 0)
+            partitions.append(tokens[start:end])
+            start = end
+        return partitions
+
+    def _tokens_to_source(self, tokens: List[Token]) -> str:
+        """Reconstruct source code from a token list.
+
+        Attempts to preserve original line/column layout.
+
+        Args:
+            tokens: List of tokens.
+
+        Returns:
+            Reconstructed source string.
+        """
+        if not tokens:
+            return ""
+
+        # Group tokens by line
+        lines_dict: dict[int, list[Token]] = {}
+        for tok in tokens:
+            if tok.type == 'NEWLINE':
+                continue
+            if tok.line not in lines_dict:
+                lines_dict[tok.line] = []
+            lines_dict[tok.line].append(tok)
+
+        if not lines_dict:
+            return ""
+
+        result_lines = []
+        for line_num in sorted(lines_dict.keys()):
+            line_tokens = sorted(lines_dict[line_num], key=lambda t: t.col)
+            line_str = ""
+            current_col = 0
+            for tok in line_tokens:
+                if tok.type == 'INDENT':
+                    line_str += tok.value
+                    current_col = len(tok.value)
+                else:
+                    if tok.col > current_col:
+                        line_str += " " * (tok.col - current_col)
+                    elif current_col > 0 and line_str and not line_str.endswith(' '):
+                        line_str += " "
+                    line_str += tok.value
+                    current_col = tok.col + len(tok.value)
+            result_lines.append(line_str)
+
+        return "\n".join(result_lines) + "\n"
+=============== reduction/driver.py ===============
+"""Reduction driver that orchestrates the reduction process.
+
+The driver coordinates parsing, reducer application, and fixpoint
+iteration to produce a minimal program.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List
+
+from reduction.grammar import Grammar
+from reduction.tree import SparTreeNode
+from reduction.parser import Parser
+from reduction.property_test import PropertyTester
+from reduction.reducer import AbstractReducer
+from reduction.config import Config
+
+
+@dataclass
+class ReductionResult:
+    """Result of a reduction run.
+
+    Attributes:
+        original_tokens: Number of tokens in the original program.
+        reduced_tokens: Number of tokens in the reduced program.
+        num_tests: Total number of property tests executed.
+        reduced_source: The final reduced source code.
+    """
+    original_tokens: int
+    reduced_tokens: int
+    num_tests: int
+    reduced_source: str
+
+    @property
+    def reduction_ratio(self) -> float:
+        """Fraction of tokens removed (1.0 = all removed, 0.0 = no change)."""
+        if self.original_tokens == 0:
+            return 0.0
+        return 1.0 - (self.reduced_tokens / self.original_tokens)
+
+
+class ReductionDriver:
+    """Orchestrates the program reduction process.
+
+    Parses source into a SparTree, applies reducers in sequence,
+    and iterates to a fixpoint (or until max iterations).
+    """
+
+    def __init__(
+        self,
+        grammar: Grammar,
+        tester: PropertyTester,
+        reducers: List[AbstractReducer],
+        config: Config | None = None
+    ):
+        """Initialize the reduction driver.
+
+        Args:
+            grammar: The grammar to use for parsing.
+            tester: Property tester for validating candidates.
+            reducers: List of reducers to apply (in order).
+            config: Configuration settings.
+        """
+        self.grammar = grammar
+        self.tester = tester
+        self.reducers = reducers
+        self.config = config or Config()
+        self.parser = Parser(grammar)
+
+    def reduce(self, source: str) -> ReductionResult:
+        """Run the full reduction pipeline on the given source.
+
+        Steps:
+        1. Parse source into a SparTree.
+        2. Verify the original program satisfies the property.
+        3. Apply each reducer in fixpoint mode until convergence.
+        4. Return the reduction result.
+
+        Args:
+            source: The original program source code.
+
+        Returns:
+            ReductionResult with statistics and reduced source.
+
+        Raises:
+            ValueError: If the original program doesn't satisfy the property.
+        """
+        # Parse source
+        tree = self.parser.parse(source)
+        original_tokens = tree.token_count()
+
+        # Verify the original satisfies the property
+        if not self.tester.test(source):
+            raise ValueError(
+                "Original program does not satisfy the property test. "
+                "Cannot reduce."
+            )
+
+        # Apply reducers in fixpoint mode
+        if self.config.fixpoint:
+            tree = self._fixpoint_reduce(tree)
+        else:
+            tree = self._single_pass_reduce(tree)
+
+        # Produce result
+        reduced_source = tree.to_source()
+        reduced_tokens = tree.token_count()
+
+        return ReductionResult(
+            original_tokens=original_tokens,
+            reduced_tokens=reduced_tokens,
+            num_tests=self.tester.test_count,
+            reduced_source=reduced_source
+        )
+
+    def _fixpoint_reduce(self, tree: SparTreeNode) -> SparTreeNode:
+        """Apply reducers repeatedly until no more progress is made.
+
+        Args:
+            tree: The parse tree to reduce.
+
+        Returns:
+            The reduced tree at fixpoint.
+        """
+        iteration = 0
+        while iteration < self.config.max_iterations:
+            prev_count = tree.token_count()
+
+            for reducer in self.reducers:
+                tree = reducer.reduce(tree, self.tester)
+
+            current_count = tree.token_count()
+            if current_count >= prev_count:
+                # No progress made
+                break
+
+            iteration += 1
+
+        return tree
+
+    def _single_pass_reduce(self, tree: SparTreeNode) -> SparTreeNode:
+        """Apply each reducer exactly once.
+
+        Args:
+            tree: The parse tree to reduce.
+
+        Returns:
+            The reduced tree after one pass.
+        """
+        for reducer in self.reducers:
+            tree = reducer.reduce(tree, self.tester)
+        return tree
+=============== reduction/grammar.py ===============
+"""Grammar rules and PNF (Perses Normal Form) representation.
+
+Provides a Grammar class with support for defining simplified Python
+grammar rules, checking PNF conformance, and building grammars that
+the parser and reducer use.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import List, Union
+
+
+class RuleType(Enum):
+    """Types of grammar rules."""
+    SEQUENCE = "sequence"          # A B C (all in order)
+    ALTERNATION = "alternation"    # A | B | C (one of)
+    KLEENE_STAR = "kleene_star"    # A* (zero or more)
+    KLEENE_PLUS = "kleene_plus"    # A+ (one or more)
+    OPTIONAL = "optional"          # A? (zero or one)
+
+
+@dataclass
+class GrammarRule:
+    """A single grammar production rule.
+
+    Attributes:
+        name: The non-terminal name for this rule.
+        rule_type: How symbols are combined (sequence, alternation, etc.).
+        symbols: List of symbol names (strings referencing other rules or terminals).
+    """
+    name: str
+    rule_type: RuleType
+    symbols: List[Union[str, 'GrammarRule']]
+
+    def is_quantified(self) -> bool:
+        """Check if this rule uses a quantifier (star, plus, optional)."""
+        return self.rule_type in (RuleType.KLEENE_STAR, RuleType.KLEENE_PLUS, RuleType.OPTIONAL)
+
+
+@dataclass
+class Grammar:
+    """A collection of grammar rules defining a language.
+
+    Attributes:
+        rules: Mapping from rule name to GrammarRule.
+        start_symbol: The top-level rule name.
+    """
+    rules: dict[str, GrammarRule] = field(default_factory=dict)
+    start_symbol: str = "program"
+
+    def add_rule(self, rule: GrammarRule) -> None:
+        """Add a rule to the grammar."""
+        self.rules[rule.name] = rule
+
+    def is_pnf(self) -> bool:
+        """Check if the grammar is in Perses Normal Form.
+
+        PNF requirements:
+        1. Every quantified sub-expression (*, +, ?) is factored out
+           into its own named rule.
+        2. No rule has nested quantifiers in its symbols list.
+        3. Alternation rules have only non-terminal symbols.
+        """
+        for rule in self.rules.values():
+            # Check no nested quantified rules in symbols
+            for sym in rule.symbols:
+                if isinstance(sym, GrammarRule) and sym.is_quantified():
+                    return False
+            # Alternation rules should reference named rules only
+            if rule.rule_type == RuleType.ALTERNATION:
+                for sym in rule.symbols:
+                    if isinstance(sym, GrammarRule):
+                        return False
+        return True
+
+    def expected_rule(self, node_name: str) -> GrammarRule | None:
+        """Get the grammar rule expected for a given node name."""
+        return self.rules.get(node_name)
+
+    @classmethod
+    def python_simplified(cls) -> 'Grammar':
+        """Create a simplified Python grammar suitable for parsing test programs.
+
+        This grammar recognizes:
+        - program = statement*
+        - statement = simple_stmt | compound_stmt
+        - simple_stmt = import_stmt | assign_stmt | expr_stmt | return_stmt | pass_stmt
+        - compound_stmt = if_stmt | for_stmt | while_stmt | func_def | class_def | try_stmt
+        - And sub-rules for each statement type.
+        """
+        g = cls()
+        g.start_symbol = "program"
+
+        # program = statement*
+        g.add_rule(GrammarRule(
+            name="program",
+            rule_type=RuleType.KLEENE_STAR,
+            symbols=["statement"]
+        ))
+
+        # statement = simple_stmt | compound_stmt
+        g.add_rule(GrammarRule(
+            name="statement",
+            rule_type=RuleType.ALTERNATION,
+            symbols=["simple_stmt", "compound_stmt"]
+        ))
+
+        # simple_stmt = import_stmt | assign_stmt | expr_stmt | return_stmt | pass_stmt
+        g.add_rule(GrammarRule(
+            name="simple_stmt",
+            rule_type=RuleType.ALTERNATION,
+            symbols=["import_stmt", "assign_stmt", "expr_stmt", "return_stmt",
+                     "pass_stmt", "raise_stmt", "break_stmt", "continue_stmt",
+                     "del_stmt", "assert_stmt", "global_stmt"]
+        ))
+
+        # compound_stmt = if_stmt | for_stmt | while_stmt | func_def | class_def | try_stmt
+        g.add_rule(GrammarRule(
+            name="compound_stmt",
+            rule_type=RuleType.ALTERNATION,
+            symbols=["if_stmt", "for_stmt", "while_stmt", "func_def",
+                     "class_def", "try_stmt", "with_stmt"]
+        ))
+
+        # import_stmt: 'import' module | 'from' module 'import' names
+        g.add_rule(GrammarRule(
+            name="import_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_import", "module_name"]
+        ))
+
+        # assign_stmt: target '=' expr
+        g.add_rule(GrammarRule(
+            name="assign_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["target", "OPERATOR_eq", "expression"]
+        ))
+
+        # expr_stmt: expression (function calls, etc.)
+        g.add_rule(GrammarRule(
+            name="expr_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["expression"]
+        ))
+
+        # return_stmt: 'return' expression?
+        g.add_rule(GrammarRule(
+            name="return_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_return", "expression_opt"]
+        ))
+
+        # pass_stmt: 'pass'
+        g.add_rule(GrammarRule(
+            name="pass_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_pass"]
+        ))
+
+        # raise_stmt: 'raise' expression?
+        g.add_rule(GrammarRule(
+            name="raise_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_raise", "expression_opt"]
+        ))
+
+        # break_stmt: 'break'
+        g.add_rule(GrammarRule(
+            name="break_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_break"]
+        ))
+
+        # continue_stmt: 'continue'
+        g.add_rule(GrammarRule(
+            name="continue_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_continue"]
+        ))
+
+        # del_stmt: 'del' target
+        g.add_rule(GrammarRule(
+            name="del_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_del", "target"]
+        ))
+
+        # assert_stmt: 'assert' expression
+        g.add_rule(GrammarRule(
+            name="assert_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_assert", "expression"]
+        ))
+
+        # global_stmt: 'global' name
+        g.add_rule(GrammarRule(
+            name="global_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_global", "name"]
+        ))
+
+        # if_stmt: 'if' expr ':' block ('elif' expr ':' block)* ('else' ':' block)?
+        g.add_rule(GrammarRule(
+            name="if_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_if", "expression", "DELIMITER_colon", "block",
+                     "elif_clauses", "else_clause_opt"]
+        ))
+
+        # elif_clauses = elif_clause*
+        g.add_rule(GrammarRule(
+            name="elif_clauses",
+            rule_type=RuleType.KLEENE_STAR,
+            symbols=["elif_clause"]
+        ))
+
+        # elif_clause = 'elif' expression ':' block
+        g.add_rule(GrammarRule(
+            name="elif_clause",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_elif", "expression", "DELIMITER_colon", "block"]
+        ))
+
+        # else_clause_opt = else_clause?
+        g.add_rule(GrammarRule(
+            name="else_clause_opt",
+            rule_type=RuleType.OPTIONAL,
+            symbols=["else_clause"]
+        ))
+
+        # else_clause = 'else' ':' block
+        g.add_rule(GrammarRule(
+            name="else_clause",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_else", "DELIMITER_colon", "block"]
+        ))
+
+        # for_stmt: 'for' target 'in' expr ':' block
+        g.add_rule(GrammarRule(
+            name="for_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_for", "target", "KEYWORD_in", "expression",
+                     "DELIMITER_colon", "block"]
+        ))
+
+        # while_stmt: 'while' expr ':' block
+        g.add_rule(GrammarRule(
+            name="while_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_while", "expression", "DELIMITER_colon", "block"]
+        ))
+
+        # func_def: 'def' name '(' params ')' ':' block
+        g.add_rule(GrammarRule(
+            name="func_def",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_def", "name", "DELIMITER_lparen", "params",
+                     "DELIMITER_rparen", "DELIMITER_colon", "block"]
+        ))
+
+        # class_def: 'class' name ('(' bases ')')? ':' block
+        g.add_rule(GrammarRule(
+            name="class_def",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_class", "name", "bases_opt",
+                     "DELIMITER_colon", "block"]
+        ))
+
+        # try_stmt: 'try' ':' block except_clauses
+        g.add_rule(GrammarRule(
+            name="try_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_try", "DELIMITER_colon", "block", "except_clauses",
+                     "finally_clause_opt"]
+        ))
+
+        # except_clauses = except_clause+
+        g.add_rule(GrammarRule(
+            name="except_clauses",
+            rule_type=RuleType.KLEENE_PLUS,
+            symbols=["except_clause"]
+        ))
+
+        # except_clause = 'except' type? ':' block
+        g.add_rule(GrammarRule(
+            name="except_clause",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_except", "type_opt", "DELIMITER_colon", "block"]
+        ))
+
+        # finally_clause_opt = finally_clause?
+        g.add_rule(GrammarRule(
+            name="finally_clause_opt",
+            rule_type=RuleType.OPTIONAL,
+            symbols=["finally_clause"]
+        ))
+
+        # with_stmt: 'with' expression 'as' name ':' block
+        g.add_rule(GrammarRule(
+            name="with_stmt",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["KEYWORD_with", "expression", "as_opt",
+                     "DELIMITER_colon", "block"]
+        ))
+
+        # block = statement+
+        g.add_rule(GrammarRule(
+            name="block",
+            rule_type=RuleType.KLEENE_PLUS,
+            symbols=["statement"]
+        ))
+
+        # expression (terminal-like, not further decomposed at statement level)
+        g.add_rule(GrammarRule(
+            name="expression",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["expr_tokens"]
+        ))
+
+        # expression_opt = expression?
+        g.add_rule(GrammarRule(
+            name="expression_opt",
+            rule_type=RuleType.OPTIONAL,
+            symbols=["expression"]
+        ))
+
+        # params (simplified - just token sequence)
+        g.add_rule(GrammarRule(
+            name="params",
+            rule_type=RuleType.KLEENE_STAR,
+            symbols=["param"]
+        ))
+
+        # param
+        g.add_rule(GrammarRule(
+            name="param",
+            rule_type=RuleType.SEQUENCE,
+            symbols=["name"]
+        ))
+
+        return g
+=============== reduction/parser.py ===============
+"""Parser that builds SparTree from Python-like source code.
+
+Uses indentation-based parsing to construct a syntax-aware parse tree.
+Top-level statements become children of the root 'program' node, and
+compound statements (if/for/while/def/class/try) have nested blocks.
+"""
+
+from __future__ import annotations
+from typing import List
+
+from reduction.token import Token, Tokenizer
+from reduction.tree import SparTreeNode, NodeType
+from reduction.grammar import Grammar
+
+
+# Keywords that start compound statements (have a body block)
+COMPOUND_KEYWORDS = {'if', 'elif', 'else', 'for', 'while', 'def', 'class',
+                     'try', 'except', 'finally', 'with'}
+
+
+class Parser:
+    """Parses Python-like source code into a SparTree.
+
+    Uses indentation levels to determine block structure. Each statement
+    becomes a node in the tree, with compound statements containing
+    their body as child nodes.
+    """
+
+    def __init__(self, grammar: Grammar):
+        self.grammar = grammar
+        self.tokenizer = Tokenizer()
+
+    def parse(self, source: str) -> SparTreeNode:
+        """Parse source code into a SparTree.
+
+        Args:
+            source: Python-like source code string.
+
+        Returns:
+            Root SparTreeNode with rule_name 'program'.
+        """
+        lines = source.split('\n')
+        statements = self._parse_block(lines, 0, 0, len(lines))
+
+        root = SparTreeNode(
+            rule_name="program",
+            node_type=NodeType.KLEENE_STAR,
+            children=statements
+        )
+        return root
+
+    def _parse_block(self, lines: List[str], start: int,
+                     expected_indent: int, end: int) -> List[SparTreeNode]:
+        """Parse a block of statements at a given indentation level.
+
+        Args:
+            lines: All source lines.
+            start: Starting line index.
+            expected_indent: Minimum indentation for this block.
+            end: Ending line index (exclusive).
+
+        Returns:
+            List of SparTreeNode for each statement in the block.
+        """
+        statements = []
+        i = start
+
+        while i < end:
+            line = lines[i]
+
+            # Skip empty lines
+            if not line.strip():
+                i += 1
+                continue
+
+            # Get indentation of current line
+            indent = self._get_indent(line)
+
+            # If indentation is less than expected, this block is done
+            if indent < expected_indent:
+                break
+
+            # Determine if this is a compound statement
+            stripped = line.strip()
+            first_word = stripped.split('(')[0].split()[0] if stripped.split() else ''
+            # Remove any trailing colon for keyword detection
+            keyword = first_word.rstrip(':')
+
+            if keyword in COMPOUND_KEYWORDS and stripped.endswith(':'):
+                # Compound statement - find its body
+                body_start = i + 1
+                body_indent = self._find_body_indent(lines, body_start, end)
+
+                if body_indent > indent:
+                    body_end = self._find_block_end(lines, body_start, body_indent, end)
+                    body_children = self._parse_block(lines, body_start, body_indent, body_end)
+
+                    # Create header tokens
+                    header_tokens = self._tokenize_line(line, i + 1)
+                    header_node = SparTreeNode(
+                        rule_name=f"{keyword}_header",
+                        node_type=NodeType.REGULAR,
+                        children=[self._make_token_node(t) for t in header_tokens]
+                    )
+
+                    # Create body node
+                    body_node = SparTreeNode(
+                        rule_name="block",
+                        node_type=NodeType.KLEENE_PLUS,
+                        children=body_children
+                    )
+
+                    # Determine the compound statement rule name
+                    rule_name = self._compound_rule_name(keyword)
+                    stmt_node = SparTreeNode(
+                        rule_name=rule_name,
+                        node_type=NodeType.REGULAR,
+                        children=[header_node, body_node]
+                    )
+
+                    # Check for elif/else/except/finally continuations
+                    i = body_end
+                    continuation = self._parse_continuations(
+                        lines, i, indent, end, keyword
+                    )
+                    if continuation:
+                        stmt_node.children.extend(continuation[0])
+                        i = continuation[1]
+
+                    statements.append(stmt_node)
+                else:
+                    # No body found - treat as simple statement
+                    stmt_node = self._make_simple_statement(line, i + 1)
+                    statements.append(stmt_node)
+                    i += 1
+            else:
+                # Simple statement
+                stmt_node = self._make_simple_statement(line, i + 1)
+                statements.append(stmt_node)
+                i += 1
+
+        return statements
+
+    def _parse_continuations(self, lines: List[str], start: int,
+                             expected_indent: int, end: int,
+                             parent_keyword: str) -> tuple | None:
+        """Parse continuation clauses (elif/else/except/finally).
+
+        Returns tuple of (list of continuation nodes, new line index) or None.
+        """
+        continuations = []
+        i = start
+
+        # Determine valid continuation keywords
+        if parent_keyword in ('if', 'elif'):
+            valid = {'elif', 'else'}
+        elif parent_keyword in ('try', 'except'):
+            valid = {'except', 'else', 'finally'}
+        elif parent_keyword == 'for' or parent_keyword == 'while':
+            valid = {'else'}
+        else:
+            return None
+
+        while i < end:
+            line = lines[i]
+            if not line.strip():
+                i += 1
+                continue
+
+            indent = self._get_indent(line)
+            if indent != expected_indent:
+                break
+
+            stripped = line.strip()
+            first_word = stripped.split('(')[0].split()[0] if stripped.split() else ''
+            keyword = first_word.rstrip(':')
+
+            if keyword not in valid:
+                break
+
+            # Parse continuation clause
+            body_start = i + 1
+            body_indent = self._find_body_indent(lines, body_start, end)
+
+            if body_indent > indent:
+                body_end = self._find_block_end(lines, body_start, body_indent, end)
+                body_children = self._parse_block(lines, body_start, body_indent, body_end)
+
+                header_tokens = self._tokenize_line(line, i + 1)
+                header_node = SparTreeNode(
+                    rule_name=f"{keyword}_header",
+                    node_type=NodeType.REGULAR,
+                    children=[self._make_token_node(t) for t in header_tokens]
+                )
+                body_node = SparTreeNode(
+                    rule_name="block",
+                    node_type=NodeType.KLEENE_PLUS,
+                    children=body_children
+                )
+
+                clause_type = NodeType.OPTIONAL if keyword == 'else' else NodeType.KLEENE_STAR
+                clause_node = SparTreeNode(
+                    rule_name=f"{keyword}_clause",
+                    node_type=clause_type,
+                    children=[header_node, body_node]
+                )
+                continuations.append(clause_node)
+                i = body_end
+
+                # Update valid continuations
+                if keyword == 'else':
+                    valid = valid - {'elif', 'else'}
+                elif keyword == 'finally':
+                    valid = set()
+            else:
+                break
+
+        if continuations:
+            return (continuations, i)
+        return None
+
+    def _make_simple_statement(self, line: str, line_num: int) -> SparTreeNode:
+        """Create a SparTreeNode for a simple (non-compound) statement."""
+        tokens = self._tokenize_line(line, line_num)
+        rule_name = self._classify_simple_statement(line.strip())
+
+        node = SparTreeNode(
+            rule_name=rule_name,
+            node_type=NodeType.REGULAR,
+            children=[self._make_token_node(t) for t in tokens]
+        )
+        return node
+
+    def _classify_simple_statement(self, stripped: str) -> str:
+        """Determine the rule name for a simple statement."""
+        if stripped.startswith('import ') or stripped.startswith('from '):
+            return "import_stmt"
+        elif stripped.startswith('return'):
+            return "return_stmt"
+        elif stripped == 'pass':
+            return "pass_stmt"
+        elif stripped.startswith('raise'):
+            return "raise_stmt"
+        elif stripped == 'break':
+            return "break_stmt"
+        elif stripped == 'continue':
+            return "continue_stmt"
+        elif stripped.startswith('del '):
+            return "del_stmt"
+        elif stripped.startswith('assert '):
+            return "assert_stmt"
+        elif stripped.startswith('global '):
+            return "global_stmt"
+        elif '=' in stripped and not stripped.startswith('=') and '==' not in stripped.split('=')[0]:
+            # Assignment (rough heuristic)
+            return "assign_stmt"
+        else:
+            return "expr_stmt"
+
+    def _compound_rule_name(self, keyword: str) -> str:
+        """Map a compound keyword to its rule name."""
+        mapping = {
+            'if': 'if_stmt',
+            'elif': 'elif_clause',
+            'else': 'else_clause',
+            'for': 'for_stmt',
+            'while': 'while_stmt',
+            'def': 'func_def',
+            'class': 'class_def',
+            'try': 'try_stmt',
+            'except': 'except_clause',
+            'finally': 'finally_clause',
+            'with': 'with_stmt',
+        }
+        return mapping.get(keyword, f"{keyword}_stmt")
+
+    def _make_token_node(self, token: Token) -> SparTreeNode:
+        """Create a leaf SparTreeNode holding a single token."""
+        return SparTreeNode(
+            rule_name="token",
+            node_type=NodeType.TOKEN,
+            token=token
+        )
+
+    def _tokenize_line(self, line: str, line_num: int) -> List[Token]:
+        """Tokenize a single line of source code."""
+        tokens = self.tokenizer.tokenize(line)
+        # Filter out NEWLINE tokens and fix line numbers
+        result = []
+        for tok in tokens:
+            if tok.type != 'NEWLINE':
+                tok.line = line_num
+                result.append(tok)
+        return result
+
+    def _get_indent(self, line: str) -> int:
+        """Get the indentation level (number of leading spaces) of a line."""
+        return len(line) - len(line.lstrip())
+
+    def _find_body_indent(self, lines: List[str], start: int, end: int) -> int:
+        """Find the indentation level of the first non-empty line starting at `start`."""
+        for i in range(start, end):
+            if lines[i].strip():
+                return self._get_indent(lines[i])
+        return 0
+
+    def _find_block_end(self, lines: List[str], start: int,
+                        block_indent: int, end: int) -> int:
+        """Find where a block at block_indent ends.
+
+        A block ends when we encounter a non-empty line with indentation
+        less than block_indent.
+        """
+        for i in range(start, end):
+            if lines[i].strip():
+                if self._get_indent(lines[i]) < block_indent:
+                    return i
+        return end
+=============== reduction/property_test.py ===============
+"""Property tester for program reduction.
+
+Runs a test script on a candidate program to check if the property
+of interest (e.g., a specific bug) is preserved after reduction.
+"""
+
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+
+class PropertyTester:
+    """Tests whether a program variant still exhibits the target property.
+
+    The property is defined by a test script that exits with code 0
+    when the property holds (e.g., the bug is still triggered).
+    """
+
+    def __init__(self, test_script: str, work_dir: str | None = None):
+        """Initialize the property tester.
+
+        Args:
+            test_script: Path to the test script (must be executable).
+            work_dir: Directory for temporary files. Uses system temp if None.
+        """
+        self.test_script = os.path.abspath(test_script)
+        self.work_dir = work_dir or tempfile.gettempdir()
+        self._test_count = 0
+        self.timeout = 10  # seconds
+
+    @property
+    def test_count(self) -> int:
+        """Number of property tests executed so far."""
+        return self._test_count
+
+    def test(self, program_source: str) -> bool:
+        """Test whether the given program source preserves the property.
+
+        Writes the source to a temporary file, runs the test script
+        with that file as an argument, and returns True if the script
+        exits with code 0.
+
+        Args:
+            program_source: The program source code to test.
+
+        Returns:
+            True if the property holds (test script exits 0), False otherwise.
+        """
+        self._test_count += 1
+
+        # Write source to temporary file
+        tmp_path = os.path.join(self.work_dir, "_reduction_candidate.py")
+        try:
+            with open(tmp_path, 'w') as f:
+                f.write(program_source)
+
+            # Run the test script
+            result = subprocess.run(
+                ['/bin/bash', self.test_script, tmp_path],
+                capture_output=True,
+                timeout=self.timeout,
+                cwd=self.work_dir
+            )
+            return result.returncode == 0
+
+        except subprocess.TimeoutExpired:
+            return False
+        except (OSError, IOError):
+            return False
+        finally:
+            # Clean up
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    def reset_count(self) -> None:
+        """Reset the test counter to zero."""
+        self._test_count = 0
+=============== reduction/reducer.py ===============
+"""Abstract reducer interface.
+
+Defines the base class that all reduction algorithms must implement.
+Concrete reducers (e.g., Perses, Vulcan, PPR) extend this interface.
+"""
+
+from __future__ import annotations
+from abc import ABC, abstractmethod
+
+from reduction.tree import SparTreeNode
+from reduction.property_test import PropertyTester
+
+
+class AbstractReducer(ABC):
+    """Abstract base class for program reducers.
+
+    A reducer takes a SparTree and a property tester, and returns
+    a reduced tree that still satisfies the property.
+    """
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """The name of this reduction algorithm."""
+        ...
+
+    @abstractmethod
+    def reduce(self, tree: SparTreeNode, tester: PropertyTester) -> SparTreeNode:
+        """Reduce the given parse tree while preserving the property.
+
+        Args:
+            tree: The SparTree to reduce.
+            tester: Property tester that validates reduction candidates.
+
+        Returns:
+            A reduced SparTreeNode (may be the same object, mutated).
+        """
+        ...
+=============== reduction/token.py ===============
+"""Token and Tokenizer classes for Python-like source code."""
+
+from dataclasses import dataclass
+import re
+from typing import List
+
+
+@dataclass
+class Token:
+    """Represents a single token in the source code."""
+    type: str
+    value: str
+    line: int
+    col: int
+
+    def __repr__(self):
+        return f"Token({self.type!r}, {self.value!r}, L{self.line}:{self.col})"
+
+
+# Python keywords
+KEYWORDS = {
+    'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await',
+    'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except',
+    'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is',
+    'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return',
+    'try', 'while', 'with', 'yield'
+}
+
+# Multi-character operators (ordered longest-first)
+OPERATORS = [
+    '**=', '//=', '>>=', '<<=',
+    '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=',
+    '==', '!=', '<=', '>=', '**', '//', '>>', '<<',
+    '->', '...', ':=',
+    '+', '-', '*', '/', '%', '&', '|', '^', '~',
+    '<', '>', '=', '.', '@', '!',
+]
+
+DELIMITERS = {'(', ')', '[', ']', '{', '}', ',', ':', ';'}
+
+
+class Tokenizer:
+    """Tokenizes Python-like source code into a list of Token objects."""
+
+    def tokenize(self, source: str) -> List[Token]:
+        """Tokenize the given source string into a list of Tokens.
+
+        Handles: keywords, identifiers, numbers, strings, operators,
+        delimiters, newlines, and indentation.
+        """
+        tokens = []
+        lines = source.split('\n')
+
+        for line_num, line in enumerate(lines, start=1):
+            if not line.strip():
+                # Empty line - emit a NEWLINE token
+                tokens.append(Token('NEWLINE', '\n', line_num, 0))
+                continue
+
+            # Handle indentation
+            indent_match = re.match(r'^( *)', line)
+            if indent_match and indent_match.group(1):
+                indent = indent_match.group(1)
+                tokens.append(Token('INDENT', indent, line_num, 0))
+
+            col = len(indent_match.group(1)) if indent_match else 0
+            remaining = line[col:]
+
+            while remaining:
+                # Skip spaces (not at start of line)
+                space_match = re.match(r'^( +)', remaining)
+                if space_match:
+                    col += len(space_match.group(1))
+                    remaining = remaining[len(space_match.group(1)):]
+                    continue
+
+                if not remaining:
+                    break
+
+                # Comments
+                if remaining.startswith('#'):
+                    tokens.append(Token('COMMENT', remaining, line_num, col))
+                    break
+
+                # Strings (triple-quoted and single-quoted)
+                str_token = self._match_string(remaining, line_num, col)
+                if str_token:
+                    tokens.append(str_token)
+                    col += len(str_token.value)
+                    remaining = remaining[len(str_token.value):]
+                    continue
+
+                # Numbers
+                num_match = re.match(r'^(\d+\.?\d*([eE][+-]?\d+)?|0[xX][0-9a-fA-F]+|0[oO][0-7]+|0[bB][01]+)', remaining)
+                if num_match:
+                    value = num_match.group(0)
+                    tokens.append(Token('NUMBER', value, line_num, col))
+                    col += len(value)
+                    remaining = remaining[len(value):]
+                    continue
+
+                # F-strings (simplified - treat as string)
+                if remaining[0] in ('f', 'F') and len(remaining) > 1 and remaining[1] in ('"', "'"):
+                    str_token = self._match_string(remaining[1:], line_num, col + 1)
+                    if str_token:
+                        full_value = remaining[0] + str_token.value
+                        tokens.append(Token('FSTRING', full_value, line_num, col))
+                        col += len(full_value)
+                        remaining = remaining[len(full_value):]
+                        continue
+
+                # Identifiers and keywords
+                id_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)', remaining)
+                if id_match:
+                    value = id_match.group(0)
+                    if value in KEYWORDS:
+                        tokens.append(Token('KEYWORD', value, line_num, col))
+                    else:
+                        tokens.append(Token('IDENTIFIER', value, line_num, col))
+                    col += len(value)
+                    remaining = remaining[len(value):]
+                    continue
+
+                # Operators (try longest match first)
+                op_matched = False
+                for op in OPERATORS:
+                    if remaining.startswith(op):
+                        tokens.append(Token('OPERATOR', op, line_num, col))
+                        col += len(op)
+                        remaining = remaining[len(op):]
+                        op_matched = True
+                        break
+                if op_matched:
+                    continue
+
+                # Delimiters
+                if remaining[0] in DELIMITERS:
+                    tokens.append(Token('DELIMITER', remaining[0], line_num, col))
+                    col += 1
+                    remaining = remaining[1:]
+                    continue
+
+                # Unknown character - skip
+                tokens.append(Token('UNKNOWN', remaining[0], line_num, col))
+                col += 1
+                remaining = remaining[1:]
+
+            # End of line
+            tokens.append(Token('NEWLINE', '\n', line_num, col))
+
+        return tokens
+
+    def _match_string(self, text: str, line: int, col: int) -> Token | None:
+        """Try to match a string literal at the start of text."""
+        for quote in ('"""', "'''", '"', "'"):
+            if text.startswith(quote):
+                if len(quote) == 3:
+                    # Triple-quoted string
+                    end = text.find(quote, 3)
+                    if end != -1:
+                        value = text[:end + 3]
+                        return Token('STRING', value, line, col)
+                    else:
+                        # Unterminated - take rest of line
+                        return Token('STRING', text, line, col)
+                else:
+                    # Single-quoted string
+                    i = 1
+                    while i < len(text):
+                        if text[i] == '\\':
+                            i += 2
+                        elif text[i] == quote:
+                            value = text[:i + 1]
+                            return Token('STRING', value, line, col)
+                        else:
+                            i += 1
+                    # Unterminated
+                    return Token('STRING', text, line, col)
+        return None
+=============== reduction/tree.py ===============
+"""SparTree (Syntax-aware Parse Tree) representation for program reduction."""
+
+from __future__ import annotations
+from enum import Enum
+from typing import List, Optional
+import copy
+
+from reduction.token import Token
+
+
+class NodeType(Enum):
+    """Types of nodes in the SparTree, corresponding to grammar quantifiers."""
+    KLEENE_STAR = "kleene_star"    # Zero or more repetitions
+    KLEENE_PLUS = "kleene_plus"    # One or more repetitions
+    OPTIONAL = "optional"          # Zero or one occurrence
+    REGULAR = "regular"            # Exactly one occurrence (sequence/alternation)
+    TOKEN = "token"                # Leaf node holding a token
+
+
+class SparTreeNode:
+    """A node in the SparTree parse tree.
+
+    The SparTree is the core data structure for syntax-aware reduction.
+    Each node corresponds to a grammar rule, and the tree structure
+    reflects the syntactic structure of the program. Nodes can be
+    marked as 'deleted' to represent program variants with fewer tokens.
+    """
+
+    def __init__(
+        self,
+        rule_name: str,
+        node_type: NodeType,
+        children: Optional[List['SparTreeNode']] = None,
+        token: Optional[Token] = None,
+    ):
+        self.rule_name = rule_name
+        self.node_type = node_type
+        self.children: List[SparTreeNode] = children if children is not None else []
+        self.token = token
+        self.deleted: bool = False
+
+    def token_count(self) -> int:
+        """Count non-deleted token descendants."""
+        if self.deleted:
+            return 0
+        if self.node_type == NodeType.TOKEN:
+            return 1
+        return sum(child.token_count() for child in self.children)
+
+    def tokens(self) -> List[Token]:
+        """Get non-deleted tokens in order (left-to-right traversal)."""
+        if self.deleted:
+            return []
+        if self.node_type == NodeType.TOKEN and self.token is not None:
+            return [self.token]
+        result = []
+        for child in self.children:
+            result.extend(child.tokens())
+        return result
+
+    def to_source(self) -> str:
+        """Reconstruct source code from non-deleted tokens.
+
+        Rebuilds the source text by placing tokens at their original
+        line/column positions where possible.
+        """
+        tokens = self.tokens()
+        if not tokens:
+            return ""
+
+        # Group tokens by line
+        lines_dict: dict[int, list[Token]] = {}
+        for tok in tokens:
+            if tok.type == 'NEWLINE':
+                continue
+            if tok.line not in lines_dict:
+                lines_dict[tok.line] = []
+            lines_dict[tok.line].append(tok)
+
+        if not lines_dict:
+            return ""
+
+        # Reconstruct lines
+        result_lines = []
+        for line_num in sorted(lines_dict.keys()):
+            line_tokens = sorted(lines_dict[line_num], key=lambda t: t.col)
+            line_str = ""
+            current_col = 0
+            for tok in line_tokens:
+                if tok.type == 'INDENT':
+                    line_str += tok.value
+                    current_col = len(tok.value)
+                else:
+                    if tok.col > current_col:
+                        line_str += " " * (tok.col - current_col)
+                    elif current_col > 0 and line_str and not line_str.endswith(' '):
+                        line_str += " "
+                    line_str += tok.value
+                    current_col = tok.col + len(tok.value)
+            result_lines.append(line_str)
+
+        return "\n".join(result_lines) + "\n"
+
+    def clone(self) -> 'SparTreeNode':
+        """Create a deep copy of this node and all descendants."""
+        return copy.deepcopy(self)
+
+    def all_nodes(self) -> List['SparTreeNode']:
+        """Get all non-deleted descendant nodes (including self) in pre-order."""
+        if self.deleted:
+            return []
+        result = [self]
+        for child in self.children:
+            result.extend(child.all_nodes())
+        return result
+
+    def delete(self) -> None:
+        """Mark this node and all children as deleted."""
+        self.deleted = True
+        for child in self.children:
+            child.delete()
+
+    def undelete(self) -> None:
+        """Unmark deletion on this node and all children."""
+        self.deleted = False
+        for child in self.children:
+            child.undelete()
+
+    def is_deletable(self) -> bool:
+        """Determine if this node can be deleted per grammar rules.
+
+        Deletion rules:
+        - KLEENE_STAR children: always deletable (zero or more)
+        - KLEENE_PLUS children: deletable if at least one sibling remains
+        - OPTIONAL children: always deletable
+        - REGULAR: depends on parent context (conservative: not deletable)
+        - TOKEN: leaf nodes follow parent's deletability
+        """
+        if self.node_type == NodeType.KLEENE_STAR:
+            return True
+        if self.node_type == NodeType.OPTIONAL:
+            return True
+        if self.node_type == NodeType.KLEENE_PLUS:
+            # Can be deleted if it's a child of a Kleene-star/plus parent
+            # and siblings remain. Conservative: return True since the
+            # parent manages the constraint.
+            return True
+        if self.node_type == NodeType.TOKEN:
+            return False
+        # REGULAR nodes are generally not independently deletable
+        return False
+
+    def __repr__(self):
+        if self.deleted:
+            return f"SparTreeNode({self.rule_name!r}, DELETED)"
+        if self.node_type == NodeType.TOKEN:
+            return f"SparTreeNode(TOKEN, {self.token!r})"
+        return f"SparTreeNode({self.rule_name!r}, {self.node_type.value}, children={len(self.children)})"

@@ -1,0 +1,313 @@
+Created under `/output` with local ESM imports only.
+
+**Library Files**
+[lib/program_name.mjs](/output/lib/program_name.mjs)
+```js
+export function getProgramName(argvEntry) {
+  if (!argvEntry) {
+    return 'test6.mjs';
+  }
+
+  const normalized = String(argvEntry).replace(/\\/g, '/');
+  const parts = normalized.split('/');
+  return parts[parts.length - 1] || normalized;
+}
+```
+
+[lib/python_int.mjs](/output/lib/python_int.mjs)
+```js
+const DECIMAL_INTEGER_PATTERN = /^[+-]?(?:\d(?:_?\d)*)$/;
+
+export function looksLikeNegativeNumber(text) {
+  return /^-\d/.test(String(text));
+}
+
+export function tryParsePythonInt(text) {
+  const raw = String(text);
+  const trimmed = raw.trim();
+
+  if (!DECIMAL_INTEGER_PATTERN.test(trimmed)) {
+    return { ok: false };
+  }
+
+  const compact = trimmed.replace(/_/g, '');
+  return { ok: true, value: BigInt(compact) };
+}
+```
+
+[lib/cli_parser.mjs](/output/lib/cli_parser.mjs)
+```js
+import { getProgramName } from './program_name.mjs';
+import { looksLikeNegativeNumber, tryParsePythonInt } from './python_int.mjs';
+
+function buildUsage(programName) {
+  return `usage: ${programName} [-h] --key KEY --val VAL`;
+}
+
+function buildHelp(programName) {
+  return `${buildUsage(programName)}\n\noptions:\n  -h, --help  show this help message and exit\n  --key KEY\n  --val VAL\n`;
+}
+
+function buildError(programName, message) {
+  return `${buildUsage(programName)}\n${programName}: error: ${message}\n`;
+}
+
+function formatMissingRequired(missingOptions) {
+  return `the following arguments are required: ${missingOptions.join(', ')}`;
+}
+
+function isOptionLikeText(token) {
+  return String(token).startsWith('-');
+}
+
+function canUseAsStringValue(token) {
+  return !isOptionLikeText(token) || looksLikeNegativeNumber(token);
+}
+
+function parseIntValue(rawValue) {
+  const parsed = tryParsePythonInt(rawValue);
+
+  if (!parsed.ok) {
+    return {
+      ok: false,
+      message: `argument --val: invalid int value: '${rawValue}'`,
+    };
+  }
+
+  return { ok: true, value: parsed.value };
+}
+
+function consumeKeyValue(argv, index) {
+  const nextValue = argv[index + 1];
+
+  if (nextValue === undefined || !canUseAsStringValue(nextValue)) {
+    return { ok: false, message: 'argument --key: expected one argument' };
+  }
+
+  return { ok: true, value: nextValue, nextIndex: index + 2 };
+}
+
+function consumeValValue(argv, index) {
+  const nextValue = argv[index + 1];
+
+  if (nextValue === undefined) {
+    return { ok: false, message: 'argument --val: expected one argument' };
+  }
+
+  const parsed = parseIntValue(nextValue);
+
+  if (parsed.ok) {
+    return { ok: true, value: parsed.value, nextIndex: index + 2 };
+  }
+
+  if (isOptionLikeText(nextValue) && !looksLikeNegativeNumber(nextValue)) {
+    return { ok: false, message: 'argument --val: expected one argument' };
+  }
+
+  return parsed;
+}
+
+export function parseCliArguments(argv, argvEntry = 'test6.mjs') {
+  const programName = getProgramName(argvEntry);
+  const unknownTokens = [];
+  let keyValue;
+  let valValue;
+  let index = 0;
+
+  while (index < argv.length) {
+    const token = argv[index];
+
+    if (token === '-h' || token === '--help') {
+      return {
+        kind: 'help',
+        programName,
+        text: buildHelp(programName),
+        exitCode: 0,
+      };
+    }
+
+    if (token === '--key') {
+      const consumed = consumeKeyValue(argv, index);
+
+      if (!consumed.ok) {
+        return {
+          kind: 'error',
+          programName,
+          text: buildError(programName, consumed.message),
+          exitCode: 2,
+        };
+      }
+
+      keyValue = consumed.value;
+      index = consumed.nextIndex;
+      continue;
+    }
+
+    if (String(token).startsWith('--key=')) {
+      keyValue = String(token).slice('--key='.length);
+      index += 1;
+      continue;
+    }
+
+    if (token === '--val') {
+      const consumed = consumeValValue(argv, index);
+
+      if (!consumed.ok) {
+        return {
+          kind: 'error',
+          programName,
+          text: buildError(programName, consumed.message),
+          exitCode: 2,
+        };
+      }
+
+      valValue = consumed.value;
+      index = consumed.nextIndex;
+      continue;
+    }
+
+    if (String(token).startsWith('--val=')) {
+      const rawValue = String(token).slice('--val='.length);
+      const parsed = parseIntValue(rawValue);
+
+      if (!parsed.ok) {
+        return {
+          kind: 'error',
+          programName,
+          text: buildError(programName, parsed.message),
+          exitCode: 2,
+        };
+      }
+
+      valValue = parsed.value;
+      index += 1;
+      continue;
+    }
+
+    unknownTokens.push(String(token));
+    index += 1;
+  }
+
+  const missingRequired = [];
+
+  if (keyValue === undefined) {
+    missingRequired.push('--key');
+  }
+
+  if (valValue === undefined) {
+    missingRequired.push('--val');
+  }
+
+  if (missingRequired.length > 0) {
+    return {
+      kind: 'error',
+      programName,
+      text: buildError(programName, formatMissingRequired(missingRequired)),
+      exitCode: 2,
+    };
+  }
+
+  if (unknownTokens.length > 0) {
+    return {
+      kind: 'error',
+      programName,
+      text: buildError(programName, `unrecognized arguments: ${unknownTokens.join(' ')}`),
+      exitCode: 2,
+    };
+  }
+
+  return {
+    kind: 'ok',
+    programName,
+    args: {
+      key: keyValue,
+      val: valValue,
+    },
+  };
+}
+```
+
+[lib/bidirectional_lookup.mjs](/output/lib/bidirectional_lookup.mjs)
+```js
+function createRecord() {
+  return Object.create(null);
+}
+
+function hasOwn(record, key) {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+class InverseLookupView {
+  constructor(reverseStore) {
+    this.reverseStore = reverseStore;
+  }
+
+  hasKey(value) {
+    return hasOwn(this.reverseStore, String(value));
+  }
+}
+
+export class BidirectionalLookup {
+  constructor(source) {
+    this.forwardStore = createRecord();
+    this.reverseStore = createRecord();
+    this.inv = new InverseLookupView(this.reverseStore);
+
+    for (const [key, value] of Object.entries(source)) {
+      const forwardKey = String(key);
+      const reverseKey = String(value);
+
+      if (hasOwn(this.forwardStore, forwardKey)) {
+        throw new Error(`Duplicate key: ${forwardKey}`);
+      }
+
+      if (hasOwn(this.reverseStore, reverseKey)) {
+        throw new Error(`Duplicate value: ${reverseKey}`);
+      }
+
+      this.forwardStore[forwardKey] = value;
+      this.reverseStore[reverseKey] = forwardKey;
+    }
+  }
+
+  hasKey(key) {
+    return hasOwn(this.forwardStore, String(key));
+  }
+}
+
+export function createBidirectionalLookup(source) {
+  return new BidirectionalLookup(source);
+}
+```
+
+**Entry File**
+[test6.mjs](/output/test6.mjs)
+```js
+import { createBidirectionalLookup } from './lib/bidirectional_lookup.mjs';
+import { parseCliArguments } from './lib/cli_parser.mjs';
+
+function toPythonBoolText(value) {
+  return value ? 'True' : 'False';
+}
+
+const parsed = parseCliArguments(process.argv.slice(2), process.argv[1]);
+
+if (parsed.kind === 'help') {
+  process.stdout.write(parsed.text);
+  process.exit(0);
+}
+
+if (parsed.kind === 'error') {
+  process.stderr.write(parsed.text);
+  process.exit(parsed.exitCode);
+}
+
+const b = createBidirectionalLookup({ a: 1, b: 2, c: 3 });
+const result1 = b.hasKey(parsed.args.key);
+const result2 = b.inv.hasKey(parsed.args.val);
+
+console.log(toPythonBoolText(result1));
+console.log(toPythonBoolText(result2));
+```
+
+Verified with `node /output/test6.mjs --key b --val 3` and matched the observed CLI behavior for help, missing required args, invalid `--val`, repeated flags, and `--key=/--val=` forms.

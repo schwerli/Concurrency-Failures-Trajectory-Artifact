@@ -1,0 +1,39 @@
+Migration complete and verified. Here's the structure:
+
+```
+/output
+├── test2.mjs                      ← entry point
+├── lib/python/                    ← CPython semantics shims
+│   ├── repr.mjs                   ·  repr() for str/list, code-point sorting
+│   ├── text.mjs                   ·  textwrap.wrap
+│   ├── print.mjs                  ·  print() (str(), not util.inspect)
+│   └── callable.mjs               ·  classes callable without `new`
+├── lib/argparse/                  ← argparse port
+│   ├── errors.mjs  action.mjs  formatter.mjs  parser.mjs  index.mjs
+└── lib/whoosh/                    ← whoosh port
+    ├── analysis.mjs  formats.mjs  fieldtypes.mjs  schema.mjs  fields.mjs  index.mjs
+```
+
+## Verification
+
+| Check | Result |
+|---|---|
+| Byte-exact stdout for `--a x` | identical (`diff` on raw bytes) |
+| 37 argv shapes, stdout+stderr+exit code | 37/37 match |
+| `--help`/usage across widths 8–300 | 0 mismatches |
+| Library self-tests | 51/51 |
+| External imports | none — all relative `.mjs`, no `node:` builtins needed |
+
+`/output/difftest.sh` and `/output/tests/` re-run these.
+
+## Three non-obvious things the black-box probing caught
+
+1. **`format_usage()` collapses its own trailing blank line.** `_format_usage` returns `...\n\n`, but it passes back through `HelpFormatter.format_help()`, which strips it to one `\n`. My first version emitted a blank line before every `error:` message — this alone failed 18 of 37 cases.
+
+2. **argparse re-splits the usage string on a regex before wrapping**, so `--a A` becomes two independently wrappable chunks. At `COLUMNS=34` Python emits `[-h] --a` / `A`, not `[-h]` / `--a A`. Reproduced with `/\(.*?\)+(?=\s|$)|\[.*?\]+(?=\s|$)|\S+/g`.
+
+3. **`--` may never be consumed as an optional's value.** `--a -- x` errors with *expected one argument* rather than taking `--` as the value, because `_get_nargs_pattern` strips the `-` placeholders for optionals. Modeled by building the same `O`/`A`/`-` pattern string over argv and matching `(A)`.
+
+Also worth flagging: `tags=KEYWORD` passes the *class*, not an instance. `Schema.add` instantiates anything callable — reproduced via a `Proxy` `apply` trap so `KEYWORD` works both bare and as `KEYWORD({...})`, with `instanceof` intact.
+
+Two fixes came from the self-tests rather than the diff: whoosh's tokenizers recycle a single `Token` object (harmless in Python list comprehensions, but spreading the generator in JS yielded N references to the same token), so the tokenizers now yield a fresh `Token` per match. And my initial `StopFilter` expectations were wrong, not the code — whoosh renumbers positions from the first *surviving* token's original position, so `'the quick brown fox'` gives `quick@1, brown@2, fox@3`. I corrected the test to match whoosh's actual semantics.

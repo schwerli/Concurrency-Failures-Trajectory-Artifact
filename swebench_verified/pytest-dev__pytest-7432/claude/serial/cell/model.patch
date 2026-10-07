@@ -1,0 +1,49 @@
+diff --git a/changelog/7392.bugfix.rst b/changelog/7392.bugfix.rst
+new file mode 100644
+index 000000000..48cd949fa
+--- /dev/null
++++ b/changelog/7392.bugfix.rst
+@@ -0,0 +1 @@
++Fix the reported location of tests skipped with ``@pytest.mark.skip`` when ``--runxfail`` is used.
+diff --git a/src/_pytest/skipping.py b/src/_pytest/skipping.py
+index 7bd975e5a..c9bdfee89 100644
+--- a/src/_pytest/skipping.py
++++ b/src/_pytest/skipping.py
+@@ -291,7 +291,7 @@ def pytest_runtest_makereport(item: Item, call: CallInfo[None]):
+             else:
+                 rep.outcome = "passed"
+                 rep.wasxfail = xfailed.reason
+-    elif (
++    if (
+         item._store.get(skipped_by_mark_key, True)
+         and rep.skipped
+         and type(rep.longrepr) is tuple
+diff --git a/testing/test_skipping.py b/testing/test_skipping.py
+index 0b1c0b49b..02b4e425f 100644
+--- a/testing/test_skipping.py
++++ b/testing/test_skipping.py
+@@ -1182,6 +1182,24 @@ def test_summary_list_after_errors(testdir):
+     )
+ 
+ 
++@pytest.mark.parametrize("runner_args", [["-rs"], ["-rs", "--runxfail"]])
++def test_skip_mark_location(testdir, runner_args) -> None:
++    """--runxfail should not affect the reported location of a skip mark (#7392)."""
++    testdir.makepyfile(
++        """
++        import pytest
++
++        @pytest.mark.skip
++        def test_skip_location() -> None:
++            assert 0
++        """
++    )
++    result = testdir.runpytest(*runner_args)
++    result.stdout.fnmatch_lines(
++        ["*SKIPPED [[]1[]] test_skip_mark_location.py:3: unconditional skip*"]
++    )
++
++
+ def test_importorskip():
+     with pytest.raises(
+         pytest.skip.Exception,

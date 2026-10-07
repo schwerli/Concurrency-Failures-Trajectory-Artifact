@@ -1,0 +1,186 @@
+2026-08-14 18:00:12,477 - INFO - Creating container for django__django-16502...
+2026-08-14 18:00:12,580 - INFO - Container for django__django-16502 created: d062932d70117d9d4f517cdfda80465004aae8b00595ee2aa44f62a501fa1b95
+2026-08-14 18:00:12,931 - INFO - Container for django__django-16502 started: d062932d70117d9d4f517cdfda80465004aae8b00595ee2aa44f62a501fa1b95
+2026-08-14 18:00:12,931 - INFO - Intermediate patch for django__django-16502 written to logs/run_evaluation/formal-claude-parallel-django__django-16502/uiuc-claude-parallel/django__django-16502/patch.diff, now applying to container...
+2026-08-14 18:00:13,054 - INFO - >>>>> Applied Patch:
+Checking patch django/core/servers/basehttp.py...
+Checking patch probe/harness.py...
+Checking patch probe/harness2.py...
+Checking patch tests/servers/tests.py...
+Applied patch django/core/servers/basehttp.py cleanly.
+Applied patch probe/harness.py cleanly.
+Applied patch probe/harness2.py cleanly.
+Applied patch tests/servers/tests.py cleanly.
+
+2026-08-14 18:00:13,830 - INFO - Git diff before:
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..6122117da2 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -11,6 +11,7 @@ import logging
+ import socket
+ import socketserver
+ import sys
++from collections import deque
+ from wsgiref import simple_server
+ 
+ from django.core.exceptions import ImproperlyConfigured
+@@ -147,6 +148,18 @@ class ServerHandler(simple_server.ServerHandler):
+         self.get_stdin().read()
+         super().close()
+ 
++    def finish_response(self):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            try:
++                deque(self.result, maxlen=0)  # Consume iterator needed for CONTENT_LENGTH.
++            except TypeError:
++                pass  # Don't choke if the response isn't iterable.
++            else:
++                self.finish_content()
++            self.close()
++        else:
++            super().finish_response()
++
+ 
+ class WSGIRequestHandler(simple_server.WSGIRequestHandler):
+     protocol_version = "HTTP/1.1"
+diff --git a/tests/servers/tests.py b/tests/servers/tests.py
+index 8796db9749..820f86489e 100644
+--- a/tests/servers/tests.py
++++ b/tests/servers/tests.py
+@@ -280,6 +280,44 @@ class LiveServerViews(LiveServerBase):
+         finally:
+             conn.close()
+ 
++    def test_head_request_does_not_return_body(self):
++        conn = HTTPConnection(
++            LiveServerViews.server_thread.host,
++            LiveServerViews.server_thread.port,
++            timeout=1,
++        )
++        try:
++            conn.request("HEAD", "/example_view/", headers={"Connection": "close"})
++            response = conn.getresponse()
++            self.assertEqual(response.status, 200)
++            self.assertEqual(response.getheader("Content-Length"), "12")
++            self.assertEqual(response.read(), b"")
++        finally:
++            conn.close()
++
++    def test_head_request_raw_socket(self):
++        s = socket.create_connection(
++            (LiveServerViews.server_thread.host, LiveServerViews.server_thread.port),
++            timeout=1,
++        )
++        try:
++            s.sendall(
++                b"HEAD /example_view/ HTTP/1.1\r\n"
++                b"Host: localhost\r\nConnection: close\r\n\r\n"
++            )
++            chunks = []
++            while True:
++                data = s.recv(4096)
++                if not data:
++                    break
++                chunks.append(data)
++        finally:
++            s.close()
++        raw = b"".join(chunks)
++        print("RAW RESPONSE:", raw)
++        headers, _, body = raw.partition(b"\r\n\r\n")
++        self.assertEqual(body, b"")
++
+     def test_404(self):
+         with self.assertRaises(HTTPError) as err:
+             self.urlopen("/")
+2026-08-14 18:00:13,830 - INFO - Eval script for django__django-16502 written to logs/run_evaluation/formal-claude-parallel-django__django-16502/uiuc-claude-parallel/django__django-16502/eval.sh; copying to container...
+2026-08-14 18:00:18,778 - INFO - Test runtime: 4.90 seconds
+2026-08-14 18:00:18,778 - INFO - Test output for django__django-16502 written to logs/run_evaluation/formal-claude-parallel-django__django-16502/uiuc-claude-parallel/django__django-16502/test_output.txt
+2026-08-14 18:00:18,834 - INFO - Git diff after:
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..6122117da2 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -11,6 +11,7 @@ import logging
+ import socket
+ import socketserver
+ import sys
++from collections import deque
+ from wsgiref import simple_server
+ 
+ from django.core.exceptions import ImproperlyConfigured
+@@ -147,6 +148,18 @@ class ServerHandler(simple_server.ServerHandler):
+         self.get_stdin().read()
+         super().close()
+ 
++    def finish_response(self):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            try:
++                deque(self.result, maxlen=0)  # Consume iterator needed for CONTENT_LENGTH.
++            except TypeError:
++                pass  # Don't choke if the response isn't iterable.
++            else:
++                self.finish_content()
++            self.close()
++        else:
++            super().finish_response()
++
+ 
+ class WSGIRequestHandler(simple_server.WSGIRequestHandler):
+     protocol_version = "HTTP/1.1"
+diff --git a/tests/servers/tests.py b/tests/servers/tests.py
+index 8796db9749..820f86489e 100644
+--- a/tests/servers/tests.py
++++ b/tests/servers/tests.py
+@@ -280,6 +280,44 @@ class LiveServerViews(LiveServerBase):
+         finally:
+             conn.close()
+ 
++    def test_head_request_does_not_return_body(self):
++        conn = HTTPConnection(
++            LiveServerViews.server_thread.host,
++            LiveServerViews.server_thread.port,
++            timeout=1,
++        )
++        try:
++            conn.request("HEAD", "/example_view/", headers={"Connection": "close"})
++            response = conn.getresponse()
++            self.assertEqual(response.status, 200)
++            self.assertEqual(response.getheader("Content-Length"), "12")
++            self.assertEqual(response.read(), b"")
++        finally:
++            conn.close()
++
++    def test_head_request_raw_socket(self):
++        s = socket.create_connection(
++            (LiveServerViews.server_thread.host, LiveServerViews.server_thread.port),
++            timeout=1,
++        )
++        try:
++            s.sendall(
++                b"HEAD /example_view/ HTTP/1.1\r\n"
++                b"Host: localhost\r\nConnection: close\r\n\r\n"
++            )
++            chunks = []
++            while True:
++                data = s.recv(4096)
++                if not data:
++                    break
++                chunks.append(data)
++        finally:
++            s.close()
++        raw = b"".join(chunks)
++        print("RAW RESPONSE:", raw)
++        headers, _, body = raw.partition(b"\r\n\r\n")
++        self.assertEqual(body, b"")
++
+     def test_404(self):
+         with self.assertRaises(HTTPError) as err:
+             self.urlopen("/")
+2026-08-14 18:00:18,834 - INFO - Grading answer for django__django-16502...
+2026-08-14 18:00:18,835 - INFO - report: {'django__django-16502': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': False, 'tests_status': {'FAIL_TO_PASS': {'success': [], 'failure': ['test_no_body_returned_for_head_requests (servers.test_basehttp.WSGIRequestHandlerTestCase.test_no_body_returned_for_head_requests)']}, 'PASS_TO_PASS': {'success': ['test_https (servers.test_basehttp.WSGIRequestHandlerTestCase.test_https)', 'test_log_message (servers.test_basehttp.WSGIRequestHandlerTestCase.test_log_message)', 'WSGIRequestHandler ignores headers containing underscores.', 'WSGIServer handles broken pipe errors.'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for django__django-16502: resolved: False
+2026-08-14 18:00:18,835 - INFO - Attempting to stop container sweb.eval.django__django-16502.formal-claude-parallel-django__django-16502...
+2026-08-14 18:00:34,424 - INFO - Container sweb.eval.django__django-16502.formal-claude-parallel-django__django-16502 stopped successfully.
+2026-08-14 18:00:34,424 - INFO - Attempting to remove container sweb.eval.django__django-16502.formal-claude-parallel-django__django-16502...
+2026-08-14 18:00:37,105 - INFO - Container sweb.eval.django__django-16502.formal-claude-parallel-django__django-16502 removed successfully.

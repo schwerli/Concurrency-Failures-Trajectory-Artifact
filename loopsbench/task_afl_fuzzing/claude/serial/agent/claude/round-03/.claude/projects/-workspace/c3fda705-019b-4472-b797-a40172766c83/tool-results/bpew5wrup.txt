@@ -1,0 +1,879 @@
+=============== fuzzsim/seed.py
+     1	"""TestCase dataclass for fuzzing seeds/corpus entries."""
+     2	
+     3	from dataclasses import dataclass, field
+     4	from typing import Set
+     5	
+     6	
+     7	@dataclass
+     8	class TestCase:
+     9	    """Represents a test case (seed) in the fuzzing queue."""
+    10	
+    11	    data: bytes
+    12	    coverage: Set[int] = field(default_factory=set)
+    13	    exec_time: float = 0.0
+    14	    is_crash: bool = False
+    15	    depth: int = 0
+    16	    fuzz_count: int = 0  # how many times this seed has been fuzzed
+    17	    was_fuzzed: bool = False
+    18	    is_favored: bool = False
+    19	    times_chosen: int = 0  # number of times selected for fuzzing
+    20	    creation_time: int = 0  # iteration when this was added to queue
+    21	    unique_edges: Set[int] = field(default_factory=set)  # edges only this TC covers
+    22	
+    23	    def __hash__(self):
+    24	        return hash(id(self))
+    25	
+    26	    def __eq__(self, other):
+    27	        return self is other
+    28	
+    29	    @property
+    30	    def size(self) -> int:
+    31	        """Return the size of the test case data in bytes."""
+    32	        return len(self.data)
+    33	
+    34	    def copy(self) -> 'TestCase':
+    35	        """Create a shallow copy of this test case."""
+    36	        return TestCase(
+    37	            data=self.data,
+    38	            coverage=set(self.coverage),
+    39	            exec_time=self.exec_time,
+    40	            is_crash=self.is_crash,
+    41	            depth=self.depth,
+    42	            fuzz_count=self.fuzz_count,
+    43	            was_fuzzed=self.was_fuzzed,
+    44	            is_favored=self.is_favored,
+    45	            times_chosen=self.times_chosen,
+    46	            creation_time=self.creation_time,
+    47	            unique_edges=set(self.unique_edges),
+    48	        )
+=============== fuzzsim/bitmap.py
+     1	"""Edge coverage bitmap (64KB shared memory simulation)."""
+     2	
+     3	from typing import Set
+     4	
+     5	
+     6	MAP_SIZE = 65536  # 64KB bitmap
+     7	
+     8	
+     9	class CoverageBitmap:
+    10	    """Simulates AFL's coverage bitmap using a set of edge IDs.
+    11	
+    12	    In real AFL, this is a 64KB shared memory region where each byte
+    13	    represents a hit count for an edge (hashed to bucket). We simplify
+    14	    to exact edge tracking for determinism.
+    15	    """
+    16	
+    17	    def __init__(self):
+    18	        self.global_coverage: Set[int] = set()
+    19	        self.virgin_bits: Set[int] = set()  # edges never seen before
+    20	
+    21	    def has_new_bits(self, edges: Set[int]) -> bool:
+    22	        """Check if the given edges contain any new coverage.
+    23	
+    24	        Returns True if at least one edge has never been seen before.
+    25	        """
+    26	        new_edges = edges - self.global_coverage
+    27	        return len(new_edges) > 0
+    28	
+    29	    def update(self, edges: Set[int]) -> Set[int]:
+    30	        """Update the global bitmap with new edges.
+    31	
+    32	        Returns the set of newly discovered edges.
+    33	        """
+    34	        new_edges = edges - self.global_coverage
+    35	        self.global_coverage.update(edges)
+    36	        self.virgin_bits.update(new_edges)
+    37	        return new_edges
+    38	
+    39	    def get_coverage_count(self) -> int:
+    40	        """Return the number of unique edges covered so far."""
+    41	        return len(self.global_coverage)
+    42	
+    43	    def get_coverage_percentage(self, total_edges: int) -> float:
+    44	        """Return coverage as a percentage of total edges."""
+    45	        if total_edges == 0:
+    46	            return 0.0
+    47	        return len(self.global_coverage) / total_edges * 100.0
+    48	
+    49	    def reset(self):
+    50	        """Reset the bitmap to empty state."""
+    51	        self.global_coverage.clear()
+    52	        self.virgin_bits.clear()
+=============== fuzzsim/mutation.py
+     1	"""Basic mutation operators for fuzzing.
+     2	
+     3	All operators are deterministic given a numpy RandomState instance.
+     4	"""
+     5	
+     6	import numpy as np
+     7	from typing import List
+     8	
+     9	
+    10	# Interesting values for different sizes (from AFL)
+    11	INTERESTING_8 = [-128, -1, 0, 1, 16, 32, 64, 100, 127]
+    12	INTERESTING_16 = [-32768, -129, 128, 255, 256, 512, 1000, 1024, 4096, 32767]
+    13	INTERESTING_32 = [-2147483648, -100663046, -32769, 32768, 65535, 65536,
+    14	                  100663045, 2147483647]
+    15	
+    16	
+    17	def bit_flip(data: bytes, pos: int, width: int = 1) -> bytes:
+    18	    """Flip 'width' consecutive bits starting at bit position 'pos'."""
+    19	    buf = bytearray(data)
+    20	    for i in range(width):
+    21	        bit_pos = pos + i
+    22	        byte_idx = bit_pos // 8
+    23	        bit_idx = bit_pos % 8
+    24	        if byte_idx < len(buf):
+    25	            buf[byte_idx] ^= (1 << (7 - bit_idx))
+    26	    return bytes(buf)
+    27	
+    28	
+    29	def byte_flip(data: bytes, pos: int, width: int = 1) -> bytes:
+    30	    """Flip 'width' consecutive bytes starting at position 'pos'."""
+    31	    buf = bytearray(data)
+    32	    for i in range(width):
+    33	        if pos + i < len(buf):
+    34	            buf[pos + i] ^= 0xFF
+    35	    return bytes(buf)
+    36	
+    37	
+    38	def arith_add(data: bytes, pos: int, value: int = 1) -> bytes:
+    39	    """Add a small value to byte at position 'pos'."""
+    40	    buf = bytearray(data)
+    41	    if pos < len(buf):
+    42	        buf[pos] = (buf[pos] + value) & 0xFF
+    43	    return bytes(buf)
+    44	
+    45	
+    46	def arith_sub(data: bytes, pos: int, value: int = 1) -> bytes:
+    47	    """Subtract a small value from byte at position 'pos'."""
+    48	    buf = bytearray(data)
+    49	    if pos < len(buf):
+    50	        buf[pos] = (buf[pos] - value) & 0xFF
+    51	    return bytes(buf)
+    52	
+    53	
+    54	def interesting_values(data: bytes, pos: int, rng: np.random.RandomState) -> bytes:
+    55	    """Replace byte at position with an interesting value."""
+    56	    buf = bytearray(data)
+    57	    if pos < len(buf):
+    58	        val = INTERESTING_8[rng.randint(0, len(INTERESTING_8))]
+    59	        buf[pos] = val & 0xFF
+    60	    return bytes(buf)
+    61	
+    62	
+    63	def random_byte(data: bytes, pos: int, rng: np.random.RandomState) -> bytes:
+    64	    """Replace byte at position with a random value."""
+    65	    buf = bytearray(data)
+    66	    if pos < len(buf):
+    67	        buf[pos] = rng.randint(0, 256)
+    68	    return bytes(buf)
+    69	
+    70	
+    71	def clone_bytes(data: bytes, src: int, dst: int, length: int) -> bytes:
+    72	    """Clone a chunk of bytes from src to dst position."""
+    73	    buf = bytearray(data)
+    74	    if src + length <= len(buf) and dst + length <= len(buf):
+    75	        chunk = buf[src:src + length]
+    76	        buf[dst:dst + length] = chunk
+    77	    return bytes(buf)
+    78	
+    79	
+    80	def delete_bytes(data: bytes, pos: int, length: int) -> bytes:
+    81	    """Delete 'length' bytes starting at position 'pos'."""
+    82	    buf = bytearray(data)
+    83	    if pos < len(buf):
+    84	        end = min(pos + length, len(buf))
+    85	        del buf[pos:end]
+    86	    if len(buf) == 0:
+    87	        buf = bytearray(b'\x00')
+    88	    return bytes(buf)
+    89	
+    90	
+    91	def insert_bytes(data: bytes, pos: int, new_bytes: bytes) -> bytes:
+    92	    """Insert new bytes at position 'pos'."""
+    93	    buf = bytearray(data)
+    94	    if pos <= len(buf):
+    95	        for i, b in enumerate(new_bytes):
+    96	            buf.insert(pos + i, b)
+    97	    return bytes(buf)
+    98	
+    99	
+   100	def havoc(data: bytes, rng: np.random.RandomState, num_mutations: int = 0) -> bytes:
+   101	    """Apply a random combination of mutations (AFL's havoc stage).
+   102	
+   103	    If num_mutations is 0, randomly choose 1-7 mutations to stack.
+   104	    """
+   105	    if num_mutations == 0:
+   106	        num_mutations = rng.randint(1, 8)
+   107	
+   108	    result = data
+   109	    for _ in range(num_mutations):
+   110	        if len(result) == 0:
+   111	            result = b'\x00'
+   112	
+   113	        op = rng.randint(0, 8)
+   114	        pos = rng.randint(0, max(1, len(result)))
+   115	
+   116	        if op == 0:
+   117	            # bit flip
+   118	            bit_pos = rng.randint(0, max(1, len(result) * 8))
+   119	            result = bit_flip(result, bit_pos)
+   120	        elif op == 1:
+   121	            # byte flip
+   122	            result = byte_flip(result, pos)
+   123	        elif op == 2:
+   124	            # arith add
+   125	            val = rng.randint(1, 36)
+   126	            result = arith_add(result, pos, val)
+   127	        elif op == 3:
+   128	            # arith sub
+   129	            val = rng.randint(1, 36)
+   130	            result = arith_sub(result, pos, val)
+   131	        elif op == 4:
+   132	            # interesting values
+   133	            result = interesting_values(result, pos, rng)
+   134	        elif op == 5:
+   135	            # random byte
+   136	            result = random_byte(result, pos, rng)
+   137	        elif op == 6:
+   138	            # delete bytes (only if input > 4 bytes)
+   139	            if len(result) > 4:
+   140	                length = rng.randint(1, min(4, len(result) - 1))
+   141	                result = delete_bytes(result, pos, length)
+   142	        elif op == 7:
+   143	            # insert random bytes
+   144	            length = rng.randint(1, 5)
+   145	            new_data = bytes(rng.randint(0, 256, size=length).astype(np.uint8))
+   146	            insert_pos = rng.randint(0, max(1, len(result)))
+   147	            result = insert_bytes(result, insert_pos, new_data)
+   148	
+   149	    return result
+   150	
+   151	
+   152	def splice(data1: bytes, data2: bytes, rng: np.random.RandomState) -> bytes:
+   153	    """Splice two test cases at a random midpoint (AFL's splice stage)."""
+   154	    if len(data1) < 2 or len(data2) < 2:
+   155	        return data1
+   156	
+   157	    min_len = min(len(data1), len(data2))
+   158	    split_pos = rng.randint(1, min_len)
+   159	
+   160	    return data1[:split_pos] + data2[split_pos:min(len(data2), len(data1))]
+=============== fuzzsim/program_model.py
+     1	"""Simulated target program with known CFG for deterministic fuzzing experiments."""
+     2	
+     3	import numpy as np
+     4	from typing import List, Set, Tuple, Dict, Optional
+     5	
+     6	
+     7	class BasicBlock:
+     8	    """A basic block in the control flow graph."""
+     9	
+    10	    def __init__(self, block_id: int, name: str = ""):
+    11	        self.block_id = block_id
+    12	        self.name = name or f"bb_{block_id}"
+    13	
+    14	
+    15	class Edge:
+    16	    """An edge in the control flow graph."""
+    17	
+    18	    def __init__(self, edge_id: int, src: int, dst: int,
+    19	                 is_crash: bool = False, is_rare: bool = False):
+    20	        self.edge_id = edge_id
+    21	        self.src = src
+    22	        self.dst = dst
+    23	        self.is_crash = is_crash
+    24	        self.is_rare = is_rare
+    25	
+    26	
+    27	class SimulatedProgram:
+    28	    """A simulated target program with a known CFG.
+    29	
+    30	    The program takes an input (bytes) and traces execution through the CFG
+    31	    based on input byte values. Returns which edges were hit.
+    32	    """
+    33	
+    34	    def __init__(self, blocks: List[BasicBlock], edges: List[Edge],
+    35	                 entry_block: int = 0, target_blocks: Optional[List[int]] = None):
+    36	        self.blocks = {b.block_id: b for b in blocks}
+    37	        self.edges = edges
+    38	        self.edge_map: Dict[Tuple[int, int], Edge] = {}
+    39	        self.adj: Dict[int, List[Edge]] = {b.block_id: [] for b in blocks}
+    40	        self.entry_block = entry_block
+    41	        self.target_blocks = target_blocks or []
+    42	
+    43	        for e in edges:
+    44	            self.edge_map[(e.src, e.dst)] = e
+    45	            self.adj[e.src].append(e)
+    46	
+    47	    def execute(self, input_data: bytes) -> Tuple[Set[int], bool, float]:
+    48	        """Execute the program on the given input.
+    49	
+    50	        Returns:
+    51	            (edges_hit, is_crash, exec_time)
+    52	            - edges_hit: set of edge IDs that were traversed
+    53	            - is_crash: whether a crash-triggering edge was hit
+    54	            - exec_time: simulated execution time (proportional to path length)
+    55	        """
+    56	        edges_hit = set()
+    57	        is_crash = False
+    58	        current_block = self.entry_block
+    59	        exec_time = 0.0
+    60	        input_pos = 0
+    61	
+    62	        max_steps = 100  # prevent infinite loops
+    63	
+    64	        for step in range(max_steps):
+    65	            outgoing = self.adj.get(current_block, [])
+    66	            if not outgoing:
+    67	                break
+    68	
+    69	            # Determine which edge to take based on input byte
+    70	            if input_pos < len(input_data):
+    71	                byte_val = input_data[input_pos]
+    72	                input_pos += 1
+    73	            else:
+    74	                byte_val = 0
+    75	
+    76	            # Select edge based on byte value modulo number of outgoing edges
+    77	            edge_idx = byte_val % len(outgoing)
+    78	            chosen_edge = outgoing[edge_idx]
+    79	
+    80	            edges_hit.add(chosen_edge.edge_id)
+    81	            exec_time += 0.001  # 1ms per edge traversal
+    82	
+    83	            if chosen_edge.is_crash:
+    84	                is_crash = True
+    85	
+    86	            current_block = chosen_edge.dst
+    87	
+    88	        return edges_hit, is_crash, exec_time
+    89	
+    90	    def get_all_edge_ids(self) -> Set[int]:
+    91	        """Return all edge IDs in the program."""
+    92	        return {e.edge_id for e in self.edges}
+    93	
+    94	    def get_crash_edges(self) -> Set[int]:
+    95	        """Return edge IDs that trigger crashes."""
+    96	        return {e.edge_id for e in self.edges if e.is_crash}
+    97	
+    98	    def get_rare_edges(self) -> Set[int]:
+    99	        """Return edge IDs that are hard to reach."""
+   100	        return {e.edge_id for e in self.edges if e.is_rare}
+   101	
+   102	    def get_shortest_distances(self, target_block_ids: List[int]) -> Dict[int, float]:
+   103	        """Compute shortest distance from each block to the nearest target block.
+   104	
+   105	        Uses BFS/Dijkstra (all edges weight 1).
+   106	        Returns dict mapping block_id -> distance (inf if unreachable).
+   107	        """
+   108	        from collections import deque
+   109	
+   110	        # Build reverse adjacency
+   111	        rev_adj: Dict[int, List[int]] = {bid: [] for bid in self.blocks}
+   112	        for e in self.edges:
+   113	            rev_adj[e.dst].append(e.src)
+   114	
+   115	        distances: Dict[int, float] = {bid: float('inf') for bid in self.blocks}
+   116	
+   117	        # BFS from each target block backwards
+   118	        queue = deque()
+   119	        for tb in target_block_ids:
+   120	            if tb in self.blocks:
+   121	                distances[tb] = 0.0
+   122	                queue.append(tb)
+   123	
+   124	        while queue:
+   125	            node = queue.popleft()
+   126	            for pred in rev_adj.get(node, []):
+   127	                new_dist = distances[node] + 1.0
+   128	                if new_dist < distances[pred]:
+   129	                    distances[pred] = new_dist
+   130	                    queue.append(pred)
+   131	
+   132	        return distances
+=============== fuzzsim/experiments/__init__.py
+=============== fuzzsim/targets/__init__.py
+=============== fuzzsim/targets/crashme.py
+     1	"""Simulated target program 'crashme' with known CFG.
+     2	
+     3	Properties:
+     4	- 20 basic blocks, 30 edges
+     5	- Multiple execution paths of varying depth
+     6	- 2 crash paths (require specific multi-byte sequences)
+     7	- Some rare edges (require specific byte values)
+     8	- Known shortest distances from each block to target blocks
+     9	"""
+    10	
+    11	from fuzzsim.program_model import SimulatedProgram, BasicBlock, Edge
+    12	from typing import Tuple, Set, Dict
+    13	import numpy as np
+    14	
+    15	
+    16	def build_crashme() -> SimulatedProgram:
+    17	    """Build the 'crashme' simulated program.
+    18	
+    19	    CFG structure (20 blocks, 30 edges):
+    20	    Block 0 (entry) -> Block 1 (byte[0] % 3 == 0)
+    21	                    -> Block 2 (byte[0] % 3 == 1)
+    22	                    -> Block 3 (byte[0] % 3 == 2)
+    23	
+    24	    Block 1 -> Block 4, Block 5
+    25	    Block 2 -> Block 6, Block 7
+    26	    Block 3 -> Block 8, Block 9
+    27	
+    28	    Block 4 -> Block 10, Block 11
+    29	    Block 5 -> Block 12
+    30	    Block 6 -> Block 13, Block 14
+    31	    Block 7 -> Block 15
+    32	    Block 8 -> Block 16, Block 17  (Block 17 = crash path 1 entry)
+    33	    Block 9 -> Block 18
+    34	
+    35	    Block 10 -> Block 19 (exit)
+    36	    Block 11 -> Block 19
+    37	    Block 12 -> Block 19
+    38	    Block 13 -> Block 19
+    39	    Block 14 -> Block 15 (rare edge)
+    40	    Block 15 -> Block 19
+    41	    Block 16 -> Block 19
+    42	    Block 17 -> Block 19 (crash edge!)
+    43	    Block 18 -> Block 17 (crash path 2 entry, rare)
+    44	    Block 19 (exit, no outgoing)
+    45	
+    46	    Target blocks: [17, 19]
+    47	    """
+    48	    blocks = [BasicBlock(i) for i in range(20)]
+    49	
+    50	    edges = [
+    51	        # From entry block 0
+    52	        Edge(0, 0, 1),
+    53	        Edge(1, 0, 2),
+    54	        Edge(2, 0, 3),
+    55	        # From block 1
+    56	        Edge(3, 1, 4),
+    57	        Edge(4, 1, 5),
+    58	        # From block 2
+    59	        Edge(5, 2, 6),
+    60	        Edge(6, 2, 7),
+    61	        # From block 3
+    62	        Edge(7, 3, 8),
+    63	        Edge(8, 3, 9),
+    64	        # From block 4
+    65	        Edge(9, 4, 10),
+    66	        Edge(10, 4, 11),
+    67	        # From block 5
+    68	        Edge(11, 5, 12),
+    69	        # From block 6
+    70	        Edge(12, 6, 13),
+    71	        Edge(13, 6, 14, is_rare=True),
+    72	        # From block 7
+    73	        Edge(14, 7, 15),
+    74	        # From block 8
+    75	        Edge(15, 8, 16),
+    76	        Edge(16, 8, 17, is_rare=True),  # rare: requires specific bytes
+    77	        # From block 9
+    78	        Edge(17, 9, 18),
+    79	        # From block 10
+    80	        Edge(18, 10, 19),
+    81	        # From block 11
+    82	        Edge(19, 11, 19),
+    83	        # From block 12
+    84	        Edge(20, 12, 19),
+    85	        # From block 13
+    86	        Edge(21, 13, 19),
+    87	        # From block 14
+    88	        Edge(22, 14, 15, is_rare=True),
+    89	        # From block 15
+    90	        Edge(23, 15, 19),
+    91	        # From block 16
+    92	        Edge(24, 16, 19),
+    93	        # From block 17 (crash!)
+    94	        Edge(25, 17, 19, is_crash=True),
+    95	        # From block 18
+    96	        Edge(26, 18, 17, is_rare=True),  # rare path to crash
+    97	        # Additional edges for more complex paths
+    98	        Edge(27, 5, 4),   # back edge for loop
+    99	        Edge(28, 12, 6),  # back edge
+   100	        Edge(29, 16, 8),  # back edge
+   101	    ]
+   102	
+   103	    target_blocks = [17, 19]
+   104	
+   105	    program = SimulatedProgram(blocks, edges, entry_block=0,
+   106	                               target_blocks=target_blocks)
+   107	    return program
+   108	
+   109	
+   110	class CrashmeProgram:
+   111	    """Wrapper around SimulatedProgram with crashme-specific execution logic.
+   112	
+   113	    Uses a more sophisticated execution model where specific byte sequences
+   114	    are needed to trigger certain paths.
+   115	    """
+   116	
+   117	    def __init__(self):
+   118	        self.program = build_crashme()
+   119	        self.total_edges = len(self.program.edges)
+   120	        self.total_blocks = len(self.program.blocks)
+   121	
+   122	    def execute(self, input_data: bytes) -> Tuple[Set[int], bool, float]:
+   123	        """Execute crashme with input-dependent path selection.
+   124	
+   125	        Path selection logic:
+   126	        - Byte 0: selects initial branch (mod 3)
+   127	        - Byte 1: selects second-level branch (mod 2)
+   128	        - Byte 2+: selects deeper branches with specific conditions
+   129	
+   130	        Crash path 1: byte[0]%3==2, byte[1]%2==0, byte[2] in [0x30..0x3F],
+   131	                       byte[3] in [0x80..0x9F]
+   132	          -> blocks 0,3,8,17,19 (crash edge 25)
+   133	        Crash path 2: byte[0]%3==2, byte[1]%2==1, byte[2]==0x4D,
+   134	                       byte[3]==0x5A, byte[4]%4==3
+   135	          -> blocks 0,3,9,18,17,19 (crash edge 25 via rare 26)
+   136	        """
+   137	        edges_hit = set()
+   138	        is_crash = False
+   139	        exec_time = 0.001  # base cost
+   140	
+   141	        if len(input_data) == 0:
+   142	            return edges_hit, False, exec_time
+   143	
+   144	        # Level 1: entry -> {1, 2, 3}
+   145	        b0 = input_data[0] if len(input_data) > 0 else 0
+   146	        branch1 = b0 % 3
+   147	
+   148	        if branch1 == 0:
+   149	            edges_hit.add(0)  # 0->1
+   150	            current = 1
+   151	        elif branch1 == 1:
+   152	            edges_hit.add(1)  # 0->2
+   153	            current = 2
+   154	        else:
+   155	            edges_hit.add(2)  # 0->3
+   156	            current = 3
+   157	
+   158	        exec_time += 0.001
+   159	
+   160	        # Level 2
+   161	        b1 = input_data[1] if len(input_data) > 1 else 0
+   162	        branch2 = b1 % 2
+   163	
+   164	        if current == 1:
+   165	            if branch2 == 0:
+   166	                edges_hit.add(3)  # 1->4
+   167	                current = 4
+   168	            else:
+   169	                edges_hit.add(4)  # 1->5
+   170	                current = 5
+   171	        elif current == 2:
+   172	            if branch2 == 0:
+   173	                edges_hit.add(5)  # 2->6
+   174	                current = 6
+   175	            else:
+   176	                edges_hit.add(6)  # 2->7
+   177	                current = 7
+   178	        elif current == 3:
+   179	            if branch2 == 0:
+   180	                edges_hit.add(7)  # 3->8
+   181	                current = 8
+   182	            else:
+   183	                edges_hit.add(8)  # 3->9
+   184	                current = 9
+   185	
+   186	        exec_time += 0.001
+   187	
+   188	        # Level 3
+   189	        b2 = input_data[2] if len(input_data) > 2 else 0
+   190	        b3 = input_data[3] if len(input_data) > 3 else 0
+   191	        b4 = input_data[4] if len(input_data) > 4 else 0
+   192	        b5 = input_data[5] if len(input_data) > 5 else 0
+   193	
+   194	        if current == 4:
+   195	            if b2 % 2 == 0:
+   196	                edges_hit.add(9)   # 4->10
+   197	                edges_hit.add(18)  # 10->19
+   198	            else:
+   199	                edges_hit.add(10)  # 4->11
+   200	                edges_hit.add(19)  # 11->19
+   201	        elif current == 5:
+   202	            edges_hit.add(11)  # 5->12
+   203	            # Loop: if byte[3] is high, take back edge
+   204	            if b3 > 200:
+   205	                edges_hit.add(27)  # 5->4 back edge
+   206	                edges_hit.add(9)   # 4->10
+   207	                edges_hit.add(18)  # 10->19
+   208	            else:
+   209	                edges_hit.add(20)  # 12->19
+   210	        elif current == 6:
+   211	            if b2 % 8 == 7:  # rare condition (1/8 chance)
+   212	                edges_hit.add(13)  # 6->14 (rare)
+   213	                edges_hit.add(22)  # 14->15 (rare)
+   214	                edges_hit.add(23)  # 15->19
+   215	            else:
+   216	                edges_hit.add(12)  # 6->13
+   217	                edges_hit.add(21)  # 13->19
+   218	        elif current == 7:
+   219	            edges_hit.add(14)  # 7->15
+   220	            edges_hit.add(23)  # 15->19
+   221	        elif current == 8:
+   222	            # Crash path 1: requires byte[2] in [0x30..0x3F] AND byte[3] in [0x80..0x9F]
+   223	            if 0x30 <= b2 <= 0x3F and 0x80 <= b3 <= 0x9F:
+   224	                edges_hit.add(16)  # 8->17 (rare)
+   225	                edges_hit.add(25)  # 17->19 (CRASH!)
+   226	                is_crash = True
+   227	            else:
+   228	                edges_hit.add(15)  # 8->16
+   229	                # Loop back edge possibility
+   230	                if b3 > 200 and b4 > 200:
+   231	                    edges_hit.add(29)  # 16->8 back edge
+   232	                    edges_hit.add(15)  # 8->16 again
+   233	                edges_hit.add(24)  # 16->19
+   234	        elif current == 9:
+   235	            edges_hit.add(17)  # 9->18
+   236	            # Crash path 2: requires byte[2]==0x4D, byte[3]==0x5A, byte[4]%4==3
+   237	            if b2 == 0x4D and b3 == 0x5A and b4 % 4 == 3:
+   238	                edges_hit.add(26)  # 18->17 (rare)
+   239	                edges_hit.add(25)  # 17->19 (CRASH!)
+   240	                is_crash = True
+   241	
+   242	        exec_time += 0.001 * len(edges_hit)
+   243	        return edges_hit, is_crash, exec_time
+   244	
+   245	    def get_total_edges(self) -> int:
+   246	        return self.total_edges
+   247	
+   248	    def get_crash_edges(self) -> Set[int]:
+   249	        return self.program.get_crash_edges()
+   250	
+   251	    def get_rare_edges(self) -> Set[int]:
+   252	        return self.program.get_rare_edges()
+   253	
+   254	    def get_target_blocks(self):
+   255	        return self.program.target_blocks
+   256	
+   257	    def get_distances(self, target_blocks=None) -> Dict[int, float]:
+   258	        if target_blocks is None:
+   259	            target_blocks = self.program.target_blocks
+   260	        return self.program.get_shortest_distances(target_blocks)
+=============== fuzzsim/targets/binutils_sim.py
+     1	"""A more complex simulated target mimicking binutils-like structure.
+     2	
+     3	Properties:
+     4	- 50 basic blocks, 80 edges
+     5	- Multiple nested conditionals
+     6	- Several crash paths of varying difficulty
+     7	- Rich set of rare edges
+     8	"""
+     9	
+    10	from fuzzsim.program_model import SimulatedProgram, BasicBlock, Edge
+    11	from typing import Tuple, Set, Dict
+    12	import numpy as np
+    13	
+    14	
+    15	def build_binutils_sim() -> SimulatedProgram:
+    16	    """Build a binutils-like simulated program with 50 blocks and 80 edges."""
+    17	    blocks = [BasicBlock(i) for i in range(50)]
+    18	
+    19	    edges = []
+    20	    edge_id = 0
+    21	
+    22	    # Layer 0: entry (block 0) branches to 4 handlers
+    23	    for dst in [1, 2, 3, 4]:
+    24	        edges.append(Edge(edge_id, 0, dst))
+    25	        edge_id += 1
+    26	
+    27	    # Layer 1: each handler branches to 2-3 sub-handlers
+    28	    # Block 1 -> 5, 6, 7
+    29	    for dst in [5, 6, 7]:
+    30	        edges.append(Edge(edge_id, 1, dst))
+    31	        edge_id += 1
+    32	    # Block 2 -> 8, 9
+    33	    for dst in [8, 9]:
+    34	        edges.append(Edge(edge_id, 2, dst))
+    35	        edge_id += 1
+    36	    # Block 3 -> 10, 11, 12
+    37	    for dst in [10, 11, 12]:
+    38	        edges.append(Edge(edge_id, 3, dst))
+    39	        edge_id += 1
+    40	    # Block 4 -> 13, 14
+    41	    for dst in [13, 14]:
+    42	        edges.append(Edge(edge_id, 4, dst))
+    43	        edge_id += 1
+    44	
+    45	    # Layer 2: deeper processing blocks
+    46	    # Block 5 -> 15, 16
+    47	    for dst in [15, 16]:
+    48	        edges.append(Edge(edge_id, 5, dst))
+    49	        edge_id += 1
+    50	    # Block 6 -> 17, 18
+    51	    for dst in [17, 18]:
+    52	        edges.append(Edge(edge_id, 6, dst))
+    53	        edge_id += 1
+    54	    # Block 7 -> 19, 20
+    55	    for dst in [19, 20]:
+    56	        is_rare = (dst == 20)
+    57	        edges.append(Edge(edge_id, 7, dst, is_rare=is_rare))
+    58	        edge_id += 1
+    59	    # Block 8 -> 21, 22
+    60	    for dst in [21, 22]:
+    61	        edges.append(Edge(edge_id, 8, dst))
+    62	        edge_id += 1
+    63	    # Block 9 -> 23, 24
+    64	    for dst in [23, 24]:
+    65	        is_rare = (dst == 24)
+    66	        edges.append(Edge(edge_id, 9, dst, is_rare=is_rare))
+    67	        edge_id += 1
+    68	    # Block 10 -> 25, 26
+    69	    for dst in [25, 26]:
+    70	        edges.append(Edge(edge_id, 10, dst))
+    71	        edge_id += 1
+    72	    # Block 11 -> 27, 28
+    73	    for dst in [27, 28]:
+    74	        edges.append(Edge(edge_id, 11, dst, is_rare=(dst == 28)))
+    75	        edge_id += 1
+    76	    # Block 12 -> 29, 30
+    77	    for dst in [29, 30]:
+    78	        edges.append(Edge(edge_id, 12, dst))
+    79	        edge_id += 1
+    80	    # Block 13 -> 31, 32
+    81	    for dst in [31, 32]:
+    82	        edges.append(Edge(edge_id, 13, dst))
+    83	        edge_id += 1
+    84	    # Block 14 -> 33, 34
+    85	    for dst in [33, 34]:
+    86	        edges.append(Edge(edge_id, 14, dst, is_rare=(dst == 34)))
+    87	        edge_id += 1
+    88	
+    89	    # Layer 3: converge to processing blocks
+    90	    # Blocks 15-34 -> blocks 35-44
+    91	    for src in range(15, 25):
+    92	        dst = 35 + (src - 15) // 2
+    93	        edges.append(Edge(edge_id, src, dst))
+    94	        edge_id += 1
+    95	    for src in range(25, 35):
+    96	        dst = 40 + (src - 25) // 2
+    97	        edges.append(Edge(edge_id, src, dst))
+    98	        edge_id += 1
+    99	
+   100	    # Layer 4: final blocks -> exit blocks
+   101	    # Blocks 35-44 -> blocks 45-49
+   102	    for src in range(35, 45):
+   103	        dst = 45 + (src - 35) // 2
+   104	        is_crash = (src in [38, 43])  # crash paths
+   105	        is_rare = (src in [37, 42])
+   106	        edges.append(Edge(edge_id, src, dst, is_crash=is_crash, is_rare=is_rare))
+   107	        edge_id += 1
+   108	
+   109	    # Back edges for loops
+   110	    edges.append(Edge(edge_id, 35, 5, is_rare=True))
+   111	    edge_id += 1
+   112	    edges.append(Edge(edge_id, 40, 10))
+   113	    edge_id += 1
+   114	    edges.append(Edge(edge_id, 42, 12))
+   115	    edge_id += 1
+   116	
+   117	    # Additional cross-edges
+   118	    edges.append(Edge(edge_id, 16, 21))
+   119	    edge_id += 1
+   120	    edges.append(Edge(edge_id, 22, 30))
+   121	    edge_id += 1
+   122	    edges.append(Edge(edge_id, 28, 33, is_rare=True))
+   123	    edge_id += 1
+   124	
+   125	    # Pad to 80 edges with additional paths
+   126	    while edge_id < 80:
+   127	        src = 45 + (edge_id % 5)
+   128	        dst = 49
+   129	        edges.append(Edge(edge_id, src, dst))
+   130	        edge_id += 1
+   131	
+   132	    target_blocks = [38, 43, 49]
+   133	    return SimulatedProgram(blocks, edges, entry_block=0,
+   134	                            target_blocks=target_blocks)
+   135	
+   136	
+   137	class BinutilsSimProgram:
+   138	    """Wrapper with binutils-sim specific execution logic."""
+   139	
+   140	    def __init__(self):
+   141	        self.program = build_binutils_sim()
+   142	        self.total_edges = len(self.program.edges)
+   143	
+   144	    def execute(self, input_data: bytes) -> Tuple[Set[int], bool, float]:
+   145	        """Execute binutils_sim with input-dependent path selection."""
+   146	        edges_hit = set()
+   147	        is_crash = False
+   148	        exec_time = 0.002
+   149	
+   150	        if len(input_data) < 2:
+   151	            return edges_hit, False, exec_time
+   152	
+   153	        # Use first bytes to navigate through layers
+   154	        b0 = input_data[0] if len(input_data) > 0 else 0
+   155	        b1 = input_data[1] if len(input_data) > 1 else 0
+   156	        b2 = input_data[2] if len(input_data) > 2 else 0
+   157	        b3 = input_data[3] if len(input_data) > 3 else 0
+   158	        b4 = input_data[4] if len(input_data) > 4 else 0
+   159	
+   160	        # Layer 0: select handler
+   161	        handler = b0 % 4
+   162	        edges_hit.add(handler)  # edge 0-3
+   163	
+   164	        # Layer 1: sub-handler selection
+   165	        if handler == 0:
+   166	            sub = b1 % 3
+   167	            edges_hit.add(4 + sub)  # edges 4-6
+   168	            current = 5 + sub
+   169	        elif handler == 1:
+   170	            sub = b1 % 2
+   171	            edges_hit.add(7 + sub)  # edges 7-8
+   172	            current = 8 + sub
+   173	        elif handler == 2:
+   174	            sub = b1 % 3
+   175	            edges_hit.add(9 + sub)  # edges 9-11
+   176	            current = 10 + sub
+   177	        else:
+   178	            sub = b1 % 2
+   179	            edges_hit.add(12 + sub)  # edges 12-13
+   180	            current = 13 + sub
+   181	
+   182	        exec_time += 0.001
+   183	
+   184	        # Layer 2: deeper processing
+   185	        layer2_base = 14
+   186	        block_offset = current - 5
+   187	        if block_offset >= 0 and block_offset < 10:
+   188	            edge_in_layer2 = layer2_base + block_offset * 2 + (b2 % 2)
+   189	            if edge_in_layer2 < len(self.program.edges):
+   190	                edges_hit.add(edge_in_layer2)
+   191	
+   192	        exec_time += 0.001
+   193	
+   194	        # Layer 3: convergence
+   195	        layer3_start = 34
+   196	        convergence_edge = layer3_start + min(b3 % 10, 9)
+   197	        if convergence_edge < len(self.program.edges):
+   198	            edges_hit.add(convergence_edge)
+   199	
+   200	        # Layer 4: final
+   201	        layer4_start = 54
+   202	        final_edge = layer4_start + min(b4 % 10, 9)
+   203	        if final_edge < len(self.program.edges):
+   204	            edge = self.program.edges[final_edge]
+   205	            edges_hit.add(final_edge)
+   206	            if edge.is_crash:
+   207	                is_crash = True
+   208	
+   209	        exec_time += 0.001 * len(edges_hit)
+   210	        return edges_hit, is_crash, exec_time
+   211	
+   212	    def get_total_edges(self) -> int:
+   213	        return self.total_edges
+   214	
+   215	    def get_crash_edges(self) -> Set[int]:
+   216	        return self.program.get_crash_edges()
+   217	
+   218	    def get_rare_edges(self) -> Set[int]:
+   219	        return self.program.get_rare_edges()

@@ -1,0 +1,1131 @@
+=============== core/ALU.v
+     1	`timescale 1ns / 1ps
+     2	
+     3	module ALU(
+     4	    input[31:0] A, B,
+     5	    input[3:0] Control,
+     6	    output[31:0] res,
+     7	    output zero, overflow
+     8	);
+     9	
+    10	    localparam ALU_ADD  = 4'b0001;
+    11	    localparam ALU_SUB  = 4'b0010;
+    12	    localparam ALU_AND  = 4'b0011;
+    13	    localparam ALU_OR   = 4'b0100;
+    14	    localparam ALU_XOR  = 4'b0101;
+    15	    localparam ALU_SLL  = 4'b0110;
+    16	    localparam ALU_SRL  = 4'b0111;
+    17	    localparam ALU_SLT  = 4'b1000;
+    18	    localparam ALU_SLTU = 4'b1001;
+    19	    localparam ALU_SRA  = 4'b1010;
+    20	    localparam ALU_Ap4  = 4'b1011;
+    21	    localparam ALU_Bout = 4'b1100;
+    22	
+    23	    // TODO: implement — compute the ALU result, zero flag, and overflow flag
+    24	    // The ALU must support: ADD, SUB, AND, OR, XOR, SLL, SRL, SLT, SLTU, SRA, A+4, B-passthrough
+    25	    // Use the Control input to select which operation to perform.
+    26	    // zero should be 1 when res is all zeros.
+    27	    // overflow should be set for signed ADD/SUB overflow.
+    28	    assign res = 32'b0;
+    29	    assign zero = 1'b0;
+    30	    assign overflow = 1'b0;
+    31	
+    32	endmodule=============== core/CtrlUnit.v
+     1	`timescale 1ns / 1ps
+     2	
+     3	
+     4	module CtrlUnit(
+     5	    input[31:0] inst,
+     6	    input cmp_res,
+     7	    output Branch, ALUSrc_A, ALUSrc_B, DatatoReg, RegWrite, mem_w,
+     8	        mem_r, rs1use, rs2use,
+     9	    output [1:0] hazard_optype,
+    10	    output [2:0] ImmSel, cmp_ctrl,
+    11	    output [3:0] ALUControl,
+    12	    output JALR, MRET,
+    13	
+    14	    output csr_rw, csr_w_imm_mux,
+    15	
+    16	    output[1:0] exp_vector
+    17	);
+    18	
+    19	    wire[6:0] funct7 = inst[31:25];
+    20	    wire[2:0] funct3 = inst[14:12];
+    21	    wire[6:0] opcode = inst[6:0];
+    22	
+    23	    wire Rop = opcode == 7'b0110011;
+    24	    wire Iop = opcode == 7'b0010011;
+    25	    wire Bop = opcode == 7'b1100011;
+    26	    wire Lop = opcode == 7'b0000011;
+    27	    wire Sop = opcode == 7'b0100011;
+    28	    wire CSRop = opcode == 7'b1110011;
+    29	
+    30	    wire funct7_0  = funct7 == 7'h0;
+    31	    wire funct7_32 = funct7 == 7'h20;
+    32	
+    33	    wire funct3_0 = funct3 == 3'h0;
+    34	    wire funct3_1 = funct3 == 3'h1;
+    35	    wire funct3_2 = funct3 == 3'h2;
+    36	    wire funct3_3 = funct3 == 3'h3;
+    37	    wire funct3_4 = funct3 == 3'h4;
+    38	    wire funct3_5 = funct3 == 3'h5;
+    39	    wire funct3_6 = funct3 == 3'h6;
+    40	    wire funct3_7 = funct3 == 3'h7;
+    41	
+    42	    wire ADD  = Rop & funct3_0 & funct7_0;
+    43	    wire SUB  = Rop & funct3_0 & funct7_32;
+    44	    wire SLL  = Rop & funct3_1 & funct7_0;
+    45	    wire SLT  = Rop & funct3_2 & funct7_0;
+    46	    wire SLTU = Rop & funct3_3 & funct7_0;
+    47	    wire XOR  = Rop & funct3_4 & funct7_0;
+    48	    wire SRL  = Rop & funct3_5 & funct7_0;
+    49	    wire SRA  = Rop & funct3_5 & funct7_32;
+    50	    wire OR   = Rop & funct3_6 & funct7_0;
+    51	    wire AND  = Rop & funct3_7 & funct7_0;
+    52	
+    53	    wire ADDI  = Iop & funct3_0;	
+    54	    wire SLTI  = Iop & funct3_2;
+    55	    wire SLTIU = Iop & funct3_3;
+    56	    wire XORI  = Iop & funct3_4;
+    57	    wire ORI   = Iop & funct3_6;
+    58	    wire ANDI  = Iop & funct3_7;
+    59	    wire SLLI  = Iop & funct3_1 & funct7_0;
+    60	    wire SRLI  = Iop & funct3_5 & funct7_0;
+    61	    wire SRAI  = Iop & funct3_5 & funct7_32;
+    62	
+    63	    wire BEQ = Bop & funct3_0;
+    64	    wire BNE = Bop & funct3_1;
+    65	    wire BLT = Bop & funct3_4;
+    66	    wire BGE = Bop & funct3_5;
+    67	    wire BLTU = Bop & funct3_6;
+    68	    wire BGEU = Bop & funct3_7;
+    69	
+    70	    wire LB =  Lop & funct3_0;
+    71	    wire LH =  Lop & funct3_1;
+    72	    wire LW =  Lop & funct3_2;
+    73	    wire LBU = Lop & funct3_4;
+    74	    wire LHU = Lop & funct3_5;
+    75	
+    76	    wire SB = Sop & funct3_0;
+    77	    wire SH = Sop & funct3_1;
+    78	    wire SW = Sop & funct3_2;
+    79	
+    80	    wire LUI   = opcode == 7'b0110111;
+    81	    wire AUIPC = opcode == 7'b0010111;
+    82	
+    83	    wire JAL  =  opcode == 7'b1101111;
+    84	    assign JALR = (opcode == 7'b1100111) && funct3_0;
+    85	
+    86	    wire CSRRW = CSRop & funct3_1;
+    87	    wire CSRRS = CSRop & funct3_2;
+    88	    wire CSRRC = CSRop & funct3_3;
+    89	    wire CSRRWI = CSRop & funct3_5;
+    90	    wire CSRRSI = CSRop & funct3_6;
+    91	    wire CSRRCI = CSRop & funct3_7;
+    92	
+    93	    assign MRET = inst == 32'b0011000_00010_00000_000_00000_1110011;
+    94	    wire ECALL = inst == 32'b0111_0011;
+    95	
+    96	    wire R_valid = AND | OR | ADD | XOR | SLL | SRL | SRA | SUB | SLT | SLTU;
+    97	    wire I_valid = ANDI | ORI | ADDI | XORI | SLLI | SRLI | SRAI | SLTI | SLTIU;
+    98	    wire B_valid = BEQ | BNE | BLT | BGE | BLTU | BGEU;
+    99	    wire L_valid = LW | LH | LB | LHU | LBU;
+   100	    wire S_valid = SW | SH | SB;
+   101	    wire CSR_valid = CSRRW | CSRRS | CSRRC | CSRRWI | CSRRSI | CSRRCI;
+   102	
+   103	
+   104	    // TODO: implement — set Branch when branch taken or unconditional jump
+   105	    assign Branch = 1'b0;
+   106	
+   107	    localparam Imm_type_I = 3'b001;
+   108	    localparam Imm_type_B = 3'b010;
+   109	    localparam Imm_type_J = 3'b011;
+   110	    localparam Imm_type_S = 3'b100;
+   111	    localparam Imm_type_U = 3'b101;
+   112	    // TODO: implement — select immediate type based on instruction
+   113	    assign ImmSel = 3'b000;
+   114	
+   115	    localparam cmp_EQ  = 3'b001;
+   116	    localparam cmp_NE  = 3'b010;
+   117	    localparam cmp_LT  = 3'b011;
+   118	    localparam cmp_LTU = 3'b100;
+   119	    localparam cmp_GE  = 3'b101;
+   120	    localparam cmp_GEU = 3'b110;
+   121	    // TODO: implement — select comparison type for cmp_32 based on branch subtype
+   122	    assign cmp_ctrl = 3'b000;
+   123	
+   124	    // TODO: implement — 1 for AUIPC/JAL/JALR (uses PC), 0 for others
+   125	    assign ALUSrc_A = 1'b0;
+   126	
+   127	    // TODO: implement — 1 for immediate-type instructions, 0 for R-type
+   128	    assign ALUSrc_B = 1'b0;
+   129	
+   130	    localparam ALU_ADD  = 4'b0001;
+   131	    localparam ALU_SUB  = 4'b0010;
+   132	    localparam ALU_AND  = 4'b0011;
+   133	    localparam ALU_OR   = 4'b0100;
+   134	    localparam ALU_XOR  = 4'b0101;
+   135	    localparam ALU_SLL  = 4'b0110;
+   136	    localparam ALU_SRL  = 4'b0111;
+   137	    localparam ALU_SLT  = 4'b1000;
+   138	    localparam ALU_SLTU = 4'b1001;
+   139	    localparam ALU_SRA  = 4'b1010;
+   140	    localparam ALU_Ap4  = 4'b1011;
+   141	    localparam ALU_Bout = 4'b1100;
+   142	    // TODO: implement — generate ALUControl signal based on instruction type
+   143	    assign ALUControl = 4'b0000;
+   144	
+   145	    // TODO: implement — DatatoReg, RegWrite, mem_w, mem_r, rs1use, rs2use
+   146	    assign DatatoReg = 1'b0;
+   147	    assign RegWrite = 1'b0;
+   148	    assign mem_w = 1'b0;
+   149	    assign mem_r = 1'b0;
+   150	    assign rs1use = 1'b0;
+   151	    assign rs2use = 1'b0;
+   152	
+   153	    localparam hazard_optype_ALU = 2'd1;
+   154	    localparam hazard_optype_LOAD = 2'd2;
+   155	    localparam hazard_optype_STORE = 2'd3;
+   156	    // TODO: implement — hazard_optype: 2'd2 for loads, 2'd1 for other writes, 2'd0 for no write
+   157	    assign hazard_optype = 2'b00;
+   158	
+   159	    // TODO: implement — CSR control signals
+   160	    assign csr_rw = 1'b0;
+   161	    assign csr_w_imm_mux = 1'b0;
+   162	
+   163	    // TODO: implement — exception vector
+   164	    assign exp_vector = 2'b00;
+   165	
+   166	endmodule=============== core/HazardDetectionUnit.v
+     1	`timescale 1ps/1ps
+     2	
+     3	module HazardDetectionUnit(
+     4	    input clk,
+     5	    input Branch_ID, rs1use_ID, rs2use_ID,
+     6	    input[1:0] hazard_optype_ID,
+     7	    input[4:0] rd_EXE, rd_MEM, rs1_ID, rs2_ID, rs2_EXE,
+     8	    output PC_EN_IF, reg_FD_stall, reg_FD_flush, reg_DE_flush,
+     9	    output forward_ctrl_ls,
+    10	    output[1:0] forward_ctrl_A, forward_ctrl_B
+    11	);
+    12	
+    13	    reg[1:0] hazard_optype_EXE, hazard_optype_MEM;
+    14	    // TODO: implement — pipeline registers for hazard_optype tracking
+    15	
+    16	    localparam hazard_optype_ALU = 2'd1;
+    17	    localparam hazard_optype_LOAD = 2'd2;
+    18	    localparam hazard_optype_STORE = 2'd3;
+    19	
+    20	    // TODO: implement hazard detection and forwarding control
+    21	    // Detect forwarding conditions for rs1 and rs2 against EXE and MEM stages.
+    22	    // Generate stall when load-use hazard is detected.
+    23	    // Generate forwarding selectors for ALU-to-ID and MEM-to-ID forwarding.
+    24	    // Generate load-store forwarding when store in EXE reads data produced by load in MEM.
+    25	
+    26	    assign PC_EN_IF = 1'b1;
+    27	    assign reg_FD_stall = 1'b0;
+    28	    assign reg_FD_flush = 1'b0;
+    29	    assign reg_DE_flush = 1'b0;
+    30	    assign forward_ctrl_A = 2'b00;
+    31	    assign forward_ctrl_B = 2'b00;
+    32	    assign forward_ctrl_ls = 1'b0;
+    33	
+    34	endmodule=============== core/ImmGen.v
+     1	`timescale 1ns / 1ps
+     2	
+     3	module ImmGen(
+     4	            input  wire [2:0] ImmSel,
+     5	            input  wire [31:0] inst_field,
+     6	            output[31:0] Imm_out
+     7	    );
+     8	    localparam Imm_type_I = 3'b001;
+     9	    localparam Imm_type_B = 3'b010;
+    10	    localparam Imm_type_J = 3'b011;
+    11	    localparam Imm_type_S = 3'b100;
+    12	    localparam Imm_type_U = 3'b101;
+    13	
+    14	    // TODO: implement — generate the sign-extended immediate value based on ImmSel
+    15	    // Must handle I-type, B-type, J-type, S-type, and U-type immediate formats
+    16	    // following the RISC-V encoding specification.
+    17	    assign Imm_out = 32'b0;
+    18	endmodule
+=============== core/RAM_B.v
+     1	`timescale 1ns / 1ps
+     2	
+     3	module RAM_B(
+     4	    input [31:0] addra,
+     5	    input clka,      // normal clock
+     6	    input[31:0] dina,
+     7	    input wea, 
+     8	    output[31:0] douta,
+     9	    output [7:0] sim_uart_char_out,
+    10	    output sim_uart_char_valid,
+    11	    input[2:0] mem_u_b_h_w
+    12	);
+    13	    localparam SIZE = 256;
+    14	    localparam ADDR_LINE = $clog2(SIZE);
+    15	    localparam SIM_UART_ADDR = 32'h10000000;
+    16	
+    17	    reg[7:0] data[0:SIZE-1];
+    18	
+    19	    initial	begin
+    20	        $readmemh("ram.mem", data);
+    21	    end
+    22	
+    23	    // TODO: implement — byte-addressable write logic
+    24	    // Write byte/halfword/word based on mem_u_b_h_w control signals.
+    25	    // mem_u_b_h_w[1]=1 means word, mem_u_b_h_w[0]=1 means halfword, otherwise byte.
+    26	    // Only write when wea is asserted. SIM_UART_ADDR writes should be excluded.
+    27	
+    28	    // TODO: implement — byte-addressable read logic with sign/zero extension
+    29	    // Read byte/halfword/word based on mem_u_b_h_w.
+    30	    // mem_u_b_h_w[2]=1 means unsigned (zero-extend), otherwise sign-extend.
+    31	    // Return 0 if address is SIM_UART_ADDR.
+    32	    assign douta = 32'b0;
+    33	
+    34	    // TODO: implement — UART simulation output
+    35	    // Detect writes to SIM_UART_ADDR, latch character data, and output via sim_uart_char_out.
+    36	    assign sim_uart_char_valid = 1'b0;
+    37	    assign sim_uart_char_out = 8'b0;
+    38	endmodule=============== core/REG_EX_MEM.v
+     1	`timescale 1ns / 1ps
+     2	//////////////////////////////////////////////////////////////////////////////////
+     3	// Company:
+     4	// Engineer:
+     5	//
+     6	// Create Date:    21:34:44 03/12/2012
+     7	// Design Name:
+     8	// Module Name:    REGS EX/MEM Latch
+     9	// Project Name:
+    10	// Target Devices:
+    11	// Tool versions:
+    12	// Description:
+    13	//
+    14	// Dependencies:
+    15	//
+    16	// Revision:
+    17	// Revision 0.01 - File Created
+    18	// Additional Comments:
+    19	//
+    20	//////////////////////////////////////////////////////////////////////////////////
+    21	
+    22	module   REG_EX_MEM(input clk,                                      //EX/MEM Latch
+    23	                    input rst,
+    24	                    input EN,                                       //流水寄存器使�?
+    25	                    input flush,                                    //异常时清除异常指令并等待中断处理(保留)�?
+    26	                    input [31:0] IR_EX,                             //当前执行指令(测试)
+    27	                    input [31:0] PCurrent_EX,                       //当前执行指令存储器指�?
+    28	                    input [31:0] ALUO_EX,                           //当前ALU执行输出：有效地�?或ALU操作
+    29	                    input [31:0] B_EX,                              //ID级读出寄存器B数据：CPU输出数据
+    30	                    input [4:0]  rs1_EX, rd_EX,                    //传�?�当前指令写目的寄存器地�?
+    31	                    input [31:0] rs1_data_EX,
+    32	                    input DatatoReg_EX,                      //传�?�当前指令REG写数据�?�道选择
+    33	                    input RegWrite_EX,                              //传�?�当前指令寄存器写信�?
+    34	                    input WR_EX,                                    //传�?�当前指令存储器读写信号
+    35	                    input[2:0] u_b_h_w_EX,
+    36	                    input mem_r_EX,
+    37	                    input csr_rw_EX,
+    38	                    input csr_w_imm_mux_EX,
+    39	                    input mret_EX,
+    40	                    input[1:0] exp_vector_EX,
+    41	
+    42	                    output reg[31:0] PCurrent_MEM,                  //锁存传�?�当前指令地�?
+    43	                    output reg[31:0] IR_MEM,                        //锁存传�?�当前指�?(测试)
+    44	                    output reg[31:0] ALUO_MEM,                      //锁存ALU操作结果：有效地�?或ALU操作
+    45	                    output reg[31:0] Datao_MEM,                     //锁存传�?�当前指令输出mem_r数据
+    46	                    output reg[4:0]  rd_MEM,                        //锁存传�?�当前指令写目的寄存器地�?
+    47	                    output reg[4:0]  rs1_MEM,
+    48	                    output reg[31:0] rs1_data_MEM,
+    49	                    output reg       DatatoReg_MEM,                 //锁存传�?�当前指令REG写数据�?�道选择
+    50	                    output reg       RegWrite_MEM,                  //锁存传�?�当前指令寄存器写信�?
+    51	                    output reg       WR_MEM,                         //锁存传�?�当前指令存储器读写信号
+    52	                    output reg[2:0]  u_b_h_w_MEM,
+    53	                    output reg       mem_r_MEM,
+    54	                    output reg       isFlushed,
+    55	                    output reg       csr_rw_MEM,
+    56	                    output reg       csr_w_imm_mux_MEM,
+    57	                    output reg       mret_MEM,
+    58	                    output reg[1:0]  exp_vector_MEM
+    59	                );
+    60	
+    61	    // TODO: implement — EX/MEM pipeline register
+    62	    // On reset: clear IR_MEM, PCurrent_MEM, rd_MEM, rs1_MEM, RegWrite_MEM, WR_MEM,
+    63	    //   mem_r_MEM, isFlushed, csr_rw_MEM, mret_MEM, exp_vector_MEM to 0.
+    64	    // When EN is asserted:
+    65	    //   - If flush: clear write signals and set isFlushed, pass PCurrent_EX to PCurrent_MEM.
+    66	    //   - Else: latch all input signals to their corresponding output registers.
+    67	
+    68	endmodule=============== core/REG_ID_EX.v
+     1	`timescale 1ns / 1ps
+     2	//////////////////////////////////////////////////////////////////////////////////
+     3	// Company:
+     4	// Engineer:
+     5	//
+     6	// Create Date:    21:34:44 03/12/2012
+     7	// Design Name:
+     8	// Module Name:    REGS ID/EX Latch
+     9	// Project Name:
+    10	// Target Devices:
+    11	// Tool versions:
+    12	// Description:
+    13	//
+    14	// Dependencies:
+    15	//
+    16	// Revision:
+    17	// Revision 0.01 - File Created
+    18	// Additional Comments:
+    19	//
+    20	//////////////////////////////////////////////////////////////////////////////////
+    21	
+    22	module    REG_ID_EX(input clk,                                         //ID/EX Latch
+    23	                    input rst,
+    24	                    input EN,                                          //流水寄存器使�?
+    25	                    input flush,                                       //数据竞争清除并等待：DStall
+    26	                    input [31:0] IR_ID,                                //当前译码指令(测试)
+    27	                    input [31:0] PCurrent_ID,                          //当前译码指令存储器指�?
+    28	                    input [4:0] rs1_addr,                               //当前指令读出寄存器A地址
+    29	                    input [4:0] rs2_addr,                               //当前指令读出寄存器B地址
+    30	                    input [31:0] rs1_data,                             //当前指令读出寄存器A数据
+    31	                    input [31:0] rs2_data,                             //当前指令读出寄存器A数据
+    32	                    input [31:0] Imm32,                                //当前指令读出并扩�?32位立即数�?
+    33	                    input [4:0]  rd_addr,                              //当前指令读出目的操作数地�?
+    34	                    input ALUSrc_A,                             //当前指令译码：ALU A通道控制
+    35	                    input ALUSrc_B,                             //当前指令译码：ALU B通道控制
+    36	                    input [3:0]  ALUC,                                 //当前指令译码：ALU操作控制
+    37	                    input DatatoReg,                            //当前指令译码：REG写数据�?�道选择
+    38	                    input RegWrite,                                    //当前指令译码：寄存器写信�?
+    39	                    input WR,                                          //当前指令译码：存储器读写信号
+    40	                    input [2:0] u_b_h_w,
+    41	                    input mem_r,
+    42	                    input csr_rw,
+    43	                    input csr_w_imm_mux,
+    44	                    input mret,
+    45	                    input[1:0] exp_vector,
+    46	
+    47	                    output reg[31:0] PCurrent_EX,                      //锁存当前译码指令地址
+    48	                    output reg[31:0] IR_EX,                            //锁存当前译码指令(测试)
+    49	                    output reg[4:0]  rs1_EX,
+    50	                    output reg[4:0]  rs2_EX,
+    51	                    output reg[31:0] A_EX,                             //锁存当前译码指令读出寄存器A数据
+    52	                    output reg[31:0] B_EX,                             //锁存当前译码指令读出寄存器B数据
+    53	                    output reg[31:0] Imm32_EX,                          //锁存当前译码指令32位立即数�?
+    54	                    output reg[4:0]  rd_EX,                            //锁存当前译码指令写目的寄存器地址
+    55	                    output reg       ALUSrc_A_EX,                      //锁存当前译码指令ALU A通道控制
+    56	                    output reg       ALUSrc_B_EX,                      //锁存当前译码指令ALU B通道控制(保留)
+    57	                    output reg[3:0]  ALUC_EX,                          //锁存当前译码指令ALU操作功能控制
+    58	                    output reg       DatatoReg_EX,                     //锁存当前译码指令REG写数据�?�道选择
+    59	                    output reg       RegWrite_EX,                      //锁存当前译码指令寄存器写信号
+    60	                    output reg       WR_EX,                            //锁存当前译码指令存储器读写信�?
+    61	                    output reg[2:0]  u_b_h_w_EX,
+    62	                    output reg       mem_r_EX,
+    63	                    output reg       isFlushed,
+    64	                    output reg       csr_rw_EX,
+    65	                    output reg       csr_w_imm_mux_EX,
+    66	                    output reg       mret_EX,
+    67	                    output reg[1:0]  exp_vector_EX
+    68	                );
+    69	
+    70	    // TODO: implement — ID/EX pipeline register
+    71	    // On reset: clear rd_EX, RegWrite_EX, WR_EX, IR_EX, PCurrent_EX, rs1_EX, rs2_EX,
+    72	    //   mem_r_EX, isFlushed, csr_rw_EX, mret_EX, exp_vector_EX to 0.
+    73	    // When EN is asserted:
+    74	    //   - If flush: insert a pipeline bubble — set IR_EX to NOP (32'h00000000), clear rd_EX,
+    75	    //     RegWrite_EX, WR_EX, mem_r_EX, csr_rw_EX, mret_EX, exp_vector_EX to 0,
+    76	    //     set isFlushed to 1, but still pass PCurrent_ID to PCurrent_EX.
+    77	    //   - Else: latch all input signals to their corresponding output registers.
+    78	
+    79	endmodule=============== core/REG_IF_ID.v
+     1	`timescale 1ns / 1ps
+     2	//////////////////////////////////////////////////////////////////////////////////
+     3	// Company:
+     4	// Engineer:
+     5	//
+     6	// Create Date:    21:34:44 03/12/2012
+     7	// Design Name:
+     8	// Module Name:    REGS IF/ID Latch
+     9	// Project Name:
+    10	// Target Devices:
+    11	// Tool versions:
+    12	// Description:
+    13	//
+    14	// Dependencies:
+    15	//
+    16	// Revision:
+    17	// Revision 0.01 - File Created
+    18	// Additional Comments:
+    19	//
+    20	//////////////////////////////////////////////////////////////////////////////////
+    21	
+    22	module    REG_IF_ID(input clk,                                      //IF/ID Latch
+    23	                    input rst,
+    24	                    input EN,                                       //流水寄存器使能
+    25	                    input Data_stall,                               //数据竞争等待
+    26	                    input flush,                                    //控制竞争清除并等待
+    27	                    input [31:0] PCOUT,                             //指令存储器指针
+    28	                    input [31:0] IR,                                //指令存储器输出
+    29	
+    30	                    output reg[31:0] IR_ID,                         //取指锁存
+    31	                    output reg[31:0] PCurrent_ID,                   //当前存在指令地址
+    32	                    output reg isFlushed
+    33	                );
+    34	
+    35	    // TODO: implement — IF/ID pipeline register
+    36	    // On reset: clear IR_ID to NOP (32'h00000013), PCurrent_ID to 0, isFlushed to 0.
+    37	    // When EN is asserted:
+    38	    //   - If Data_stall: hold current values (stall the pipeline stage)
+    39	    //   - Else if flush: replace IR_ID with NOP (32'h00000013), hold PCurrent_ID, set isFlushed
+    40	    //   - Else: latch new instruction IR and program counter PCOUT, clear isFlushed
+    41	
+    42	endmodule=============== core/REG_MEM_WB.v
+     1	`timescale 1ns / 1ps
+     2	//////////////////////////////////////////////////////////////////////////////////
+     3	// Company:
+     4	// Engineer:
+     5	//
+     6	// Create Date:    21:34:44 03/12/2012
+     7	// Design Name:
+     8	// Module Name:    REGS EX/MEM Latch
+     9	// Project Name:
+    10	// Target Devices:
+    11	// Tool versions:
+    12	// Description:
+    13	//
+    14	// Dependencies:
+    15	//
+    16	// Revision:
+    17	// Revision 0.01 - File Created
+    18	// Additional Comments:
+    19	//
+    20	//////////////////////////////////////////////////////////////////////////////////
+    21	module   REG_MEM_WB(input clk,                                      //MEM/WB Latch
+    22	                    input rst,
+    23	                    input EN,                                       //流水寄存器使能
+    24	                    input [31:0] IR_MEM,                             //当前执行指令(测试)
+    25	                    input [31:0] PCurrent_MEM,                       //当前执行指令存储器指针
+    26	                    input [31:0] ALUO_MEM,                           //当前ALU执行输出：有效地址或ALU操作
+    27	                    input [31:0] Datai,                              //MIOl输入CPU数据
+    28	                    input [4:0]  rd_MEM,                             //传递当前指令写目的寄存器地址
+    29	                    input DatatoReg_MEM,                      //传递当前指令REG写数据通道选择
+    30	                    input RegWrite_MEM,                              //传递当前指令寄存器写信号
+    31	                    input flush,
+    32	                    input [3:0]  exp_vector_MEM,
+    33	                    output reg[31:0] PCurrent_WB,                  //锁存传递当前指令地址
+    34	                    output reg[31:0] IR_WB,                        //锁存传递当前指令(测试)
+    35	                    output reg[31:0] ALUO_WB,                      //锁存ALU操作结果：有效地址或ALU操作
+    36	                    output reg[31:0] MDR_WB,                       //锁存MIO送CPU输入数据
+    37	                    output reg[4:0]  rd_WB,                        //锁存传递当前指令写目的寄存器地址
+    38	                    output reg       DatatoReg_WB,                 //锁存传递当前指令REG写数据通道选择
+    39	                    output reg       RegWrite_WB,                  //锁存传递当前指令寄存器写信号
+    40	                    output reg       isFlushed,
+    41	                    output reg[3:0]  exp_vector_WB
+    42	                );
+    43	
+    44	    // TODO: implement — MEM/WB pipeline register
+    45	    // On reset: clear rd_WB, RegWrite_WB, IR_WB, PCurrent_WB, isFlushed, exp_vector_WB to 0.
+    46	    // When EN is asserted:
+    47	    //   - If flush: clear write signals and set isFlushed, pass PCurrent_MEM to PCurrent_WB.
+    48	    //   - Else: latch all input signals to their corresponding output registers.
+    49	endmodule=============== core/ROM_D.v
+     1	`timescale 1ns / 1ps
+     2	
+     3	module ROM_D(
+     4	    input[7:0] a,
+     5	    output[31:0] spo
+     6	);
+     7	
+     8	    reg[31:0] inst_data[0:255];
+     9	
+    10	    initial	begin
+    11	        $readmemh("rom.mem", inst_data);
+    12	    end
+    13	
+    14	    assign spo = inst_data[a];
+    15	
+    16	endmodule=============== core/RV32core.v
+     1	`timescale 1ns / 1ps
+     2	
+     3	
+     4	module  RV32core(
+     5	        input debug_en,  // debug enable
+     6	        input debug_step,  // debug step clock
+     7	        input [6:0] debug_addr,  // debug address
+     8	        output[31:0] debug_data,  // debug data
+     9	        input clk,  // main clock
+    10	        input rst,  // synchronous reset
+    11	        output[31:0] wb_pc,
+    12	        output[31:0] wb_inst,
+    13	        output[31:0] mem_addr,
+    14	        output[31:0] mem_data,
+    15	        input interrupter,  // interrupt source, for future use
+    16	        
+    17	        output[7:0] sim_uart_char_out,
+    18	        output sim_uart_char_valid
+    19		);
+    20	
+    21		wire debug_clk;
+    22	
+    23		debug_clk clock(.clk(clk),.debug_en(debug_en),.debug_step(debug_step),.debug_clk(debug_clk));
+    24	
+    25	    wire Branch_ctrl, JALR, RegWrite_ctrl, mem_w_ctrl, mem_r_ctrl,
+    26	        ALUSrc_A_ctrl, ALUSrc_B_ctrl, DatatoReg_ctrl, rs1use_ctrl, rs2use_ctrl,
+    27	        MRET, csr_rw_ctrl, csr_w_imm_mux_ctrl;
+    28	    wire[1:0] hazard_optype_ctrl, exp_vector_ctrl;
+    29	    wire[2:0] ImmSel_ctrl, cmp_ctrl;
+    30	    wire[3:0] ALUControl_ctrl;
+    31	
+    32	    wire forward_ctrl_ls;
+    33	    wire[1:0] forward_ctrl_A, forward_ctrl_B;
+    34	
+    35		wire PC_EN_IF;
+    36		wire [31:0] PC_IF, next_PC_IF, PC_4_IF, inst_IF, final_PC_IF;
+    37	
+    38	    wire reg_FD_stall, reg_FD_flush, isFlushed_ID, cmp_res_ID;
+    39	    wire [31:0] jump_PC_ID, PC_ID, inst_ID, Debug_regs, rs1_data_reg, rs2_data_reg,
+    40	        Imm_out_ID, rs1_data_ID, rs2_data_ID, addA_ID;
+    41	    
+    42	    wire reg_DE_flush, isFlushed_EXE, RegWrite_EXE, mem_w_EXE, mem_r_EXE,
+    43	        ALUSrc_A_EXE, ALUSrc_B_EXE, ALUzero_EXE, ALUoverflow_EXE, DatatoReg_EXE,
+    44	        csr_rw_EXE, csr_w_imm_mux_EXE, mret_EXE;
+    45	    wire[1:0] exp_vector_EXE;
+    46	    wire[2:0] u_b_h_w_EXE;
+    47	    wire[3:0] ALUControl_EXE;
+    48	    wire[4:0] rs1_EXE, rs2_EXE, rd_EXE;
+    49	    wire[31:0] ALUout_EXE, PC_EXE, inst_EXE, rs1_data_EXE, rs2_data_EXE, Imm_EXE,
+    50	        ALUA_EXE, ALUB_EXE, Dataout_EXE;
+    51	
+    52	    wire redirect_mux_exp, reg_FD_flush_exp, reg_DE_flush_exp,
+    53	        reg_EM_flush_exp, reg_MW_flush_exp, RegWrite_cancel_exp, MemWrite_cancel_exp;
+    54	    wire[31:0] PC_redirect_exp;
+    55	    
+    56	    wire isFlushed_MEM, RegWrite_MEM, DatatoReg_MEM, mem_w_MEM, mem_r_MEM,
+    57	        csr_rw_MEM, csr_w_imm_mux_MEM, mret_MEM, l_access_fault_MEM, s_access_fault_MEM;
+    58	    wire[1:0] exp_vector_MEM;
+    59	    wire[2:0] u_b_h_w_MEM;
+    60	    wire[4:0] rs1_MEM, rd_MEM;
+    61	    wire[31:0] ALUout_MEM, PC_MEM, inst_MEM, Dataout_MEM, Datain_MEM,
+    62	        rs1_data_MEM, CSRout_MEM, RAMout_MEM;
+    63	
+    64	
+    65	    wire isFlushed_WB, RegWrite_WB, DatatoReg_WB;
+    66	    wire[3:0] exp_vector_WB;
+    67	    wire[4:0] rd_WB;
+    68	    wire [31:0] wt_data_WB, PC_WB, inst_WB, ALUout_WB, Datain_WB;
+    69	
+    70	
+    71	    // IF
+    72	    REG32 REG_PC(.clk(debug_clk),.rst(rst),.CE(PC_EN_IF),.D(next_PC_IF),.Q(PC_IF));
+    73	    
+    74	    add_32 add_IF(.a(PC_IF),.b(32'd4),.c(PC_4_IF));
+    75	
+    76	    MUX2T1_32 mux_IF(.I0(),.I1(),.s(),.o()); // TODO: connect — select between PC+4 and branch target
+    77	
+    78	    ROM_D inst_rom(.a(PC_IF[9:2]),.spo(inst_IF));
+    79	
+    80	
+    81	    // ID
+    82	    REG_IF_ID reg_IF_ID(.clk(debug_clk),.rst(rst),.EN(1'b1),.Data_stall(reg_FD_stall),
+    83	        .flush(reg_FD_flush),.PCOUT(PC_IF),.IR(inst_IF),
+    84	
+    85	        .IR_ID(inst_ID),.PCurrent_ID(PC_ID),.isFlushed(isFlushed_ID));
+    86	    
+    87	    CtrlUnit ctrl(.inst(inst_ID),.cmp_res(cmp_res_ID),.Branch(Branch_ctrl),.ALUSrc_A(ALUSrc_A_ctrl),
+    88	        .ALUSrc_B(ALUSrc_B_ctrl),.DatatoReg(DatatoReg_ctrl),.RegWrite(RegWrite_ctrl),
+    89	        .mem_w(mem_w_ctrl),.mem_r(mem_r_ctrl),.rs1use(rs1use_ctrl),.rs2use(rs2use_ctrl),
+    90	        .hazard_optype(hazard_optype_ctrl),.ImmSel(ImmSel_ctrl),.cmp_ctrl(cmp_ctrl),
+    91	        .ALUControl(ALUControl_ctrl),.JALR(JALR),.MRET(MRET),.csr_rw(csr_rw_ctrl),
+    92	        .csr_w_imm_mux(csr_w_imm_mux_ctrl),.exp_vector(exp_vector_ctrl));
+    93	    
+    94	    Regs register(.clk(debug_clk),.rst(rst),.L_S(RegWrite_WB),
+    95	        .R_addr_A(inst_ID[19:15]),.R_addr_B(inst_ID[24:20]),
+    96	        .rdata_A(rs1_data_reg),.rdata_B(rs2_data_reg),
+    97	        .Wt_addr(rd_WB),.Wt_data(wt_data_WB),
+    98	        .Debug_addr(debug_addr[4:0]),.Debug_regs(Debug_regs));
+    99	    
+   100	    ImmGen imm_gen(.ImmSel(ImmSel_ctrl),.inst_field(inst_ID),.Imm_out(Imm_out_ID));
+   101	    
+   102	    // TODO: connect forwarding muxes — forward_ctrl: 00=reg, 01=EXE result, 10=MEM ALU, 11=MEM load
+   103	    MUX4T1_32 mux_forward_A(.I0(),.I1(),.I2(),.I3(),
+   104	        .s(),.o());
+   105	
+   106	    MUX4T1_32 mux_forward_B(.I0(),.I1(),.I2(),.I3(),
+   107	        .s(),.o());
+   108	    
+   109	    MUX2T1_32 mux_branch_ID(.I0(PC_ID),.I1(rs1_data_ID),.s(JALR),.o(addA_ID));
+   110	
+   111	    add_32 add_branch_ID(.a(addA_ID),.b(Imm_out_ID),.c(jump_PC_ID));
+   112	
+   113	    cmp_32 cmp_ID(.a(rs1_data_ID),.b(rs2_data_ID),.ctrl(cmp_ctrl),.c(cmp_res_ID));
+   114	    
+   115	    HazardDetectionUnit hazard_unit(.clk(debug_clk),.Branch_ID(Branch_ctrl),.rs1use_ID(rs1use_ctrl),
+   116	        .rs2use_ID(rs2use_ctrl),.hazard_optype_ID(hazard_optype_ctrl),.rd_EXE(rd_EXE),
+   117	        .rd_MEM(rd_MEM),.rs1_ID(inst_ID[19:15]),.rs2_ID(inst_ID[24:20]),.rs2_EXE(rs2_EXE),
+   118	        .PC_EN_IF(PC_EN_IF),.reg_FD_stall(reg_FD_stall),.reg_FD_flush(reg_FD_flush),
+   119	        .reg_DE_flush(reg_DE_flush),.forward_ctrl_ls(forward_ctrl_ls),.forward_ctrl_A(forward_ctrl_A),
+   120	        .forward_ctrl_B(forward_ctrl_B));
+   121	
+   122	
+   123	    // EX
+   124	    REG_ID_EX reg_ID_EX(.clk(debug_clk),.rst(rst),.EN(1'b1),
+   125	        .flush(reg_DE_flush | isFlushed_ID),
+   126	        .IR_ID(inst_ID),.PCurrent_ID(PC_ID),.rs1_addr(inst_ID[19:15]),.rs2_addr(inst_ID[24:20]),
+   127	        .rs1_data(rs1_data_ID),.rs2_data(rs2_data_ID),.Imm32(Imm_out_ID),.rd_addr(inst_ID[11:7]),
+   128	        .ALUSrc_A(ALUSrc_A_ctrl),.ALUSrc_B(ALUSrc_B_ctrl),.ALUC(ALUControl_ctrl),.DatatoReg(DatatoReg_ctrl),
+   129	        .RegWrite(RegWrite_ctrl),.WR(mem_w_ctrl),.u_b_h_w(inst_ID[14:12]),.mem_r(mem_r_ctrl),
+   130	        .csr_rw(csr_rw_ctrl),.csr_w_imm_mux(csr_w_imm_mux_ctrl),.mret(MRET),
+   131	        .exp_vector(exp_vector_ctrl),
+   132	
+   133	        .PCurrent_EX(PC_EXE),.IR_EX(inst_EXE),.rs1_EX(rs1_EXE),.rs2_EX(rs2_EXE),
+   134	        .A_EX(rs1_data_EXE),.B_EX(rs2_data_EXE),.Imm32_EX(Imm_EXE),.rd_EX(rd_EXE),
+   135	        .ALUSrc_A_EX(ALUSrc_A_EXE),.ALUSrc_B_EX(ALUSrc_B_EXE),.ALUC_EX(ALUControl_EXE),
+   136	        .DatatoReg_EX(DatatoReg_EXE),.RegWrite_EX(RegWrite_EXE),.WR_EX(mem_w_EXE),
+   137	        .u_b_h_w_EX(u_b_h_w_EXE),.mem_r_EX(mem_r_EXE),.isFlushed(isFlushed_EXE),
+   138	        .csr_rw_EX(csr_rw_EXE),.csr_w_imm_mux_EX(csr_w_imm_mux_EXE),.mret_EX(mret_EXE),
+   139	        .exp_vector_EX(exp_vector_EXE));
+   140	    
+   141	    MUX2T1_32 mux_A_EXE(.I0(),.I1(),.s(),.o()); // TODO: connect — ALU A: register or PC
+   142	
+   143	    MUX2T1_32 mux_B_EXE(.I0(),.I1(),.s(),.o()); // TODO: connect — ALU B: register or immediate
+   144	
+   145	    ALU alu(.A(ALUA_EXE),.B(ALUB_EXE),.Control(ALUControl_EXE),
+   146	        .res(ALUout_EXE),.zero(ALUzero_EXE),.overflow(ALUoverflow_EXE));
+   147	    
+   148	    MUX2T1_32 mux_forward_EXE(.I0(),.I1(),.s(),.o()); // TODO: connect — store data forwarding from MEM
+   149	
+   150	
+   151	    // MEM
+   152	    REG_EX_MEM reg_EXE_MEM(.clk(debug_clk),.rst(rst),.EN(1'b1),.flush( isFlushed_EXE),
+   153	        .IR_EX(inst_EXE),.PCurrent_EX(PC_EXE),.ALUO_EX(ALUout_EXE),.B_EX(Dataout_EXE),
+   154	        .rd_EX(rd_EXE),.rs1_EX(rs1_EXE),.rs1_data_EX(rs1_data_EXE),.DatatoReg_EX(DatatoReg_EXE),
+   155	        .RegWrite_EX(RegWrite_EXE),.WR_EX(mem_w_EXE),.u_b_h_w_EX(u_b_h_w_EXE),.mem_r_EX(mem_r_EXE),
+   156	        .csr_rw_EX(csr_rw_EXE),.csr_w_imm_mux_EX(csr_w_imm_mux_EXE),.mret_EX(mret_EXE),
+   157	        .exp_vector_EX(exp_vector_EXE),
+   158	
+   159	        .PCurrent_MEM(PC_MEM),.IR_MEM(inst_MEM),.ALUO_MEM(ALUout_MEM),.Datao_MEM(Dataout_MEM),
+   160	        .rd_MEM(rd_MEM),.rs1_MEM(rs1_MEM),.rs1_data_MEM(rs1_data_MEM),.DatatoReg_MEM(DatatoReg_MEM),
+   161	        .RegWrite_MEM(RegWrite_MEM),.WR_MEM(mem_w_MEM),.u_b_h_w_MEM(u_b_h_w_MEM),.mem_r_MEM(mem_r_MEM),
+   162	        .isFlushed(isFlushed_MEM),.csr_rw_MEM(csr_rw_MEM),.csr_w_imm_mux_MEM(csr_w_imm_mux_MEM),
+   163	        .mret_MEM(mret_MEM),.exp_vector_MEM(exp_vector_MEM));
+   164	    
+   165	    RAM_B data_ram(.addra(ALUout_MEM),.clka(debug_clk),.dina(Dataout_MEM), 
+   166	        .wea(mem_w_MEM),.douta(Datain_MEM),.mem_u_b_h_w(u_b_h_w_MEM),
+   167	        .sim_uart_char_out(sim_uart_char_out),
+   168	        .sim_uart_char_valid(sim_uart_char_valid));
+   169	
+   170	    /*
+   171	    ExceptionUnit exp_unit(.clk(debug_clk),.rst(rst),.csr_rw_in(csr_rw_MEM),.csr_wsc_mode_in(inst_MEM[13:12]),
+   172	        .csr_w_imm_mux(csr_w_imm_mux_MEM),.csr_rw_addr_in(inst_MEM[31:20]),
+   173	        .csr_w_data_reg(rs1_data_MEM),.csr_w_data_imm(rs1_MEM),
+   174	        .csr_r_data_out(CSRout_MEM),
+   175	
+   176	        .interrupt(interrupter),
+   177	        .illegal_inst(~isFlushed_WB & exp_vector_WB[3]),
+   178	        .ecall_m(~isFlushed_WB & exp_vector_WB[2]),
+   179	        .l_access_fault(~isFlushed_WB & exp_vector_WB[1]),
+   180	        .s_access_fault(~isFlushed_WB & exp_vector_WB[0]),
+   181	        .mret(mret_MEM),
+   182	        
+   183	        .epc_cur(PC_WB),
+   184	        .epc_next(~isFlushed_MEM ? PC_MEM : ~isFlushed_EXE ? PC_EXE :
+   185	        ~isFlushed_ID ? PC_ID : PC_IF),
+   186	        .PC_redirect(PC_redirect_exp),.redirect_mux(redirect_mux_exp),
+   187	        .reg_FD_flush(reg_FD_flush_exp),.reg_DE_flush(reg_DE_flush_exp),
+   188	        .reg_EM_flush(reg_EM_flush_exp),.reg_MW_flush(reg_MW_flush_exp),
+   189	        .RegWrite_cancel(RegWrite_cancel_exp),.MemWrite_cancel(MemWrite_cancel_exp));
+   190	    
+   191	    MUX2T1_32 mux_csrout(.I0(RAMout_MEM),.I1(CSRout_MEM),.s(csr_rw_MEM),.o(Datain_MEM));
+   192	    */  
+   193	
+   194	    // WB
+   195	    REG_MEM_WB reg_MEM_WB(.clk(debug_clk),.rst(rst),.EN(1'b1),.flush( isFlushed_MEM),
+   196	        .IR_MEM(inst_MEM),.PCurrent_MEM(PC_MEM),.ALUO_MEM(ALUout_MEM),.Datai(Datain_MEM),
+   197	        .rd_MEM(rd_MEM),.DatatoReg_MEM(DatatoReg_MEM),.RegWrite_MEM(RegWrite_MEM),
+   198	        .exp_vector_MEM({exp_vector_MEM, l_access_fault_MEM, s_access_fault_MEM}),
+   199	
+   200	        .PCurrent_WB(PC_WB),.IR_WB(inst_WB),.ALUO_WB(ALUout_WB),.MDR_WB(Datain_WB),
+   201	        .rd_WB(rd_WB),.DatatoReg_WB(DatatoReg_WB),.RegWrite_WB(RegWrite_WB),
+   202	        .isFlushed(isFlushed_WB),.exp_vector_WB(exp_vector_WB));
+   203	    
+   204	    MUX2T1_32 mux_WB(.I0(ALUout_WB),.I1(Datain_WB),.s(DatatoReg_WB),.o(wt_data_WB));
+   205	
+   206	    assign wb_inst = inst_WB;
+   207	    assign wb_pc = PC_WB;
+   208	    assign mem_addr = (mem_r_MEM | mem_w_MEM) ? ALUout_MEM : 32'hFFFFFFFF ;
+   209	    assign mem_data = (mem_r_MEM | mem_w_MEM) ? Datain_MEM : 32'hAA55AA55 ;
+   210	
+   211		wire [31:0] Test_signal;
+   212		assign debug_data = debug_addr[5] ? Test_signal : Debug_regs;
+   213		
+   214	    CPUTEST    U1_3(.PC_IF(PC_IF),
+   215	                    .PC_ID(PC_ID),
+   216	                    .PC_EXE(PC_EXE),
+   217	                    .PC_MEM(PC_MEM),
+   218	                    .PC_WB(PC_WB),
+   219	                    .PC_next_IF(next_PC_IF),
+   220	                    .PCJump(jump_PC_ID),
+   221	                    .inst_IF(inst_IF),
+   222	                    .inst_ID(inst_ID),
+   223	                    .inst_EXE(inst_EXE),
+   224	                    .inst_MEM(inst_MEM),
+   225	                    .inst_WB(inst_WB),
+   226	                    .PCEN(PC_EN_IF),
+   227	                    .Branch(Branch_ctrl),
+   228	                    .PCSource(Branch_ctrl),
+   229	                    .RS1DATA(rs1_data_reg),
+   230	                    .RS2DATA(rs2_data_reg),
+   231	                    .Imm32(Imm_out_ID),
+   232	                    .ImmSel(ImmSel_ctrl),
+   233	                    .ALUC(ALUControl_ctrl),
+   234	                    .ALUSrc_A(ALUSrc_A_ctrl),
+   235	                    .ALUSrc_B(ALUSrc_B_ctrl),
+   236	                    .A(ALUA_EXE),
+   237	                    .B(ALUB_EXE),
+   238	                    .ALU_out(ALUout_MEM),
+   239	                    .Datai(Datain_MEM),
+   240	                    .Datao(Dataout_MEM),
+   241	                    .Addr(Addr),
+   242	                    .WR(MWR),
+   243	                    .MIO(mem_r_MEM),
+   244	                    .WDATA(wt_data_WB),
+   245	                    .DatatoReg(DatatoReg_WB),
+   246	                    .RegWrite(RegWrite_WB),
+   247	                    .data_hazard(reg_FD_stall),
+   248	                    .control_hazard(Branch_ctrl),
+   249	                    .exp_sig({csr_rw_MEM,2'b0,csr_w_imm_mux_MEM,
+   250	                        isFlushed_ID, isFlushed_EXE, isFlushed_MEM, isFlushed_WB,
+   251	                        interrupter,3'b0,exp_vector_WB,
+   252	                        4'b0,
+   253	                        3'b0,redirect_mux_exp,
+   254	                        reg_FD_flush_exp,reg_DE_flush_exp,reg_EM_flush_exp,reg_MW_flush_exp,
+   255	                        3'b0,RegWrite_cancel_exp}),
+   256	
+   257	                    .Debug_addr(debug_addr[4:0]),
+   258	                    .Test_signal(Test_signal)    
+   259	                    );
+   260	
+   261	endmodule
+=============== core/Regs.v
+     1	`timescale 1ns / 1ps
+     2	//////////////////////////////////////////////////////////////////////////////////
+     3	// Company: 
+     4	// Engineer: 
+     5	// 
+     6	// Create Date:    21:34:44 03/12/2012 
+     7	// Design Name: 
+     8	// Module Name:    Regs 
+     9	// Project Name: 
+    10	// Target Devices: 
+    11	// Tool versions: 
+    12	// Description: 
+    13	//
+    14	// Dependencies: 
+    15	//
+    16	// Revision: 
+    17	// Revision 0.01 - File Created
+    18	// Additional Comments: 
+    19	//
+    20	//////////////////////////////////////////////////////////////////////////////////
+    21	
+    22	module     Regs(input clk,
+    23					input rst,
+    24					input [4:0] R_addr_A, 
+    25					input [4:0] R_addr_B, 
+    26					input [4:0] Wt_addr, 
+    27					input [31:0]Wt_data, 
+    28					input L_S, 
+    29					output [31:0] rdata_A, 
+    30					output [31:0] rdata_B,
+    31					input [4:0] Debug_addr,         // debug address
+    32					output[31:0] Debug_regs        // debug data
+    33				  );
+    34	
+    35	reg [31:0] register [1:31]; 				// r1 - r31
+    36	integer i;
+    37	
+    38		// TODO: implement — register file with two read ports and one write port
+    39		// - Reading two registers simultaneously (rdata_A, rdata_B)
+    40		// - Writing one register per cycle when L_S is asserted (write to Wt_addr with Wt_data)
+    41		// - x0 always reads as 0
+    42		// - Synchronous reset clears all registers to 0
+    43		// - Debug port reads register[Debug_addr] (0 if addr is 0)
+    44		assign rdata_A = 32'b0;
+    45		assign rdata_B = 32'b0;
+    46		assign Debug_regs = 32'b0;
+    47	
+    48	endmodule
+    49	
+    50	
+=============== common/MUX2T1_32.v
+     1	`timescale 1ns / 1ps
+     2	//////////////////////////////////////////////////////////////////////////////////
+     3	// Company: 
+     4	// Engineer: 
+     5	// 
+     6	// Create Date: 2020/11/09 15:27:41
+     7	// Design Name: 
+     8	// Module Name: MUX2T1_32
+     9	// Project Name: 
+    10	// Target Devices: 
+    11	// Tool Versions: 
+    12	// Description: 
+    13	// 
+    14	// Dependencies: 
+    15	// 
+    16	// Revision:
+    17	// Revision 0.01 - File Created
+    18	// Additional Comments:
+    19	// 
+    20	//////////////////////////////////////////////////////////////////////////////////
+    21	
+    22	
+    23	module MUX2T1_32(input[31:0]I0,
+    24					 input[31:0]I1,
+    25					 input s,
+    26					 output[31:0]o
+    27	
+    28	    );
+    29	    assign o = s ? I1 : I0;
+    30	endmodule
+=============== common/MUX4T1_32.v
+     1	`timescale 1ns / 1ps
+     2	//////////////////////////////////////////////////////////////////////////////////
+     3	// Company: 
+     4	// Engineer: 
+     5	// 
+     6	// Create Date: 2020/11/09 15:47:19
+     7	// Design Name: 
+     8	// Module Name: MUX4T1_32
+     9	// Project Name: 
+    10	// Target Devices: 
+    11	// Tool Versions: 
+    12	// Description: 
+    13	// 
+    14	// Dependencies: 
+    15	// 
+    16	// Revision:
+    17	// Revision 0.01 - File Created
+    18	// Additional Comments:
+    19	// 
+    20	//////////////////////////////////////////////////////////////////////////////////
+    21	
+    22	
+    23	module MUX4T1_32(
+    24	    input [1:0]s,
+    25	    input [31:0]I0, I1, I2, I3,
+    26	    output [31:0]o
+    27	    );
+    28	
+    29	    wire s0 = s == 2'b00;
+    30	    wire s1 = s == 2'b01;
+    31	    wire s2 = s == 2'b10;
+    32	    wire s3 = s == 2'b11;
+    33	    
+    34	    assign o =  {32{s0}} & I0 |
+    35	                {32{s1}} & I1 |
+    36	                {32{s2}} & I2 |
+    37	                {32{s3}} & I3 ;
+    38	endmodule
+=============== common/REG32.v
+     1	`timescale 1ns / 1ps
+     2	//////////////////////////////////////////////////////////////////////////////////
+     3	// Company: 
+     4	// Engineer: 
+     5	// 
+     6	// Create Date: 2021/02/18 12:57:09
+     7	// Design Name: 
+     8	// Module Name: REG32
+     9	// Project Name: 
+    10	// Target Devices: 
+    11	// Tool Versions: 
+    12	// Description: 
+    13	// 
+    14	// Dependencies: 
+    15	// 
+    16	// Revision:
+    17	// Revision 0.01 - File Created
+    18	// Additional Comments:
+    19	// 
+    20	//////////////////////////////////////////////////////////////////////////////////
+    21	
+    22	
+    23	module REG32(
+    24	                    input clk,
+    25						input rst,
+    26						input CE,
+    27						input [31:0]D,
+    28						output reg[31:0]Q
+    29						);
+    30						
+    31		always @(posedge clk or posedge rst)
+    32			if (rst)  Q <= 32'h00000000;
+    33			else if (CE) Q <= D;
+    34	
+    35	endmodule
+=============== common/add_32.v
+     1	`timescale 1ns / 1ps
+     2	//////////////////////////////////////////////////////////////////////////////////
+     3	// Company: 
+     4	// Engineer: 
+     5	// 
+     6	// Create Date: 2020/11/09 16:03:56
+     7	// Design Name: 
+     8	// Module Name: add_32
+     9	// Project Name: 
+    10	// Target Devices: 
+    11	// Tool Versions: 
+    12	// Description: 
+    13	// 
+    14	// Dependencies: 
+    15	// 
+    16	// Revision:
+    17	// Revision 0.01 - File Created
+    18	// Additional Comments:
+    19	// 
+    20	//////////////////////////////////////////////////////////////////////////////////
+    21	
+    22	
+    23	module add_32(    input [31:0] a, 
+    24					  input [31:0] b, 
+    25					  output [31:0]c
+    26	
+    27	
+    28	    );
+    29	    assign c=a+b;
+    30	endmodule
+=============== common/cmp_32.v
+     1	`timescale 1ns / 1ps
+     2	
+     3	module cmp_32(  input [31:0] a,
+     4	                input [31:0] b,
+     5	                input [2:0] ctrl,
+     6	                output c
+     7	    );
+     8	    localparam cmp_EQ  = 3'b001;
+     9	    localparam cmp_NE  = 3'b010;
+    10	    localparam cmp_LT  = 3'b011;
+    11	    localparam cmp_LTU = 3'b100;
+    12	    localparam cmp_GE  = 3'b101;
+    13	    localparam cmp_GEU = 3'b110;
+    14	
+    15	    wire res_EQ  = a == b;
+    16	    wire res_NE  = ~res_EQ;
+    17	    wire res_LT  = (a[31] & ~b[31]) || (~(a[31] ^ b[31]) && a < b);
+    18	    wire res_LTU = a < b;
+    19	    wire res_GE  = ~res_LT;
+    20	    wire res_GEU = ~res_LTU;
+    21	
+    22	    wire EQ  = ctrl == cmp_EQ ; 
+    23	    wire NE  = ctrl == cmp_NE ; 
+    24	    wire LT  = ctrl == cmp_LT ; 
+    25	    wire LTU = ctrl == cmp_LTU;
+    26	    wire GE  = ctrl == cmp_GE ; 
+    27	    wire GEU = ctrl == cmp_GEU;
+    28	
+    29	    // TODO: implement — select correct comparison result based on ctrl
+    30	    assign c = 1'b0;
+    31	    
+    32	
+    33	endmodule=============== sim/core_sim.v
+     1	`timescale 1ns / 1ps
+     2	
+     3	module core_sim;
+     4	    reg clk, rst;
+     5	
+     6	    RV32core core(
+     7	        .debug_en(1'b0),
+     8	        .debug_step(1'b0),
+     9	        .debug_addr(7'b0),
+    10	        .debug_data(),
+    11	        .clk(clk),
+    12	        .rst(rst),
+    13	        .interrupter(1'b0)
+    14	    );
+    15	
+    16	    initial begin
+    17	        clk = 0;
+    18	        rst = 1;
+    19	        #2 rst = 0;
+    20	    end
+    21	    always #1 clk = ~clk;
+    22	
+    23	endmodule=============== README.md
+     1	# Computer Architecture lab3
+     2	
+     3	框架结构
+     4	
+     5	```bash
+     6	.
+     7	├── README.md
+     8	├── auxillary
+     9	│   ├── CPUTEST.v
+    10	│   ├── UART_TX_CTRL.vhd
+    11	│   ├── btn_scan.v
+    12	│   ├── debug_clk.v
+    13	│   ├── debug_ctrl.v
+    14	│   ├── display.v
+    15	│   ├── function.vh
+    16	│   ├── my_clk_gen.v
+    17	│   ├── parallel2serial.v
+    18	│   ├── top.v
+    19	│   └── uart_buffer.v
+    20	├── common
+    21	│   ├── MUX2T1_32.v
+    22	│   ├── MUX4T1_32.v
+    23	│   ├── REG32.v
+    24	│   ├── add_32.v
+    25	│   └── cmp_32.v
+    26	├── constraint.xdc
+    27	├── core
+    28	│   ├── ALU.v
+    29	│   ├── CtrlUnit.v
+    30	│   ├── HazardDetectionUnit.v
+    31	│   ├── ImmGen.v
+    32	│   ├── RAM_B.v
+    33	│   ├── REG_EX_MEM.v
+    34	│   ├── REG_ID_EX.v
+    35	│   ├── REG_IF_ID.v
+    36	│   ├── REG_MEM_WB.v
+    37	│   ├── ROM_D.v
+    38	│   ├── RV32core.v
+    39	│   ├── Regs.v
+    40	│   ├── ram.mem
+    41	│   └── rom.mem
+    42	├── lab3_ref
+    43	│   ├── obj
+    44	│   │   ├── sort-riscv32-cpu.elf
+    45	│   │   └── sort-riscv32-cpu.txt
+    46	│   └── src
+    47	│       └── sort.c
+    48	└── sim
+    49	    ├── README.md
+    50	    ├── core_sim.v
+    51	    ├── core_sim_behav.wcfg
+    52	    └── example.png
+    53	```
+    54	
+    55	创建 vivado 工程，将 `auxillary`, `common`, `core` 三个文件夹的文件作为 design source 添加，将 `sim` 文件夹下的 `.v` 和 `.wcfg` 文件作为 simulation source 添加，将 `constraint.xdc` 作为 constraints 添加。
+    56	
+    57	`lab3_ref/` 中有本次实验用于测试的排序算法的源代码和汇编代码。上板时请将 SW8 和 SW13 调至高电平，以在串口输出打印的结果，其他开关保持在低电平（注意不要开启用于单步调试的 SW0）
+    58	
+    59	
+    60	`.mem` 文件需要添加到 vivado 工程中，在 add source 时若使用 add Directories 添加源文件可能会导致 `.mem` 文件未被成功添加，如果遇到仿真上板时没有读取到数据，请确认 `.mem` 文件已经添加且路径正确。
+    61	
+    62	ROM 和 RAM 读取 `.mem` 文件的格式如下
+    63	
+    64	```verilog
+    65	    reg[31:0] data [0:X];
+    66	    initial	begin
+    67	        $readmemh("XXX", data);
+    68	    end
+    69	```
+    70	
+    71	其中 `XXX` 是初始化文件的路径，若为相对路径则是相对于相关的源文件（如 `ROM_D.v`）的路径。在框架中我们默认 `RAM_B.v` 和 `ROM_D.v` 与其对应的 `.mem` 文件在同一目录下，若你的文件结构有变化则需要自行修改 `ROM_D.v` 和 `RAM_B.v` 中的初始化路径。=============== sim/README.md
+     1	To simulate, the ROM and RAM should be implemented like:
+     2	
+     3	```verilog
+     4		reg[31:0] data [0:X];
+     5	    initial	begin
+     6	        $readmemh("XXX", data);
+     7	    end
+     8	```
+     9	
+    10	"XXX" is the initialization file with path. If written in relative form, the path is relative to the source file (like `ROM.v`) in Synthesis and to the `$(ProjectName).sim\sim_x\behav\xsim\.` in Simulation.

@@ -1,0 +1,22 @@
+Fixed. Both `ASCIIUsernameValidator` and `UnicodeUsernameValidator` now use `r'\A[\w.@+-]+\Z'`.
+
+**The change** (`django/contrib/auth/validators.py`): `^`/`$` → `\A`/`\Z` in both validators. `$` matches at a trailing newline, so `"joe\n"` passed; `\Z` anchors to the true end of string.
+
+**Verified behaviorally**, not just via tests — exercised both validators directly:
+
+| input | before | after |
+|---|---|---|
+| `'joe'` | accepted | accepted |
+| `'joe\n'` | **accepted (bug)** | rejected |
+| `'joe\nbad'`, `'jo\ne'` | rejected | rejected |
+
+Confirmed the old pattern matched `'joe\n'` (`True`) and the new one does not (`False`), so the added assertions are meaningful rather than vacuously passing.
+
+**Tests** (`tests/auth_tests/test_validators.py`): added `'trailingnewline\n'` to `invalid_usernames` in both `test_unicode_validator` and `test_ascii_validator`.
+
+**Suites run** — all green: `auth_tests` (494), `validators` + `forms_tests.tests.test_validators` (16), and `auth_tests migrations model_forms admin_views.test_forms` (1167).
+
+Two notes on scope:
+
+- **No migration needed.** The validators are `@deconstructible` classes, so `AbstractUser.username`'s migration state serializes the class path, not the regex literal — changing `regex` doesn't alter the deconstructed form and won't provoke a spurious `makemigrations` diff. `migrations` and `model_forms` passing supports this.
+- **This is a behavior change for existing data.** Stored usernames with a trailing newline (accepted by prior versions) will now fail validation on next form save. Upstream Django treated this as an intentional backwards-incompatible fix and called it out in the 3.0 release notes; I did not add a release note here since the tree has no entry for this ticket — say the word if you want one in `docs/releases/`.

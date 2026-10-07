@@ -1,0 +1,616 @@
+diff --git a/django/contrib/auth/backends.py b/django/contrib/auth/backends.py
+index f4b1722757..a3765ae0f1 100644
+--- a/django/contrib/auth/backends.py
++++ b/django/contrib/auth/backends.py
+@@ -39,6 +39,8 @@ class ModelBackend(BaseBackend):
+     def authenticate(self, request, username=None, password=None, **kwargs):
+         if username is None:
+             username = kwargs.get(UserModel.USERNAME_FIELD)
++        if username is None or password is None:
++            return
+         try:
+             user = UserModel._default_manager.get_by_natural_key(username)
+         except UserModel.DoesNotExist:
+diff --git a/nullapp/__init__.py b/nullapp/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/nullapp/models.py b/nullapp/models.py
+new file mode 100644
+index 0000000000..34ec4a5437
+--- /dev/null
++++ b/nullapp/models.py
+@@ -0,0 +1,10 @@
++
++from django.db import models
++from django.contrib.auth.base_user import AbstractBaseUser, BaseUserManager
++
++class NullUser(AbstractBaseUser):
++    username = models.CharField(max_length=50, unique=True, null=True)
++    USERNAME_FIELD = 'username'
++    objects = BaseUserManager()
++    class Meta:
++        app_label = 'nullapp'
+diff --git a/nullprobe.py b/nullprobe.py
+new file mode 100644
+index 0000000000..9e12c03b6f
+--- /dev/null
++++ b/nullprobe.py
+@@ -0,0 +1,97 @@
++import django
++from django.conf import settings
++
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 'nullapp'],
++    AUTH_USER_MODEL='nullapp.NullUser',
++    AUTHENTICATION_BACKENDS=['django.contrib.auth.backends.ModelBackend'],
++    PASSWORD_HASHERS=['django.contrib.auth.hashers.MD5PasswordHasher'],
++    USE_TZ=True,
++)
++
++# create a fake app package on the fly
++import sys, types, os
++pkg = types.ModuleType('nullapp')
++pkg.__path__ = ['/workspace/nullapp']
++sys.modules['nullapp'] = pkg
++os.makedirs('/workspace/nullapp', exist_ok=True)
++open('/workspace/nullapp/__init__.py', 'w').close()
++with open('/workspace/nullapp/models.py', 'w') as f:
++    f.write('''
++from django.db import models
++from django.contrib.auth.base_user import AbstractBaseUser, BaseUserManager
++
++class NullUser(AbstractBaseUser):
++    username = models.CharField(max_length=50, unique=True, null=True)
++    USERNAME_FIELD = 'username'
++    objects = BaseUserManager()
++    class Meta:
++        app_label = 'nullapp'
++''')
++
++django.setup()
++
++from django.db import connection
++from nullapp.models import NullUser
++from django.contrib.auth import authenticate
++from django.contrib.auth.backends import ModelBackend
++import inspect
++
++print("PATCH PRESENT IN SOURCE?:", 'if username is None or password is None' in
++      inspect.getsource(ModelBackend.authenticate))
++
++with connection.schema_editor() as se:
++    se.create_model(NullUser)
++
++u = NullUser(username=None)
++u.set_password('secret')
++u.save()
++print("created row pk=%s username=%r" % (u.pk, u.username))
++
++def run(label, **creds):
++    from django.db import reset_queries
++    reset_queries()
++    try:
++        res = authenticate(None, **creds)
++        print("%-40s -> %r  (queries=%d)" % (label, res and (res.pk, res.username), len(connection.queries)))
++        for q in connection.queries:
++            print("      SQL:", q['sql'])
++    except Exception as e:
++        print("%-40s -> RAISED %s: %s (queries=%d)" % (label, type(e).__name__, e, len(connection.queries)))
++        for q in connection.queries:
++            print("      SQL:", q['sql'])
++
++print("\n--- POST-PATCH (current source) ---")
++run("password only, no username", password='secret')
++run("no credentials at all")
++run("username only", username=None)
++
++# Now monkeypatch to simulate PRE-PATCH behavior
++def prepatch_authenticate(self, request, username=None, password=None, **kwargs):
++    if username is None:
++        username = kwargs.get(NullUser.USERNAME_FIELD)
++    try:
++        user = NullUser._default_manager.get_by_natural_key(username)
++    except NullUser.DoesNotExist:
++        NullUser().set_password(password)
++    else:
++        if user.check_password(password) and self.user_can_authenticate(user):
++            return user
++
++ModelBackend.authenticate = prepatch_authenticate
++print("\n--- PRE-PATCH (guard removed) ---")
++run("password only, no username", password='secret')
++run("password only, WRONG password", password='wrong')
++run("no credentials at all")
++
++# add a second NULL-username row
++u2 = NullUser(username=None)
++u2.set_password('secret')
++u2.save()
++print("\nsecond NULL row pk=%s; total NULL rows=%d" % (u2.pk, NullUser.objects.filter(username=None).count()))
++print("--- PRE-PATCH with two NULL rows ---")
++run("password only, no username", password='secret')
++
++ModelBackend.authenticate = ModelBackend.__dict__.get('authenticate')
+diff --git a/prepatch_backends.py b/prepatch_backends.py
+new file mode 100644
+index 0000000000..a3765ae0f1
+--- /dev/null
++++ b/prepatch_backends.py
+@@ -0,0 +1,210 @@
++import inspect
++import warnings
++
++from django.contrib.auth import get_user_model
++from django.contrib.auth.models import Permission
++from django.utils.deprecation import RemovedInDjango31Warning
++
++UserModel = get_user_model()
++
++
++class BaseBackend:
++    def authenticate(self, request, **kwargs):
++        return None
++
++    def get_user(self, user_id):
++        return None
++
++    def get_user_permissions(self, user_obj, obj=None):
++        return set()
++
++    def get_group_permissions(self, user_obj, obj=None):
++        return set()
++
++    def get_all_permissions(self, user_obj, obj=None):
++        return {
++            *self.get_user_permissions(user_obj, obj=obj),
++            *self.get_group_permissions(user_obj, obj=obj),
++        }
++
++    def has_perm(self, user_obj, perm, obj=None):
++        return perm in self.get_all_permissions(user_obj, obj=obj)
++
++
++class ModelBackend(BaseBackend):
++    """
++    Authenticates against settings.AUTH_USER_MODEL.
++    """
++
++    def authenticate(self, request, username=None, password=None, **kwargs):
++        if username is None:
++            username = kwargs.get(UserModel.USERNAME_FIELD)
++        if username is None or password is None:
++            return
++        try:
++            user = UserModel._default_manager.get_by_natural_key(username)
++        except UserModel.DoesNotExist:
++            # Run the default password hasher once to reduce the timing
++            # difference between an existing and a nonexistent user (#20760).
++            UserModel().set_password(password)
++        else:
++            if user.check_password(password) and self.user_can_authenticate(user):
++                return user
++
++    def user_can_authenticate(self, user):
++        """
++        Reject users with is_active=False. Custom user models that don't have
++        that attribute are allowed.
++        """
++        is_active = getattr(user, 'is_active', None)
++        return is_active or is_active is None
++
++    def _get_user_permissions(self, user_obj):
++        return user_obj.user_permissions.all()
++
++    def _get_group_permissions(self, user_obj):
++        user_groups_field = get_user_model()._meta.get_field('groups')
++        user_groups_query = 'group__%s' % user_groups_field.related_query_name()
++        return Permission.objects.filter(**{user_groups_query: user_obj})
++
++    def _get_permissions(self, user_obj, obj, from_name):
++        """
++        Return the permissions of `user_obj` from `from_name`. `from_name` can
++        be either "group" or "user" to return permissions from
++        `_get_group_permissions` or `_get_user_permissions` respectively.
++        """
++        if not user_obj.is_active or user_obj.is_anonymous or obj is not None:
++            return set()
++
++        perm_cache_name = '_%s_perm_cache' % from_name
++        if not hasattr(user_obj, perm_cache_name):
++            if user_obj.is_superuser:
++                perms = Permission.objects.all()
++            else:
++                perms = getattr(self, '_get_%s_permissions' % from_name)(user_obj)
++            perms = perms.values_list('content_type__app_label', 'codename').order_by()
++            setattr(user_obj, perm_cache_name, {"%s.%s" % (ct, name) for ct, name in perms})
++        return getattr(user_obj, perm_cache_name)
++
++    def get_user_permissions(self, user_obj, obj=None):
++        """
++        Return a set of permission strings the user `user_obj` has from their
++        `user_permissions`.
++        """
++        return self._get_permissions(user_obj, obj, 'user')
++
++    def get_group_permissions(self, user_obj, obj=None):
++        """
++        Return a set of permission strings the user `user_obj` has from the
++        groups they belong.
++        """
++        return self._get_permissions(user_obj, obj, 'group')
++
++    def get_all_permissions(self, user_obj, obj=None):
++        if not user_obj.is_active or user_obj.is_anonymous or obj is not None:
++            return set()
++        if not hasattr(user_obj, '_perm_cache'):
++            user_obj._perm_cache = super().get_all_permissions(user_obj)
++        return user_obj._perm_cache
++
++    def has_perm(self, user_obj, perm, obj=None):
++        return user_obj.is_active and super().has_perm(user_obj, perm, obj=obj)
++
++    def has_module_perms(self, user_obj, app_label):
++        """
++        Return True if user_obj has any permissions in the given app_label.
++        """
++        return user_obj.is_active and any(
++            perm[:perm.index('.')] == app_label
++            for perm in self.get_all_permissions(user_obj)
++        )
++
++    def get_user(self, user_id):
++        try:
++            user = UserModel._default_manager.get(pk=user_id)
++        except UserModel.DoesNotExist:
++            return None
++        return user if self.user_can_authenticate(user) else None
++
++
++class AllowAllUsersModelBackend(ModelBackend):
++    def user_can_authenticate(self, user):
++        return True
++
++
++class RemoteUserBackend(ModelBackend):
++    """
++    This backend is to be used in conjunction with the ``RemoteUserMiddleware``
++    found in the middleware module of this package, and is used when the server
++    is handling authentication outside of Django.
++
++    By default, the ``authenticate`` method creates ``User`` objects for
++    usernames that don't already exist in the database.  Subclasses can disable
++    this behavior by setting the ``create_unknown_user`` attribute to
++    ``False``.
++    """
++
++    # Create a User object if not already in the database?
++    create_unknown_user = True
++
++    def authenticate(self, request, remote_user):
++        """
++        The username passed as ``remote_user`` is considered trusted. Return
++        the ``User`` object with the given username. Create a new ``User``
++        object if ``create_unknown_user`` is ``True``.
++
++        Return None if ``create_unknown_user`` is ``False`` and a ``User``
++        object with the given username is not found in the database.
++        """
++        if not remote_user:
++            return
++        user = None
++        username = self.clean_username(remote_user)
++
++        # Note that this could be accomplished in one try-except clause, but
++        # instead we use get_or_create when creating unknown users since it has
++        # built-in safeguards for multiple threads.
++        if self.create_unknown_user:
++            user, created = UserModel._default_manager.get_or_create(**{
++                UserModel.USERNAME_FIELD: username
++            })
++            if created:
++                args = (request, user)
++                try:
++                    inspect.getcallargs(self.configure_user, request, user)
++                except TypeError:
++                    args = (user,)
++                    warnings.warn(
++                        'Update %s.configure_user() to accept `request` as '
++                        'the first argument.'
++                        % self.__class__.__name__, RemovedInDjango31Warning
++                    )
++                user = self.configure_user(*args)
++        else:
++            try:
++                user = UserModel._default_manager.get_by_natural_key(username)
++            except UserModel.DoesNotExist:
++                pass
++        return user if self.user_can_authenticate(user) else None
++
++    def clean_username(self, username):
++        """
++        Perform any cleaning on the "username" prior to using it to get or
++        create the user object.  Return the cleaned username.
++
++        By default, return the username unchanged.
++        """
++        return username
++
++    def configure_user(self, request, user):
++        """
++        Configure a user after creation and return the updated user.
++
++        By default, return the user unmodified.
++        """
++        return user
++
++
++class AllowAllUsersRemoteUserBackend(RemoteUserBackend):
++    def user_can_authenticate(self, user):
++        return True
+diff --git a/probe.py b/probe.py
+new file mode 100644
+index 0000000000..113b66b37a
+--- /dev/null
++++ b/probe.py
+@@ -0,0 +1,7 @@
++# 1) Pure Python binding semantics for the new test's literal 'username' key
++def sig(request, username=None, password=None, **kwargs):
++    return username, password, kwargs
++print("bind {'username': 'test@example.com'} ->", sig(None, **{'username': 'test@example.com'}))
++print("bind {'email': 'test@example.com'}    ->", sig(None, **{'email': 'test@example.com'}))
++print("bind {}                              ->", sig(None))
++print("bind {'password': 'test'}             ->", sig(None, **{'password': 'test'}))
+diff --git a/probe2.py b/probe2.py
+new file mode 100644
+index 0000000000..39dda04ca7
+--- /dev/null
++++ b/probe2.py
+@@ -0,0 +1,40 @@
++import re
++src = open('/testbed/django/contrib/auth/backends.py').read()
++open('/workspace/prepatch_backends.py','w').write(src)
++
++import django
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 'nullapp'],
++    AUTH_USER_MODEL='nullapp.NullUser',
++    AUTHENTICATION_BACKENDS=['django.contrib.auth.backends.ModelBackend'],
++    PASSWORD_HASHERS=['django.contrib.auth.hashers.MD5PasswordHasher'],
++    USE_TZ=True,
++)
++import sys, types
++pkg = types.ModuleType('nullapp'); pkg.__path__=['/workspace/nullapp']; sys.modules['nullapp']=pkg
++django.setup()
++from django.db import connection
++from nullapp.models import NullUser
++from django.contrib.auth import authenticate
++from django.contrib.auth.backends import ModelBackend
++with connection.schema_editor() as se: se.create_model(NullUser)
++u = NullUser(username=None); u.set_password('secret'); u.save()
++
++def prepatch(self, request, username=None, password=None, **kwargs):
++    if username is None:
++        username = kwargs.get(NullUser.USERNAME_FIELD)
++    try:
++        user = NullUser._default_manager.get_by_natural_key(username)
++    except NullUser.DoesNotExist:
++        NullUser().set_password(password)
++    else:
++        if user.check_password(password) and self.user_can_authenticate(user):
++            return user
++ModelBackend.authenticate = prepatch
++
++# realistic "credentials meant for another backend" shape
++r = authenticate(None, password='secret', token='abc123', device_id='42')
++print("PRE-PATCH authenticate(password=..., token=..., device_id=...) ->", r and (r.pk, r.username), "backend=", getattr(r,'backend',None))
+diff --git a/probe2/probeapp/__init__.py b/probe2/probeapp/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/probe2/probeapp/models.py b/probe2/probeapp/models.py
+new file mode 100644
+index 0000000000..03c55e507d
+--- /dev/null
++++ b/probe2/probeapp/models.py
+@@ -0,0 +1,16 @@
++from django.contrib.auth.base_user import AbstractBaseUser, BaseUserManager
++
++
++class EmailUserManager(BaseUserManager):
++    def create_user(self, email, password):
++        u = self.model(email=email)
++        u.set_password(password)
++        u.save()
++        return u
++
++
++class EmailUser(AbstractBaseUser):
++    from django.db import models as _m
++    email = _m.EmailField(unique=True)
++    USERNAME_FIELD = 'email'
++    objects = EmailUserManager()
+diff --git a/probe2/run.py b/probe2/run.py
+new file mode 100644
+index 0000000000..d9d2d7c96a
+--- /dev/null
++++ b/probe2/run.py
+@@ -0,0 +1,70 @@
++import django
++from django.conf import settings
++
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 'probeapp'],
++    AUTH_USER_MODEL='probeapp.EmailUser',
++    AUTHENTICATION_BACKENDS=['django.contrib.auth.backends.ModelBackend'],
++    PASSWORD_HASHERS=['django.contrib.auth.hashers.MD5PasswordHasher'],
++    USE_TZ=False,
++)
++django.setup()
++from django.core.management import call_command
++call_command('migrate', run_syncdb=True, verbosity=0)
++
++from django.contrib.auth import authenticate, get_user_model, hashers
++from django.contrib.auth.backends import ModelBackend
++from django.db import connection, reset_queries
++
++UserModel = get_user_model()
++u = UserModel.objects.create_user('test@example.com', 'test')
++
++# Count real hasher invocations (encode/verify), independent of the test's counter.
++hash_calls = []
++_orig_encode = hashers.MD5PasswordHasher.encode
++_orig_verify = hashers.MD5PasswordHasher.verify
++hashers.MD5PasswordHasher.encode = lambda self, *a, **k: (hash_calls.append('encode'), _orig_encode(self, *a, **k))[1]
++hashers.MD5PasswordHasher.verify = lambda self, *a, **k: (hash_calls.append('verify'), _orig_verify(self, *a, **k))[1]
++
++PATCHED = ModelBackend.authenticate
++
++
++def UNPATCHED(self, request, username=None, password=None, **kwargs):
++    if username is None:
++        username = kwargs.get(UserModel.USERNAME_FIELD)
++    try:
++        user = UserModel._default_manager.get_by_natural_key(username)
++    except UserModel.DoesNotExist:
++        UserModel().set_password(password)
++    else:
++        if user.check_password(password) and self.user_can_authenticate(user):
++            return user
++
++
++CASES = [
++    ("{}", {}),
++    ("{'username': <email value>}  <-- new test line 234", {'username': 'test@example.com'}),
++    ("{'password': 'test'}", {'password': 'test'}),
++    ("{USERNAME_FIELD: value}  <-- MISSING case", {'email': 'test@example.com'}),
++    ("{'token': 'x'} (other backend)", {'token': 'x'}),
++    ("{USERNAME_FIELD: value, 'password': 'test'} (happy kwargs path)",
++     {'email': 'test@example.com', 'password': 'test'}),
++]
++
++print(f"{'credentials':62} | {'impl':9} | ret   | queries | hasher")
++print("-" * 115)
++for label, creds in CASES:
++    for name, impl in (('patched', PATCHED), ('unpatched', UNPATCHED)):
++        ModelBackend.authenticate = impl
++        reset_queries()
++        del hash_calls[:]
++        try:
++            r = authenticate(**creds)
++            ret = 'user' if r is not None else 'None'
++        except Exception as e:
++            ret = type(e).__name__
++        print(f"{label:62} | {name:9} | {ret:5} | {len(connection.queries):7} | {hash_calls}")
++    print("-" * 115)
++ModelBackend.authenticate = PATCHED
+diff --git a/tests/auth_tests/test_auth_backends.py b/tests/auth_tests/test_auth_backends.py
+index 6447edefc9..94c18e3f13 100644
+--- a/tests/auth_tests/test_auth_backends.py
++++ b/tests/auth_tests/test_auth_backends.py
+@@ -226,6 +226,19 @@ class BaseModelBackendTest:
+         authenticate(username='no_such_user', password='test')
+         self.assertEqual(CountingMD5PasswordHasher.calls, 1)
+ 
++    @override_settings(PASSWORD_HASHERS=['auth_tests.test_auth_backends.CountingMD5PasswordHasher'])
++    def test_authentication_without_credentials(self):
++        CountingMD5PasswordHasher.calls = 0
++        for credentials in (
++            {},
++            {'username': getattr(self.user, self.UserModel.USERNAME_FIELD)},
++            {'password': 'test'},
++        ):
++            with self.subTest(credentials=credentials):
++                with self.assertNumQueries(0):
++                    authenticate(**credentials)
++        self.assertEqual(CountingMD5PasswordHasher.calls, 0)
++
+ 
+ class ModelBackendTest(BaseModelBackendTest, TestCase):
+     """
+diff --git a/verif/probe.py b/verif/probe.py
+new file mode 100644
+index 0000000000..70f2e4c4c7
+--- /dev/null
++++ b/verif/probe.py
+@@ -0,0 +1,60 @@
++import django
++from django.conf import settings
++
++settings.configure(
++    DEBUG=True,
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++    PASSWORD_HASHERS=['probe_hasher.CountingMD5PasswordHasher'],
++    AUTHENTICATION_BACKENDS=['django.contrib.auth.backends.ModelBackend'],
++    USE_TZ=True,
++    SECRET_KEY='x',
++)
++django.setup()
++
++import probe_hasher  # noqa
++from django.core.management import call_command
++from django.db import connection
++from django.contrib.auth import authenticate
++from django.contrib.auth.backends import ModelBackend, UserModel
++from django.test.utils import CaptureQueriesContext
++
++call_command('migrate', run_syncdb=True, verbosity=0)
++u = UserModel._default_manager.create_user('alice', 'a@b.c', 'test')
++
++POST = ModelBackend.authenticate
++
++def PRE(self, request, username=None, password=None, **kwargs):
++    """Exact pre-patch body from git HEAD."""
++    if username is None:
++        username = kwargs.get(UserModel.USERNAME_FIELD)
++    try:
++        user = UserModel._default_manager.get_by_natural_key(username)
++    except UserModel.DoesNotExist:
++        UserModel().set_password(password)
++    else:
++        if user.check_password(password) and self.user_can_authenticate(user):
++            return user
++
++CASES = [
++    ('no credentials            {}', {}),
++    ('remote_user only          ', {'remote_user': 'alice'}),
++    ('token only                ', {'token': 'abc'}),
++    ('username only (no pw)     ', {'username': 'alice'}),
++    ('username only, no such usr', {'username': 'nobody'}),
++    ('password only (no uname)  ', {'password': 'test'}),
++    ('valid creds               ', {'username': 'alice', 'password': 'test'}),
++    ('bad pw, real user         ', {'username': 'alice', 'password': 'WRONG'}),
++]
++
++for label, impl in (('PRE ', PRE), ('POST', POST)):
++    ModelBackend.authenticate = impl
++    print('==== %s-patch ====' % label)
++    for name, creds in CASES:
++        probe_hasher.CountingMD5PasswordHasher.calls = 0
++        with CaptureQueriesContext(connection) as ctx:
++            ret = authenticate(**creds)
++        print('  %-28s queries=%d encode_calls=%d ret=%r  sql=%s' % (
++            name, len(ctx.captured_queries),
++            probe_hasher.CountingMD5PasswordHasher.calls, ret,
++            [q['sql'] for q in ctx.captured_queries] or '-'))
+diff --git a/verif/probe_hasher.py b/verif/probe_hasher.py
+new file mode 100644
+index 0000000000..1e9608ef9a
+--- /dev/null
++++ b/verif/probe_hasher.py
+@@ -0,0 +1,9 @@
++from django.contrib.auth.hashers import MD5PasswordHasher
++
++
++class CountingMD5PasswordHasher(MD5PasswordHasher):
++    calls = 0
++
++    def encode(self, *args, **kwargs):
++        type(self).calls += 1
++        return super().encode(*args, **kwargs)

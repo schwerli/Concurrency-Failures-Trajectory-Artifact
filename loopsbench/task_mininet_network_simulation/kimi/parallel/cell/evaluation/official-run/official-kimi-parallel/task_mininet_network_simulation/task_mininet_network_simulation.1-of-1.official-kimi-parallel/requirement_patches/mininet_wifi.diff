@@ -1,0 +1,522 @@
+diff --git a/agent_tests/test_mininet_wifi.py b/agent_tests/test_mininet_wifi.py
+new file mode 100644
+index 0000000..8cd5397
+--- /dev/null
++++ b/agent_tests/test_mininet_wifi.py
+@@ -0,0 +1,116 @@
++"""Quick API tests for the Mininet-WiFi layer."""
++
++import math
++
++from netsim.node import Host, Switch
++from netsim.wifi.accesspoint import AccessPoint
++from netsim.wifi.mobility import RandomWaypointMobility
++from netsim.wifi.propagation import (friis_free_space_loss,
++                                     log_distance_path_loss, max_range,
++                                     received_signal_strength)
++from netsim.wifi.station import Station
++from netsim.wifi.wireless_link import WirelessLink, rssi_to_bandwidth
++from netsim.wifi_net import MininetWifi
++
++
++def test_propagation():
++    # Friis at 1m, 2.4GHz ~= 40.05 dB
++    pl1 = friis_free_space_loss(2.4e9, 1.0)
++    assert math.isclose(pl1, 40.05, abs_tol=0.01)
++    # 10x distance adds 20 dB in free space
++    pl10 = friis_free_space_loss(2.4e9, 10.0)
++    assert math.isclose(pl10 - pl1, 20.0, rel_tol=1e-9)
++    # log-distance: PL(d0) is Friis at ref distance
++    pl_ref = log_distance_path_loss(2.4e9, 1.0, 3.0, 1.0)
++    assert math.isclose(pl_ref, pl1, rel_tol=1e-9)
++    # PL(50m, n=3) = PL(1m) + 30*log10(50)
++    pl50 = log_distance_path_loss(2.4e9, 50.0, 3.0, 1.0)
++    assert math.isclose(pl50, pl1 + 30.0 * math.log10(50.0), rel_tol=1e-9)
++    # RSSI = tx_power + gains - path loss
++    rssi = received_signal_strength(20.0, 2.4e9, 50.0, path_loss_exp=3.0)
++    assert math.isclose(rssi, 20.0 - pl50, rel_tol=1e-9)
++    # max_range inverts the RSSI equation
++    r = max_range(20.0, -80.0, 2.4e9, path_loss_exp=3.0)
++    assert math.isclose(received_signal_strength(20.0, 2.4e9, r,
++                                                 path_loss_exp=3.0),
++                        -80.0, rel_tol=1e-9)
++    assert math.isclose(r, 99.6, abs_tol=0.1)
++
++
++def test_station_and_ap():
++    sta = Station("sta1", position=(3.0, 4.0))
++    assert isinstance(sta, Host) and sta.position == (3.0, 4.0)
++    assert sta.associated_ap is None
++    sta.set_position(10.0, 20.0)
++    assert sta.position == (10.0, 20.0)
++    ap = AccessPoint("ap1", position=(0.0, 0.0), ssid="test", channel=6,
++                     tx_power_dbm=15.0, freq_ghz=5.0, path_loss_exp=2.5,
++                     min_rssi_dbm=-70.0)
++    assert isinstance(ap, Switch) and ap.associated_stations == []
++    assert ap.ssid == "test" and ap.channel == 6 and ap.min_rssi_dbm == -70.0
++
++
++def test_wireless_link():
++    assert rssi_to_bandwidth(-45.0) == 54.0
++    assert rssi_to_bandwidth(-50.0) == 54.0
++    assert rssi_to_bandwidth(-55.0) == 48.0
++    assert rssi_to_bandwidth(-62.0) == 36.0
++    assert rssi_to_bandwidth(-68.0) == 24.0
++    assert rssi_to_bandwidth(-73.0) == 12.0
++    assert rssi_to_bandwidth(-78.0) == 6.0
++    assert rssi_to_bandwidth(-85.0) == 0.0
++    sta, ap = Station("sta1"), AccessPoint("ap1")
++    link = WirelessLink(sta, ap, rssi_dbm=-55.0)
++    assert link.bw == 48.0 and link.rssi_dbm == -55.0
++    link2 = WirelessLink(sta, ap, rssi_dbm=-90.0)
++    assert link2.bw == 0.0
++
++
++def test_mobility_reproducible():
++    m1 = RandomWaypointMobility(200.0, 200.0, seed=42)
++    m2 = RandomWaypointMobility(200.0, 200.0, seed=42)
++    t1 = m1.generate_trace((100.0, 100.0), 500)
++    t2 = m2.generate_trace((100.0, 100.0), 500)
++    assert t1 == t2 and len(t1) == 500 and t1[0] == (100.0, 100.0)
++    for x, y in t1:
++        assert 0.0 <= x <= 200.0 and 0.0 <= y <= 200.0
++    m3 = RandomWaypointMobility(200.0, 200.0, seed=7)
++    assert m3.generate_trace((100.0, 100.0), 500) != t1
++
++
++def test_mininet_wifi_association():
++    net = MininetWifi()
++    ap1 = net.addAccessPoint("ap1", position=(0.0, 0.0))
++    ap2 = net.addAccessPoint("ap2", position=(1000.0, 0.0))
++    net.addStation("sta1", position=(10.0, 0.0))
++    net.addStation("sta2", position=(990.0, 0.0))
++    net.addStation("sta3", position=(500.0, 0.0))  # out of range of both
++    net.auto_associate()
++    assert net.stations[0].associated_ap is ap1
++    assert net.stations[1].associated_ap is ap2
++    assert net.stations[2].associated_ap is None
++    assert net.count_associated() == 2
++    assert ap1.associated_stations == [net.stations[0]]
++    assert ap2.associated_stations == [net.stations[1]]
++    # stations are hosts, APs are switches in the base Mininet lists
++    assert set(net.hosts) == set(net.stations)
++    assert set(net.switches) == set(net.access_points)
++
++
++def test_strongest_signal_wins():
++    net = MininetWifi()
++    ap1 = net.addAccessPoint("ap1", position=(0.0, 0.0))
++    ap2 = net.addAccessPoint("ap2", position=(30.0, 0.0))
++    sta = net.addStation("sta1", position=(28.0, 0.0))
++    net.auto_associate()
++    assert sta.associated_ap is ap2
++
++
++if __name__ == "__main__":
++    test_propagation()
++    test_station_and_ap()
++    test_wireless_link()
++    test_mobility_reproducible()
++    test_mininet_wifi_association()
++    test_strongest_signal_wins()
++    print("ALL TESTS PASSED")
+diff --git a/netsim/experiments/wifi_exp.py b/netsim/experiments/wifi_exp.py
+new file mode 100644
+index 0000000..35c533a
+--- /dev/null
++++ b/netsim/experiments/wifi_exp.py
+@@ -0,0 +1,97 @@
++"""Mininet-WiFi experiments: path loss, RSSI, association, and mobility."""
++
++from netsim.experiments import print_result
++from netsim.targets.configs import WIFI_EXPERIMENTS
++from netsim.wifi.mobility import RandomWaypointMobility
++from netsim.wifi.propagation import (log_distance_path_loss,
++                                     received_signal_strength)
++from netsim.wifi_net import MininetWifi
++
++
++def exp_pathloss():
++    """WIFI_PATHLOSS_50M: log-distance path loss at 50m (f=2.4GHz, n=3)."""
++    cfg = WIFI_EXPERIMENTS["pathloss"]
++    pl = log_distance_path_loss(cfg["freq_ghz"] * 1e9, cfg["test_distance_m"],
++                                cfg["path_loss_exp"], cfg["ref_distance_m"])
++    print_result("WIFI_PATHLOSS_50M", pl)
++
++
++def exp_signal():
++    """WIFI_SIGNAL_100M: RSSI at 100m with tx=20dBm."""
++    cfg = WIFI_EXPERIMENTS["signal_strength"]
++    rssi = received_signal_strength(cfg["tx_power_dbm"], cfg["freq_ghz"] * 1e9,
++                                    cfg["test_distance_m"],
++                                    path_loss_exp=cfg["path_loss_exp"],
++                                    ref_distance_m=cfg["ref_distance_m"])
++    print_result("WIFI_SIGNAL_100M", rssi)
++
++
++def exp_association():
++    """WIFI_ASSOC_COUNT: stations associated (10 at distances 10-190m)."""
++    cfg = WIFI_EXPERIMENTS["association"]
++    net = MininetWifi()
++    net.addAccessPoint("ap1", position=(0.0, 0.0),
++                       tx_power_dbm=cfg["tx_power_dbm"],
++                       freq_ghz=cfg["freq_ghz"],
++                       path_loss_exp=cfg["path_loss_exp"],
++                       min_rssi_dbm=cfg["min_rssi_dbm"])
++    for i, dist in enumerate(cfg["distances"]):
++        net.addStation(f"sta{i + 1}", position=(float(dist), 0.0))
++    net.auto_associate()
++    print_result("WIFI_ASSOC_COUNT", net.count_associated())
++
++
++def _mobility_associations():
++    """Run the seeded RandomWaypoint trace; return per-step associated APs."""
++    cfg = WIFI_EXPERIMENTS["mobility"]
++    model = RandomWaypointMobility(cfg["area_width"], cfg["area_height"],
++                                   speed_range=cfg["speed_range"],
++                                   seed=cfg["seed"])
++    start = (cfg["area_width"] / 2.0, cfg["area_height"] / 2.0)
++    trace = model.generate_trace(start, cfg["num_steps"])
++    net = MininetWifi()
++    for i, pos in enumerate(cfg["ap_positions"]):
++        net.addAccessPoint(f"ap{i + 1}", position=pos,
++                           tx_power_dbm=cfg["tx_power_dbm"],
++                           freq_ghz=cfg["freq_ghz"],
++                           path_loss_exp=cfg["path_loss_exp"],
++                           min_rssi_dbm=cfg["min_rssi_dbm"])
++    sta = net.addStation("sta1", position=trace[0])
++    associations = []
++    for pos in trace:
++        sta.set_position(*pos)
++        net.auto_associate()
++        associations.append(sta.associated_ap)
++    return associations
++
++
++def exp_handover():
++    """WIFI_HANDOVER_COUNT: handovers during a 500-step RandomWaypoint trace.
++
++    A handover is the station switching from one associated AP to a
++    different AP between consecutive steps.
++    """
++    associations = _mobility_associations()
++    handovers = sum(1 for prev, cur in zip(associations, associations[1:])
++                    if prev is not None and cur is not None and prev is not cur)
++    print_result("WIFI_HANDOVER_COUNT", handovers)
++
++
++def exp_coverage():
++    """WIFI_COVERAGE_PCT: percentage of trace steps with an association."""
++    associations = _mobility_associations()
++    covered = sum(1 for ap in associations if ap is not None)
++    print_result("WIFI_COVERAGE_PCT", 100.0 * covered / len(associations))
++
++
++def run():
++    """Run all Mininet-WiFi experiments and print their results."""
++    exp_pathloss()
++    exp_signal()
++    exp_association()
++    exp_handover()
++    exp_coverage()
++
++
++if __name__ == "__main__":
++    run()
+diff --git a/netsim/wifi/__init__.py b/netsim/wifi/__init__.py
+index e69de29..de98aee 100644
+--- a/netsim/wifi/__init__.py
++++ b/netsim/wifi/__init__.py
+@@ -0,0 +1,13 @@
++"""Mininet-WiFi wireless emulation modules."""
++
++from netsim.wifi.accesspoint import AccessPoint
++from netsim.wifi.mobility import RandomWaypointMobility
++from netsim.wifi.propagation import (friis_free_space_loss,
++                                     log_distance_path_loss, max_range,
++                                     received_signal_strength)
++from netsim.wifi.station import Station
++from netsim.wifi.wireless_link import WirelessLink, rssi_to_bandwidth
++
++__all__ = ["AccessPoint", "RandomWaypointMobility", "Station", "WirelessLink",
++           "friis_free_space_loss", "log_distance_path_loss", "max_range",
++           "received_signal_strength", "rssi_to_bandwidth"]
+diff --git a/netsim/wifi/__pycache__/__init__.cpython-312.pyc b/netsim/wifi/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000..54bc875
+Binary files /dev/null and b/netsim/wifi/__pycache__/__init__.cpython-312.pyc differ
+diff --git a/netsim/wifi/__pycache__/accesspoint.cpython-312.pyc b/netsim/wifi/__pycache__/accesspoint.cpython-312.pyc
+new file mode 100644
+index 0000000..5d046e3
+Binary files /dev/null and b/netsim/wifi/__pycache__/accesspoint.cpython-312.pyc differ
+diff --git a/netsim/wifi/__pycache__/mobility.cpython-312.pyc b/netsim/wifi/__pycache__/mobility.cpython-312.pyc
+new file mode 100644
+index 0000000..44ee9c1
+Binary files /dev/null and b/netsim/wifi/__pycache__/mobility.cpython-312.pyc differ
+diff --git a/netsim/wifi/__pycache__/propagation.cpython-312.pyc b/netsim/wifi/__pycache__/propagation.cpython-312.pyc
+new file mode 100644
+index 0000000..83c0862
+Binary files /dev/null and b/netsim/wifi/__pycache__/propagation.cpython-312.pyc differ
+diff --git a/netsim/wifi/__pycache__/station.cpython-312.pyc b/netsim/wifi/__pycache__/station.cpython-312.pyc
+new file mode 100644
+index 0000000..882c78c
+Binary files /dev/null and b/netsim/wifi/__pycache__/station.cpython-312.pyc differ
+diff --git a/netsim/wifi/__pycache__/wireless_link.cpython-312.pyc b/netsim/wifi/__pycache__/wireless_link.cpython-312.pyc
+new file mode 100644
+index 0000000..c4e9ec8
+Binary files /dev/null and b/netsim/wifi/__pycache__/wireless_link.cpython-312.pyc differ
+diff --git a/netsim/wifi/accesspoint.py b/netsim/wifi/accesspoint.py
+new file mode 100644
+index 0000000..84a0838
+--- /dev/null
++++ b/netsim/wifi/accesspoint.py
+@@ -0,0 +1,21 @@
++"""WiFi access point: a switch with radio parameters and associations."""
++
++from netsim.node import Switch
++
++
++class AccessPoint(Switch):
++    """Wireless access point with position, radio config, and stations."""
++
++    def __init__(self, name, position=(0.0, 0.0), ssid="netsim-wifi", channel=1,
++                 tx_power_dbm=20.0, freq_ghz=2.4, path_loss_exp=3.0,
++                 min_rssi_dbm=-80.0, **params):
++        """Create an access point with radio and propagation parameters."""
++        super().__init__(name, **params)
++        self.position = position
++        self.ssid = ssid
++        self.channel = channel
++        self.tx_power_dbm = tx_power_dbm
++        self.freq_ghz = freq_ghz
++        self.path_loss_exp = path_loss_exp
++        self.min_rssi_dbm = min_rssi_dbm
++        self.associated_stations = []
+diff --git a/netsim/wifi/mobility.py b/netsim/wifi/mobility.py
+new file mode 100644
+index 0000000..1258df2
+--- /dev/null
++++ b/netsim/wifi/mobility.py
+@@ -0,0 +1,45 @@
++"""Mobility models for wireless stations."""
++
++import math
++
++import numpy as np
++
++
++class RandomWaypointMobility:
++    """Random waypoint mobility over a rectangular area.
++
++    A station moves toward a random target at a random speed; on arrival a
++    new target is picked. Uses numpy RandomState with a configurable seed
++    for reproducibility.
++    """
++
++    def __init__(self, area_width=200.0, area_height=200.0,
++                 speed_range=(1.0, 5.0), seed=None):
++        """Create the model for an area, a per-step speed range, and a seed."""
++        self.area_width = area_width
++        self.area_height = area_height
++        self.speed_range = speed_range
++        self.seed = seed
++        self.rs = np.random.RandomState(seed)
++
++    def _random_point(self):
++        """Draw a uniformly random point inside the area."""
++        return (self.rs.uniform(0.0, self.area_width),
++                self.rs.uniform(0.0, self.area_height))
++
++    def generate_trace(self, start_pos, num_steps):
++        """Return a list of num_steps (x, y) positions starting at start_pos."""
++        pos = (float(start_pos[0]), float(start_pos[1]))
++        positions = [pos]
++        target = self._random_point()
++        for _ in range(num_steps - 1):
++            speed = self.rs.uniform(*self.speed_range)
++            dx, dy = target[0] - pos[0], target[1] - pos[1]
++            dist = math.hypot(dx, dy)
++            if dist <= speed:
++                pos = target
++                target = self._random_point()
++            else:
++                pos = (pos[0] + speed * dx / dist, pos[1] + speed * dy / dist)
++            positions.append(pos)
++        return positions
+diff --git a/netsim/wifi/propagation.py b/netsim/wifi/propagation.py
+new file mode 100644
+index 0000000..48cd3e8
+--- /dev/null
++++ b/netsim/wifi/propagation.py
+@@ -0,0 +1,40 @@
++"""Wireless propagation models: Friis free-space and log-distance path loss."""
++
++import math
++
++SPEED_OF_LIGHT = 3e8
++
++
++def friis_free_space_loss(freq_hz, distance_m):
++    """Free-space path loss in dB: 20*log10(4*pi*d*f/c)."""
++    if distance_m <= 0:
++        return 0.0
++    return 20.0 * math.log10(4.0 * math.pi * distance_m * freq_hz / SPEED_OF_LIGHT)
++
++
++def log_distance_path_loss(freq_hz, distance_m, path_loss_exp=3.0,
++                           ref_distance_m=1.0):
++    """Log-distance path loss in dB: PL(d) = PL(d0) + 10*n*log10(d/d0).
++
++    PL(d0) is the Friis free-space loss at the reference distance.
++    """
++    if distance_m <= 0:
++        distance_m = ref_distance_m
++    pl_ref = friis_free_space_loss(freq_hz, ref_distance_m)
++    return pl_ref + 10.0 * path_loss_exp * math.log10(distance_m / ref_distance_m)
++
++
++def received_signal_strength(tx_power_dbm, freq_hz, distance_m, tx_gain_dbi=0.0,
++                             rx_gain_dbi=0.0, path_loss_exp=3.0,
++                             ref_distance_m=1.0):
++    """RSSI in dBm: tx_power + antenna gains - log-distance path loss."""
++    pl = log_distance_path_loss(freq_hz, distance_m, path_loss_exp, ref_distance_m)
++    return tx_power_dbm + tx_gain_dbi + rx_gain_dbi - pl
++
++
++def max_range(tx_power_dbm, min_rssi_dbm, freq_hz, tx_gain_dbi=0.0,
++              rx_gain_dbi=0.0, path_loss_exp=3.0, ref_distance_m=1.0):
++    """Solve for the distance at which RSSI falls to min_rssi_dbm."""
++    pl_ref = friis_free_space_loss(freq_hz, ref_distance_m)
++    budget = tx_power_dbm + tx_gain_dbi + rx_gain_dbi - pl_ref - min_rssi_dbm
++    return ref_distance_m * 10.0 ** (budget / (10.0 * path_loss_exp))
+diff --git a/netsim/wifi/station.py b/netsim/wifi/station.py
+new file mode 100644
+index 0000000..7ab4fde
+--- /dev/null
++++ b/netsim/wifi/station.py
+@@ -0,0 +1,17 @@
++"""WiFi station: a mobile wireless client host."""
++
++from netsim.node import Host
++
++
++class Station(Host):
++    """WiFi client with a 2D position and an associated access point."""
++
++    def __init__(self, name, position=(0.0, 0.0), **params):
++        """Create a station at the given (x, y) position."""
++        super().__init__(name, **params)
++        self.position = position
++        self.associated_ap = None
++
++    def set_position(self, x, y):
++        """Move the station to a new (x, y) position."""
++        self.position = (x, y)
+diff --git a/netsim/wifi/wireless_link.py b/netsim/wifi/wireless_link.py
+new file mode 100644
+index 0000000..929b440
+--- /dev/null
++++ b/netsim/wifi/wireless_link.py
+@@ -0,0 +1,26 @@
++"""Wireless link whose bandwidth depends on received signal strength."""
++
++from netsim.link import TCLink
++
++# Simplified 802.11g rate table: (min RSSI in dBm, bandwidth in Mbps).
++RSSI_BW_TABLE = [(-50.0, 54.0), (-60.0, 48.0), (-65.0, 36.0),
++                 (-70.0, 24.0), (-75.0, 12.0), (-80.0, 6.0)]
++
++
++def rssi_to_bandwidth(rssi_dbm):
++    """Map RSSI (dBm) to 802.11g bandwidth (Mbps); 0 below sensitivity."""
++    for min_rssi, bw in RSSI_BW_TABLE:
++        if rssi_dbm >= min_rssi:
++            return bw
++    return 0.0
++
++
++class WirelessLink(TCLink):
++    """TCLink whose bandwidth is derived from RSSI via the 802.11g table."""
++
++    def __init__(self, node1, node2, rssi_dbm=None, **params):
++        """Create a wireless link; bandwidth comes from the given RSSI."""
++        self.rssi_dbm = rssi_dbm
++        if rssi_dbm is not None:
++            params["bw"] = rssi_to_bandwidth(rssi_dbm)
++        super().__init__(node1, node2, **params)
+diff --git a/netsim/wifi_net.py b/netsim/wifi_net.py
+new file mode 100644
+index 0000000..ceb8378
+--- /dev/null
++++ b/netsim/wifi_net.py
+@@ -0,0 +1,61 @@
++"""Mininet-WiFi network engine: wireless stations, APs, and association."""
++
++from netsim.net import Mininet
++from netsim.utils import distance_2d
++from netsim.wifi.accesspoint import AccessPoint
++from netsim.wifi.propagation import received_signal_strength
++from netsim.wifi.station import Station
++
++
++class MininetWifi(Mininet):
++    """Mininet extended with WiFi stations and access points."""
++
++    def __init__(self, topo=None, host=Station, switch=AccessPoint, **kwargs):
++        """Create a wireless network with station and access point lists."""
++        super().__init__(topo, host=host, switch=switch, **kwargs)
++        self.stations = []
++        self.access_points = []
++
++    def addStation(self, name, position=(0.0, 0.0), **params):
++        """Add a WiFi station at the given position and return it."""
++        sta = Station(name, position=position, **params)
++        self.stations.append(sta)
++        self.hosts.append(sta)
++        self._nodes[name] = sta
++        self.graph.add_node(name)
++        return sta
++
++    def addAccessPoint(self, name, **params):
++        """Add a WiFi access point and return it."""
++        ap = AccessPoint(name, **params)
++        self.access_points.append(ap)
++        self.switches.append(ap)
++        self._nodes[name] = ap
++        self.graph.add_node(name)
++        return ap
++
++    def rssi(self, station, ap):
++        """RSSI (dBm) a station would receive from an access point."""
++        dist = distance_2d(station.position, ap.position)
++        return received_signal_strength(ap.tx_power_dbm, ap.freq_ghz * 1e9, dist,
++                                        path_loss_exp=ap.path_loss_exp)
++
++    def auto_associate(self):
++        """Associate each station with the strongest-signal AP in range."""
++        for ap in self.access_points:
++            ap.associated_stations = []
++        for sta in self.stations:
++            best_ap, best_rssi = None, None
++            for ap in self.access_points:
++                rssi = self.rssi(sta, ap)
++                if rssi < ap.min_rssi_dbm:
++                    continue
++                if best_rssi is None or rssi > best_rssi:
++                    best_ap, best_rssi = ap, rssi
++            sta.associated_ap = best_ap
++            if best_ap is not None:
++                best_ap.associated_stations.append(sta)
++
++    def count_associated(self):
++        """Return the number of stations currently associated with an AP."""
++        return sum(1 for sta in self.stations if sta.associated_ap is not None)
+diff --git a/run.sh b/run.sh
+index 75a071e..2ffddde 100755
+--- a/run.sh
++++ b/run.sh
+@@ -2,3 +2,4 @@
+ set -e
+ cd /workspace
+ python3 -m netsim.experiments.mininet_exp
++python3 -m netsim.experiments.wifi_exp

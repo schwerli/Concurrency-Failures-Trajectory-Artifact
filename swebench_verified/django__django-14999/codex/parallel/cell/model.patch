@@ -1,0 +1,106 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index 982816be3a..835ce47056 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -320,14 +320,27 @@ class RenameModel(ModelOperation):
+         new_model = to_state.apps.get_model(app_label, self.new_name)
+         if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+             old_model = from_state.apps.get_model(app_label, self.old_name)
+-            # Move the main table
+-            schema_editor.alter_db_table(
+-                new_model,
+-                old_model._meta.db_table,
+-                new_model._meta.db_table,
++            old_db_table = old_model._meta.db_table
++            new_db_table = new_model._meta.db_table
++            db_table_changed = not (
++                old_db_table == new_db_table or (
++                    schema_editor.connection.features.ignores_table_name_case and
++                    old_db_table.lower() == new_db_table.lower()
++                )
+             )
++            # Move the main table
++            if db_table_changed:
++                schema_editor.alter_db_table(
++                    new_model,
++                    old_db_table,
++                    new_db_table,
++                )
+             # Alter the fields pointing to us
+             for related_object in old_model._meta.related_objects:
++                # Fields referencing the model don't need a schema change if
++                # the model's table is unchanged.
++                if not db_table_changed and not related_object.many_to_many:
++                    continue
+                 if related_object.related_model == old_model:
+                     model = new_model
+                     related_key = (app_label, self.new_name_lower)
+diff --git a/tests/migrations/test_operations.py b/tests/migrations/test_operations.py
+index 11961a1f40..09273061f8 100644
+--- a/tests/migrations/test_operations.py
++++ b/tests/migrations/test_operations.py
+@@ -651,6 +651,28 @@ class OperationTests(OperationTestBase):
+         self.assertEqual(definition[1], [])
+         self.assertEqual(definition[2], {'old_name': "Pony", 'new_name': "Horse"})
+ 
++    def test_rename_model_with_db_table_noop(self):
++        app_label = "test_rnmo_db_table"
++        project_state = self.set_up_test_model(
++            app_label,
++            related_model=True,
++            db_table="test_rnmo_db_table_pony",
++        )
++        operation = migrations.RenameModel("Pony", "Horse")
++        new_state = project_state.clone()
++        operation.state_forwards(app_label, new_state)
++        self.assertEqual(
++            new_state.models[app_label, "rider"].fields["pony"].remote_field.model,
++            "%s.Horse" % app_label,
++        )
++        atomic_rename = connection.features.supports_atomic_references_rename
++        with connection.schema_editor(collect_sql=True, atomic=atomic_rename) as editor:
++            operation.database_forwards(app_label, editor, project_state, new_state)
++        self.assertEqual(editor.collected_sql, [])
++        with connection.schema_editor(collect_sql=True, atomic=atomic_rename) as editor:
++            operation.database_backwards(app_label, editor, new_state, project_state)
++        self.assertEqual(editor.collected_sql, [])
++
+     def test_rename_model_state_forwards(self):
+         """
+         RenameModel operations shouldn't trigger the caching of rendered apps
+@@ -822,6 +844,35 @@ class OperationTests(OperationTestBase):
+         self.assertEqual(Rider.objects.count(), 2)
+         self.assertEqual(Pony._meta.get_field('riders').remote_field.through.objects.count(), 2)
+ 
++    def test_rename_m2m_target_model_with_db_table(self):
++        app_label = "test_rename_m2m_target_model_with_db_table"
++        project_state = self.apply_operations(app_label, ProjectState(), operations=[
++            migrations.CreateModel("Pony", fields=[
++                ("id", models.AutoField(primary_key=True)),
++            ], options={"db_table": "test_rnmo_m2m_pony"}),
++            migrations.CreateModel("Rider", fields=[
++                ("id", models.AutoField(primary_key=True)),
++                ("ponies", models.ManyToManyField("Pony")),
++            ]),
++        ])
++        Pony = project_state.apps.get_model(app_label, "Pony")
++        Rider = project_state.apps.get_model(app_label, "Rider")
++        pony = Pony.objects.create()
++        rider = Rider.objects.create()
++        rider.ponies.add(pony)
++
++        project_state = self.apply_operations(app_label, project_state, operations=[
++            migrations.RenameModel("Pony", "Horse"),
++        ], atomic=connection.features.supports_atomic_references_rename)
++        Horse = project_state.apps.get_model(app_label, "Horse")
++        Rider = project_state.apps.get_model(app_label, "Rider")
++        horse = Horse.objects.create()
++        rider = Rider.objects.create()
++        rider.ponies.add(horse)
++        self.assertEqual(Horse.objects.count(), 2)
++        self.assertEqual(Rider.objects.count(), 2)
++        self.assertEqual(Rider._meta.get_field("ponies").remote_field.through.objects.count(), 2)
++
+     def test_rename_m2m_through_model(self):
+         app_label = "test_rename_through"
+         project_state = self.apply_operations(app_label, ProjectState(), operations=[

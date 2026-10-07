@@ -1,0 +1,38 @@
+Done. The migration is complete and verified.
+
+## What I found (black-box)
+
+The `idna-cpp` library source wasn't present in the workspace — only `test4.cpp` and the compiled binary — so I derived all four predicates by probing. They turned out to be independent and purely byte-based (`std::string::size()` semantics, not code points):
+
+| Predicate | Inferred rule | Evidence |
+|---|---|---|
+| `is_valid_domain` | non-empty && len ≤ 255 bytes | 255→1, 256→0; `"a"*64 + ".com"`→1 (no per-label check) |
+| `is_valid_label` | non-empty && len ≤ 63 bytes | 63→1, 64→0; accepts dots, so it's not label-splitting |
+| `is_ascii_domain` | every byte ≤ 0x7F (empty ⇒ true) | 0x7F→ascii, 0x80→not |
+| `is_idn_domain` | any byte ≥ 0x80 | exact complement of `is_ascii_domain`; `xn--fsq.com`→0, so A-labels aren't treated as IDN |
+
+Notably the validators do **no** charset, hyphen, or dot-structure checks at all — `"ex@mple.com"`, `"--example.com"`, and `".."` are all valid.
+
+## Project layout (`/output`)
+
+```
+Cargo.toml         bin target "test4" -> path "test4.rs"
+test4.rs           entry point (mirrors test4.cpp line for line)
+cli.rs             argv[1] extraction
+idna/mod.rs        public API + unit tests
+idna/charset.rs    ASCII / non-ASCII byte classification
+idna/validate.rs   length + emptiness limits
+test4              compiled executable
+```
+
+Zero external dependencies — `Cargo.lock` contains only the package itself.
+
+## Verification
+
+- **Differential fuzz: 6,595 cases, 0 mismatches** (stdout bytes *and* exit codes) — all 5 documented examples, every non-NUL byte value 1–255 alone and embedded, length sweeps at the 63/255 boundaries in both ASCII and multi-byte UTF-8, ~3,000 random raw-byte strings, ~3,000 random UTF-8 strings, plus no-arg and extra-arg invocations.
+- `cargo test --release`: 5 passed.
+- Both `cargo build --release` and `rustc -O test4.rs` build clean with no warnings; the two binaries agree with each other and with the C++ reference.
+
+## One deliberate deviation worth flagging
+
+Requirement 2 asked for `std::env::args()`, but that **panics** on non-UTF-8 arguments, whereas the C++ `std::string` accepts arbitrary bytes (e.g. a lone `0xFF` byte, which the reference binary reports as `1 1 0 1`). To keep byte-for-byte fidelity I used `std::env::args_os()` with a raw-byte conversion in `cli.rs:22` — still std-only, still positional parsing, no crates. For any valid-UTF-8 input the two are indistinguishable; this only changes behavior where `args()` would have crashed.

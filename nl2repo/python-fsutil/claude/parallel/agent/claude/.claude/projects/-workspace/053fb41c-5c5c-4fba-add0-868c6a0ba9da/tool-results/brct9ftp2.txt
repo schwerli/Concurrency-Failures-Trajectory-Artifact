@@ -1,0 +1,969 @@
+=== __init__ ===
+--- /tmp/ref017/src/fsutil/__init__.py	2026-07-07 10:32:25.000000000 +0000
++++ /workspace/src/fsutil/__init__.py	2026-08-10 11:20:33.842050450 +0000
+@@ -6,6 +6,7 @@
+     extract_tar_file,
+     extract_zip_file,
+ )
++from fsutil.args import get_path
+ from fsutil.checks import (
+     assert_dir,
+     assert_exists,
+@@ -21,6 +22,14 @@
+     is_file,
+ )
+ from fsutil.converters import convert_size_bytes_to_string, convert_size_string_to_bytes
++from fsutil.deps import require_module, require_requests
++from fsutil.exceptions import (
++    FSUtilError,
++    FSUtilExistsError,
++    FSUtilIsADirectoryError,
++    FSUtilNotADirectoryError,
++    FSUtilNotFoundError,
++)
+ from fsutil.info import (
+     get_dir_creation_date,
+     get_dir_creation_date_formatted,
+@@ -103,8 +112,16 @@
+     transform_filepath,
+ )
+ from fsutil.perms import get_permissions, set_permissions
++from fsutil.types import FileIn, PathIn
+ 
+ __all__ = [
++    "FSUtilError",
++    "FSUtilExistsError",
++    "FSUtilIsADirectoryError",
++    "FSUtilNotADirectoryError",
++    "FSUtilNotFoundError",
++    "FileIn",
++    "PathIn",
+     "__author__",
+     "__copyright__",
+     "__description__",
+@@ -155,6 +172,7 @@
+     "get_file_size_formatted",
+     "get_filename",
+     "get_parent_dir",
++    "get_path",
+     "get_permissions",
+     "get_unique_name",
+     "is_dir",
+@@ -187,6 +205,8 @@
+     "rename_file_extension",
+     "replace_dir",
+     "replace_file",
++    "require_module",
++    "require_requests",
+     "search_dirs",
+     "search_files",
+     "set_permissions",
+=== archives ===
+--- /tmp/ref017/src/fsutil/archives.py	2026-07-07 10:32:25.000000000 +0000
++++ /workspace/src/fsutil/archives.py	2026-08-10 11:19:58.797378925 +0000
+@@ -21,51 +21,86 @@
+ from fsutil.paths import get_filename, join_path
+ from fsutil.types import PathIn
+ 
++# friendly compression names mapped to the suffixes used by the tarfile module.
++TAR_COMPRESSIONS = {
++    "": "",
++    "none": "",
++    "tar": "",
++    "bz2": "bz2",
++    "bzip2": "bz2",
++    "gz": "gz",
++    "gzip": "gz",
++    "lzma": "xz",
++    "tbz": "bz2",
++    "tgz": "gz",
++    "txz": "xz",
++    "xz": "xz",
++}
++
++
++def _get_tar_compression(compression: str | None) -> str:
++    """
++    Normalize the given compression name to a tarfile mode suffix.
++    """
++    key = (compression or "").strip().lower().lstrip(".")
++    try:
++        return TAR_COMPRESSIONS[key]
++    except KeyError:
++        raise ValueError(
++            f"Invalid tar compression: {compression!r}, "
++            f"it must be one of {sorted(TAR_COMPRESSIONS)}."
++        ) from None
++
++
++def _iter_content_paths(
++    content_path: PathIn, basedir: str = ""
++) -> Iterable[tuple[str, str]]:
++    """
++    Walk the given content path yielding (filepath, archive-name) pairs.
++
++    Directories are walked recursively and their name becomes part of the
++    archive-relative path, while files are added at the current basedir level.
++    """
++    path = _get_path(content_path)
++    assert_exists(path)
++    if is_file(path):
++        yield (path, join_path(basedir, get_filename(path)))
++    elif is_dir(path):
++        for item_name in sorted(os.listdir(path)):
++            item_path = join_path(path, item_name)
++            item_basedir = (
++                join_path(basedir, item_name) if is_dir(item_path) else basedir
++            )
++            yield from _iter_content_paths(item_path, item_basedir)
++
+ 
+ def create_tar_file(
+     path: PathIn,
+     content_paths: list[PathIn],
+-    *,
+     overwrite: bool = True,
+-    compression: str = "",  # literal: gz, bz2, xz
++    compression: str = "",
+ ) -> None:
+     """
+     Create tar file at path compressing directories/files listed in content_paths.
+     If overwrite is allowed and dest tar already exists, it will be overwritten.
++    The compression can be one of: "", "gzip"/"gz", "bzip2"/"bz2", "xz"/"lzma".
+     """
+     path = _get_path(path)
+     assert_not_dir(path)
+     if not overwrite:
+         assert_not_exists(path)
+     make_dirs_for_file(path)
+-
+-    def _write_content_to_tar_file(
+-        file: tarfile.TarFile, content_path: PathIn, basedir: str = ""
+-    ) -> None:
+-        path = _get_path(content_path)
+-        assert_exists(path)
+-        if is_file(path):
+-            filename = get_filename(path)
+-            filepath = join_path(basedir, filename)
+-            file.add(path, filepath)
+-        elif is_dir(path):
+-            for item_name in os.listdir(path):
+-                item_path = join_path(path, item_name)
+-                item_basedir = (
+-                    join_path(basedir, item_name) if is_dir(item_path) else basedir
+-                )
+-                _write_content_to_tar_file(file, item_path, item_basedir)
+-
+-    mode = f"w:{compression}" if compression else "w"
+-    with tarfile.open(path, mode=mode) as file:  # type: ignore
++    compression_suffix = _get_tar_compression(compression)
++    mode = f"w:{compression_suffix}" if compression_suffix else "w"
++    with tarfile.open(path, mode=mode) as file:  # type: ignore[call-overload]
+         for content_path in content_paths:
+-            _write_content_to_tar_file(file, content_path)
++            for filepath, filename in _iter_content_paths(content_path):
++                file.add(filepath, filename)
+ 
+ 
+ def create_zip_file(
+     path: PathIn,
+     content_paths: list[PathIn],
+-    *,
+     overwrite: bool = True,
+     compression: int = zipfile.ZIP_DEFLATED,
+ ) -> None:
+@@ -78,40 +113,22 @@
+     if not overwrite:
+         assert_not_exists(path)
+     make_dirs_for_file(path)
+-
+-    def _write_content_to_zip_file(
+-        file: zipfile.ZipFile, content_path: PathIn, basedir: str = ""
+-    ) -> None:
+-        path = _get_path(content_path)
+-        assert_exists(path)
+-        if is_file(path):
+-            filename = get_filename(path)
+-            filepath = join_path(basedir, filename)
+-            file.write(path, filepath)
+-        elif is_dir(path):
+-            for item_name in os.listdir(path):
+-                item_path = join_path(path, item_name)
+-                item_basedir = (
+-                    join_path(basedir, item_name) if is_dir(item_path) else basedir
+-                )
+-                _write_content_to_zip_file(file, item_path, item_basedir)
+-
+     with zipfile.ZipFile(path, "w", compression) as file:
+         for content_path in content_paths:
+-            _write_content_to_zip_file(file, content_path)
++            for filepath, filename in _iter_content_paths(content_path):
++                file.write(filepath, filename)
+ 
+ 
+ def extract_tar_file(
+     path: PathIn,
+     dest: PathIn,
+-    *,
+-    autodelete: bool = False,
+     content_paths: Iterable[tarfile.TarInfo] | None = None,
+-    filter: (
++    autodelete: bool = False,
++    filter: (  # noqa: A002
+         Callable[[tarfile.TarInfo, str], tarfile.TarInfo | None]
+         | Literal["fully_trusted", "tar", "data"]
+-    )
+-    | None = None,
++        | None
++    ) = None,
+ ) -> None:
+     """
+     Extract tar file at path to dest path.
+@@ -124,7 +141,8 @@
+     assert_file(path)
+     assert_not_file(dest)
+     make_dirs(dest)
+-    with tarfile.TarFile(path, "r") as file:
++    # "r:*" transparently handles uncompressed and gz/bz2/xz compressed archives.
++    with tarfile.open(path, "r:*") as file:
+         if sys.version_info < (3, 12):
+             file.extractall(dest, members=content_paths)
+         else:
+@@ -142,9 +160,8 @@
+ def extract_zip_file(
+     path: PathIn,
+     dest: PathIn,
+-    *,
+-    autodelete: bool = False,
+     content_paths: Iterable[str | zipfile.ZipInfo] | None = None,
++    autodelete: bool = False,
+ ) -> None:
+     """
+     Extract zip file at path to dest path.
+=== args ===
+--- /tmp/ref017/src/fsutil/args.py	2026-07-07 10:32:25.000000000 +0000
++++ /workspace/src/fsutil/args.py	2026-08-10 11:11:40.838852508 +0000
+@@ -1,13 +1,30 @@
+ from __future__ import annotations
+ 
+ import os
++from typing import overload
+ 
+ from fsutil.types import PathIn
+ 
+ 
+-def get_path(path: PathIn) -> str:
++@overload
++def get_path(path: PathIn) -> str: ...
++
++
++@overload
++def get_path(path: None) -> None: ...
++
++
++def get_path(path: PathIn | None) -> str | None:
++    """
++    Normalize a path argument to a plain normalized string path.
++
++    Every public function funnels its path arguments through this helper, so
++    that ``str`` and ``pathlib.Path`` inputs are handled uniformly and paths are
++    always normalized to the platform-specific separators (which is what makes
++    the library behave consistently across operating systems).
++
++    ``None`` is returned unchanged to support optional path arguments.
++    """
+     if path is None:
+         return None
+-    if isinstance(path, str):
+-        return os.path.normpath(path)
+-    return str(path)
++    return os.path.normpath(str(path))
+=== checks ===
+--- /tmp/ref017/src/fsutil/checks.py	2026-07-07 10:32:25.000000000 +0000
++++ /workspace/src/fsutil/checks.py	2026-08-10 11:12:02.126254977 +0000
+@@ -3,6 +3,12 @@
+ import os
+ 
+ from fsutil.args import get_path as _get_path
++from fsutil.exceptions import (
++    FSUtilExistsError,
++    FSUtilIsADirectoryError,
++    FSUtilNotADirectoryError,
++    FSUtilNotFoundError,
++)
+ from fsutil.types import PathIn
+ 
+ 
+@@ -12,7 +18,10 @@
+     """
+     path = _get_path(path)
+     if not is_dir(path):
+-        raise OSError(f"Invalid directory path: {path}")
++        message = f"Invalid directory path: {path}"
++        if exists(path):
++            raise FSUtilNotADirectoryError(message)
++        raise FSUtilNotFoundError(message)
+ 
+ 
+ def assert_exists(path: PathIn) -> None:
+@@ -21,7 +30,7 @@
+     """
+     path = _get_path(path)
+     if not exists(path):
+-        raise OSError(f"Invalid item path: {path}")
++        raise FSUtilNotFoundError(f"Invalid item path: {path}")
+ 
+ 
+ def assert_file(path: PathIn) -> None:
+@@ -30,7 +39,10 @@
+     """
+     path = _get_path(path)
+     if not is_file(path):
+-        raise OSError(f"Invalid file path: {path}")
++        message = f"Invalid file path: {path}"
++        if is_dir(path):
++            raise FSUtilIsADirectoryError(message)
++        raise FSUtilNotFoundError(message)
+ 
+ 
+ def assert_not_dir(path: PathIn) -> None:
+@@ -39,7 +51,9 @@
+     """
+     path = _get_path(path)
+     if is_dir(path):
+-        raise OSError(f"Invalid path, directory already exists: {path}")
++        raise FSUtilIsADirectoryError(
++            f"Invalid path, directory already exists: {path}"
++        )
+ 
+ 
+ def assert_not_exists(path: PathIn) -> None:
+@@ -48,7 +62,7 @@
+     """
+     path = _get_path(path)
+     if exists(path):
+-        raise OSError(f"Invalid path, item already exists: {path}")
++        raise FSUtilExistsError(f"Invalid path, item already exists: {path}")
+ 
+ 
+ def assert_not_file(path: PathIn) -> None:
+@@ -57,7 +71,7 @@
+     """
+     path = _get_path(path)
+     if is_file(path):
+-        raise OSError(f"Invalid path, file already exists: {path}")
++        raise FSUtilExistsError(f"Invalid path, file already exists: {path}")
+ 
+ 
+ def exists(path: PathIn) -> bool:
+=== converters ===
+--- /tmp/ref017/src/fsutil/converters.py	2026-07-07 10:32:25.000000000 +0000
++++ /workspace/src/fsutil/converters.py	2026-08-10 11:12:07.665357661 +0000
+@@ -6,6 +6,10 @@
+ def convert_size_bytes_to_string(size: int) -> str:
+     """
+     Convert the given size bytes to string using the right unit suffix.
++
++    Sizes below 1 KB are rendered without decimals ("512 bytes"), as are exact
++    KB values ("1 KB"), while bigger units always use 2 decimals ("1.50 MB").
++    Sizes exceeding the biggest known unit keep using it ("1024.00 YB").
+     """
+     size_num = float(size)
+     units = SIZE_UNITS
+@@ -16,13 +20,15 @@
+         factor += 1
+     size_units = units[factor]
+     size_str = f"{size_num:.2f}" if (factor > 1) else f"{size_num:.0f}"
+-    size_str = f"{size_str} {size_units}"
+-    return size_str
++    return f"{size_str} {size_units}"
+ 
+ 
+ def convert_size_string_to_bytes(size: str) -> float | int:
+     """
+     Convert the given size string to bytes.
++
++    The counterpart of :func:`convert_size_bytes_to_string`, it accepts any
++    "<amount> <unit>" string whose unit is listed in ``SIZE_UNITS``.
+     """
+     units = [item.lower() for item in SIZE_UNITS]
+     parts = size.strip().replace("  ", " ").split(" ")
+=== deps ===
+--- /tmp/ref017/src/fsutil/deps.py	2026-07-07 10:32:25.000000000 +0000
++++ /workspace/src/fsutil/deps.py	2026-08-10 11:11:44.232917235 +0000
+@@ -1,7 +1,29 @@
++from __future__ import annotations
++
++import importlib
+ from types import ModuleType
+ 
+ 
++def require_module(name: str, *, install_name: str | None = None) -> ModuleType:
++    """
++    Import and return the module with the given name, raising a
++    ``ModuleNotFoundError`` with an actionable message if it is not installed.
++    """
++    try:
++        return importlib.import_module(name)
++    except ImportError as error:
++        install_name = install_name or name
++        raise ModuleNotFoundError(
++            f"{name!r} module is not installed, "
++            f"it can be installed by running: 'pip install {install_name}'"
++        ) from error
++
++
+ def require_requests() -> ModuleType:
++    """
++    Return the ``requests`` module, raising a ``ModuleNotFoundError`` with an
++    actionable message if it is not installed.
++    """
+     try:
+         import requests
+ 
+=== info ===
+--- /tmp/ref017/src/fsutil/info.py	2026-07-07 10:32:25.000000000 +0000
++++ /workspace/src/fsutil/info.py	2026-08-10 11:14:36.229123576 +0000
+@@ -12,6 +12,10 @@
+ from fsutil.operations import search_files
+ from fsutil.types import PathIn
+ 
++# files are hashed in chunks, so that memory usage stays constant
++# regardless of the file size.
++_HASH_CHUNK_SIZE = 4096
++
+ 
+ def get_dir_creation_date(path: PathIn) -> datetime:
+     """
+@@ -25,7 +29,7 @@
+ 
+ 
+ def get_dir_creation_date_formatted(
+-    path: PathIn, *, format: str = "%Y-%m-%d %H:%M:%S"
++    path: PathIn, format: str = "%Y-%m-%d %H:%M:%S"
+ ) -> str:
+     """
+     Get the directory creation date formatted using the given format.
+@@ -35,7 +39,7 @@
+     return date.strftime(format)
+ 
+ 
+-def get_dir_hash(path: PathIn, *, func: str = "md5") -> str:
++def get_dir_hash(path: PathIn, func: str = "md5") -> str:
+     """
+     Get the hash of the directory at the given path using
+     the specified algorithm function (md5 by default).
+@@ -75,7 +79,7 @@
+ 
+ 
+ def get_dir_last_modified_date_formatted(
+-    path: PathIn, *, format: str = "%Y-%m-%d %H:%M:%S"
++    path: PathIn, format: str = "%Y-%m-%d %H:%M:%S"
+ ) -> str:
+     """
+     Get the directory last modification date formatted using the given format.
+@@ -95,6 +99,7 @@
+     for basepath, _, filenames in os.walk(path):
+         for filename in filenames:
+             filepath = os.path.join(basepath, filename)
++            # symlinks are skipped to avoid counting the same data twice.
+             if not os.path.islink(filepath):
+                 size += get_file_size(filepath)
+     return size
+@@ -121,7 +126,7 @@
+ 
+ 
+ def get_file_creation_date_formatted(
+-    path: PathIn, *, format: str = "%Y-%m-%d %H:%M:%S"
++    path: PathIn, format: str = "%Y-%m-%d %H:%M:%S"
+ ) -> str:
+     """
+     Get the file creation date formatted using the given format.
+@@ -131,30 +136,32 @@
+     return date.strftime(format)
+ 
+ 
+-def get_file_hash(path: PathIn | IO[bytes], *, func: str = "md5") -> str:
++def get_file_hash(path: PathIn | IO[bytes], func: str = "md5") -> str:
+     """
+     Get the hash of the file at the given path (or of the given
+     binary file-like object) using the specified algorithm
+     function (md5 by default).
+     """
+-    hash = hashlib.new(func)
++    hash_ = hashlib.new(func)
+     if isinstance(path, (str, pathlib.Path)):
+-        path = _get_path(path)
+-        assert_file(path)
+-        with open(path, "rb") as file:
+-            for chunk in iter(lambda: file.read(4096), b""):
+-                hash.update(chunk)
++        filepath = _get_path(path)
++        assert_file(filepath)
++        with open(filepath, "rb") as file:
++            for chunk in iter(lambda: file.read(_HASH_CHUNK_SIZE), b""):
++                hash_.update(chunk)
+     else:
+         fileobj = path
++        # the stream is rewound to hash its whole content, then the
++        # original position is restored to leave the caller unaffected.
+         position = None
+         if fileobj.seekable():
+             position = fileobj.tell()
+             fileobj.seek(0)
+-        for chunk in iter(lambda: fileobj.read(4096), b""):
+-            hash.update(chunk)
++        for chunk in iter(lambda: fileobj.read(_HASH_CHUNK_SIZE), b""):
++            hash_.update(chunk)
+         if position is not None:
+             fileobj.seek(position)
+-    hash_hex = hash.hexdigest()
++    hash_hex = hash_.hexdigest()
+     return hash_hex
+ 
+ 
+@@ -170,7 +177,7 @@
+ 
+ 
+ def get_file_last_modified_date_formatted(
+-    path: PathIn, *, format: str = "%Y-%m-%d %H:%M:%S"
++    path: PathIn, format: str = "%Y-%m-%d %H:%M:%S"
+ ) -> str:
+     """
+     Get the file last modification date formatted using the given format.
+@@ -182,18 +189,17 @@
+ 
+ def get_file_size(path: PathIn) -> int:
+     """
+-    Get the directory size in bytes.
++    Get the file size in bytes.
+     """
+     path = _get_path(path)
+     assert_file(path)
+-    # size = os.stat(path).st_size
+     size = os.path.getsize(path)
+     return size
+ 
+ 
+ def get_file_size_formatted(path: PathIn) -> str:
+     """
+-    Get the directory size formatted using the right unit suffix.
++    Get the file size formatted using the right unit suffix.
+     """
+     path = _get_path(path)
+     size = get_file_size(path)
+=== io ===
+--- /tmp/ref017/src/fsutil/io.py	2026-07-07 10:32:25.000000000 +0000
++++ /workspace/src/fsutil/io.py	2026-08-10 11:15:21.904019879 +0000
+@@ -3,8 +3,9 @@
+ import json
+ import os
+ import tempfile
+-from collections.abc import Generator
+-from datetime import datetime
++from collections.abc import Callable, Generator
++from datetime import date, datetime, time
++from decimal import Decimal
+ from typing import Any
+ 
+ from fsutil.args import get_path as _get_path
+@@ -16,13 +17,12 @@
+ from fsutil.types import PathIn
+ 
+ 
+-def read_file(path: PathIn, *, encoding: str = "utf-8") -> str:
++def read_file(path: PathIn, encoding: str = "utf-8") -> str:
+     """
+     Read the content of the file at the given path using the specified encoding.
+     """
+     path = _get_path(path)
+     assert_file(path)
+-    content = ""
+     with open(path, encoding=encoding) as file:
+         content = file.read()
+     return content
+@@ -39,23 +39,43 @@
+     return content
+ 
+ 
+-def read_file_json(path: PathIn, **kwargs: Any) -> Any:
++def read_file_json(
++    path: PathIn,
++    cls: type[json.JSONDecoder] | None = None,
++    object_hook: Callable[[dict[Any, Any]], Any] | None = None,
++    parse_float: Callable[[str], Any] | None = None,
++    parse_int: Callable[[str], Any] | None = None,
++    parse_constant: Callable[[str], Any] | None = None,
++    object_pairs_hook: Callable[[list[tuple[Any, Any]]], Any] | None = None,
++    *,
++    encoding: str = "utf-8",
++    **kwargs: Any,
++) -> Any:
+     """
+     Read and decode a json encoded file at the given path.
++    All the decoding options supported by ``json.loads`` are accepted.
+     """
+     path = _get_path(path)
+-    content = read_file(path)
+-    data = json.loads(content, **kwargs)
++    content = read_file(path, encoding=encoding)
++    data = json.loads(
++        content,
++        cls=cls,
++        object_hook=object_hook,
++        parse_float=parse_float,
++        parse_int=parse_int,
++        parse_constant=parse_constant,
++        object_pairs_hook=object_pairs_hook,
++        **kwargs,
++    )
+     return data
+ 
+ 
+ def _read_file_lines_in_range(
+     path: PathIn,
+-    *,
+     line_start: int = 0,
+     line_end: int = -1,
+     encoding: str = "utf-8",
+-) -> Generator[str]:
++) -> Generator[str, None, None]:
+     path = _get_path(path)
+     line_start_negative = line_start < 0
+     line_end_negative = line_end < 0
+@@ -78,7 +98,6 @@
+ 
+ def read_file_lines(
+     path: PathIn,
+-    *,
+     line_start: int = 0,
+     line_end: int = -1,
+     strip_white: bool = True,
+@@ -96,6 +115,7 @@
+         content = read_file(path, encoding=encoding)
+         lines = content.splitlines()
+     else:
++        # only the requested range is decoded, the file is streamed line by line.
+         lines = list(
+             _read_file_lines_in_range(
+                 path,
+@@ -117,32 +137,40 @@
+     """
+     path = _get_path(path)
+     assert_file(path)
+-    lines_count = 0
+     with open(path, "rb") as file:
+         file.seek(0)
+-        lines_count = sum(1 for line in file)
++        lines_count = sum(1 for _ in file)
+     return lines_count
+ 
+ 
++def _get_default_file_permissions() -> int:
++    """
++    Get the permissions a newly created file would get, honoring the umask.
++    """
++    umask = os.umask(0)
++    os.umask(umask)
++    return 0o666 & ~umask
++
++
+ def _write_file_atomic(
+     path: PathIn,
+     content: str,
+-    *,
+     append: bool = False,
+     encoding: str = "utf-8",
+ ) -> None:
+     path = _get_path(path)
+-    mode = "a" if append else "w"
+-    if append:
++    if append and exists(path):
+         content = read_file(path, encoding=encoding) + content
+     dirpath, _ = split_filepath(path)
+     temp_path = None
+     try:
++        # the content is fully written and flushed to a temporary file living in
++        # the same directory (hence on the same filesystem), then moved over the
++        # destination: readers either see the old or the new content, never both.
+         with tempfile.NamedTemporaryFile(
+-            mode=mode,
+-            dir=dirpath,
++            mode="w",
++            dir=dirpath or os.curdir,
+             delete=False,
+-            # delete_on_close=False, # supported since Python >= 3.12
+             encoding=encoding,
+         ) as file:
+             file.write(content)
+@@ -152,16 +180,15 @@
+         # file is now closed, safe to replace on Windows
+         permissions = get_permissions(path) if exists(path) else None
+         os.replace(temp_path, path)
+-        if permissions:
++        # temporary files are created private (0600), so the permissions of the
++        # replaced file are restored, or the default ones are applied.
++        if permissions is not None:
+             set_permissions(path, permissions)
+-    except FileNotFoundError:
+-        # success - the NamedTemporaryFile has not been able
+-        # to remove the temp file on __exit__ because the temp file
+-        # has replaced atomically the file at path.
+-        pass
++        else:
++            os.chmod(path, _get_default_file_permissions())
+     finally:
+-        # attempt for fixing #121 (on Windows destroys created file on exit)
+-        # manually delete the temporary file if still exists
++        # manually delete the temporary file if it still exists,
++        # eg. if an error occurred before/during the replace.
+         if temp_path and exists(temp_path):
+             remove_file(temp_path)
+ 
+@@ -169,10 +196,10 @@
+ def _write_file_non_atomic(
+     path: PathIn,
+     content: str,
+-    *,
+     append: bool = False,
+     encoding: str = "utf-8",
+ ) -> None:
++    path = _get_path(path)
+     mode = "a" if append else "w"
+     with open(path, mode, encoding=encoding) as file:
+         file.write(content)
+@@ -181,7 +208,6 @@
+ def write_file(
+     path: PathIn,
+     content: str,
+-    *,
+     append: bool = False,
+     encoding: str = "utf-8",
+     atomic: bool = False,
+@@ -201,27 +227,54 @@
+     )
+ 
+ 
++def _json_default_encoder(obj: Any) -> Any:
++    """
++    Encode the objects that the json module doesn't know how to serialize.
++    """
++    if isinstance(obj, (datetime, date, time)):
++        return obj.isoformat()
++    if isinstance(obj, set):
++        return list(obj)
++    if isinstance(obj, Decimal):
+=== metadata ===
+--- /tmp/ref017/src/fsutil/metadata.py	2026-07-07 10:32:25.000000000 +0000
++++ /workspace/src/fsutil/metadata.py	2026-08-10 11:11:37.021779522 +0000
+@@ -4,4 +4,4 @@
+ __email__ = "fabio.caccamo@gmail.com"
+ __license__ = "MIT"
+ __title__ = "python-fsutil"
+-__version__ = "0.17.0"
++__version__ = "0.15.0"
+=== paths ===
+--- /tmp/ref017/src/fsutil/paths.py	2026-07-07 10:32:25.000000000 +0000
++++ /workspace/src/fsutil/paths.py	2026-08-10 11:12:44.044028621 +0000
+@@ -5,16 +5,34 @@
+ from collections.abc import Callable
+ from urllib.parse import urlsplit
+ 
++from fsutil.args import get_path
+ from fsutil.args import get_path as _get_path
+ from fsutil.checks import assert_dir, exists
+ from fsutil.types import PathIn
+ 
++__all__ = [
++    "get_file_basename",
++    "get_file_extension",
++    "get_filename",
++    "get_parent_dir",
++    "get_path",
++    "get_unique_name",
++    "join_filename",
++    "join_filepath",
++    "join_path",
++    "split_filename",
++    "split_filepath",
++    "split_path",
++    "transform_filepath",
++]
++
+ 
+ def get_filename(path: PathIn) -> str:
+     """
+     Get the filename from the given path/url.
+     """
+     path = _get_path(path)
++    # urlsplit drops any query-string/fragment, so urls are supported too.
+     filepath = urlsplit(path).path
+     filename = os.path.basename(filepath)
+     return filename
+@@ -38,7 +56,7 @@
+     return extension
+ 
+ 
+-def get_parent_dir(path: PathIn, *, levels: int = 1) -> str:
++def get_parent_dir(path: PathIn, levels: int = 1) -> str:
+     """
+     Get the parent directory for the given path going up N levels.
+     """
+@@ -48,7 +66,6 @@
+ 
+ def get_unique_name(
+     path: PathIn,
+-    *,
+     prefix: str = "",
+     suffix: str = "",
+     extension: str = "",
+@@ -59,21 +76,17 @@
+     """
+     path = _get_path(path)
+     assert_dir(path)
+-    name = ""
+     while True:
++        name = ""
+         if prefix:
+             name += f"{prefix}{separator}"
+-        uid = uuid.uuid4()
+-        name += f"{uid}"
++        name += f"{uuid.uuid4()}"
+         if suffix:
+             name += f"{separator}{suffix}"
+         if extension:
+-            extension = extension.lstrip(".").lower()
+-            name += f".{extension}"
+-        if exists(join_path(path, name)):
+-            continue
+-        break
+-    return name
++            name += f".{extension.lstrip('.').lower()}"
++        if not exists(join_path(path, name)):
++            return name
+ 
+ 
+ def join_filename(basename: str, extension: str) -> str:
+@@ -83,8 +96,7 @@
+     basename = basename.rstrip(".").strip()
+     extension = extension.replace(".", "").strip()
+     if basename and extension:
+-        filename = f"{basename}.{extension}"
+-        return filename
++        return f"{basename}.{extension}"
+     return basename or extension
+ 
+ 
+@@ -106,7 +118,9 @@
+     basepath = path
+     if get_file_extension(path) in ["py", "pyc", "pyo"]:
+         basepath = os.path.dirname(os.path.realpath(path))
+-    paths_str = [_get_path(path).lstrip("/\\") for path in paths]
++    # leading separators are stripped, so that joining an "absolute" path
++    # keeps the result relative to basepath instead of discarding it.
++    paths_str = [_get_path(item).lstrip("/\\") for item in paths]
+     return os.path.normpath(os.path.join(basepath, *paths_str))
+ 
+ 
+@@ -144,7 +158,6 @@
+ 
+ def transform_filepath(
+     path: PathIn,
+-    *,
+     dirpath: str | Callable[[str], str] | None = None,
+     basename: str | Callable[[str], str] | None = None,
+     extension: str | Callable[[str], str] | None = None,
+@@ -169,31 +182,27 @@
+         new_value: str | Callable[[str], str] | None,
+         old_value: str,
+     ) -> str:
+-        value = old_value
+-        if new_value is not None:
+-            if callable(new_value):
+-                value = new_value(old_value)
+-            elif isinstance(new_value, str):
+-                value = new_value
+-            else:
+-                value = old_value
+-        return value
+-
++        if new_value is None:
++            return old_value
++        if callable(new_value):
++            return new_value(old_value)
++        if isinstance(new_value, str):
++            return new_value
++        return old_value
++
++    error_message = (
++        "Invalid arguments: at least one of "
++        "'dirpath', 'basename' or 'extension' is required."
++    )
+     if all([dirpath is None, basename is None, extension is None]):
+-        raise ValueError(
+-            "Invalid arguments: at least one of "
+-            "'dirpath', 'basename' or 'extension' is required."
+-        )
++        raise ValueError(error_message)
+     old_dirpath, old_filename = split_filepath(path)
+     old_basename, old_extension = split_filename(old_filename)
+     new_dirpath = _get_value(dirpath, old_dirpath)
+     new_basename = _get_value(basename, old_basename)
+     new_extension = _get_value(extension, old_extension)
+     if not any([new_dirpath, new_basename, new_extension]):
+-        raise ValueError(
+-            "Invalid arguments: at least one of "
+-            "'dirpath', 'basename' or 'extension' is required."
+-        )
++        raise ValueError(error_message)
+     new_filename = join_filename(new_basename, new_extension)
+     new_filepath = join_filepath(new_dirpath, new_filename)
+     return new_filepath
+=== perms ===
+--- /tmp/ref017/src/fsutil/perms.py	2026-07-07 10:32:25.000000000 +0000
++++ /workspace/src/fsutil/perms.py	2026-08-10 11:12:12.730452895 +0000
+@@ -10,6 +10,10 @@
+ def get_permissions(path: PathIn) -> int:
+     """
+     Get the file/directory permissions.
++
++    The returned value is the octal representation read as a decimal int, eg.
++    a file with mode ``0o644`` returns ``644``, so that it round-trips with
++    :func:`set_permissions`.
+     """
+     path = _get_path(path)
+     assert_exists(path)
+@@ -21,8 +25,16 @@
+ def set_permissions(path: PathIn, value: int) -> None:
+     """
+     Set the file/directory permissions.
++
++    The value is interpreted the same way it is returned by
++    :func:`get_permissions`, ie. ``set_permissions(path, 644)`` applies the
++    ``0o644`` mode. Values that cannot be read as octal digits (eg. the result
++    of an ``0o755`` literal, which is ``493``) are used as raw modes instead.
+     """
+     path = _get_path(path)
+     assert_exists(path)
+-    permissions = int(str(value), 8) & 0o777
++    try:
++        permissions = int(str(value), 8) & 0o777
++    except ValueError:
++        permissions = int(value) & 0o777
+     os.chmod(path, permissions)
+=== types ===
+--- /tmp/ref017/src/fsutil/types.py	2026-07-07 10:32:25.000000000 +0000
++++ /workspace/src/fsutil/types.py	2026-08-10 11:11:31.374670962 +0000
+@@ -1,6 +1,11 @@
+ from __future__ import annotations
+ 
+ import pathlib
+-from typing import Union
++from typing import IO, Union
+ 
++# A path accepted as input by (almost) every public function:
++# either a string or a `pathlib.Path` instance.
+ PathIn = Union[str, pathlib.Path]
++
++# A path or an already opened binary file-like object.
++FileIn = Union[PathIn, IO[bytes]]

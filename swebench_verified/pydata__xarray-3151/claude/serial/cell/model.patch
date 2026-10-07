@@ -1,0 +1,78 @@
+diff --git a/doc/whats-new.rst b/doc/whats-new.rst
+index a8c53423..43c28e3d 100644
+--- a/doc/whats-new.rst
++++ b/doc/whats-new.rst
+@@ -41,6 +41,10 @@ Bug fixes
+ - XFAIL several tests which are expected to fail on ARM systems
+   due to a ``datetime`` issue in NumPy (:issue:`2334`).
+   By `Graham Inggs <https://github.com/ginggs>`_.
++- Fix :py:func:`~xarray.combine_by_coords` to allow for non-monotonic
++  coordinate values along dimensions which are identical between all the
++  datasets, and so are not concatenated over (:issue:`3150`).
++  By `Ryan Abernathey <https://github.com/rabernat>`_.
+ 
+ .. _whats-new.0.12.3:
+ 
+diff --git a/xarray/core/combine.py b/xarray/core/combine.py
+index 37ae903b..5718698f 100644
+--- a/xarray/core/combine.py
++++ b/xarray/core/combine.py
+@@ -501,14 +501,13 @@ def combine_by_coords(datasets, compat='no_conflicts', data_vars='all',
+                                    fill_value=fill_value)
+ 
+         # Check the overall coordinates are monotonically increasing
+-        for dim in concatenated.dims:
+-            if dim in concatenated:
+-                indexes = concatenated.indexes.get(dim)
+-                if not (indexes.is_monotonic_increasing
+-                        or indexes.is_monotonic_decreasing):
+-                    raise ValueError("Resulting object does not have monotonic"
+-                                     " global indexes along dimension {}"
+-                                     .format(dim))
++        for dim in concat_dims:
++            indexes = concatenated.indexes.get(dim)
++            if not (indexes.is_monotonic_increasing
++                    or indexes.is_monotonic_decreasing):
++                raise ValueError("Resulting object does not have monotonic"
++                                 " global indexes along dimension {}"
++                                 .format(dim))
+         concatenated_grouped_by_data_vars.append(concatenated)
+ 
+     return merge(concatenated_grouped_by_data_vars, compat=compat,
+diff --git a/xarray/tests/test_combine.py b/xarray/tests/test_combine.py
+index 77e2993b..7c74cd88 100644
+--- a/xarray/tests/test_combine.py
++++ b/xarray/tests/test_combine.py
+@@ -618,6 +618,32 @@ class TestCombineAuto:
+                                       " along dimension x"):
+             combine_by_coords([ds1, ds0])
+ 
++    def test_combine_by_coords_non_monotonic_bystander_coord(self):
++        # Identical, non-monotonic coords along a dimension which is not
++        # concatenated over should be left alone, not rejected. GH3150
++        y = ['a', 'c', 'b']
++        ds0 = Dataset({'data': (['x', 'y'], np.zeros((3, 3)))},
++                      coords={'x': [1, 2, 3], 'y': y})
++        ds1 = Dataset({'data': (['x', 'y'], np.ones((4, 3)))},
++                      coords={'x': [4, 5, 6, 7], 'y': y})
++
++        actual = combine_by_coords([ds0, ds1])
++        expected = Dataset(
++            {'data': (['x', 'y'], np.concatenate([np.zeros((3, 3)),
++                                                  np.ones((4, 3))]))},
++            coords={'x': [1, 2, 3, 4, 5, 6, 7], 'y': y})
++        assert_identical(expected, actual)
++
++        # ...but a genuinely unorderable concat dimension is still an error,
++        # even when such a bystander coord is present
++        ds2 = Dataset({'data': (['x', 'y'], np.zeros((3, 3)))},
++                      coords={'x': [1, 2, 7], 'y': y})
++        ds3 = Dataset({'data': (['x', 'y'], np.ones((2, 3)))},
++                      coords={'x': [4, 5], 'y': y})
++        with raises_regex(ValueError, "does not have monotonic global indexes"
++                                      " along dimension x"):
++            combine_by_coords([ds3, ds2])
++
+ 
+ @pytest.mark.filterwarnings("ignore:In xarray version 0.13 `auto_combine` "
+                             "will be deprecated")

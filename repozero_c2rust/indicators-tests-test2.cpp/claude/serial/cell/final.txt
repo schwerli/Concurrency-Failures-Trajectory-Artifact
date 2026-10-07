@@ -1,0 +1,34 @@
+Done. The port is complete and verified byte-identical to the C++ binary.
+
+## What the C++ actually does
+
+The `indicators/` library source wasn't present in the dataset, so this was a genuine black-box port. Two findings drove the design:
+
+1. **`main` ignores `argc`/`argv` entirely** — the 75/100/30/0.75 values are literals in the body. The five published test cases confirm it: all five pass different `progress`/`total`/`width`/`percentage` values and all five expect the *same* two lines. I verified this against the binary across 15 arg sets (positional, `--flag value`, `--flag=value`, junk, negatives, unicode, empty strings) — output never changed and exit was always 0.
+2. **The bar formula**, recovered from the one observable rendering: `floor(75/100 × 30) = 22` fill chars, one `>` lead, then `30 − 22 − 1 = 7` pad spaces. `grep -o '=' | wc -l` pinned the fill count at exactly 22 rather than eyeballing the `od` dump, which pads spaces ambiguously.
+
+## Structure
+
+```
+/output/Cargo.toml              single [[bin]] → test2.rs
+/output/test2.rs                entry point (mirrors main() line for line)
+/output/src/cli.rs              arg parsing — accepted, deliberately unused
+/output/src/indicators/mod.rs   library facade
+      ├── progress_bar.rs       ProgressBar: set_progress/set_total/set_width/str
+      ├── percentage.rs         Percentage::new(f32) / str
+      └── format.rs             std::fixed + setprecision semantics
+```
+
+`test2.rs` pulls modules in via `#[path]`, so **both** `rustc test2.rs` and `cargo build --release` work from the same file — no `extern crate` split. std only, no crates.io.
+
+Two details worth flagging:
+- **`float`, not `double`.** `Percentage` holds `f32` and scales in `f32` before widening for print, matching the C++ `float` expression. For 0.75 it's exact either way, but it keeps other inputs faithful.
+- **Non-finite spelling.** Rust's `Display` emits `NaN`; iostreams emit `nan`. `format::fixed` special-cases inf/NaN (preserving the sign bit, as glibc does) so the library generalizes correctly beyond the one exercised value.
+
+## Verification
+
+- Byte-identical to `test2_executable` (`cmp`, exit codes matched) across all 15 arg sets, for the `rustc` binary and the cargo release binary.
+- `cargo test`: 11/11 pass, including golden-string assertions for both output lines and a width invariant swept over `width` 0–39 × `progress` 0–20.
+- Compiles warning-free under edition 2021, and also under a bare `rustc test2.rs` (which defaults to edition 2015) — imports use `self::`/`super::` to stay valid under both path rules.
+
+One note on requirement 7: an executable can't live *at* `/output/test2.rs`, since that's the source file. `rustc test2.rs` names its output `test2`, so the binaries are at **`/output/test2`** and `/output/target/release/test2`.

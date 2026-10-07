@@ -1,0 +1,25 @@
+**Root cause:** exactly as you diagnosed — `zip()` stops at the shorter iterable, so the extra coordinate was silently dropped:
+
+```python
+sqrt(sum([(a - b)**2 for a, b in zip(self.args, p.args ...)]))
+```
+
+**Fix** (`sympy/geometry/point.py:269`): switched to `zip_longest(..., fillvalue=S.Zero)`, which treats the lower-dimensional point as embedded in the higher-dimensional space (missing coordinates = 0). `zip_longest` already had a Py2/Py3 shim in `sympy.core.compatibility`, so no new import machinery was needed.
+
+I also fixed `taxicab_distance` at line 310 — it had the identical `zip` truncation bug three lines below, returning `1` instead of `3` for the same pair. It seemed wrong to fix one and leave its twin broken.
+
+**Verified:**
+
+| call | before | after |
+|---|---|---|
+| `Point(2,0).distance(Point(1,0,2))` | `1` | `sqrt(5)` |
+| `Point(1,0,2).distance(Point(2,0))` | `1` | `sqrt(5)` |
+| `Point(2,0).taxicab_distance(Point(1,0,2))` | `1` | `3` |
+
+Symmetric in both directions, and the bare-sequence branch (`.distance((1,0,2))`) works too. Same-dimension results are unchanged (2D, 3D, 4D, symbolic, `abs()`).
+
+Added regression assertions to `test_point.py` plus a doctest, and ran the full geometry suite and doctests: **33 passed, 239 doctests passed**.
+
+One thing to flag rather than bury: `test_line.py` reports 2 exceptions (`test_line_geom`, `test_line_intersection`). These are **pre-existing and unrelated** — I confirmed with a `git stash` baseline run that produces the byte-identical result. They're a Python 3.9 incompatibility in this old checkout (`from collections import MutableMapping` in `sympy/assumptions/sathandlers.py`, moved to `collections.abc` in 3.3+), not something my change touches.
+
+Note that `midpoint`, `dot`, and `__add__` still zip same-dimension-only — `__add__` explicitly raises on a dimension mismatch, while `midpoint` and `dot` truncate silently like `distance` did. I left those alone since they're beyond the reported bug, but `midpoint` in particular is arguably the same defect if you want it addressed.

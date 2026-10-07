@@ -1,0 +1,244 @@
+diff --git a/django/db/models/fields/related.py b/django/db/models/fields/related.py
+index c2aea9c730..733b33c89c 100644
+--- a/django/db/models/fields/related.py
++++ b/django/db/models/fields/related.py
+@@ -582,9 +582,12 @@ class ForeignObject(RelatedField):
+         if self.remote_field.parent_link:
+             kwargs['parent_link'] = self.remote_field.parent_link
+         if isinstance(self.remote_field.model, str):
+-            kwargs['to'] = self.remote_field.model.lower()
++            if '.' in self.remote_field.model:
++                kwargs['to'] = self.remote_field.model
++            else:
++                kwargs['to'] = self.remote_field.model.lower()
+         else:
+-            kwargs['to'] = self.remote_field.model._meta.label_lower
++            kwargs['to'] = self.remote_field.model._meta.label
+         # If swappable is True, then see if we're actually pointing to the target
+         # of a swap.
+         swappable_setting = self.swappable_setting
+diff --git a/tests/field_deconstruction/tests.py b/tests/field_deconstruction/tests.py
+index bf00aa44e2..cea0eef40d 100644
+--- a/tests/field_deconstruction/tests.py
++++ b/tests/field_deconstruction/tests.py
+@@ -202,39 +202,46 @@ class FieldDeconstructionTests(SimpleTestCase):
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.ForeignKey")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "auth.permission", "on_delete": models.CASCADE})
++        self.assertEqual(kwargs, {"to": "auth.Permission", "on_delete": models.CASCADE})
+         self.assertFalse(hasattr(kwargs['to'], "setting_name"))
+         # Test swap detection for swappable model
+         field = models.ForeignKey("auth.User", models.CASCADE)
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.ForeignKey")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "auth.user", "on_delete": models.CASCADE})
++        self.assertEqual(kwargs, {"to": "auth.User", "on_delete": models.CASCADE})
+         self.assertEqual(kwargs['to'].setting_name, "AUTH_USER_MODEL")
+         # Test nonexistent (for now) model
+         field = models.ForeignKey("something.Else", models.CASCADE)
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.ForeignKey")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "something.else", "on_delete": models.CASCADE})
++        self.assertEqual(kwargs, {"to": "something.Else", "on_delete": models.CASCADE})
++        # Test a dotted string reference with a mixed-case app label; the
++        # case must be preserved so the app registry can resolve it.
++        field = models.ForeignKey("MixedCaseApp.Model", models.CASCADE)
++        name, path, args, kwargs = field.deconstruct()
++        self.assertEqual(path, "django.db.models.ForeignKey")
++        self.assertEqual(args, [])
++        self.assertEqual(kwargs, {"to": "MixedCaseApp.Model", "on_delete": models.CASCADE})
+         # Test on_delete
+         field = models.ForeignKey("auth.User", models.SET_NULL)
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.ForeignKey")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "auth.user", "on_delete": models.SET_NULL})
++        self.assertEqual(kwargs, {"to": "auth.User", "on_delete": models.SET_NULL})
+         # Test to_field preservation
+         field = models.ForeignKey("auth.Permission", models.CASCADE, to_field="foobar")
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.ForeignKey")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "auth.permission", "to_field": "foobar", "on_delete": models.CASCADE})
++        self.assertEqual(kwargs, {"to": "auth.Permission", "to_field": "foobar", "on_delete": models.CASCADE})
+         # Test related_name preservation
+         field = models.ForeignKey("auth.Permission", models.CASCADE, related_name="foobar")
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.ForeignKey")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "auth.permission", "related_name": "foobar", "on_delete": models.CASCADE})
++        self.assertEqual(kwargs, {"to": "auth.Permission", "related_name": "foobar", "on_delete": models.CASCADE})
+         # Test related_query_name
+         field = models.ForeignKey("auth.Permission", models.CASCADE, related_query_name="foobar")
+         name, path, args, kwargs = field.deconstruct()
+@@ -242,7 +249,7 @@ class FieldDeconstructionTests(SimpleTestCase):
+         self.assertEqual(args, [])
+         self.assertEqual(
+             kwargs,
+-            {"to": "auth.permission", "related_query_name": "foobar", "on_delete": models.CASCADE}
++            {"to": "auth.Permission", "related_query_name": "foobar", "on_delete": models.CASCADE}
+         )
+         # Test limit_choices_to
+         field = models.ForeignKey("auth.Permission", models.CASCADE, limit_choices_to={'foo': 'bar'})
+@@ -251,14 +258,14 @@ class FieldDeconstructionTests(SimpleTestCase):
+         self.assertEqual(args, [])
+         self.assertEqual(
+             kwargs,
+-            {"to": "auth.permission", "limit_choices_to": {'foo': 'bar'}, "on_delete": models.CASCADE}
++            {"to": "auth.Permission", "limit_choices_to": {'foo': 'bar'}, "on_delete": models.CASCADE}
+         )
+         # Test unique
+         field = models.ForeignKey("auth.Permission", models.CASCADE, unique=True)
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.ForeignKey")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "auth.permission", "unique": True, "on_delete": models.CASCADE})
++        self.assertEqual(kwargs, {"to": "auth.Permission", "unique": True, "on_delete": models.CASCADE})
+ 
+     @override_settings(AUTH_USER_MODEL="auth.Permission")
+     def test_foreign_key_swapped(self):
+@@ -270,7 +277,7 @@ class FieldDeconstructionTests(SimpleTestCase):
+ 
+         self.assertEqual(path, "django.db.models.ForeignKey")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "auth.permission", "on_delete": models.CASCADE})
++        self.assertEqual(kwargs, {"to": "auth.Permission", "on_delete": models.CASCADE})
+         self.assertEqual(kwargs['to'].setting_name, "AUTH_USER_MODEL")
+ 
+     def test_one_to_one(self):
+@@ -282,39 +289,39 @@ class FieldDeconstructionTests(SimpleTestCase):
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.OneToOneField")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "auth.permission", "on_delete": models.CASCADE})
++        self.assertEqual(kwargs, {"to": "auth.Permission", "on_delete": models.CASCADE})
+         self.assertFalse(hasattr(kwargs['to'], "setting_name"))
+         # Test swap detection for swappable model
+         field = models.OneToOneField("auth.User", models.CASCADE)
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.OneToOneField")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "auth.user", "on_delete": models.CASCADE})
++        self.assertEqual(kwargs, {"to": "auth.User", "on_delete": models.CASCADE})
+         self.assertEqual(kwargs['to'].setting_name, "AUTH_USER_MODEL")
+         # Test nonexistent (for now) model
+         field = models.OneToOneField("something.Else", models.CASCADE)
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.OneToOneField")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "something.else", "on_delete": models.CASCADE})
++        self.assertEqual(kwargs, {"to": "something.Else", "on_delete": models.CASCADE})
+         # Test on_delete
+         field = models.OneToOneField("auth.User", models.SET_NULL)
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.OneToOneField")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "auth.user", "on_delete": models.SET_NULL})
++        self.assertEqual(kwargs, {"to": "auth.User", "on_delete": models.SET_NULL})
+         # Test to_field
+         field = models.OneToOneField("auth.Permission", models.CASCADE, to_field="foobar")
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.OneToOneField")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "auth.permission", "to_field": "foobar", "on_delete": models.CASCADE})
++        self.assertEqual(kwargs, {"to": "auth.Permission", "to_field": "foobar", "on_delete": models.CASCADE})
+         # Test related_name
+         field = models.OneToOneField("auth.Permission", models.CASCADE, related_name="foobar")
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.OneToOneField")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "auth.permission", "related_name": "foobar", "on_delete": models.CASCADE})
++        self.assertEqual(kwargs, {"to": "auth.Permission", "related_name": "foobar", "on_delete": models.CASCADE})
+         # Test related_query_name
+         field = models.OneToOneField("auth.Permission", models.CASCADE, related_query_name="foobar")
+         name, path, args, kwargs = field.deconstruct()
+@@ -322,7 +329,7 @@ class FieldDeconstructionTests(SimpleTestCase):
+         self.assertEqual(args, [])
+         self.assertEqual(
+             kwargs,
+-            {"to": "auth.permission", "related_query_name": "foobar", "on_delete": models.CASCADE}
++            {"to": "auth.Permission", "related_query_name": "foobar", "on_delete": models.CASCADE}
+         )
+         # Test limit_choices_to
+         field = models.OneToOneField("auth.Permission", models.CASCADE, limit_choices_to={'foo': 'bar'})
+@@ -331,14 +338,14 @@ class FieldDeconstructionTests(SimpleTestCase):
+         self.assertEqual(args, [])
+         self.assertEqual(
+             kwargs,
+-            {"to": "auth.permission", "limit_choices_to": {'foo': 'bar'}, "on_delete": models.CASCADE}
++            {"to": "auth.Permission", "limit_choices_to": {'foo': 'bar'}, "on_delete": models.CASCADE}
+         )
+         # Test unique
+         field = models.OneToOneField("auth.Permission", models.CASCADE, unique=True)
+         name, path, args, kwargs = field.deconstruct()
+         self.assertEqual(path, "django.db.models.OneToOneField")
+         self.assertEqual(args, [])
+-        self.assertEqual(kwargs, {"to": "auth.permission", "on_delete": models.CASCADE})
++        self.assertEqual(kwargs, {"to": "auth.Permission", "on_delete": models.CASCADE})
+ 
+     def test_image_field(self):
+         field = models.ImageField(upload_to="foo/barness", width_field="width", height_field="height")
+diff --git a/tests/migrations/test_state.py b/tests/migrations/test_state.py
+index 40277bf506..fb56a990cf 100644
+--- a/tests/migrations/test_state.py
++++ b/tests/migrations/test_state.py
+@@ -1,3 +1,4 @@
++from django.apps import AppConfig
+ from django.apps.registry import Apps
+ from django.contrib.contenttypes.fields import GenericForeignKey
+ from django.db import models
+@@ -385,6 +386,51 @@ class StateTests(SimpleTestCase):
+         self.assertEqual([mgr.__class__ for mgr in Food._meta.managers],
+                          [models.Manager, FoodManager, FoodManager])
+ 
++    def test_render_model_with_mixed_case_app_label_fk(self):
++        """
++        Building a ProjectState for an app with a mixed-case label that
++        contains a ForeignKey between two of its models doesn't raise a
++        ValueError about a lazy reference to the lowercased app label.
++        """
++        class MixedCaseAppConfig(AppConfig):
++            name = 'mixed_case_app'
++            label = 'MixedCase'
++            path = ''
++
++        new_apps = Apps([MixedCaseAppConfig('mixed_case_app', None)])
++
++        class Category(models.Model):
++            title = models.CharField(max_length=255)
++
++            class Meta:
++                app_label = 'MixedCase'
++                apps = new_apps
++
++        class Content(models.Model):
++            category = models.ForeignKey(Category, models.CASCADE)
++
++            class Meta:
++                app_label = 'MixedCase'
++                apps = new_apps
++
++        # deconstruct() preserves the app-label case of a model class
++        # reference.
++        name, path, args, kwargs = Content._meta.get_field('category').deconstruct()
++        self.assertEqual(kwargs['to'], 'MixedCase.Category')
++
++        project_state = ProjectState.from_apps(new_apps)
++        content_state = project_state.models[('MixedCase', 'content')]
++        self.assertEqual(
++            content_state.fields['category'].remote_field.model,
++            'MixedCase.Category',
++        )
++        # Rendering the state builds StateApps without raising.
++        rendered_apps = project_state.apps
++        self.assertEqual(
++            {model._meta.label for model in rendered_apps.get_models()},
++            {'MixedCase.Category', 'MixedCase.Content'},
++        )
++
+     def test_render_model_inheritance(self):
+         class Book(models.Model):
+             title = models.CharField(max_length=1000)

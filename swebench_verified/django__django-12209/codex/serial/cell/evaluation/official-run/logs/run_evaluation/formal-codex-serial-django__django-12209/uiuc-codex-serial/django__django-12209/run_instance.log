@@ -1,0 +1,402 @@
+2026-08-12 23:08:16,814 - INFO - Creating container for django__django-12209...
+2026-08-12 23:08:16,943 - INFO - Container for django__django-12209 created: 4f6b776ccc24fad43390492357e9f11d5eaa086aa019bb1bb232ebf96b2ca102
+2026-08-12 23:08:17,357 - INFO - Container for django__django-12209 started: 4f6b776ccc24fad43390492357e9f11d5eaa086aa019bb1bb232ebf96b2ca102
+2026-08-12 23:08:17,357 - INFO - Intermediate patch for django__django-12209 written to logs/run_evaluation/formal-codex-serial-django__django-12209/uiuc-codex-serial/django__django-12209/patch.diff, now applying to container...
+2026-08-12 23:08:17,533 - INFO - >>>>> Applied Patch:
+Checking patch django/db/models/base.py...
+Checking patch tests/basic/models.py...
+Checking patch tests/basic/tests.py...
+Checking patch tests/fixtures/tests.py...
+Applied patch django/db/models/base.py cleanly.
+Applied patch tests/basic/models.py cleanly.
+Applied patch tests/basic/tests.py cleanly.
+Applied patch tests/fixtures/tests.py cleanly.
+
+2026-08-12 23:08:18,432 - INFO - Git diff before:
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index e3b14a41a0..340aacc52c 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -398,6 +398,9 @@ class ModelState:
+     # explicit (non-auto) PKs. This impacts validation only; it has no effect
+     # on the actual save.
+     adding = True
++    # Tracks when an instance's primary key is populated from the field default.
++    adding_default_pk = False
++    adding_default_pk_value = NOT_PROVIDED
+     fields_cache = ModelStateFieldsCacheDescriptor()
+ 
+ 
+@@ -414,6 +417,10 @@ class Model(metaclass=ModelBase):
+ 
+         # Set up the storage for instance state
+         self._state = ModelState()
++        self._state.adding_default_pk = False
++        self._state.adding_default_pk_value = NOT_PROVIDED
++        pk_set_explicitly = False
++        pk_default_value = NOT_PROVIDED
+ 
+         # There is a rather weird disparity here; if kwargs, it's set, then args
+         # overrides it. It should be one or the other; don't duplicate the work
+@@ -432,6 +439,8 @@ class Model(metaclass=ModelBase):
+             for val, field in zip(args, fields_iter):
+                 if val is _DEFERRED:
+                     continue
++                if field.primary_key and val is not None:
++                    pk_set_explicitly = True
+                 _setattr(self, field.attname, val)
+         else:
+             # Slower, kwargs-ready version.
+@@ -439,6 +448,8 @@ class Model(metaclass=ModelBase):
+             for val, field in zip(args, fields_iter):
+                 if val is _DEFERRED:
+                     continue
++                if field.primary_key and val is not None:
++                    pk_set_explicitly = True
+                 _setattr(self, field.attname, val)
+                 kwargs.pop(field.name, None)
+ 
+@@ -447,6 +458,7 @@ class Model(metaclass=ModelBase):
+ 
+         for field in fields_iter:
+             is_related_object = False
++            pk_default_used = False
+             # Virtual field
+             if field.attname not in kwargs and field.column is None:
+                 continue
+@@ -462,6 +474,7 @@ class Model(metaclass=ModelBase):
+                             val = kwargs.pop(field.attname)
+                         except KeyError:
+                             val = field.get_default()
++                            pk_default_used = field.primary_key
+                 else:
+                     try:
+                         val = kwargs.pop(field.attname)
+@@ -471,8 +484,18 @@ class Model(metaclass=ModelBase):
+                         # get_default() to be evaluated, and then not used.
+                         # Refs #12057.
+                         val = field.get_default()
++                        pk_default_used = field.primary_key
+             else:
+                 val = field.get_default()
++                pk_default_used = field.primary_key
++
++            if field.primary_key:
++                if is_related_object:
++                    pk_set_explicitly = rel_obj is not None
++                elif pk_default_used:
++                    pk_default_value = val
++                elif val is not None:
++                    pk_set_explicitly = True
+ 
+             if is_related_object:
+                 # If we are passed a related instance, set it using the
+@@ -493,12 +516,17 @@ class Model(metaclass=ModelBase):
+                     # virtual fields.
+                     if prop in property_names or opts.get_field(prop):
+                         if kwargs[prop] is not _DEFERRED:
++                            if prop == 'pk' and kwargs[prop] is not None:
++                                pk_set_explicitly = True
+                             _setattr(self, prop, kwargs[prop])
+                         del kwargs[prop]
+                 except (AttributeError, FieldDoesNotExist):
+                     pass
+             for kwarg in kwargs:
+                 raise TypeError("%s() got an unexpected keyword argument '%s'" % (cls.__name__, kwarg))
++        if not pk_set_explicitly and pk_default_value is not NOT_PROVIDED:
++            self._state.adding_default_pk = True
++            self._state.adding_default_pk_value = pk_default_value
+         super().__init__()
+         post_init.send(sender=cls, instance=self)
+ 
+@@ -840,19 +868,30 @@ class Model(metaclass=ModelBase):
+                        if f.name in update_fields or f.attname in update_fields]
+ 
+         pk_val = self._get_pk_val(meta)
++        pk_generated_on_save = False
+         if pk_val is None:
+             pk_val = meta.pk.get_pk_value_on_save(self)
+             setattr(self, meta.pk.attname, pk_val)
++            pk_generated_on_save = pk_val is not None
++            if pk_generated_on_save and meta.pk.has_default():
++                self._state.adding_default_pk = True
++                self._state.adding_default_pk_value = pk_val
+         pk_set = pk_val is not None
+         if not pk_set and (force_update or update_fields):
+             raise ValueError("Cannot force an update in save() with no primary key.")
+         updated = False
+-        # Skip an UPDATE when adding an instance and primary key has a default.
++        # Skip an UPDATE when adding an instance and primary key is generated
++        # from the field default.
+         if (
+             not force_insert and
+             self._state.adding and
+-            self._meta.pk.default and
+-            self._meta.pk.default is not NOT_PROVIDED
++            meta.pk.has_default() and
++            (
++                pk_generated_on_save or (
++                    self._state.adding_default_pk and
++                    pk_val == self._state.adding_default_pk_value
++                )
++            )
+         ):
+             force_insert = True
+         # If possible, try an UPDATE. If that doesn't update anything, do an INSERT.
+diff --git a/tests/basic/models.py b/tests/basic/models.py
+index 7b2b1aee54..ab807fbe4b 100644
+--- a/tests/basic/models.py
++++ b/tests/basic/models.py
+@@ -46,3 +46,4 @@ class SelfRef(models.Model):
+ 
+ class PrimaryKeyWithDefault(models.Model):
+     uuid = models.UUIDField(primary_key=True, default=uuid.uuid4)
++    name = models.CharField(blank=True, max_length=100)
+diff --git a/tests/basic/tests.py b/tests/basic/tests.py
+index 5eada343e1..8de7eaadd1 100644
+--- a/tests/basic/tests.py
++++ b/tests/basic/tests.py
+@@ -139,6 +139,18 @@ class ModelInstanceCreationTests(TestCase):
+         with self.assertNumQueries(1):
+             PrimaryKeyWithDefault().save()
+ 
++    def test_save_primary_with_default_when_pk_set_explicitly(self):
++        original = PrimaryKeyWithDefault.objects.create(name='original')
++
++        with self.assertNumQueries(1):
++            PrimaryKeyWithDefault(pk=original.pk, name='updated').save()
++
++        self.assertEqual(PrimaryKeyWithDefault.objects.count(), 1)
++        self.assertEqual(
++            PrimaryKeyWithDefault.objects.get(pk=original.pk).name,
++            'updated',
++        )
++
+ 
+ class ModelTest(TestCase):
+     def test_objects_attribute_is_only_available_on_the_class_itself(self):
+diff --git a/tests/fixtures/tests.py b/tests/fixtures/tests.py
+index 02dd38e635..b11967018d 100644
+--- a/tests/fixtures/tests.py
++++ b/tests/fixtures/tests.py
+@@ -457,6 +457,21 @@ class FixtureLoadingTests(DumpDataAssertMixin, TestCase):
+         self.assertIn('"pk": "%s"' % m1.id, result)
+         self.assertIn('"pk": "%s"' % m2.id, result)
+ 
++    def test_loaddata_with_default_pk_explicitly_specified(self):
++        instance = PrimaryKeyUUIDModel.objects.create()
++        fixture = (
++            '[{"model": "fixtures.primarykeyuuidmodel", "pk": "%s", "fields": {}}]'
++            % instance.pk
++        )
++        with NamedTemporaryFile(mode='w+', suffix='.json', delete=False) as file:
++            file.write(fixture)
++        try:
++            management.call_command('loaddata', file.name, verbosity=0)
++            management.call_command('loaddata', file.name, verbosity=0)
++        finally:
++            os.remove(file.name)
++        self.assertEqual(PrimaryKeyUUIDModel.objects.count(), 1)
++
+     def test_dumpdata_with_file_output(self):
+         management.call_command('loaddata', 'fixture1.json', verbosity=0)
+         self._dumpdata_assert(
+2026-08-12 23:08:18,433 - INFO - Eval script for django__django-12209 written to logs/run_evaluation/formal-codex-serial-django__django-12209/uiuc-codex-serial/django__django-12209/eval.sh; copying to container...
+2026-08-12 23:08:29,132 - INFO - Test runtime: 10.62 seconds
+2026-08-12 23:08:29,132 - INFO - Test output for django__django-12209 written to logs/run_evaluation/formal-codex-serial-django__django-12209/uiuc-codex-serial/django__django-12209/test_output.txt
+2026-08-12 23:08:29,191 - INFO - Git diff after:
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index e3b14a41a0..340aacc52c 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -398,6 +398,9 @@ class ModelState:
+     # explicit (non-auto) PKs. This impacts validation only; it has no effect
+     # on the actual save.
+     adding = True
++    # Tracks when an instance's primary key is populated from the field default.
++    adding_default_pk = False
++    adding_default_pk_value = NOT_PROVIDED
+     fields_cache = ModelStateFieldsCacheDescriptor()
+ 
+ 
+@@ -414,6 +417,10 @@ class Model(metaclass=ModelBase):
+ 
+         # Set up the storage for instance state
+         self._state = ModelState()
++        self._state.adding_default_pk = False
++        self._state.adding_default_pk_value = NOT_PROVIDED
++        pk_set_explicitly = False
++        pk_default_value = NOT_PROVIDED
+ 
+         # There is a rather weird disparity here; if kwargs, it's set, then args
+         # overrides it. It should be one or the other; don't duplicate the work
+@@ -432,6 +439,8 @@ class Model(metaclass=ModelBase):
+             for val, field in zip(args, fields_iter):
+                 if val is _DEFERRED:
+                     continue
++                if field.primary_key and val is not None:
++                    pk_set_explicitly = True
+                 _setattr(self, field.attname, val)
+         else:
+             # Slower, kwargs-ready version.
+@@ -439,6 +448,8 @@ class Model(metaclass=ModelBase):
+             for val, field in zip(args, fields_iter):
+                 if val is _DEFERRED:
+                     continue
++                if field.primary_key and val is not None:
++                    pk_set_explicitly = True
+                 _setattr(self, field.attname, val)
+                 kwargs.pop(field.name, None)
+ 
+@@ -447,6 +458,7 @@ class Model(metaclass=ModelBase):
+ 
+         for field in fields_iter:
+             is_related_object = False
++            pk_default_used = False
+             # Virtual field
+             if field.attname not in kwargs and field.column is None:
+                 continue
+@@ -462,6 +474,7 @@ class Model(metaclass=ModelBase):
+                             val = kwargs.pop(field.attname)
+                         except KeyError:
+                             val = field.get_default()
++                            pk_default_used = field.primary_key
+                 else:
+                     try:
+                         val = kwargs.pop(field.attname)
+@@ -471,8 +484,18 @@ class Model(metaclass=ModelBase):
+                         # get_default() to be evaluated, and then not used.
+                         # Refs #12057.
+                         val = field.get_default()
++                        pk_default_used = field.primary_key
+             else:
+                 val = field.get_default()
++                pk_default_used = field.primary_key
++
++            if field.primary_key:
++                if is_related_object:
++                    pk_set_explicitly = rel_obj is not None
++                elif pk_default_used:
++                    pk_default_value = val
++                elif val is not None:
++                    pk_set_explicitly = True
+ 
+             if is_related_object:
+                 # If we are passed a related instance, set it using the
+@@ -493,12 +516,17 @@ class Model(metaclass=ModelBase):
+                     # virtual fields.
+                     if prop in property_names or opts.get_field(prop):
+                         if kwargs[prop] is not _DEFERRED:
++                            if prop == 'pk' and kwargs[prop] is not None:
++                                pk_set_explicitly = True
+                             _setattr(self, prop, kwargs[prop])
+                         del kwargs[prop]
+                 except (AttributeError, FieldDoesNotExist):
+                     pass
+             for kwarg in kwargs:
+                 raise TypeError("%s() got an unexpected keyword argument '%s'" % (cls.__name__, kwarg))
++        if not pk_set_explicitly and pk_default_value is not NOT_PROVIDED:
++            self._state.adding_default_pk = True
++            self._state.adding_default_pk_value = pk_default_value
+         super().__init__()
+         post_init.send(sender=cls, instance=self)
+ 
+@@ -840,19 +868,30 @@ class Model(metaclass=ModelBase):
+                        if f.name in update_fields or f.attname in update_fields]
+ 
+         pk_val = self._get_pk_val(meta)
++        pk_generated_on_save = False
+         if pk_val is None:
+             pk_val = meta.pk.get_pk_value_on_save(self)
+             setattr(self, meta.pk.attname, pk_val)
++            pk_generated_on_save = pk_val is not None
++            if pk_generated_on_save and meta.pk.has_default():
++                self._state.adding_default_pk = True
++                self._state.adding_default_pk_value = pk_val
+         pk_set = pk_val is not None
+         if not pk_set and (force_update or update_fields):
+             raise ValueError("Cannot force an update in save() with no primary key.")
+         updated = False
+-        # Skip an UPDATE when adding an instance and primary key has a default.
++        # Skip an UPDATE when adding an instance and primary key is generated
++        # from the field default.
+         if (
+             not force_insert and
+             self._state.adding and
+-            self._meta.pk.default and
+-            self._meta.pk.default is not NOT_PROVIDED
++            meta.pk.has_default() and
++            (
++                pk_generated_on_save or (
++                    self._state.adding_default_pk and
++                    pk_val == self._state.adding_default_pk_value
++                )
++            )
+         ):
+             force_insert = True
+         # If possible, try an UPDATE. If that doesn't update anything, do an INSERT.
+diff --git a/tests/basic/models.py b/tests/basic/models.py
+index 7b2b1aee54..ab807fbe4b 100644
+--- a/tests/basic/models.py
++++ b/tests/basic/models.py
+@@ -46,3 +46,4 @@ class SelfRef(models.Model):
+ 
+ class PrimaryKeyWithDefault(models.Model):
+     uuid = models.UUIDField(primary_key=True, default=uuid.uuid4)
++    name = models.CharField(blank=True, max_length=100)
+diff --git a/tests/basic/tests.py b/tests/basic/tests.py
+index 5eada343e1..8de7eaadd1 100644
+--- a/tests/basic/tests.py
++++ b/tests/basic/tests.py
+@@ -139,6 +139,18 @@ class ModelInstanceCreationTests(TestCase):
+         with self.assertNumQueries(1):
+             PrimaryKeyWithDefault().save()
+ 
++    def test_save_primary_with_default_when_pk_set_explicitly(self):
++        original = PrimaryKeyWithDefault.objects.create(name='original')
++
++        with self.assertNumQueries(1):
++            PrimaryKeyWithDefault(pk=original.pk, name='updated').save()
++
++        self.assertEqual(PrimaryKeyWithDefault.objects.count(), 1)
++        self.assertEqual(
++            PrimaryKeyWithDefault.objects.get(pk=original.pk).name,
++            'updated',
++        )
++
+ 
+ class ModelTest(TestCase):
+     def test_objects_attribute_is_only_available_on_the_class_itself(self):
+diff --git a/tests/fixtures/tests.py b/tests/fixtures/tests.py
+index 02dd38e635..b11967018d 100644
+--- a/tests/fixtures/tests.py
++++ b/tests/fixtures/tests.py
+@@ -457,6 +457,21 @@ class FixtureLoadingTests(DumpDataAssertMixin, TestCase):
+         self.assertIn('"pk": "%s"' % m1.id, result)
+         self.assertIn('"pk": "%s"' % m2.id, result)
+ 
++    def test_loaddata_with_default_pk_explicitly_specified(self):
++        instance = PrimaryKeyUUIDModel.objects.create()
++        fixture = (
++            '[{"model": "fixtures.primarykeyuuidmodel", "pk": "%s", "fields": {}}]'
++            % instance.pk
++        )
++        with NamedTemporaryFile(mode='w+', suffix='.json', delete=False) as file:
++            file.write(fixture)
++        try:
++            management.call_command('loaddata', file.name, verbosity=0)
++            management.call_command('loaddata', file.name, verbosity=0)
++        finally:
++            os.remove(file.name)
++        self.assertEqual(PrimaryKeyUUIDModel.objects.count(), 1)
++
+     def test_dumpdata_with_file_output(self):
+         management.call_command('loaddata', 'fixture1.json', verbosity=0)
+         self._dumpdata_assert(
+2026-08-12 23:08:29,191 - INFO - Grading answer for django__django-12209...
+2026-08-12 23:08:29,192 - INFO - report: {'django__django-12209': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': True, 'tests_status': {'FAIL_TO_PASS': {'success': ['partial(func, *args, **keywords) - new function with partial application'], 'failure': []}, 'PASS_TO_PASS': {'success': [], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for django__django-12209: resolved: True
+2026-08-12 23:08:29,192 - INFO - Attempting to stop container sweb.eval.django__django-12209.formal-codex-serial-django__django-12209...
+2026-08-12 23:08:44,878 - INFO - Container sweb.eval.django__django-12209.formal-codex-serial-django__django-12209 stopped successfully.
+2026-08-12 23:08:44,879 - INFO - Attempting to remove container sweb.eval.django__django-12209.formal-codex-serial-django__django-12209...
+2026-08-12 23:08:47,554 - INFO - Container sweb.eval.django__django-12209.formal-codex-serial-django__django-12209 removed successfully.

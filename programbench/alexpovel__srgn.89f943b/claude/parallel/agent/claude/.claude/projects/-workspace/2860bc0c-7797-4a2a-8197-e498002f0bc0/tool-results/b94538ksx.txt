@@ -1,0 +1,902 @@
+=== --help extra ===
+A grep-like tool which understands source code syntax and allows for manipulation in
+addition to search
+
+Usage: orig-srgn [OPTIONS] [SCOPE] [-- <REPLACEMENT>]
+
+Arguments:
+  [SCOPE]
+          Scope to apply to, as a regular expression pattern.
+          
+          If string literal mode is requested, will be interpreted as a literal
+          string.
+          
+          Actions will apply their transformations within this scope only.
+          
+          The default is the global scope, matching the entire input. Where that
+          default is meaningless or dangerous (e.g., deletion), this argument is
+          required.
+          
+          [default: .*]
+
+Options:
+      --completions <SHELL>
+          Print shell completions for the given shell.
+          
+          [possible values: bash, elvish, fish, powershell, zsh]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Composable Actions:
+  -u, --upper
+          Uppercase anything in scope.
+          
+          [env: UPPER=]
+
+  -l, --lower
+          Lowercase anything in scope.
+          
+          [env: LOWER=]
+
+  -t, --titlecase
+          Titlecase anything in scope.
+          
+          [env: TITLECASE=]
+
+  -n, --normalize
+          Normalize (Normalization Form D) anything in scope, and throw away marks.
+          
+          [env: NORMALIZE=]
+
+  -g, --german
+          Perform substitutions on German words, such as 'Abenteuergruesse' to
+          'Abenteuergrüße', for anything in scope.
+          
+          ASCII spellings for Umlauts (ae, oe, ue) and Eszett (ss) are replaced by
+          their respective native Unicode (ä, ö, ü, ß).
+          
+          Arbitrary compound words are supported.
+          
+          Words legally containing alternative spellings are not modified.
+          
+          Words require correct spelling to be detected.
+
+  -S, --symbols
+          Perform substitutions on symbols, such as '!=' to '≠', '->' to '→', on
+          anything in scope.
+          
+          Helps translate 'ASCII art' into native Unicode representations.
+
+  [REPLACEMENT]
+          Replace anything in scope with this value.
+          
+          Variables are supported: if a regex pattern was used for scoping and
+          captured content in named or numbered capture groups, access these in the
+          replacement value using `$1` etc. for numbered, `$NAME` etc. for named
+          capture groups.
+          
+          This action is specially treated as a positional argument for ergonomics and
+          compatibility with `tr`.
+          
+          If given, will run before any other action.
+          
+          [env: REPLACE=]
+
+Standalone Actions (only usable alone):
+  -d, --delete
+          Delete anything in scope.
+          
+          Cannot be used with any other action: there is no point in deleting and
+          performing any other processing. Sibling actions would either receive empty
+          input or have their work wiped.
+
+  -s, --squeeze
+          Squeeze consecutive occurrences of scope into one.
+          
+          [env: SQUEEZE=]
+          [aliases: squeeze-repeats]
+
+Options (global):
+  -G, --glob <GLOB>
+          Glob of files to work on (instead of reading stdin).
+          
+          If actions are applied, they overwrite files in-place.
+          
+          For supported glob syntax, see:
+          <https://docs.rs/glob/0.3.1/glob/struct.Pattern.html>
+          
+          Names of processed files are written to stdout.
+
+      --fail-no-files
+          Fail if working on files (e.g. globbing is requested) but none are found.
+          
+          Processing no files is not an error condition in itself, but might be an
+          unexpected outcome in some contexts. This flag makes the condition explicit.
+
+      --dry-run
+          Do not destructively overwrite files, instead print rich diff only.
+          
+          The diff details the names of files which would be modified, alongside all
+          changes inside those files which would be performed outside of dry running.
+          It is similar to git diff with word diffing enabled.
+
+  -i, --invert
+          Undo the effects of passed actions, where applicable.
+          
+          Requires a 1:1 mapping between replacements and original, which is currently
+          available only for:
+          
+          - symbols: '≠' <-> '!=' etc.
+          
+          Other actions:
+          
+          - german: inverting e.g. 'Ä' is ambiguous (can be 'Ae' or 'AE')
+          
+          - upper, lower, deletion, squeeze: inversion is impossible as information is
+            lost
+          
+          These may still be passed, but will be ignored for inversion and applied
+          normally.
+          
+          [env: INVERT=]
+
+  -L, --literal-string
+          Do not interpret the scope as a regex. Instead, interpret it as a literal
+          string. Will require a scope to be passed.
+          
+          [env: LITERAL_STRING=]
+
+      --fail-any
+          If anything at all is found to be in scope, fail.
+          
+          The default is to continue processing normally.
+
+      --fail-none
+          If nothing is found to be in scope, fail.
+          
+          The default is to return the input unchanged (without failure).
+
+  -j, --join-language-scopes
+          Join (logical 'OR') multiple language scopes, instead of intersecting them.
+          
+          The default when multiple language scopes are given is to intersect their
+          scopes, left to right. For example, `--go func --go strings` will first
+          scope down to `func` bodies, then look for strings only within those. This
+          flag instead joins (in the set logic sense) all scopes. The example would
+          then scope any `func` bodies, and any strings, anywhere. Language scopers
+          can then also be given in any order.
+          
+          No effect if only a single language scope is given. Also does not affect
+          non-language scopers (regex pattern etc.), which always intersect.
+
+  -H, --hidden
+          Do not ignore hidden files and directories.
+
+      --gitignored
+          Do not ignore `.gitignore`d files and directories.
+
+      --sorted
+          Process files in lexicographically sorted order, by file path.
+          
+          In search mode, this emits results in sorted order. Otherwise, it processes
+          files in sorted order.
+          
+          Sorted processing disables parallel processing.
+
+      --stdin-detection <STDIN_DETECTION>
+          Control heuristics for stdin readability detection, and force to value.
+          
+          [default: auto]
+
+          Possible values:
+          - auto:             Automatically detect if stdin is readable
+          - force-readable:   Act as if stdin is readable
+          - force-unreadable: Act as if stdin is not readable
+
+      --stdout-detection <STDOUT_DETECTION>
+          Control heuristics for stdout detection, and potentially force to value.
+          
+          [default: auto]
+
+          Possible values:
+          - auto:       Automatically detect if stdout is a TTY and act accordingly
+          - force-tty:  Act as if stdout is a TTY
+          - force-pipe: Act as if stdout is not a TTY, e.g. a pipe, redirect
+
+      --threads <THREADS>
+          Number of threads to run processing on, when working with files.
+          
+          If not specified, will default to available parallelism. Set to 1 for
+          sequential, deterministic (but not sorted) output.
+
+  -v, --verbose...
+          Increase log verbosity level.
+          
+          The base log level to use is read from the `RUST_LOG` environment variable
+          (if unspecified, defaults to 'error'), and increased according to the number
+          of times this flag is given, maxing out at 'trace' verbosity.
+
+Language scopes:
+      --c <C>
+          Scope C code using a prepared query.
+          
+          [env: C=]
+
+          Possible values:
+          - comments:        Comments (single- and multi-line)
+          - strings:         Strings
+          - includes:        Includes
+          - type-def:        Type definitions
+          - enum:            `enum` definitions
+          - struct:          `struct` type definitions
+          - variable:        Variable definitions
+          - function:        All functions usages (declarations and calls)
+          - function-def:    Function definitions
+          - function-decl:   Function declaration
+          - switch:          `switch` blocks
+          - if:              `if` blocks
+          - for:             `for` blocks
+          - while:           `while` blocks
+          - do:              `do` blocks
+          - union:           `union` blocks
+          - identifier:      Identifier
+          - declaration:     Declaration
+          - call-expression: Call expression
+
+      --c-query <TREE-SITTER-QUERY-VALUE>
+          Scope C code using a custom tree-sitter query.
+          
+          [env: C_QUERY=]
+
+      --c-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope C code using a custom tree-sitter query from file.
+          
+          [env: C_QUERY_FILE=]
+
+      --csharp <CSHARP>
+          Scope C# code using a prepared query.
+          
+          [env: CSHARP=]
+          [aliases: cs]
+
+          Possible values:
+          - comments:             Comments (including XML, inline, doc comments)
+          - strings:              Strings (incl. verbatim, interpolated; incl. quotes,
+            except for interpolated)
+          - usings:               `using` directives (including periods)
+          - struct:               `struct` definitions (in their entirety)
+          - enum:                 `enum` definitions (in their entirety)
+          - interface:            `interface` definitions (in their entirety)
+          - class:                `class` definitions (in their entirety)
+          - method:               Method definitions (in their entirety)
+          - variable-declaration: Variable declarations (in their entirety)
+          - property:             Property definitions (in their entirety)
+          - constructor:          Constructor definitions (in their entirety)
+          - destructor:           Destructor definitions (in their entirety)
+          - field:                Field definitions on types (in their entirety)
+          - attribute:            Attribute names
+          - identifier:           Identifier names
+
+      --csharp-query <TREE-SITTER-QUERY-VALUE>
+          Scope C# code using a custom tree-sitter query.
+          
+          [env: CSHARP_QUERY=]
+
+      --csharp-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope C# code using a custom tree-sitter query from file.
+          
+          [env: CSHARP_QUERY_FILE=]
+
+      --go <GO>
+          Scope Go code using a prepared query.
+          
+          [env: GO=]
+
+          Possible values:
+          - comments:            Comments (single- and multi-line)
+          - strings:             Strings (interpreted and raw; excluding struct tags)
+          - imports:             Imports
+          - expression:          Expressions (all of them!)
+          - type-def:            Type definitions
+          - type-alias:          Type alias assignments
+          - struct:              `struct` type definitions
+          - struct~<PATTERN>:    Like struct, but only considers items whose name matches
+            PATTERN.
+          - interface:           `interface` type definitions
+          - interface~<PATTERN>: Like interface, but only considers items whose name
+            matches PATTERN.
+          - const:               `const` specifications
+          - var:                 `var` specifications
+          - func:                `func` definitions
+          - func~<PATTERN>:      Like func, but only considers items whose name matches
+            PATTERN.
+          - method:              Method `func` definitions (`func (recv Recv) SomeFunc()`)
+          - free-func:           Free `func` definitions (`func SomeFunc()`)
+          - init-func:           `func init()` definitions
+          - type-params:         Type parameters (generics)
+          - defer:               `defer` blocks
+          - select:              `select` blocks
+          - go:                  `go` blocks
+          - switch:              `switch` blocks
+          - labeled:             Labeled statements
+          - goto:                `goto` statements
+          - struct-tags:         Struct tags
+
+      --go-query <TREE-SITTER-QUERY-VALUE>
+          Scope Go code using a custom tree-sitter query.
+          
+          [env: GO_QUERY=]
+
+      --go-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope Go code using a custom tree-sitter query from file.
+          
+          [env: GO_QUERY_FILE=]
+
+      --hcl <HCL>
+          Scope HashiCorp Configuration Language code using a prepared query.
+          
+          [env: HCL=]
+
+          Possible values:
+          - variable:           `variable` blocks (in their entirety)
+          - resource:           `resource` blocks (in their entirety)
+          - data:               `data` blocks (in their entirety)
+          - output:             `output` blocks (in their entirety)
+          - provider:           `provider` blocks (in their entirety)
+          - required-providers: All `required_providers` from the `terraform` block
+          - terraform:          `terraform` blocks (in their entirety)
+          - locals:             `locals` blocks (in their entirety)
+          - module:             `module` blocks (in their entirety)
+          - variables:          Variable declarations and usages
+          - resource-names:     `resource` name declarations and usages
+          - resource-types:     `resource` type declarations and usages
+          - data-names:         `data` name declarations and usages
+          - data-sources:       `data` source declarations and usages
+          - comments:           Comments
+          - strings:            Literal strings
+
+      --hcl-query <TREE-SITTER-QUERY-VALUE>
+          Scope HashiCorp Configuration Language code using a custom tree-sitter query.
+          
+          [env: HCL_QUERY=]
+
+      --hcl-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope HashiCorp Configuration Language code using a custom tree-sitter query
+          from file.
+          
+          [env: HCL_QUERY_FILE=]
+
+      --python <PYTHON>
+          Scope Python code using a prepared query.
+          
+          [env: PYTHON=]
+          [aliases: py]
+
+          Possible values:
+          - comments:             Comments
+          - strings:              Strings (raw, byte, f-strings; interpolation not
+            included)
+          - imports:              Module names in imports (incl. periods; excl.
+            `import`/`from`/`as`/`*`)
+          - doc-strings:          Docstrings (not including multi-line strings)
+          - function-names:       Function names, at the definition site
+          - function-calls:       Function calls
+          - class:                Class definitions (in their entirety)
+          - def:                  Function definitions (*all* `def` block in their
+            entirety)
+          - async-def:            Async function definitions (*all* `async def` block in
+            their entirety)
+          - methods:              Function definitions inside `class` bodies
+          - class-methods:        Function definitions decorated as `classmethod` (excl.
+            the decorator)
+          - static-methods:       Function definitions decorated as `staticmethod` (excl.
+            the decorator)
+          - with:                 `with` blocks (in their entirety)
+          - try:                  `try` blocks (in their entirety)
+          - lambda:               `lambda` statements (in their entirety)
+          - globals:              Global, i.e. module-level variables
+          - variable-identifiers: Identifiers for variables (left-hand side of
+            assignments)
+          - types:                Types in type hints
+          - identifiers:          Identifiers (variable names, ...)
+
+      --python-query <TREE-SITTER-QUERY-VALUE>
+          Scope Python code using a custom tree-sitter query.
+          
+          [env: PYTHON_QUERY=]
+
+      --python-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope Python code using a custom tree-sitter query from file.
+          
+          [env: PYTHON_QUERY_FILE=]
+
+      --rust <RUST>
+          Scope Rust code using a prepared query.
+          
+          [env: RUST=]
+          [aliases: rs]
+
+          Possible values:
+          - comments:         Comments (line and block styles; excluding doc comments;
+            comment chars incl.)
+          - doc-comments:     Doc comments (comment chars included)
+          - uses:             Use statements (paths only; excl. `use`/`as`/`*`)
+          - strings:          Strings (regular, raw, byte; includes interpolation parts in
+            format strings!)
+          - attribute:        Attributes like `#[attr]`
+          - struct:           `struct` definitions
+          - struct~<PATTERN>: Like struct, but only considers items whose name matches
+            PATTERN.
+          - priv-struct:      `struct` definitions not marked `pub`
+          - pub-struct:       `struct` definitions marked `pub`
+          - pub-crate-struct: `struct` definitions marked `pub(crate)`
+          - pub-self-struct:  `struct` definitions marked `pub(self)`
+          - pub-super-struct: `struct` definitions marked `pub(super)`
+          - enum:             `enum` definitions
+          - enum~<PATTERN>:   Like enum, but only considers items whose name matches
+            PATTERN.
+          - priv-enum:        `enum` definitions not marked `pub`
+          - pub-enum:         `enum` definitions marked `pub`
+          - pub-crate-enum:   `enum` definitions marked `pub(crate)`
+          - pub-self-enum:    `enum` definitions marked `pub(self)`
+          - pub-super-enum:   `enum` definitions marked `pub(super)`
+          - enum-variant:     Variant members of `enum` definitions
+          - fn:               Function definitions
+          - fn~<PATTERN>:     Like fn, but only considers items whose name matches
+            PATTERN.
+          - impl-fn:          Function definitions inside `impl` blocks (associated
+            functions/methods)
+          - priv-fn:          Function definitions not marked `pub`
+          - pub-fn:           Function definitions marked `pub`
+          - pub-crate-fn:     Function definitions marked `pub(crate)`
+          - pub-self-fn:      Function definitions marked `pub(self)`
+          - pub-super-fn:     Function definitions marked `pub(super)`
+          - const-fn:         Function definitions marked `const`
+          - async-fn:         Function definitions marked `async`
+          - unsafe-fn:        Function definitions marked `unsafe`
+          - extern-fn:        Function definitions marked `extern`
+          - test-fn:          Function definitions with attributes containing `test`
+            (`#[test]`, `#[rstest]`, ...)
+          - trait:            `trait` definitions
+          - trait~<PATTERN>:  Like trait, but only considers items whose name matches
+            PATTERN.
+          - impl:             `impl` blocks
+          - impl-type:        `impl` blocks for types (`impl SomeType {}`)
+          - impl-trait:       `impl` blocks for traits on types (`impl SomeTrait for
+            SomeType {}`)
+          - mod:              `mod` blocks
+          - mod~<PATTERN>:    Like mod, but only considers items whose name matches
+            PATTERN.
+          - mod-tests:        `mod tests` blocks
+          - type-def:         Type definitions (`struct`, `enum`, `union`)
+          - identifier:       Identifiers
+          - type-identifier:  Identifiers for types
+          - closure:          Closure definitions
+          - unsafe:           `unsafe` keyword usages (`unsafe fn`, `unsafe` blocks,
+            `unsafe Trait`, `unsafe impl Trait`)
+
+      --rust-query <TREE-SITTER-QUERY-VALUE>
+          Scope Rust code using a custom tree-sitter query.
+          
+          [env: RUST_QUERY=]
+
+      --rust-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope Rust code using a custom tree-sitter query from file.
+          
+          [env: RUST_QUERY_FILE=]
+
+      --typescript <TYPESCRIPT>
+          Scope TypeScript code using a prepared query.
+          
+          [env: TYPESCRIPT=]
+          [aliases: ts]
+
+          Possible values:
+          - comments:       Comments
+          - strings:        Strings (literal, template)
+          - imports:        Imports (module specifiers)
+          - function:       Any `function` definitions
+          - async-function: `async function` definitions
+          - sync-function:  Non-`async function` definitions
+          - method:         Method definitions
+          - constructor:    `constructor` method definitions
+          - class:          `class` definitions
+          - enum:           `enum` definitions
+          - interface:      `interface` definitions
+          - try-catch:      `try`/`catch`/`finally` blocks
+          - var-decl:       Variable declarations (`let`, `const`, `var`)
+          - let:            `let` variable declarations
+          - const:          `const` variable declarations
+          - var:            `var` variable declarations
+          - type-params:    Type (generic) parameters
+          - type-alias:     Type alias declarations
+          - namespace:      `namespace` blocks
+          - export:         `export` blocks
+
+      --typescript-query <TREE-SITTER-QUERY-VALUE>
+          Scope TypeScript code using a custom tree-sitter query.
+          
+          [env: TYPESCRIPT_QUERY=]
+
+      --typescript-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope TypeScript code using a custom tree-sitter query from file.
+          
+          [env: TYPESCRIPT_QUERY_FILE=]
+
+Options (german):
+      --german-prefer-original
+          When some original version and its replacement are equally legal, prefer the
+          original and do not modify.
+          
+          For example, "Busse" (original) and "Buße" (replacement) are equally legal
+          words: by default, the tool would prefer the latter.
+          
+          [env: GERMAN_PREFER_ORIGINAL=]
+
+      --german-naive
+          Always perform any possible replacement ('ae' -> 'ä', 'ss' -> 'ß', etc.),
+          regardless of legality of the resulting word
+          
+          Useful for names, which are otherwise not modifiable as they do not occur in
+          dictionaries. Called 'naive' as this does not perform legal checks.
+          
+          [env: GERMAN_NAIVE=]
+rc=0
+=== -h -V ===
+A grep-like tool which understands source code syntax and allows for manipulation in
+addition to search
+
+Usage: orig-srgn [OPTIONS] [SCOPE] [-- <REPLACEMENT>]
+
+Arguments:
+  [SCOPE]  Scope to apply to, as a regular expression pattern. [default: .*]
+
+Options:
+      --completions <SHELL>  Print shell completions for the given shell. [possible
+                             values: bash, elvish, fish, powershell, zsh]
+  -h, --help                 Print help (see more with '--help')
+  -V, --version              Print version
+
+Composable Actions:
+  -u, --upper        Uppercase anything in scope. [env: UPPER=]
+  -l, --lower        Lowercase anything in scope. [env: LOWER=]
+  -t, --titlecase    Titlecase anything in scope. [env: TITLECASE=]
+  -n, --normalize    Normalize (Normalization Form D) anything in scope, and throw away
+                     marks. [env: NORMALIZE=]
+  -g, --german       Perform substitutions on German words, such as 'Abenteuergruesse' to
+                     'Abenteuergrüße', for anything in scope.
+  -S, --symbols      Perform substitutions on symbols, such as '!=' to '≠', '->' to '→',
+                     on
+                     anything in scope.
+  [REPLACEMENT]  Replace anything in scope with this value. [env: REPLACE=]
+
+Standalone Actions (only usable alone):
+  -d, --delete   Delete anything in scope.
+  -s, --squeeze  Squeeze consecutive occurrences of scope into one. [env: SQUEEZE=]
+                 [aliases: squeeze-repeats]
+
+Options (global):
+  -G, --glob <GLOB>
+          Glob of files to work on (instead of reading stdin).
+      --fail-no-files
+          Fail if working on files (e.g. globbing is requested) but none are found.
+      --dry-run
+          Do not destructively overwrite files, instead print rich diff only.
+  -i, --invert
+          Undo the effects of passed actions, where applicable. [env: INVERT=]
+  -L, --literal-string
+          Do not interpret the scope as a regex. Instead, interpret it as a literal
+          string. Will require a scope to be passed. [env: LITERAL_STRING=]
+      --fail-any
+          If anything at all is found to be in scope, fail.
+      --fail-none
+          If nothing is found to be in scope, fail.
+  -j, --join-language-scopes
+          Join (logical 'OR') multiple language scopes, instead of intersecting them.
+  -H, --hidden
+          Do not ignore hidden files and directories.
+      --gitignored
+          Do not ignore `.gitignore`d files and directories.
+      --sorted
+          Process files in lexicographically sorted order, by file path.
+      --stdin-detection <STDIN_DETECTION>
+          Control heuristics for stdin readability detection, and force to value.
+          [default: auto] [possible values: auto, force-readable, force-unreadable]
+      --stdout-detection <STDOUT_DETECTION>
+          Control heuristics for stdout detection, and potentially force to value.
+          [default: auto] [possible values: auto, force-tty, force-pipe]
+      --threads <THREADS>
+          Number of threads to run processing on, when working with files.
+  -v, --verbose...
+          Increase log verbosity level.
+
+Language scopes:
+      --c <C>
+          Scope C code using a prepared query. [env: C=] [possible values: comments,
+          strings, includes, type-def, enum, struct, variable, function, function-def,
+          function-decl, switch, if, for, while, do, union, identifier, declaration,
+          call-expression]
+      --c-query <TREE-SITTER-QUERY-VALUE>
+          Scope C code using a custom tree-sitter query. [env: C_QUERY=]
+      --c-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope C code using a custom tree-sitter query from file. [env: C_QUERY_FILE=]
+      --csharp <CSHARP>
+          Scope C# code using a prepared query. [env: CSHARP=] [aliases: cs] [possible
+          values: comments, strings, usings, struct, enum, interface, class, method,
+          variable-declaration, property, constructor, destructor, field, attribute,
+          identifier]
+      --csharp-query <TREE-SITTER-QUERY-VALUE>
+          Scope C# code using a custom tree-sitter query. [env: CSHARP_QUERY=]
+      --csharp-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope C# code using a custom tree-sitter query from file. [env:
+          CSHARP_QUERY_FILE=]
+      --go <GO>
+          Scope Go code using a prepared query. [env: GO=] [possible values: comments,
+          strings, imports, expression, type-def, type-alias, struct, struct~<PATTERN>,
+          interface, interface~<PATTERN>, const, var, func, func~<PATTERN>, method,
+          free-func, init-func, type-params, defer, select, go, switch, labeled, goto,
+          struct-tags]
+      --go-query <TREE-SITTER-QUERY-VALUE>
+          Scope Go code using a custom tree-sitter query. [env: GO_QUERY=]
+      --go-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope Go code using a custom tree-sitter query from file. [env: GO_QUERY_FILE=]
+      --hcl <HCL>
+          Scope HashiCorp Configuration Language code using a prepared query. [env: HCL=]
+          [possible values: variable, resource, data, output, provider,
+          required-providers, terraform, locals, module, variables, resource-names,
+          resource-types, data-names, data-sources, comments, strings]
+      --hcl-query <TREE-SITTER-QUERY-VALUE>
+          Scope HashiCorp Configuration Language code using a custom tree-sitter query.
+          [env: HCL_QUERY=]
+      --hcl-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope HashiCorp Configuration Language code using a custom tree-sitter query
+          from file. [env: HCL_QUERY_FILE=]
+      --python <PYTHON>
+          Scope Python code using a prepared query. [env: PYTHON=] [aliases: py] [possible
+          values: comments, strings, imports, doc-strings, function-names, function-calls,
+          class, def, async-def, methods, class-methods, static-methods, with, try,
+          lambda, globals, variable-identifiers, types, identifiers]
+      --python-query <TREE-SITTER-QUERY-VALUE>
+          Scope Python code using a custom tree-sitter query. [env: PYTHON_QUERY=]
+      --python-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope Python code using a custom tree-sitter query from file. [env:
+          PYTHON_QUERY_FILE=]
+      --rust <RUST>
+          Scope Rust code using a prepared query. [env: RUST=] [aliases: rs] [possible
+          values: comments, doc-comments, uses, strings, attribute, struct,
+          struct~<PATTERN>, priv-struct, pub-struct, pub-crate-struct, pub-self-struct,
+          pub-super-struct, enum, enum~<PATTERN>, priv-enum, pub-enum, pub-crate-enum,
+          pub-self-enum, pub-super-enum, enum-variant, fn, fn~<PATTERN>, impl-fn, priv-fn,
+          pub-fn, pub-crate-fn, pub-self-fn, pub-super-fn, const-fn, async-fn, unsafe-fn,
+          extern-fn, test-fn, trait, trait~<PATTERN>, impl, impl-type, impl-trait, mod,
+          mod~<PATTERN>, mod-tests, type-def, identifier, type-identifier, closure,
+          unsafe]
+      --rust-query <TREE-SITTER-QUERY-VALUE>
+          Scope Rust code using a custom tree-sitter query. [env: RUST_QUERY=]
+      --rust-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope Rust code using a custom tree-sitter query from file. [env:
+          RUST_QUERY_FILE=]
+      --typescript <TYPESCRIPT>
+          Scope TypeScript code using a prepared query. [env: TYPESCRIPT=] [aliases: ts]
+          [possible values: comments, strings, imports, function, async-function,
+          sync-function, method, constructor, class, enum, interface, try-catch, var-decl,
+          let, const, var, type-params, type-alias, namespace, export]
+      --typescript-query <TREE-SITTER-QUERY-VALUE>
+          Scope TypeScript code using a custom tree-sitter query. [env: TYPESCRIPT_QUERY=]
+      --typescript-query-file <TREE-SITTER-QUERY-FILENAME>
+          Scope TypeScript code using a custom tree-sitter query from file. [env:
+          TYPESCRIPT_QUERY_FILE=]
+
+Options (german):
+      --german-prefer-original  When some original version and its replacement are equally
+                                legal, prefer the
+                                original and do not modify. [env: GERMAN_PREFER_ORIGINAL=]
+      --german-naive            Always perform any possible replacement ('ae' -> 'ä', 'ss'
+                                -> 'ß', etc.),
+                                regardless of legality of the resulting word [env:
+                                GERMAN_NAIVE=]
+rc=0
+=== -V -h ===
+srgn 0.14.1
+rc=0
+=== --completions bash --upper ===
+_srgn() {
+    local i cur prev opts cmd
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    cmd=""
+    opts=""
+
+    for i in ${COMP_WORDS[@]}
+    do
+        case "${cmd},${i}" in
+            ",$1")
+                cmd="srgn"
+                ;;
+            *)
+                ;;
+        esac
+    done
+
+    case "${cmd}" in
+        srgn)
+            opts="-u -l -t -n -g -S -d -s -G -i -L -j -H -v -h -V --completions --upper --lower --titlecase --normalize --german --symbols --delete --squeeze-repeats --squeeze --glob --fail-no-files --dry-run --invert --literal-string --fail-any --fail-none --join-language-scopes --line-numbers --only-matching --hidden --gitignored --sorted --stdin-detection --stdout-detection --threads --verbose --c --c-query --c-query-file --cs --csharp --csharp-query --csharp-query-file --go --go-query --go-query-file --hcl --hcl-query --hcl-query-file --py --python --python-query --python-query-file --rs --rust --rust-query --rust-query-file --ts --typescript --typescript-query --typescript-query-file --german-prefer-original --german-naive --help --version [SCOPE] [REPLACEMENT]"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --completions)
+                    COMPREPLY=($(compgen -W "bash elvish fish powershell zsh" -- "${cur}"))
+                    return 0
+                    ;;
+                --glob)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -G)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --stdin-detection)
+                    COMPREPLY=($(compgen -W "auto force-readable force-unreadable" -- "${cur}"))
+                    return 0
+                    ;;
+                --stdout-detection)
+                    COMPREPLY=($(compgen -W "auto force-tty force-pipe" -- "${cur}"))
+                    return 0
+                    ;;
+                --threads)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --c)
+                    COMPREPLY=($(compgen -W "comments strings includes type-def enum struct variable function function-def function-decl switch if for while do union identifier declaration call-expression" -- "${cur}"))
+                    return 0
+                    ;;
+                --c-query)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --c-query-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --csharp)
+                    COMPREPLY=($(compgen -W "comments strings usings struct enum interface class method variable-declaration property constructor destructor field attribute identifier" -- "${cur}"))
+                    return 0
+                    ;;
+                --cs)
+                    COMPREPLY=($(compgen -W "comments strings usings struct enum interface class method variable-declaration property constructor destructor field attribute identifier" -- "${cur}"))
+                    return 0
+                    ;;
+                --csharp-query)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --csharp-query-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --go)
+                    COMPREPLY=($(compgen -W "comments strings imports expression type-def type-alias struct struct~<PATTERN> interface interface~<PATTERN> const var func func~<PATTERN> method free-func init-func type-params defer select go switch labeled goto struct-tags" -- "${cur}"))
+                    return 0
+                    ;;
+                --go-query)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --go-query-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --hcl)
+                    COMPREPLY=($(compgen -W "variable resource data output provider required-providers terraform locals module variables resource-names resource-types data-names data-sources comments strings" -- "${cur}"))
+                    return 0
+                    ;;
+                --hcl-query)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --hcl-query-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --python)
+                    COMPREPLY=($(compgen -W "comments strings imports doc-strings function-names function-calls class def async-def methods class-methods static-methods with try lambda globals variable-identifiers types identifiers" -- "${cur}"))
+                    return 0
+                    ;;
+                --py)
+                    COMPREPLY=($(compgen -W "comments strings imports doc-strings function-names function-calls class def async-def methods class-methods static-methods with try lambda globals variable-identifiers types identifiers" -- "${cur}"))
+                    return 0
+                    ;;
+                --python-query)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --python-query-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --rust)
+                    COMPREPLY=($(compgen -W "comments doc-comments uses strings attribute struct struct~<PATTERN> priv-struct pub-struct pub-crate-struct pub-self-struct pub-super-struct enum enum~<PATTERN> priv-enum pub-enum pub-crate-enum pub-self-enum pub-super-enum enum-variant fn fn~<PATTERN> impl-fn priv-fn pub-fn pub-crate-fn pub-self-fn pub-super-fn const-fn async-fn unsafe-fn extern-fn test-fn trait trait~<PATTERN> impl impl-type impl-trait mod mod~<PATTERN> mod-tests type-def identifier type-identifier closure unsafe" -- "${cur}"))
+                    return 0
+                    ;;
+                --rs)
+                    COMPREPLY=($(compgen -W "comments doc-comments uses strings attribute struct struct~<PATTERN> priv-struct pub-struct pub-crate-struct pub-self-struct pub-super-struct enum enum~<PATTERN> priv-enum pub-enum pub-crate-enum pub-self-enum pub-super-enum enum-variant fn fn~<PATTERN> impl-fn priv-fn pub-fn pub-crate-fn pub-self-fn pub-super-fn const-fn async-fn unsafe-fn extern-fn test-fn trait trait~<PATTERN> impl impl-type impl-trait mod mod~<PATTERN> mod-tests type-def identifier type-identifier closure unsafe" -- "${cur}"))
+                    return 0
+                    ;;
+                --rust-query)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --rust-query-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --typescript)
+                    COMPREPLY=($(compgen -W "comments strings imports function async-function sync-function method constructor class enum interface try-catch var-decl let const var type-params type-alias namespace export" -- "${cur}"))
+                    return 0
+                    ;;
+                --ts)
+                    COMPREPLY=($(compgen -W "comments strings imports function async-function sync-function method constructor class enum interface try-catch var-decl let const var type-params type-alias namespace export" -- "${cur}"))
+                    return 0
+                    ;;
+                --typescript-query)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --typescript-query-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+    esac
+}
+
+if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
+    complete -F _srgn -o nosort -o bashdefault -o default srgn
+else
+    complete -F _srgn -o bashdefault -o default srgn
+fi
+rc=0
+=== --upper --completions bash ===
+_srgn() {
+    local i cur prev opts cmd
+rc=0
+=== --completions ===
+error: a value is required for '--completions <SHELL>' but none was supplied
+  [possible values: bash, elvish, fish, powershell, zsh]
+
+For more information, try '--help'.
+rc=2
+### short flag clustering ###
+=== -uL l ===
+heLLo
+rc=0
+=== -Lu l ===
+heLLo
+rc=0
+=== -vvu l ===
+[2026-08-08T11:58:46.002379Z INFO  srgn] Launching app with args: Args { scope: "l", shell: None, composable_actions: ComposableActions { replace: None, upper: true, lower: false, titlecase: false, normalize: false, german: false, symbols: false }, standalone_actions: StandaloneActions { delete: false, squeeze: false }, options: GlobalOptions { glob: None, fail_no_files: false, dry_run: false, invert: false, literal_string: false, fail_any: false, fail_none: false, join_language_scopes: false, line_numbers: false, only_matching: false, hidden: false, gitignored: false, sorted: false, stdin_detection: Auto, stdout_detection: Auto, threads: None, additional_verbosity: 2 }, languages_scopes: LanguageScopes { c: None, csharp: None, go: None, hcl: None, python: None, rust: None, typescript: None }, german_options: GermanOptions { german_prefer_original: false, german_naive: false } }
+[2026-08-08T11:58:46.002488Z INFO  srgn] Treating stdout as tty: false.
+[2026-08-08T11:58:46.002497Z INFO  srgn] Treating stdin as readable: true.
+[2026-08-08T11:58:46.002501Z INFO  srgn] Will read from stdin and write to stdout, applying actions.
+[2026-08-08T11:58:46.002503Z INFO  srgn] Will use stdin to stdout.
+heLLo
+[2026-08-08T11:58:46.002534Z INFO  srgn] Done, exiting
+rc=0
+=== -uvv l ===
+[2026-08-08T11:58:46.005558Z INFO  srgn] Launching app with args: Args { scope: "l", shell: None, composable_actions: ComposableActions { replace: None, upper: true, lower: false, titlecase: false, normalize: false, german: false, symbols: false }, standalone_actions: StandaloneActions { delete: false, squeeze: false }, options: GlobalOptions { glob: None, fail_no_files: false, dry_run: false, invert: false, literal_string: false, fail_any: false, fail_none: false, join_language_scopes: false, line_numbers: false, only_matching: false, hidden: false, gitignored: false, sorted: false, stdin_detection: Auto, stdout_detection: Auto, threads: None, additional_verbosity: 2 }, languages_scopes: LanguageScopes { c: None, csharp: None, go: None, hcl: None, python: None, rust: None, typescript: None }, german_options: GermanOptions { german_prefer_original: false, german_naive: false } }
+[2026-08-08T11:58:46.005628Z INFO  srgn] Treating stdout as tty: false.

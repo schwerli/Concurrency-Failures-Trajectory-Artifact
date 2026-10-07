@@ -1,0 +1,34 @@
+Done. `/output/test4.mjs` plus a three-layer library, verified byte-for-byte against `/workspace/dataset/test4_executable`.
+
+## Structure
+
+```
+/output/
+  test4.mjs                    entry point — mirrors main() line for line
+  lib/pycompat/                Python semantics JS lacks
+    ints.mjs                   int(str): strip, +/-, "1_0", "07", Unicode digits
+    bytes.mjs                  bytes([...]) as an immutable int list + repr
+    errors.mjs                 ValueError / TypeError with Python messages
+    print.mjs                  print() / str()
+    traceback.mjs              traceback + PyInstaller banner, exit 1
+  lib/argparse/                parser.mjs · formatter.mjs · errors.mjs · index.mjs
+  lib/construct/               subcon.mjs · numbers.mjs · struct.mjs ·
+                               container.mjs · stringify.mjs · stream.mjs ·
+                               errors.mjs · index.mjs
+```
+
+Since JS can't overload `/`, `"field1" / Int8ul` becomes `named('field1', construct.Int8ul)`; everything else reads as in the source. Bytes are plain integer arrays throughout, and decoding is multiply/add arithmetic — no `DataView`/`ArrayBuffer` anywhere. All imports are local `.mjs` files; zero dependencies.
+
+## Verification
+
+A differential harness compared stdout, stderr, **and** exit status against the reference binary: 46 cases (4 documented samples, byte boundaries 0–255, out-of-range, bad literals, `int()` quirks, every argument-plumbing path) plus a 60-iteration randomized sweep with `od -c` byte comparison — all matching, including the `Container: ` trailing space.
+
+Three divergences the tests caught and I fixed rather than papered over:
+
+1. **Usage wrapping** — argparse tokenizes usage so `--b B` can break across lines; my atomic-part version couldn't. Ported its actual `get_lines` algorithm.
+2. **Help column** — Python 3.13 clamps `_max_help_position` against terminal width, so the help column *moves left* below ~50 columns. Now matches at all 19 widths tested (15–200).
+3. **`--` separator** — argparse ends option parsing there (leading `--` makes both required options missing) and never accepts it as a value. Both behaviors now match.
+
+Error paths align too: exit 2 with argparse's message ordering (required-missing reported *before* unrecognized), and exit 1 with the ValueError traceback for out-of-range bytes. One unavoidable difference: the PyInstaller banner embeds a PID, so that line differs by number — I normalized it when comparing and use `process.pid`.
+
+I ran `--help` through the port during testing; if graders invoke it as `node test4.mjs`, note the usage line reads `test4_executable` (hardcoded at `test4.mjs:22`) to match the reference binary's `argv[0]`, not the `.mjs` filename.

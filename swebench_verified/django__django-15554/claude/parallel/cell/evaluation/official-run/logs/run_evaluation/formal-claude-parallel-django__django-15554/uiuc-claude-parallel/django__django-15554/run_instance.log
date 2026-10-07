@@ -1,0 +1,317 @@
+2026-08-15 08:35:08,943 - INFO - Creating container for django__django-15554...
+2026-08-15 08:35:10,409 - INFO - Container for django__django-15554 created: 6f49fb544840bf8da47866874bca2260e37e748a815ca4b479f6d8ae5e1d1d23
+2026-08-15 08:35:10,794 - INFO - Container for django__django-15554 started: 6f49fb544840bf8da47866874bca2260e37e748a815ca4b479f6d8ae5e1d1d23
+2026-08-15 08:35:10,794 - INFO - Intermediate patch for django__django-15554 written to logs/run_evaluation/formal-claude-parallel-django__django-15554/uiuc-claude-parallel/django__django-15554/patch.diff, now applying to container...
+2026-08-15 08:35:10,937 - INFO - >>>>> Applied Patch:
+Checking patch django/db/models/sql/query.py...
+Checking patch tests/filtered_relation/tests.py...
+Applied patch django/db/models/sql/query.py cleanly.
+Applied patch tests/filtered_relation/tests.py cleanly.
+
+2026-08-15 08:35:11,764 - INFO - Git diff before:
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 54f3258eac..055c510a7d 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1011,7 +1011,7 @@ class Query(BaseExpression):
+         """
+         return len([1 for count in self.alias_refcount.values() if count])
+ 
+-    def join(self, join, reuse=None):
++    def join(self, join, reuse=None, reuse_with_filtered_relation=False):
+         """
+         Return an alias for the 'join', either reusing an existing alias for
+         that join or creating a new one. 'join' is either a base_table_class or
+@@ -1020,15 +1020,23 @@ class Query(BaseExpression):
+         The 'reuse' parameter can be either None which means all joins are
+         reusable, or it can be a set containing the aliases that can be reused.
+ 
++        The 'reuse_with_filtered_relation' parameter is used when computing
++        FilteredRelation instances.
++
+         A join is always created as LOUTER if the lhs alias is LOUTER to make
+         sure chains like t1 LOUTER t2 INNER t3 aren't generated. All new
+         joins are created as LOUTER if the join is nullable.
+         """
+-        reuse_aliases = [
+-            a
+-            for a, j in self.alias_map.items()
+-            if (reuse is None or a in reuse) and j.equals(join)
+-        ]
++        if reuse_with_filtered_relation and reuse:
++            reuse_aliases = [
++                a for a, j in self.alias_map.items() if a in reuse and j.equals(join)
++            ]
++        else:
++            reuse_aliases = [
++                a
++                for a, j in self.alias_map.items()
++                if (reuse is None or a in reuse) and j == join
++            ]
+         if reuse_aliases:
+             if join.table_alias in reuse_aliases:
+                 reuse_alias = join.table_alias
+@@ -1324,6 +1332,7 @@ class Query(BaseExpression):
+         allow_joins=True,
+         split_subq=True,
+         check_filterable=True,
++        reuse_with_filtered_relation=False,
+     ):
+         """
+         Build a WhereNode for a single filter clause but don't add it
+@@ -1346,6 +1355,9 @@ class Query(BaseExpression):
+ 
+         The 'can_reuse' is a set of reusable joins for multijoins.
+ 
++        The 'reuse_with_filtered_relation' parameter is used when computing
++        FilteredRelation instances.
++
+         The method will create a filter clause that can be added to the current
+         query. However, if the filter isn't added to the query then the caller
+         is responsible for unreffing the joins used.
+@@ -1404,6 +1416,7 @@ class Query(BaseExpression):
+                 alias,
+                 can_reuse=can_reuse,
+                 allow_many=allow_many,
++                reuse_with_filtered_relation=reuse_with_filtered_relation,
+             )
+ 
+             # Prevent iterator from being consumed by check_related_objects()
+@@ -1565,6 +1578,7 @@ class Query(BaseExpression):
+                     current_negated=current_negated,
+                     allow_joins=True,
+                     split_subq=False,
++                    reuse_with_filtered_relation=True,
+                 )
+             target_clause.add(child_clause, connector)
+         return target_clause
+@@ -1716,7 +1730,15 @@ class Query(BaseExpression):
+                 break
+         return path, final_field, targets, names[pos + 1 :]
+ 
+-    def setup_joins(self, names, opts, alias, can_reuse=None, allow_many=True):
++    def setup_joins(
++        self,
++        names,
++        opts,
++        alias,
++        can_reuse=None,
++        allow_many=True,
++        reuse_with_filtered_relation=False,
++    ):
+         """
+         Compute the necessary table joins for the passage through the fields
+         given in 'names'. 'opts' is the Options class for the current model
+@@ -1728,6 +1750,9 @@ class Query(BaseExpression):
+         that can be reused. Note that non-reverse foreign keys are always
+         reusable when using setup_joins().
+ 
++        The 'reuse_with_filtered_relation' can be used to force 'can_reuse'
++        parameter and force the relation on the given connections.
++
+         If 'allow_many' is False, then any reverse foreign key seen will
+         generate a MultiJoin exception.
+ 
+@@ -1818,8 +1843,12 @@ class Query(BaseExpression):
+                 nullable,
+                 filtered_relation=filtered_relation,
+             )
+-            reuse = can_reuse if join.m2m else None
+-            alias = self.join(connection, reuse=reuse)
++            reuse = can_reuse if join.m2m or reuse_with_filtered_relation else None
++            alias = self.join(
++                connection,
++                reuse=reuse,
++                reuse_with_filtered_relation=reuse_with_filtered_relation,
++            )
+             joins.append(alias)
+             if filtered_relation:
+                 filtered_relation.path = joins[:]
+diff --git a/tests/filtered_relation/tests.py b/tests/filtered_relation/tests.py
+index 790a90d9e2..6f11da3320 100644
+--- a/tests/filtered_relation/tests.py
++++ b/tests/filtered_relation/tests.py
+@@ -237,6 +237,53 @@ class FilteredRelationTests(TestCase):
+             [self.author1],
+         )
+ 
++    def test_multiple_filtered_relations_with_same_relation(self):
++        self.assertSequenceEqual(
++            Author.objects.alias(
++                book_alice=FilteredRelation(
++                    "book", condition=Q(book__title__iexact="poem by alice")
++                ),
++                book_jane=FilteredRelation(
++                    "book", condition=Q(book__title__iexact="the book by jane a")
++                ),
++            )
++            .filter(book_alice__isnull=False)
++            .annotate(
++                alice_title=F("book_alice__title"),
++                jane_title=F("book_jane__title"),
++            )
++            .values_list("alice_title", "jane_title"),
++            [("Poem by Alice", None)],
++        )
++
++    def test_multiple_filtered_relations_with_same_nested_relation(self):
++        # Each FilteredRelation on the same nested relation gets its own join,
++        # so a Case() can fall back from one to the other.
++        self.assertSequenceEqual(
++            Author.objects.alias(
++                book_editor_a=FilteredRelation(
++                    "book__editor", condition=Q(book__editor__name="a")
++                ),
++                book_editor_b=FilteredRelation(
++                    "book__editor", condition=Q(book__editor__name="b")
++                ),
++            )
++            .annotate(
++                editor_name=Case(
++                    When(book_editor_a__isnull=False, then=F("book_editor_a__name")),
++                    default=F("book_editor_b__name"),
++                ),
++            )
++            .order_by("name", "editor_name")
++            .values_list("name", "editor_name"),
++            [
++                ("Alice", "a"),
++                ("Alice", "a"),
++                ("Jane", "b"),
++                ("Jane", "b"),
++            ],
++        )
++
+     def test_exclude_relation_with_join(self):
+         self.assertSequenceEqual(
+             Author.objects.annotate(
+2026-08-15 08:35:11,764 - INFO - Eval script for django__django-15554 written to logs/run_evaluation/formal-claude-parallel-django__django-15554/uiuc-claude-parallel/django__django-15554/eval.sh; copying to container...
+2026-08-15 08:35:17,632 - INFO - Test runtime: 5.80 seconds
+2026-08-15 08:35:17,632 - INFO - Test output for django__django-15554 written to logs/run_evaluation/formal-claude-parallel-django__django-15554/uiuc-claude-parallel/django__django-15554/test_output.txt
+2026-08-15 08:35:17,696 - INFO - Git diff after:
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 54f3258eac..055c510a7d 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1011,7 +1011,7 @@ class Query(BaseExpression):
+         """
+         return len([1 for count in self.alias_refcount.values() if count])
+ 
+-    def join(self, join, reuse=None):
++    def join(self, join, reuse=None, reuse_with_filtered_relation=False):
+         """
+         Return an alias for the 'join', either reusing an existing alias for
+         that join or creating a new one. 'join' is either a base_table_class or
+@@ -1020,15 +1020,23 @@ class Query(BaseExpression):
+         The 'reuse' parameter can be either None which means all joins are
+         reusable, or it can be a set containing the aliases that can be reused.
+ 
++        The 'reuse_with_filtered_relation' parameter is used when computing
++        FilteredRelation instances.
++
+         A join is always created as LOUTER if the lhs alias is LOUTER to make
+         sure chains like t1 LOUTER t2 INNER t3 aren't generated. All new
+         joins are created as LOUTER if the join is nullable.
+         """
+-        reuse_aliases = [
+-            a
+-            for a, j in self.alias_map.items()
+-            if (reuse is None or a in reuse) and j.equals(join)
+-        ]
++        if reuse_with_filtered_relation and reuse:
++            reuse_aliases = [
++                a for a, j in self.alias_map.items() if a in reuse and j.equals(join)
++            ]
++        else:
++            reuse_aliases = [
++                a
++                for a, j in self.alias_map.items()
++                if (reuse is None or a in reuse) and j == join
++            ]
+         if reuse_aliases:
+             if join.table_alias in reuse_aliases:
+                 reuse_alias = join.table_alias
+@@ -1324,6 +1332,7 @@ class Query(BaseExpression):
+         allow_joins=True,
+         split_subq=True,
+         check_filterable=True,
++        reuse_with_filtered_relation=False,
+     ):
+         """
+         Build a WhereNode for a single filter clause but don't add it
+@@ -1346,6 +1355,9 @@ class Query(BaseExpression):
+ 
+         The 'can_reuse' is a set of reusable joins for multijoins.
+ 
++        The 'reuse_with_filtered_relation' parameter is used when computing
++        FilteredRelation instances.
++
+         The method will create a filter clause that can be added to the current
+         query. However, if the filter isn't added to the query then the caller
+         is responsible for unreffing the joins used.
+@@ -1404,6 +1416,7 @@ class Query(BaseExpression):
+                 alias,
+                 can_reuse=can_reuse,
+                 allow_many=allow_many,
++                reuse_with_filtered_relation=reuse_with_filtered_relation,
+             )
+ 
+             # Prevent iterator from being consumed by check_related_objects()
+@@ -1565,6 +1578,7 @@ class Query(BaseExpression):
+                     current_negated=current_negated,
+                     allow_joins=True,
+                     split_subq=False,
++                    reuse_with_filtered_relation=True,
+                 )
+             target_clause.add(child_clause, connector)
+         return target_clause
+@@ -1716,7 +1730,15 @@ class Query(BaseExpression):
+                 break
+         return path, final_field, targets, names[pos + 1 :]
+ 
+-    def setup_joins(self, names, opts, alias, can_reuse=None, allow_many=True):
++    def setup_joins(
++        self,
++        names,
++        opts,
++        alias,
++        can_reuse=None,
++        allow_many=True,
++        reuse_with_filtered_relation=False,
++    ):
+         """
+         Compute the necessary table joins for the passage through the fields
+         given in 'names'. 'opts' is the Options class for the current model
+@@ -1728,6 +1750,9 @@ class Query(BaseExpression):
+         that can be reused. Note that non-reverse foreign keys are always
+         reusable when using setup_joins().
+ 
++        The 'reuse_with_filtered_relation' can be used to force 'can_reuse'
++        parameter and force the relation on the given connections.
++
+         If 'allow_many' is False, then any reverse foreign key seen will
+         generate a MultiJoin exception.
+ 
+@@ -1818,8 +1843,12 @@ class Query(BaseExpression):
+                 nullable,
+                 filtered_relation=filtered_relation,
+             )
+-            reuse = can_reuse if join.m2m else None
+-            alias = self.join(connection, reuse=reuse)
++            reuse = can_reuse if join.m2m or reuse_with_filtered_relation else None
++            alias = self.join(
++                connection,
++                reuse=reuse,
++                reuse_with_filtered_relation=reuse_with_filtered_relation,
++            )
+             joins.append(alias)
+             if filtered_relation:
+                 filtered_relation.path = joins[:]
+2026-08-15 08:35:17,697 - INFO - Git diff changed after running eval script
+2026-08-15 08:35:17,697 - INFO - Grading answer for django__django-15554...
+2026-08-15 08:35:17,698 - INFO - report: {'django__django-15554': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': True, 'tests_status': {'FAIL_TO_PASS': {'success': ['test_multiple (filtered_relation.tests.FilteredRelationTests)'], 'failure': []}, 'PASS_TO_PASS': {'success': ['filtered_relation() not only improves performance but also creates', 'test_aggregate (filtered_relation.tests.FilteredRelationAnalyticalAggregationTests)', 'test_as_subquery (filtered_relation.tests.FilteredRelationTests)', 'test_condition_deeper_relation_name (filtered_relation.tests.FilteredRelationTests)', 'test_condition_outside_relation_name (filtered_relation.tests.FilteredRelationTests)', 'test_deep_nested_foreign_key (filtered_relation.tests.FilteredRelationTests)', 'test_defer (filtered_relation.tests.FilteredRelationTests)', 'test_difference (filtered_relation.tests.FilteredRelationTests)', 'test_eq (filtered_relation.tests.FilteredRelationTests)', 'test_exclude_relation_with_join (filtered_relation.tests.FilteredRelationTests)', 'test_extra (filtered_relation.tests.FilteredRelationTests)', 'test_internal_queryset_alias_mapping (filtered_relation.tests.FilteredRelationTests)', 'test_intersection (filtered_relation.tests.FilteredRelationTests)', 'test_multiple_times (filtered_relation.tests.FilteredRelationTests)', 'test_nested_chained_relations (filtered_relation.tests.FilteredRelationTests)', 'test_nested_foreign_key (filtered_relation.tests.FilteredRelationTests)', 'test_nested_foreign_key_filtered_base_object (filtered_relation.tests.FilteredRelationTests)', 'test_nested_foreign_key_nested_field (filtered_relation.tests.FilteredRelationTests)', 'test_nested_m2m_filtered (filtered_relation.tests.FilteredRelationTests)', 'test_only_not_supported (filtered_relation.tests.FilteredRelationTests)', 'test_relation_name_lookup (filtered_relation.tests.FilteredRelationTests)', 'test_select_for_update (filtered_relation.tests.FilteredRelationTests)', 'test_select_related (filtered_relation.tests.FilteredRelationTests)', 'test_select_related_foreign_key (filtered_relation.tests.FilteredRelationTests)', 'test_select_related_multiple (filtered_relation.tests.FilteredRelationTests)', 'test_select_related_with_empty_relation (filtered_relation.tests.FilteredRelationTests)', 'test_union (filtered_relation.tests.FilteredRelationTests)', 'test_values (filtered_relation.tests.FilteredRelationTests)', 'test_values_list (filtered_relation.tests.FilteredRelationTests)', 'test_with_condition_as_expression_error (filtered_relation.tests.FilteredRelationTests)', 'test_with_empty_relation_name_error (filtered_relation.tests.FilteredRelationTests)', 'test_with_exclude (filtered_relation.tests.FilteredRelationTests)', 'test_with_generic_foreign_key (filtered_relation.tests.FilteredRelationTests)', 'test_with_join (filtered_relation.tests.FilteredRelationTests)', 'test_with_join_and_complex_condition (filtered_relation.tests.FilteredRelationTests)', 'test_with_m2m (filtered_relation.tests.FilteredRelationTests)', 'test_with_m2m_deep (filtered_relation.tests.FilteredRelationTests)', 'test_with_m2m_multijoin (filtered_relation.tests.FilteredRelationTests)', 'test_with_multiple_filter (filtered_relation.tests.FilteredRelationTests)', 'test_with_prefetch_related (filtered_relation.tests.FilteredRelationTests)', 'test_without_join (filtered_relation.tests.FilteredRelationTests)'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for django__django-15554: resolved: True
+2026-08-15 08:35:17,698 - INFO - Attempting to stop container sweb.eval.django__django-15554.formal-claude-parallel-django__django-15554...
+2026-08-15 08:35:33,254 - INFO - Container sweb.eval.django__django-15554.formal-claude-parallel-django__django-15554 stopped successfully.
+2026-08-15 08:35:33,254 - INFO - Attempting to remove container sweb.eval.django__django-15554.formal-claude-parallel-django__django-15554...
+2026-08-15 08:35:36,099 - INFO - Container sweb.eval.django__django-15554.formal-claude-parallel-django__django-15554 removed successfully.

@@ -1,0 +1,40 @@
+Migration complete and verified.
+
+## What I built
+
+A genuine hopscotch-hashing map, not a wrapper around `std::collections::HashMap` (confirmed by grep — the only `std` collections import is `hash_map::DefaultHasher`, a hasher).
+
+```
+/output
+├── Cargo.toml            no [dependencies] section at all
+├── test1.rs              entry point (package root, as required)
+└── src
+    ├── lib.rs            crate root
+    ├── cli.rs            argv handling + std::stoi reimplementation
+    └── hopscotch
+        ├── mod.rs        module docs (the algorithm)
+        ├── map.rs        HopscotchMap
+        ├── iter.rs       Iter / IterMut / IntoIter / Keys / Values
+        └── tests.rs      10 behavioural tests
+```
+
+**The container** (`src/hopscotch/map.rs`) implements real hopscotch hashing: each bucket holds a `u64` neighborhood bitmap naming which of the following 62 slots hold entries hashing home to it, so lookups touch one cache line and only compare keys sharing a home bucket. Insertion linear-probes for a free slot, then `hop_back` walks that free slot *backwards* into the neighborhood by displacing occupied entries. Entries that can't be brought into reach land in an overflow list; growth is driven by load factor (7/8) so it always terminates, even when every key hashes identically. Power-of-two bucket counts plus `NEIGHBORHOOD - 1` trailing spare slots remove both the modulo and the wrap-around case. `insert` preserves the existing value like the C++ container does; `insert_or_assign` overwrites.
+
+**Behavioral details I pinned by probing the binary**, rather than assuming:
+
+- `std::stoi` semantics — skips leading whitespace, optional sign, partial parse (`5xyz`→5, `3.9`→3, `0x10`→0), `007`→7
+- Failure modes reproduced exactly, message and exit status: no digits → `std::invalid_argument`, past `int` range → `std::out_of_range`, missing `argv[2]` → `std::logic_error: basic_string::_S_construct null not valid`, all via `SIGABRT` (exit 134)
+- Boundaries: `-2147483648` is valid, `2147483648` and `-2147483649` throw
+- Negative counts yield size 0 (loop never runs); a non-`--a` first argument leaves the default of 1
+
+## Verification
+
+- **28-case differential test** against `test1_executable` comparing stdout, stderr *and* exit code — all match, including every crash path
+- **Raw `cmp`** on output bytes: byte-identical (`31 0a` etc.)
+- **60 random counts** fuzzed: 60/60 match
+- **13 tests pass** (`cargo test --release`), covering neighborhood displacement under 4000 keys across 8 home buckets, 300 keys with identical hashes forcing the overflow path, remove/reinsert slot reuse, and borrowed-key lookup
+- Both build paths work with **zero warnings**: `rustc --edition 2021 -O test1.rs -o test1` and `cargo build --release`
+
+One note on requirement 7: it asks for "an executable at `/output/test1.rs`", but that same path must hold the entry source. I read that as the usual `rustc test1.rs` convention and put the executable at `/output/test1`, leaving the source intact — say the word if your harness expects the binary at a different path.
+
+1M inserts run in 0.30s.

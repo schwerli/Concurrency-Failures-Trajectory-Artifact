@@ -1,0 +1,486 @@
+export const meta = {
+  name: 'cpp-to-rust-indicators-test20',
+  description: 'Black-box port of C++ indicators test20 to a zero-dependency Rust Cargo project with byte-exact output',
+  phases: [
+    { title: 'Spec', detail: '3 independent analysts derive API semantics from source + golden output' },
+    { title: 'Synthesize', detail: 'merge lenses into one authoritative spec' },
+    { title: 'Implement', detail: '3 independent Rust implementations, each self-verified byte-exact' },
+    { title: 'Judge', detail: 'clean-room verification of each candidate against the reference binary' },
+    { title: 'Install', detail: 'install winning candidate into /output and re-verify' },
+    { title: 'Review', detail: 'adversarial review of installed project for correctness + requirement compliance' },
+    { title: 'Final', detail: 'final gate: rebuild from scratch and diff' },
+  ],
+}
+
+const CONTEXT = `
+# Task context (shared)
+
+We are porting a C++ program to Rust. This is a BLACK-BOX port.
+
+- C++ entry program: /workspace/dataset/indicators/tests/test20.cpp  (READ THIS - it is the test driver, allowed)
+- The C++ library header ../include/indicators.hpp DOES NOT EXIST on disk. You cannot read it. Do not try.
+- Reference compiled C++ binary: /workspace/dataset/test20_executable  (you MAY run it)
+- Golden expected stdout (35 lines): /workspace/gold/expected.txt  (md5 df2520598063825f66838d536e1f26cf)
+- The program ignores argv entirely (verified: running it with extra args yields identical output).
+- Toolchain: rustc 1.75.0, cargo 1.75.0. Edition 2021. ZERO external crates - std only.
+
+# Golden output, line by line (this is the entire contract)
+
+ 1|[====================>                   ] 50.0%
+ 2|[====================>                   ] 50.0%
+ 3|45.0%
+ 4|67.00%
+ 5|45.0%
+ 6|45/90
+ 7|45/90
+ 8|50.0%
+ 9|1/3
+10|33.3%
+11|33.0%
+12|33/100
+13|[========>                ] 33.0%
+14|Bar 1: [===============>                                  ] 30.0%
+15|Bar 2: [==============================>                   ] 60.0%
+16|Progress: 50.0% (50/100)
+17|Progress: 75.0% (75/100)
+18|<U+28FB> 20.0%        (the first char is the braille char U+28FB, UTF-8 bytes E2 A3 BB, followed by a space)
+19|Test: 3/10 - 30.0%
+20|12.3%
+21|12.35%
+22|12.345%
+23|12.3450%
+24|12.34500%
+25|[=====>    ] 50.0%
+26|[==========>         ] 50.0%
+27|[===============>              ] 50.0%
+28|[====================>                   ] 50.0%
+29|[=========================>                        ] 50.0%
+30|25/100
+31|50/100
+32|75/100
+33|25.0%
+34|50.00%
+35|75.000%
+
+Always read the real bytes from /workspace/gold/expected.txt rather than trusting this transcription.
+
+# C++ API surface exercised by test20.cpp (namespace indicators)
+
+- ProgressBar: default ctor; set_progress(int); set_total(int); set_width(int); str() -> std::string; operator()() -> std::string
+- Percentage(float value, int precision); str(); explicit-or-implicit operator std::string
+- Counter: Counter(int,int); default ctor; set_current(int); set_total(int); str(); operator std::string
+- ProgressBuilder: default ctor; set_progress(int) and set_total(int) return *this (chainable); build() -> something streamable
+- ProgressTracker: default ctor; add_stage(const std::string&) chainable; set_progress(int); set_total(int);
+  get_progress() -> streamable (prints "1/3"); get_percentage() -> streamable (prints "33.3%")
+- Format (static/free functions): percentage(float), percentage(float,int), progress(int,int), bar(int,int,int)
+- MultiProgress: default ctor; add_bar(ProgressBar) (by value/const-ref, i.e. a copy); str()
+- ProgressDisplay(int total); update(int); increment(int); display()
+- CyclicProgress(int total); next(); str()
+- TaskProgress(const std::string& name, int total); complete(int); status()
+`
+
+const KEY_DERIVATIONS = `
+# Derivations already established by the lead engineer (verify, do not blindly trust)
+
+- Default ProgressBar width is 50 (lines 14/15: b1,b2 never had set_width called, and the bracket
+  interior is exactly 50 chars).
+- Bar rendering with width W and ratio r: filled = (int)(r * W) truncated toward zero; render
+  '[' + '='*filled + '>' + ' '*(W - filled - 1) + ']'. Interior length is exactly W.
+  Check line 13: W=25, r=0.33 -> filled=8 -> 8 '=' + '>' + 16 spaces = 25.
+  Check line 1: W=40, r=0.5 -> 20 '=' + '>' + 19 spaces = 40.
+- Percentage text is C-printf "%.*f%%" of ratio*100 with the given precision. Default precision is 1
+  (lines 11, and bar suffixes).
+- Bar suffix is "] " + percentage(ratio, 1) i.e. "] 50.0%".
+- ProgressBuilder::build() with progress=45,total=90 printed "50.0%".
+- ProgressTracker::get_progress() printed "1/3" (a STRING "current/total", not an int),
+  get_percentage() printed "33.3%" (a STRING).
+- MultiProgress::str() = lines "Bar {i}: {bar.str()}" for i starting at 1, joined by '\\n',
+  with NO trailing newline (there is no blank line before line 16 in the golden output).
+- ProgressDisplay::display() = "Progress: {pct(1)} ({current}/{total})".
+- CyclicProgress(10) then next() twice then str() -> "<U+28FB> 20.0%".
+  current becomes 2 after two next() calls -> 2/10 = 20.0%.
+  Spinner frame set is the 8-frame braille set ["\\u{28FE}","\\u{28FD}","\\u{28FB}","\\u{28BF}","\\u{287F}","\\u{28DF}","\\u{28EF}","\\u{28F7}"]
+  i.e. the classic sequence U+28FE U+28FD U+28FB U+28BF U+287F U+28DF U+28EF U+28F7
+  ("dots" spinner). Index = current % 8 = 2 -> U+28FB. This matches. Format: "{frame} {pct(1)}".
+- TaskProgress::status() = "{name}: {done}/{total} - {pct(1)}".
+- Float precision subtlety (line 21 is the discriminator): Format::percentage(0.12345f, 2) must
+  print "12.35", NOT "12.34". The literal 0.12345f as f32 is 0.12345000356435775756835938,
+  so ratio*100 = 12.3450003... which rounds UP to 12.35. If you were to parse/store 0.12345 as
+  f64 you would get 12.344999999999999 and print "12.34" - WRONG.
+  => Percentage / Format::percentage MUST take an f32 and widen to f64 only for formatting.
+  Verify all five of lines 20-24 explicitly.
+- Integer-ratio call sites (Format::progress, Format::bar, Counter, ProgressBar, tracker,
+  display, cyclic, task) compute the ratio from ints; doing that in f64 is fine and matches.
+`
+
+const STRUCTURE = `
+# Required deliverable structure (hard requirements from the user)
+
+1. A complete Cargo project rooted at /output.
+2. Library code organized into MODULES (multiple files, not one blob).
+3. The entry file must be at /output/test20.rs (package ROOT, not src/).
+4. Building must work. Aim to satisfy ALL THREE of these:
+     (a) cd /output && cargo build --release
+     (b) cd /output && rustc --edition 2021 test20.rs -o test20
+     (c) cd /output && rustc test20.rs -o test20      <- NOTE: defaults to edition 2015
+   To make (a) and (b)/(c) both work, the recommended shape is:
+     /output/Cargo.toml    -> [package] edition="2021";
+                              [lib] name="indicators" path="src/lib.rs";
+                              [[bin]] name="test20" path="test20.rs"
+     /output/src/lib.rs    -> pub mod <several modules>;
+     /output/src/*.rs      -> the modules
+     /output/test20.rs     -> #[path = "src/lib.rs"] mod indicators;  then use indicators::...;
+   Using #[path] means the bin does NOT depend on the lib crate, so plain rustc works too,
+   while cargo still builds both targets. Keep the code edition-agnostic (avoid anything that
+   only parses under 2021) so (c) also succeeds.
+5. Leave a compiled executable /output/test20 in place at the end.
+6. std only. No crates.io dependencies. No [dependencies] entries.
+7. Output must be byte-for-byte identical to the golden file.
+`
+
+// ---------------- Phase 1: independent spec lenses ----------------
+phase('Spec')
+
+const SPEC_SCHEMA = {
+  type: 'object',
+  properties: {
+    lens: { type: 'string' },
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          topic: { type: 'string' },
+          conclusion: { type: 'string' },
+          evidence: { type: 'string' },
+          confidence: { type: 'string', enum: ['certain', 'likely', 'guess'] },
+        },
+        required: ['topic', 'conclusion', 'evidence', 'confidence'],
+      },
+    },
+    disagreements_with_lead: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Any place the lead engineer derivations above look WRONG, with evidence',
+    },
+    pseudocode: { type: 'string', description: 'Exact pseudocode for the constructs in your lens' },
+  },
+  required: ['lens', 'findings', 'disagreements_with_lead', 'pseudocode'],
+}
+
+const LENSES = [
+  {
+    key: 'numeric-format',
+    prompt: `Your lens: NUMERIC FORMATTING AND FLOAT SEMANTICS.
+
+Determine exactly how every number in the golden output is produced. Cover:
+- the printf-equivalent used for percentages at each precision (lines 3,4,5,8,10,11,20-24,33,34,35)
+- default precision when Format::percentage is called with one arg (line 11) and inside bar suffixes
+- whether the ratio must be computed/stored as f32 vs f64 at each call site, and PROVE it using the
+  0.12345 case (lines 20-24) and the 0.45/0.67/0.33 cases
+- how Rust's {:.N} formatting compares to C++ std::fixed<<setprecision(N) for exactly these values.
+  Write and RUN small Rust programs (in /tmp, e.g. /tmp/probe_num) and small C++ programs (g++ is
+  likely available; if not, rely on Rust + reasoning) to confirm every one of the 12 numeric strings.
+- confirm Rust {:.2} on the f32->f64 widened value of 0.12345f32*100 yields "12.35".
+  Also report what f64 0.12345*100.0 formats to, to document the trap.
+
+Report exact Rust expressions that reproduce each numeric substring.`,
+  },
+  {
+    key: 'bar-geometry',
+    prompt: `Your lens: BAR / SPINNER GEOMETRY AND CHARACTER LAYOUT.
+
+Determine byte-exact layout rules. Cover:
+- ProgressBar default width (prove it from lines 14/15 by counting bytes in the golden file)
+- the fill formula: is filled = trunc(ratio*W), round(ratio*W), or (progress*W)/total integer math?
+  Test all candidates against lines 1, 13, 25-29 (W=10,20,25,30,40,50 and ratios 0.5, 0.33, 0.3, 0.6).
+  Report which candidates are indistinguishable on this data and pick the most natural.
+- exact composition of the bracket segment, and that interior length == W in every golden line
+- the ' ' vs '>' placement, and what should happen at ratio 0 and ratio 1 (not exercised - state your
+  chosen sensible behavior and say it is unconstrained)
+- the exact UTF-8 bytes of line 18's first character, and which 8-frame braille spinner sequence has
+  that char at index 2. Enumerate the common sequences and say which fits.
+- the exact prefix/separator strings: "Bar 1: ", "Progress: ", " (", "/", ")", "Test: ", " - "
+
+Use xxd / od on /workspace/gold/expected.txt and count characters programmatically, not by eye.`,
+  },
+  {
+    key: 'api-state',
+    prompt: `Your lens: CLASS API SEMANTICS AND STATE MACHINES.
+
+For each C++ type, define the Rust-facing API and its state transitions. Cover:
+- ProgressBar: fields, defaults, and that str() and operator()() are identical
+- Percentage / Counter: the two conversion paths (str() and operator std::string) produce identical
+  text; default-constructed Counter state (line 30-32 path: default ctor then set_current/set_total)
+- ProgressBuilder: chainable setters returning self, build() returning the percentage string "50.0%"
+- ProgressTracker: add_stage chainable; do stages affect get_progress/get_percentage? Note that
+  3 stages were added AND set_total(3) was called, and the output is "1/3" - argue whether total
+  comes from set_total or from stage count, and note that this test cannot distinguish them.
+  Recommend the implementation that satisfies the observed output under BOTH readings.
+  IMPORTANT ORDERING NOTE: in the C++ source, set_progress(1) is called BEFORE set_total(3), and
+  get_progress() still prints "1/3" - so setters must not clamp/reset each other.
+- MultiProgress: add_bar takes a COPY (later mutation of the original must not matter here, but the
+  bars are mutated BEFORE being added anyway); numbering starts at 1; join with '\\n'; no trailing '\\n'
+  (prove from the golden file that there is no blank line between line 15 and 16)
+- ProgressDisplay: ctor takes total, update(n) SETS current to n, increment(n) ADDS n
+  (prove: update(50) -> 50/100, then increment(25) -> 75/100)
+- CyclicProgress: ctor takes total; next() advances; after 2 calls -> "2/10 = 20.0%" and spinner
+  index 2. State whether current starts at 0 and next() pre- or post-increments.
+- TaskProgress: ctor(name,total); complete(3) sets done=3 (or adds 3 to 0 - indistinguishable);
+  status() format.
+
+Also design idiomatic Rust signatures (Display impls, From<T> for String, builder chaining with
+&mut self or self) that keep test20.rs readable and close to the C++ call sites.`,
+  },
+]
+
+const specs = await parallel(LENSES.map((l) => () =>
+  agent(`${CONTEXT}\n${KEY_DERIVATIONS}\n\n${l.prompt}\n\nYou are ANALYSIS ONLY - do NOT write any files into /output. You may write scratch probes under /tmp/probe_${l.key}/. Be rigorous and verify with executed commands.`,
+    { label: `spec:${l.key}`, phase: 'Spec', schema: SPEC_SCHEMA })
+))
+
+const goodSpecs = specs.filter(Boolean)
+log(`spec lenses returned: ${goodSpecs.length}/3`)
+
+// ---------------- Phase 2: synthesize ----------------
+phase('Synthesize')
+
+const merged = await agent(
+  `${CONTEXT}\n${KEY_DERIVATIONS}\n${STRUCTURE}\n\n` +
+  `Three independent analysts examined the port. Here are their structured findings as JSON:\n\n` +
+  JSON.stringify(goodSpecs, null, 2) +
+  `\n\nYour job: produce ONE authoritative, unambiguous implementation specification and WRITE IT to ` +
+  `/workspace/spec.md. Resolve every disagreement by re-running the evidence yourself (run the ` +
+  `reference binary, inspect /workspace/gold/expected.txt bytes, run tiny Rust probes in /tmp). ` +
+  `The spec must be detailed enough that an engineer who has never seen the golden output can ` +
+  `reproduce it byte-exactly: give exact format strings, exact field defaults, exact arithmetic ` +
+  `(including f32 vs f64 at each site), exact separator literals, and the exact module layout. ` +
+  `Include a mapping table: golden line number -> the call in test20.cpp -> the exact expected bytes. ` +
+  `Flag any behavior that is UNCONSTRAINED by the test so implementers do not waste effort. ` +
+  `Do NOT write anything into /output.\n\n` +
+  `Return: the full text of the spec you wrote (so downstream agents get it directly).`,
+  { label: 'synthesize-spec', phase: 'Synthesize' }
+)
+
+// ---------------- Phase 3: implement (panel) + Phase 4: judge, pipelined ----------------
+const CANDIDATES = [
+  { key: 'A', dir: '/tmp/implA', style: 'Prefer one module per C++ type (bar.rs, percentage.rs, counter.rs, builder.rs, tracker.rs, format.rs, multi.rs, display.rs, cyclic.rs, task.rs) with a shared internal fmt helper module.' },
+  { key: 'B', dir: '/tmp/implB', style: 'Prefer a few cohesive modules grouped by concern (format.rs for all text formatting primitives, bars.rs for ProgressBar/MultiProgress/CyclicProgress, counters.rs for Percentage/Counter, tracking.rs for ProgressBuilder/ProgressTracker/ProgressDisplay/TaskProgress).' },
+  { key: 'C', dir: '/tmp/implC', style: 'Prefer modules mirroring the rendering pipeline (core.rs for ratio/percent math, render.rs for bar+spinner rendering, widgets.rs for the stateful types, format.rs for the free Format functions).' },
+]
+
+const VERDICT_SCHEMA = {
+  type: 'object',
+  properties: {
+    candidate: { type: 'string' },
+    cargo_release_ok: { type: 'boolean' },
+    rustc_2021_ok: { type: 'boolean' },
+    rustc_default_edition_ok: { type: 'boolean' },
+    byte_exact: { type: 'boolean', description: 'diff of program stdout vs /workspace/gold/expected.txt is empty' },
+    md5_matches: { type: 'boolean' },
+    zero_deps: { type: 'boolean' },
+    entry_at_package_root: { type: 'boolean' },
+    modularized: { type: 'boolean' },
+    module_files: { type: 'array', items: { type: 'string' } },
+    warnings_count: { type: 'integer' },
+    problems: { type: 'array', items: { type: 'string' } },
+    code_quality_notes: { type: 'string' },
+    score: { type: 'integer', description: '0-100. Byte-exactness and building under all 3 commands dominate; then code quality/idiomaticity.' },
+    commands_run: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['candidate', 'cargo_release_ok', 'rustc_2021_ok', 'rustc_default_edition_ok', 'byte_exact', 'md5_matches', 'zero_deps', 'entry_at_package_root', 'modularized', 'module_files', 'warnings_count', 'problems', 'code_quality_notes', 'score', 'commands_run'],
+}
+
+const judged = await pipeline(
+  CANDIDATES,
+  (c) => agent(
+    `${CONTEXT}\n${STRUCTURE}\n\n# Authoritative spec\n\n${merged}\n\n` +
+    `# Your assignment\n\n` +
+    `Build the COMPLETE Rust Cargo project in ${c.dir} (create it; it is your private sandbox - ` +
+    `do NOT touch /output and do NOT touch other /tmp/impl* directories). ` +
+    `Use the SAME internal layout the final /output must have, i.e. ${c.dir}/Cargo.toml, ` +
+    `${c.dir}/src/lib.rs, ${c.dir}/src/<modules>.rs, ${c.dir}/test20.rs.\n\n` +
+    `Module organization preference for your candidate: ${c.style}\n\n` +
+    `test20.rs must mirror the C++ test20.cpp control flow faithfully (same order of prints, the same ` +
+    `loops, the arrays of 3 Counters and 3 Percentages, etc.), read args via std::env::args() even ` +
+    `though they are unused (keep it non-warning: bind and ignore appropriately, e.g. let _args: Vec<String> = std::env::args().collect();).\n\n` +
+    `Hard acceptance gate you must reach BEFORE returning:\n` +
+    `  cd ${c.dir} && cargo build --release            -> succeeds, zero warnings ideally\n` +
+    `  cd ${c.dir} && ./target/release/test20 | diff - /workspace/gold/expected.txt   -> EMPTY diff\n` +
+    `  cd ${c.dir} && rustc --edition 2021 test20.rs -o /tmp/t20_${c.key}_2021 && /tmp/t20_${c.key}_2021 | diff - /workspace/gold/expected.txt  -> EMPTY\n` +
+    `  cd ${c.dir} && rustc test20.rs -o /tmp/t20_${c.key}_2015 && /tmp/t20_${c.key}_2015 | diff - /workspace/gold/expected.txt  -> EMPTY\n` +
+    `  cargo build must NOT create a Cargo.lock with any dependency, and Cargo.toml must have no [dependencies].\n` +
+    `Iterate until all gates pass. Also run the reference binary and md5sum-compare.\n` +
+    `Write real, clean, idiomatic Rust with doc comments on public items. Implement Display where the ` +
+    `C++ had operator std::string / str(), and From<&T> for String where the C++ used static_cast<std::string>.\n\n` +
+    `Return a concise report: files created, the exact gate command outputs (pass/fail), and any ` +
+    `behavior you had to guess.`,
+    { label: `impl:${c.key}`, phase: 'Implement' }
+  ),
+  (implReport, c) => agent(
+    `${CONTEXT}\n${STRUCTURE}\n\n` +
+    `# Independent verification assignment\n\n` +
+    `A candidate Rust port lives in ${c.dir}. You are an INDEPENDENT, SKEPTICAL verifier. ` +
+    `Do NOT trust the implementer's claims. Assume they may have faked or partially verified things.\n\n` +
+    `The implementer's self-report was:\n${implReport}\n\n` +
+    `Verify from scratch, running every command yourself:\n` +
+    `  1. rm -rf ${c.dir}/target ${c.dir}/Cargo.lock ; cd ${c.dir} && cargo build --release 2>&1 (capture warnings)\n` +
+    `  2. ${c.dir}/target/release/test20 | diff - /workspace/gold/expected.txt ; echo "diff rc=$?"\n` +
+    `  3. ${c.dir}/target/release/test20 | md5sum  (must be df2520598063825f66838d536e1f26cf)\n` +
+    `  4. cd ${c.dir} && rustc --edition 2021 test20.rs -o /tmp/v_${c.key}_21 2>&1 and diff its output\n` +
+    `  5. cd ${c.dir} && rustc test20.rs -o /tmp/v_${c.key}_15 2>&1 and diff its output\n` +
+    `  6. grep for [dependencies] in Cargo.toml and any extern crate / non-std use; confirm std-only\n` +
+    `  7. confirm /output was NOT touched by this candidate and that test20.rs sits at the package root\n` +
+    `  8. confirm library code is split across multiple module files under src/\n` +
+    `  9. READ the source files and look for cheating: hardcoded golden strings, a literal table of the\n` +
+    `     35 output lines, printing a stored constant instead of computing, if/else on magic inputs.\n` +
+    `     Real computation is required. Report any such cheat as a fatal problem.\n` +
+    ` 10. sanity-probe the library beyond the test: does percentage(0.0)/percentage(1.0), width smaller\n` +
+    `     than needed, or total=0 panic? A panic on total=0 (divide by zero) is a real robustness bug\n` +
+    `     worth reporting though not fatal. Write a tiny extra probe binary in /tmp to check.\n\n` +
+    `Score honestly. byte_exact=false or any cheating => score below 30.`,
+    { label: `verify:${c.key}`, phase: 'Judge', schema: VERDICT_SCHEMA, effort: 'high' }
+  )
+)
+
+const verdicts = judged.filter(Boolean)
+log(`verdicts: ${verdicts.map(v => `${v.candidate}=${v.score}(exact=${v.byte_exact})`).join(', ')}`)
+
+const passing = verdicts.filter(v => v.byte_exact && v.md5_matches && v.cargo_release_ok && v.zero_deps)
+const ranked = (passing.length ? passing : verdicts).slice().sort((a, b) => b.score - a.score)
+const winner = ranked[0]
+if (!winner) return { error: 'no candidate produced a verdict', verdicts }
+const winnerDir = CANDIDATES.find(c => c.key === winner.candidate)?.dir
+  || CANDIDATES.find(c => winner.candidate && winner.candidate.includes(c.key))?.dir
+log(`winner: candidate ${winner.candidate} (score ${winner.score}) from ${winnerDir}`)
+
+// ---------------- Phase 5: install ----------------
+phase('Install')
+
+const runnersUp = ranked.slice(1)
+const install = await agent(
+  `${CONTEXT}\n${STRUCTURE}\n\n# Authoritative spec\n\n${merged}\n\n` +
+  `# Install assignment\n\n` +
+  `Candidate ${winner.candidate} at ${winnerDir} won the panel with score ${winner.score}.\n` +
+  `Verifier notes on the winner: ${JSON.stringify({ problems: winner.problems, quality: winner.code_quality_notes, modules: winner.module_files }, null, 2)}\n\n` +
+  `Runner-up verdicts (mine their code at their dirs for better ideas ONLY if it does not risk the ` +
+  `byte-exact gate): ${JSON.stringify(runnersUp.map(r => ({ c: r.candidate, score: r.score, quality: r.code_quality_notes, problems: r.problems })), null, 2)}\n` +
+  `Runner-up directories: ${CANDIDATES.filter(c => c.key !== winner.candidate).map(c => c.dir).join(', ')}\n\n` +
+  `Do this:\n` +
+  `  1. Install the winning project into /output: /output/Cargo.toml, /output/src/lib.rs,\n` +
+  `     /output/src/*.rs modules, /output/test20.rs. Copy the FILES (use cp), do not retype them.\n` +
+  `     Do not copy target/ or Cargo.lock cruft; a Cargo.lock generated by a clean build is fine.\n` +
+  `  2. Fix every non-fatal problem the verifier raised (warnings, robustness on total=0, doc comments)\n` +
+  `     WITHOUT breaking byte-exactness. Graft clearly-better module code or naming from runners-up if\n` +
+  `     it improves clarity; re-verify after every change.\n` +
+  `  3. Ensure the package name and bin target are sane (bin name test20).\n` +
+  `  4. Build and leave the executable at /output/test20 as well:\n` +
+  `       cd /output && cargo build --release\n` +
+  `       cd /output && rustc --edition 2021 test20.rs -o /output/test20\n` +
+  `  5. Final gates, all must pass:\n` +
+  `       /output/test20 | diff - /workspace/gold/expected.txt        -> EMPTY\n` +
+  `       /output/target/release/test20 | diff - /workspace/gold/expected.txt  -> EMPTY\n` +
+  `       cd /output && rustc test20.rs -o /tmp/out_2015 && /tmp/out_2015 | diff - /workspace/gold/expected.txt -> EMPTY\n` +
+  `       cargo build --release emits zero warnings\n` +
+  `       no [dependencies] in Cargo.toml\n` +
+  `  6. ls -R /output (excluding target) and report the final tree.\n\n` +
+  `Return: final /output tree, the gate results verbatim, and a list of what you changed vs the winner.`,
+  { label: 'install-to-output', phase: 'Install' }
+)
+
+// ---------------- Phase 6: adversarial review ----------------
+phase('Review')
+
+const REVIEW_SCHEMA = {
+  type: 'object',
+  properties: {
+    lens: { type: 'string' },
+    fatal: { type: 'array', items: { type: 'object', properties: { file: { type: 'string' }, issue: { type: 'string' }, proof: { type: 'string' } }, required: ['file', 'issue', 'proof'] } },
+    important: { type: 'array', items: { type: 'object', properties: { file: { type: 'string' }, issue: { type: 'string' }, proof: { type: 'string' } }, required: ['file', 'issue', 'proof'] } },
+    nits: { type: 'array', items: { type: 'string' } },
+    verdict_ship: { type: 'boolean' },
+  },
+  required: ['lens', 'fatal', 'important', 'nits', 'verdict_ship'],
+}
+
+const REVIEW_LENSES = [
+  { key: 'requirements', prompt: 'Lens: REQUIREMENT COMPLIANCE. Re-read the user requirements in STRUCTURE plus these: 2021 edition; CLI args parsed via std::env::args() and accepting exactly the same args as the C++ binary (which ignores them); zero external crates; library code organized into modules; entry test file at /output/test20.rs; an executable produced. Audit /output against every single one and prove each with a command. Also verify the project builds from a pristine clone (copy /output to /tmp/pristine_req excluding target and Cargo.lock, then build there).' },
+  { key: 'byte-exactness', prompt: 'Lens: OUTPUT FIDELITY. Independently re-derive that /output/test20 output equals the reference binary byte for byte. Use cmp, md5sum, and a byte-level diff (xxd both, diff the hexdumps). Then go line by line through /workspace/dataset/indicators/tests/test20.cpp and confirm the Rust test20.rs performs the SAME sequence of operations (not just that the final bytes happen to match) - e.g. that the Percentage array really constructs three Percentage values with precisions 1,2,3, that the loops really iterate i=1..=5 and i=10,20,..,50, that increment() really adds. Report any place the Rust cheats by short-circuiting the computation.' },
+  { key: 'correctness-robustness', prompt: 'Lens: LIBRARY CORRECTNESS BEYOND THE TEST. Read all of /output/src. Hunt for real defects: integer overflow, division by zero (total=0), negative inputs, ratio>1 causing a huge or panicking String allocation or a subtract-with-overflow in the spaces count, usize underflow when width==0 or filled+1>width, f32/f64 mixups that would break other precisions, off-by-one in spinner indexing, char boundary bugs. Write probe programs in /tmp/review_probe to actually trigger what you suspect, and report only defects you reproduced (or can prove by reading arithmetic). Note that panics on absurd input are acceptable-ish but a debug-mode subtract overflow panic on plausible input (progress>total) is an important finding.' },
+]
+
+const reviews = await parallel(REVIEW_LENSES.map((r) => () =>
+  agent(`${CONTEXT}\n${STRUCTURE}\n\n# Install report\n\n${install}\n\n${r.prompt}\n\n` +
+    `Be adversarial and specific. Do NOT modify /output - you are read-only except for /tmp probes. ` +
+    `Default to reporting an issue only if you can prove it.`,
+    { label: `review:${r.key}`, phase: 'Review', schema: REVIEW_SCHEMA, effort: 'high' })
+))
+
+const goodReviews = reviews.filter(Boolean)
+const allFatal = goodReviews.flatMap(r => r.fatal.map(f => ({ lens: r.lens, ...f })))
+const allImportant = goodReviews.flatMap(r => r.important.map(f => ({ lens: r.lens, ...f })))
+log(`review: ${allFatal.length} fatal, ${allImportant.length} important`)
+
+// ---------------- Phase 7: fix + final gate ----------------
+phase('Final')
+
+let fixReport = 'no fixes needed'
+if (allFatal.length || allImportant.length) {
+  fixReport = await agent(
+    `${CONTEXT}\n${STRUCTURE}\n\n# Authoritative spec\n\n${merged}\n\n` +
+    `# Fix assignment\n\nAdversarial reviewers found issues in /output.\n\n` +
+    `FATAL:\n${JSON.stringify(allFatal, null, 2)}\n\nIMPORTANT:\n${JSON.stringify(allImportant, null, 2)}\n\n` +
+    `NITS:\n${JSON.stringify(goodReviews.flatMap(r => r.nits), null, 2)}\n\n` +
+    `Fix all FATAL and all IMPORTANT issues in /output. Apply nits only when they are clear wins. ` +
+    `Some reported issues may be wrong or may be unconstrained-behavior opinions - reproduce each ` +
+    `before changing code, and explicitly say which ones you rejected and why.\n` +
+    `THE BYTE-EXACT GATE IS SACRED: after every change run\n` +
+    `  cd /output && cargo build --release && ./target/release/test20 | diff - /workspace/gold/expected.txt\n` +
+    `and revert anything that breaks it.\n` +
+    `Finish by rebuilding /output/test20 (rustc --edition 2021 test20.rs -o /output/test20) and ` +
+    `re-running all gates.\n\nReturn what you changed, what you rejected, and the final gate output.`,
+    { label: 'apply-fixes', phase: 'Final' }
+  )
+}
+
+const FINAL_SCHEMA = {
+  type: 'object',
+  properties: {
+    all_gates_pass: { type: 'boolean' },
+    gate_results: { type: 'array', items: { type: 'object', properties: { gate: { type: 'string' }, pass: { type: 'boolean' }, detail: { type: 'string' } }, required: ['gate', 'pass', 'detail'] } },
+    tree: { type: 'string', description: 'ls -R of /output excluding target/' },
+    line_counts: { type: 'string', description: 'wc -l of each rust source file' },
+    remaining_concerns: { type: 'array', items: { type: 'string' } },
+    summary_for_user: { type: 'string', description: 'Short factual summary of what was delivered, including the module layout and how the tricky float rounding was handled.' },
+  },
+  required: ['all_gates_pass', 'gate_results', 'tree', 'line_counts', 'remaining_concerns', 'summary_for_user'],
+}
+
+const final = await agent(
+  `${CONTEXT}\n${STRUCTURE}\n\n# Fix report\n\n${fixReport}\n\n` +
+  `# FINAL GATE - be pedantic, trust nothing\n\n` +
+  `Run these and report each verbatim:\n` +
+  `  G1  cp -r /output /tmp/final_pristine && rm -rf /tmp/final_pristine/target /tmp/final_pristine/Cargo.lock /tmp/final_pristine/test20 && cd /tmp/final_pristine && cargo build --release 2>&1  (expect success, ZERO warnings)\n` +
+  `  G2  /tmp/final_pristine/target/release/test20 | diff - /workspace/gold/expected.txt ; echo rc=$?\n` +
+  `  G3  cd /tmp/final_pristine && rustc --edition 2021 test20.rs -o /tmp/fp21 2>&1 ; /tmp/fp21 | diff - /workspace/gold/expected.txt ; echo rc=$?\n` +
+  `  G4  cd /tmp/final_pristine && rustc test20.rs -o /tmp/fp15 2>&1 ; /tmp/fp15 | diff - /workspace/gold/expected.txt ; echo rc=$?\n` +
+  `  G5  /output/test20 | cmp - <(/workspace/dataset/test20_executable) ; echo rc=$?   (use bash for process substitution)\n` +
+  `  G6  /output/test20 arg1 --flag 7 | diff - /workspace/gold/expected.txt ; echo rc=$?   (args must be accepted and ignored, same as C++)\n` +
+  `  G7  grep -n 'dependencies' /output/Cargo.toml ; grep -rn 'extern crate' /output --include=*.rs ; (expect no real deps)\n` +
+  `  G8  test -f /output/test20.rs && test -x /output/test20 && echo entry+exe ok\n` +
+  `  G9  ls /output/src/*.rs | wc -l   (expect >= 3 module files -> modularized)\n` +
+  ` G10  grep -rn 'edition' /output/Cargo.toml  (expect 2021)\n` +
+  `If any gate fails, FIX /output yourself and re-run until green. Do not report success unless you ` +
+  `actually observed the green output. Report honestly if something cannot be made to pass.\n` +
+  `Finally, if /output/target exists leave it (harmless), and make sure /output/test20 is a fresh executable.`,
+  { label: 'final-gate', phase: 'Final', schema: FINAL_SCHEMA, effort: 'high' }
+)
+
+return {
+  winner: winner.candidate,
+  winner_score: winner.score,
+  verdicts: verdicts.map(v => ({ c: v.candidate, score: v.score, exact: v.byte_exact, problems: v.problems })),
+  fatal_found: allFatal,
+  important_found: allImportant,
+  final,
+}

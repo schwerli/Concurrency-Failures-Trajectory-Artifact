@@ -1,0 +1,123 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index d5aa968400..ca05b5530f 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -372,12 +372,10 @@ class ReverseOneToOneDescriptor:
+         instances_dict = {instance_attr(inst): inst for inst in instances}
+         query = {'%s__in' % self.related.field.name: instances}
+         queryset = queryset.filter(**query)
+-
+-        # Since we're going to assign directly in the cache,
+-        # we must manage the reverse relation cache manually.
+-        for rel_obj in queryset:
+-            instance = instances_dict[rel_obj_attr(rel_obj)]
+-            self.related.field.set_cached_value(rel_obj, instance)
++        queryset._prefetch_related_parent_cache = {
++            'instances_dict': instances_dict,
++            'field': self.related.field,
++        }
+         return queryset, rel_obj_attr, instance_attr, True, self.related.get_cache_name(), False
+ 
+     def __get__(self, instance, cls=None):
+@@ -642,12 +640,10 @@ def create_reverse_many_to_one_manager(superclass, rel):
+             instances_dict = {instance_attr(inst): inst for inst in instances}
+             query = {'%s__in' % self.field.name: instances}
+             queryset = queryset.filter(**query)
+-
+-            # Since we just bypassed this class' get_queryset(), we must manage
+-            # the reverse relation manually.
+-            for rel_obj in queryset:
+-                instance = instances_dict[rel_obj_attr(rel_obj)]
+-                setattr(rel_obj, self.field.name, instance)
++            queryset._prefetch_related_parent_cache = {
++                'instances_dict': instances_dict,
++                'field': self.field,
++            }
+             cache_name = self.field.remote_field.get_cache_name()
+             return queryset, rel_obj_attr, instance_attr, False, cache_name, False
+ 
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index fb6639793a..2f877b2a9b 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1866,6 +1866,28 @@ def get_prefetcher(instance, through_attr, to_attr):
+     return prefetcher, rel_obj_descriptor, attr_found, is_fetched
+ 
+ 
++def _prefetch_related_back_reference(all_related_objects, rel_qs, rel_obj_attr, additional_lookups):
++    cache = getattr(rel_qs, '_prefetch_related_parent_cache', None)
++    if cache is None:
++        return
++
++    field = cache['field']
++    # A nested prefetch back to the parent relation should populate this cache
++    # from its own queryset rather than reusing the outer instance.
++    if any(
++        getattr(lookup, 'prefetch_through', lookup).split(LOOKUP_SEP, 1)[0] == field.name
++        for lookup in additional_lookups
++    ):
++        return
++
++    instances_dict = cache['instances_dict']
++    for rel_obj in all_related_objects:
++        if field.is_cached(rel_obj):
++            continue
++        instance = instances_dict[rel_obj_attr(rel_obj)]
++        field.set_cached_value(rel_obj, instance)
++
++
+ def prefetch_one_level(instances, prefetcher, lookup, level):
+     """
+     Helper function for prefetch_related_objects().
+@@ -1908,6 +1930,12 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
+         rel_qs._prefetch_related_lookups = ()
+ 
+     all_related_objects = list(rel_qs)
++    _prefetch_related_back_reference(
++        all_related_objects,
++        rel_qs,
++        rel_obj_attr,
++        additional_lookups,
++    )
+ 
+     rel_obj_cache = {}
+     for rel_obj in all_related_objects:
+diff --git a/tests/prefetch_related/tests.py b/tests/prefetch_related/tests.py
+index 4ea7fccd5e..906a6289ee 100644
+--- a/tests/prefetch_related/tests.py
++++ b/tests/prefetch_related/tests.py
+@@ -811,6 +811,34 @@ class CustomPrefetchTests(TestCase):
+             self.room2_1
+         )
+ 
++    def test_nested_prefetch_related_overrides_cached_foreign_key(self):
++        houses = House.objects.only('address').prefetch_related(
++            Prefetch(
++                'rooms',
++                queryset=Room.objects.prefetch_related(
++                    Prefetch('house', queryset=House.objects.only('name')),
++                ),
++            ),
++        )
++        with self.assertNumQueries(3):
++            house = houses.get(pk=self.house1.pk)
++        with self.assertNumQueries(0):
++            self.assertEqual(house.rooms.all()[0].house.name, self.house1.name)
++
++    def test_nested_prefetch_related_overrides_cached_one_to_one(self):
++        rooms = Room.objects.only('house').prefetch_related(
++            Prefetch(
++                'main_room_of',
++                queryset=House.objects.prefetch_related(
++                    Prefetch('main_room', queryset=Room.objects.only('name')),
++                ),
++            ),
++        )
++        with self.assertNumQueries(3):
++            room = rooms.get(pk=self.room1_1.pk)
++        with self.assertNumQueries(0):
++            self.assertEqual(room.main_room_of.main_room.name, self.room1_1.name)
++
+     def test_nested_prefetch_related_with_duplicate_prefetcher(self):
+         """
+         Nested prefetches whose name clashes with descriptor names

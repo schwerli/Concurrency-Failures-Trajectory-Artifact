@@ -1,0 +1,189 @@
+diff --git a/probe_addfield.py b/probe_addfield.py
+new file mode 100644
+index 0000000000..5c82a985ef
+--- /dev/null
++++ b/probe_addfield.py
+@@ -0,0 +1,54 @@
++import django
++from django.conf import settings
++settings.configure(
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++    USE_TZ=False,
++)
++django.setup()
++from django.db import connection, models
++
++
++class Author(models.Model):
++    name = models.CharField(max_length=10)
++
++    class Meta:
++        app_label = 'testapp'
++
++
++with connection.schema_editor() as e:
++    e.create_model(Author)
++
++print('sqlite version:', connection.Database.sqlite_version)
++
++
++def try_add(label, field, fname):
++    field.set_attributes_from_name(fname)
++    collected = []
++    orig = connection.SchemaEditorClass.execute
++
++    def spy(self, sql, params=()):
++        collected.append(str(sql))
++        return orig(self, sql, params)
++
++    connection.SchemaEditorClass.execute = spy
++    try:
++        with connection.schema_editor() as ed:
++            ed.add_field(Author, field)
++        first = collected[0] if collected else '(no sql)'
++        print('OK   :', label, '| n_sql=%d | first=%s' % (len(collected), first[:90]))
++    except Exception as ex:
++        print('FAIL :', label, '->', type(ex).__name__, ex)
++        print('       sql:', collected[-1][:160] if collected else '(none)')
++    finally:
++        connection.SchemaEditorClass.execute = orig
++
++
++try_add('nullable UNIQUE CharField', models.CharField(max_length=10, unique=True, null=True), 'u1')
++try_add('nullable OneToOneField', models.OneToOneField('testapp.Author', models.CASCADE, null=True), 'o1')
++try_add('nullable unique FK', models.ForeignKey('testapp.Author', models.CASCADE, null=True, unique=True), 'f1')
++try_add('nullable plain FK', models.ForeignKey('testapp.Author', models.CASCADE, null=True), 'f2')
++try_add('nullable plain CharField', models.CharField(max_length=10, null=True), 'c1')
++try_add('nullable db_index CharField', models.CharField(max_length=10, null=True, db_index=True), 'i1')
++try_add('NOT NULL w/ default', models.CharField(max_length=10, default='x'), 'n1')
++try_add('nullable PositiveIntegerField (has CHECK on some backends)', models.PositiveIntegerField(null=True), 'p1')
+diff --git a/probe_addfield2.py b/probe_addfield2.py
+new file mode 100644
+index 0000000000..6b26b7d39e
+--- /dev/null
++++ b/probe_addfield2.py
+@@ -0,0 +1,60 @@
++import django
++from django.conf import settings
++settings.configure(
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++    USE_TZ=False,
++)
++django.setup()
++from django.db import connection, models
++
++
++class Author(models.Model):
++    name = models.CharField(max_length=10)
++
++    class Meta:
++        app_label = 'testapp'
++
++
++class Target(models.Model):
++    class Meta:
++        app_label = 'testapp'
++
++
++with connection.schema_editor() as e:
++    e.create_model(Target)
++    e.create_model(Author)
++
++
++def try_add(label, field, fname, model=Author):
++    field.set_attributes_from_name(fname)
++    collected = []
++    orig = connection.SchemaEditorClass.execute
++
++    def spy(self, sql, params=()):
++        collected.append(str(sql))
++        return orig(self, sql, params)
++
++    connection.SchemaEditorClass.execute = spy
++    try:
++        with connection.schema_editor() as ed:
++            ed.add_field(model, field)
++        path = 'REMAKE' if collected and collected[0].startswith('CREATE TABLE "new__') else 'ALTER '
++        print('OK   [%s]: %s | %s' % (path, label, (collected[0] if collected else '(no sql)')[:110]))
++    except Exception as ex:
++        print('FAIL      : %s -> %s: %s' % (label, type(ex).__name__, ex))
++        print('            sql: %s' % (collected[-1][:170] if collected else '(none)'))
++    finally:
++        connection.SchemaEditorClass.execute = orig
++
++
++try_add('nullable OneToOneField (unique implied)', models.OneToOneField(Target, models.CASCADE, null=True), 'o1')
++try_add('nullable unique FK', models.ForeignKey(Target, models.CASCADE, null=True, unique=True), 'f1')
++try_add('nullable plain FK', models.ForeignKey(Target, models.CASCADE, null=True), 'f2')
++try_add('nullable unique BooleanField', models.BooleanField(null=True, unique=True), 'b1')
++try_add('FK null=True with default=None', models.ForeignKey(Target, models.CASCADE, null=True, default=None), 'f3')
++try_add('nullable DateTimeField auto_now (default -> now)', models.DateTimeField(null=True, auto_now=True), 'd1')
++try_add('nullable unique_for_date? n/a', models.IntegerField(null=True), 'z1')
++try_add('nullable M2M', models.ManyToManyField(Target), 'm1')
++# primary_key path (Django checks forbid null=True + pk, but exercise the branch)
++try_add('pk=True unique implied, null=False', models.CharField(max_length=5, primary_key=True), 'pk1')
+diff --git a/probe_m2m.py b/probe_m2m.py
+new file mode 100644
+index 0000000000..e378ecd9b0
+--- /dev/null
++++ b/probe_m2m.py
+@@ -0,0 +1,57 @@
++import django
++from django.conf import settings
++settings.configure(
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++    USE_TZ=False,
++)
++django.setup()
++from django.db import connection, models
++
++
++class Target(models.Model):
++    class Meta:
++        app_label = 'testapp'
++
++
++class Author(models.Model):
++    name = models.CharField(max_length=10)
++
++    class Meta:
++        app_label = 'testapp'
++
++
++with connection.schema_editor() as e:
++    e.create_model(Target)
++    e.create_model(Author)
++
++m2m = models.ManyToManyField(Target, related_name='authors')
++m2m.set_attributes_from_name('tags')
++m2m.model = Author
++m2m.contribute_to_class(Author, 'tags')
++print('m2m.null =', m2m.null, '| auto_created through =', m2m.remote_field.through._meta.auto_created,
++      '| expected through table =', m2m.remote_field.through._meta.db_table)
++
++sqls = []
++orig = connection.SchemaEditorClass.execute
++
++
++def spy(self, sql, params=()):
++    sqls.append(str(sql))
++    return orig(self, sql, params)
++
++
++connection.SchemaEditorClass.execute = spy
++try:
++    with connection.schema_editor() as ed:
++        ed.add_field(Author, m2m)
++except Exception as ex:
++    print('EXC:', type(ex).__name__, ex)
++finally:
++    connection.SchemaEditorClass.execute = orig
++
++for s in sqls:
++    print('  SQL>', s[:150])
++with connection.cursor() as c:
++    c.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
++    print('TABLES:', [r[0] for r in c.fetchall()])

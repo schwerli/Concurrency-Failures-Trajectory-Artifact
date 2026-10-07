@@ -1,0 +1,158 @@
+{
+  "schema_version": 2,
+  "phase": "fixed",
+  "pair_id": "programbench/antonmedv__walk.bf802ef/codex",
+  "task": {
+    "plain_summary_zh": "根据捆绑文档和黑盒运行结果，从零重新实现 walk v1.13.0 终端文件导航器，最终交付不依赖原二进制的可执行文件。",
+    "acceptance_target_zh": "通过 ProgramBench 官方测试，覆盖帮助/版本/错误启动、命令行标志、TUI 导航、预览、搜索、删除/撤销、图标、状态栏以及编辑器和 open-with 环境变量等行为。"
+  },
+  "modes": {
+    "parallel": {
+      "solution_passed": false,
+      "evaluation_completed": true,
+      "passed": 664,
+      "total": 786,
+      "rate": 0.8447837150127226,
+      "wall_seconds": 2884.029
+    },
+    "serial": {
+      "solution_passed": false,
+      "evaluation_completed": true,
+      "passed": 388,
+      "total": 786,
+      "rate": 0.49363867684478374,
+      "wall_seconds": 3126.556
+    }
+  },
+  "reconstruction": {
+    "parallel_strategy_zh": "并行轨迹先由父线程读文档并做初始 CLI/TUI 探测，随后在 13:24:45 同时派出 flags_probe、tui_probe、feature_probe，父线程继续本地 TUI 探测。TUI 子线程集中确认移动、进入、返回、退出码和路径输出；feature 子线程集中确认隐藏文件、dir-only、预览、搜索、删除/撤销、状态栏和 open-with；flags 子线程覆盖启动/标志/状态栏契约，并在共享工作区把这些发现补进 Go 实现，最终运行 compile.sh 生成 /workspace/executable 并做烟测。",
+    "serial_strategy_zh": "串行轨迹只有一个模型上下文。它依次阅读文档、做 CLI 和大量 PTY 行为探测，再处理 search、delete、open-with、状态栏等细节；到 13:02 之后才进入实现。随后写 Go 代码，因自行选择外部依赖遇到 go mod 下载失败，又改成本地实现；最后只来得及修正编译错误并让 go build 成功，未在轨迹中完成最终 compile.sh 运行或最终制品烟测。",
+    "realized_parallelism_zh": "真实重叠来自父线程加三个有用子线程。13:25:10 的 list_agents 显示 /root、/root/feature_probe、/root/flags_probe、/root/tui_probe 同时 running；父线程在子线程存活期间继续探测和随后实现。TUI 子线程约 13:30 完成，feature 子线程约 13:38 完成，flags 子线程约 14:00 完成并已将补丁构建进最终制品。",
+    "parallel_workers": 4,
+    "peak_overlapping_useful_workers": 4
+  },
+  "baseline_audit": {
+    "same_task_and_prompt": true,
+    "serial_run_valid": true,
+    "parallel_run_valid": true,
+    "external_or_harness_issues_zh": []
+  },
+  "decision": "retain",
+  "exclusion_code": null,
+  "decision_reason_zh": "保留。两边 prompt 和任务相同，制品和官方评测有效；串行虽然超时，但它在单模型上下文中持续做任务内探测和实现，没有 provider、harness、启动、评测、污染或无关取消问题。并行实际发生了父线程与三个子线程的重叠模型工作，且子线程覆盖的行为族和后续共享工作区补丁进入最终制品。官方通过数从串行 388/786 提高到并行 664/786，差异能由并发覆盖更多必要行为并把发现合入实现来解释，而不是只由普通实现差异或单纯更高分数解释。",
+  "advantage": {
+    "proposed_dimension_zh": "互补工作并行化",
+    "secondary_mechanism_zh": null,
+    "benefit_kind": "quality",
+    "measured_benefit_zh": "并行官方结果为 664/786，84.48%；串行为 388/786，49.36%。并行多通过 276 个测试，提升约 35.11 个百分点。并行 cell wall time 为 2884.029 秒，串行为 3126.556 秒，虽少约 242.527 秒，但只约 7.8% 降低，未达到本规则下的独立时间优势；保留的收益是质量。",
+    "parallel_action_zh": "并行把行为空间按互补目标拆开：父线程继续本地 TUI 与后续实现，tui_probe 提供移动/Enter/Backspace/q/Esc/Ctrl+C/路径参数语义，feature_probe 提供 hidden、dir-only、icons、preview、search、delete/undo、y、status、WALK_OPEN_WITH 等语义，flags_probe 提供 help/version/-v/状态栏编译顺序/特殊标志优先级等启动契约并直接修改共享实现。",
+    "serial_contrast_zh": "串行缺少重叠模型上下文，只能按一个路径顺序探测同一批行为。它在 open-with、search 和 PTY 捕获上花费较长时间，open-with 早期没有 logger 导致语义不清；进入实现较晚，依赖清理和编译修复后轨迹结束，没有完成最终制品层面的系统烟测。",
+    "mechanism_link_zh": "质量收益对应的是互补行为发现和合入链条。并行的子线程报告在父线程实现前或实现中可用，flags 子线程随后明确按已测得的启动契约修正已有实现，又发现并修复 Delete 后索引越界，并把结果通过 compile.sh 构建到最终 /workspace/executable。串行也做了正常努力，但同一上下文顺序完成这些行为族，导致实现和验证阶段被压缩；其较低官方覆盖更符合缺少并发互补覆盖后的遗漏，而不是外部失败。"
+  },
+  "new_pattern_candidate": {
+    "is_candidate": false,
+    "name_zh": null,
+    "mechanism_zh": null,
+    "why_existing_dimensions_fail_zh": null
+  },
+  "evidence": {
+    "parallel": [
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/07/rollout-2026-08-07T13-23-13-019fdc64-5f2d-7ea3-8a26-4fa894816b7d.jsonl",
+        "line": 100,
+        "summary_zh": "父线程在同一回合发起 flags_probe、tui_probe、feature_probe；随后几行记录三个子线程均在 13:24:45 启动。"
+      },
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/07/rollout-2026-08-07T13-23-13-019fdc64-5f2d-7ea3-8a26-4fa894816b7d.jsonl",
+        "line": 112,
+        "summary_zh": "父线程说明已委派三个并行探测，同时自己继续用临时目录和 tmux 捕获 TUI 行为。"
+      },
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/07/rollout-2026-08-07T13-24-45-019fdc65-c63c-77d1-95ce-0ed6eb947e15.jsonl",
+        "line": 70,
+        "summary_zh": "flags 子线程的 list_agents 显示父线程、feature_probe、flags_probe、tui_probe 四个上下文同时 running。"
+      },
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/07/rollout-2026-08-07T13-24-45-019fdc65-c668-70a1-9f67-2e1461c4e1e9.jsonl",
+        "line": 186,
+        "summary_zh": "TUI 子线程最终报告移动换行、Enter、Backspace、q/Esc/Ctrl+C、路径参数和当前目录输出等交互语义。"
+      },
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/07/rollout-2026-08-07T13-24-45-019fdc65-c698-7c03-ade8-19574cb11e40.jsonl",
+        "line": 451,
+        "summary_zh": "feature 子线程用 logger 确认 WALK_OPEN_WITH 命令收到被选文件路径，解决串行早期未精确确认的 open-with 语义。"
+      },
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/07/rollout-2026-08-07T13-24-45-019fdc65-c63c-77d1-95ce-0ed6eb947e15.jsonl",
+        "line": 811,
+        "summary_zh": "flags 子线程明确按原二进制探测到的启动契约修正共享实现，包括状态栏先编译、特殊标志优先、-v 和 help 输出到 stderr。"
+      },
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/07/rollout-2026-08-07T13-24-45-019fdc65-c63c-77d1-95ce-0ed6eb947e15.jsonl",
+        "line": 1039,
+        "summary_zh": "flags 子线程在删除单文件后发现候选实现的索引越界崩溃，并马上修 selectedEntry 防护。"
+      },
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/07/rollout-2026-08-07T13-24-45-019fdc65-c63c-77d1-95ce-0ed6eb947e15.jsonl",
+        "line": 1096,
+        "summary_zh": "flags 子线程称行为已足够匹配，准备构建到最终 ./executable；随后 compile.sh 成功，1102-1109 行记录最终制品烟测。"
+      }
+    ],
+    "serial": [
+      {
+        "path": "serial/agent/codex/sessions/2026/08/07/rollout-2026-08-07T12-31-00-019fdc34-912f-73e3-9e6e-40ec8895930d.jsonl",
+        "line": 6,
+        "summary_zh": "串行 turn_context 显示 multi_agent_version 为 disabled，只有单个模型上下文可用。"
+      },
+      {
+        "path": "serial/agent/codex/sessions/2026/08/07/rollout-2026-08-07T12-31-00-019fdc34-912f-73e3-9e6e-40ec8895930d.jsonl",
+        "line": 151,
+        "summary_zh": "串行把 CLI、导航、预览、删除、搜索和环境变量等全部安排在一个顺序计划内。"
+      },
+      {
+        "path": "serial/agent/codex/sessions/2026/08/07/rollout-2026-08-07T12-31-00-019fdc34-912f-73e3-9e6e-40ec8895930d.jsonl",
+        "line": 601,
+        "summary_zh": "串行同时启动了几个 shell PTY 试探 WALK_OPEN_WITH 的 txt=cat、.txt=cat、txt:cat 形式，但这是单模型上下文控制的 shell 并行，且未用 logger 精确确认 argv。"
+      },
+      {
+        "path": "serial/agent/codex/sessions/2026/08/07/rollout-2026-08-07T12-31-00-019fdc34-912f-73e3-9e6e-40ec8895930d.jsonl",
+        "line": 904,
+        "summary_zh": "串行在 13:02:25 才认为 search 语义稳定并开始实现，说明大量行为探测被顺序放在实现之前。"
+      },
+      {
+        "path": "serial/agent/codex/sessions/2026/08/07/rollout-2026-08-07T12-31-00-019fdc34-912f-73e3-9e6e-40ec8895930d.jsonl",
+        "line": 942,
+        "summary_zh": "go mod tidy 因网络不可达无法下载外部模块；下一步轨迹显示串行选择移除这些自选依赖并继续，不作为外部失败排除。"
+      },
+      {
+        "path": "serial/agent/codex/sessions/2026/08/07/rollout-2026-08-07T12-31-00-019fdc34-912f-73e3-9e6e-40ec8895930d.jsonl",
+        "line": 1008,
+        "summary_zh": "串行最后可见的 go build 成功发生在轨迹末端；之后没有最终 compile.sh 构建或最终制品烟测记录。"
+      }
+    ],
+    "evaluator": [
+      {
+        "path": "parallel/cell.json",
+        "line": 2,
+        "summary_zh": "cell 记录 actual_parallel_used 为 true；同文件还给出 artifact_ok、evaluation_completed、664/786 和 2884.029 秒。"
+      },
+      {
+        "path": "serial/cell.json",
+        "line": 2,
+        "summary_zh": "cell 记录 actual_parallel_used 为 false；同文件还给出 artifact_ok、evaluation_completed、388/786 和 3126.556 秒。"
+      },
+      {
+        "path": "parallel/cell/evaluation/summary.json",
+        "line": 7,
+        "summary_zh": "官方 ProgramBench evaluator 完成且 ok，通过 664、失败 121、solution_passed 为 false。"
+      },
+      {
+        "path": "serial/cell/evaluation/summary.json",
+        "line": 7,
+        "summary_zh": "官方 ProgramBench evaluator 完成且 ok，通过 388、失败 392、solution_passed 为 false。"
+      }
+    ]
+  },
+  "case_narrative_zh": "本任务要求在只观察捆绑文档和原二进制行为的前提下，从零实现 walk 终端文件导航器。并行轨迹在早期就让父线程继续做本地 TUI 探测，同时让三个子线程分别覆盖启动/标志/状态栏、导航/路径/退出、预览/搜索/删除/open-with 等互补行为族；这些结果不是停留在报告里，flags 子线程后来把启动契约、状态栏和删除崩溃修复合入共享 Go 实现，并构建最终 /workspace/executable 后烟测。串行轨迹是有效基线，但只能把同一批行为顺序探完，open-with 等语义一度不清，13:02 后才开始实现，依赖清理和编译修复后没有最终制品验证。官方结果并行 664/786、串行 388/786，质量差异较大；墙钟差异不足以单独构成时间优势。该收益可由并发互补工作让更多必要行为覆盖进入交付路径解释，故保留为互补工作并行化，而不是多路尝试优选或单纯独立校验纠错。",
+  "confidence": "high"
+}

@@ -1,0 +1,54 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index c1a76584f0..361b43717a 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -863,6 +863,13 @@ class ExpressionWrapper(Expression):
+     def get_source_expressions(self):
+         return [self.expression]
+ 
++    def get_group_by_cols(self, alias=None):
++        expression = self.expression
++        if hasattr(self.expression, 'get_expression'):
++            # Handle case when the expression is a Window.
++            expression = self.expression.get_expression()
++        return expression.get_group_by_cols()
++
+     def as_sql(self, compiler, connection):
+         return self.expression.as_sql(compiler, connection)
+ 
+@@ -1229,6 +1236,9 @@ class Window(Expression):
+     def _resolve_output_field(self):
+         return self.source_expression.output_field
+ 
++    def get_expression(self):
++        return self.source_expression
++
+     def get_source_expressions(self):
+         return [self.source_expression, self.partition_by, self.order_by, self.frame]
+ 
+diff --git a/tests/expressions/tests.py b/tests/expressions/tests.py
+index 72bca4f205..567ca5f742 100644
+--- a/tests/expressions/tests.py
++++ b/tests/expressions/tests.py
+@@ -74,6 +74,21 @@ class BasicExpressionsTests(TestCase):
+         companies = Company.objects.annotate(foo=RawSQL('%s', ['value']))
+         self.assertEqual(companies.count(), 3)
+ 
++    def test_annotate_values_constant_expression_wrapper(self):
++        # A constant expression wrapped in an ExpressionWrapper should be
++        # omitted from the GROUP BY clause.
++        companies = Company.objects.annotate(
++            constant=ExpressionWrapper(Value(3), output_field=IntegerField()),
++        ).values('constant', 'name').annotate(num_chairs_sum=Sum('num_chairs'))
++        sql = str(companies.query).lower()
++        group_by = sql[sql.index('group by'):]
++        self.assertNotIn('3', group_by)
++        self.assertCountEqual(companies, [
++            {'constant': 3, 'name': 'Example Inc.', 'num_chairs_sum': 5},
++            {'constant': 3, 'name': 'Foobar Ltd.', 'num_chairs_sum': 4},
++            {'constant': 3, 'name': 'Test GmbH', 'num_chairs_sum': 1},
++        ])
++
+     @skipUnlessDBFeature('supports_boolean_expr_in_select_clause')
+     def test_filtering_on_annotate_that_uses_q(self):
+         self.assertEqual(

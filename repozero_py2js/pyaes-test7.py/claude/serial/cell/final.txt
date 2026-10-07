@@ -1,0 +1,97 @@
+Everything verified. Here is the delivered code.
+
+## Library files
+
+**`/output/lib/pyerrors.mjs`** — Python exception + traceback emulation
+
+```js
+/**
+ * Minimal emulation of the CPython exception objects that the original script
+ * can surface, plus the interpreter's top-level traceback rendering.
+ */
+
+/** Equivalent of Python's `ValueError`. */
+export class ValueError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ValueError';
+    this.pyFrames = [];
+  }
+}
+
+/** Records a Python-side call frame on an exception as it propagates outward. */
+export function addFrame(error, file, line, name) {
+  if (error instanceof ValueError) error.pyFrames.push({ file, line, name });
+  return error;
+}
+
+/** Renders a traceback in CPython's format. */
+export function formatTraceback(error, callerFrames = []) {
+  const frames = [...callerFrames, ...[...error.pyFrames].reverse()];
+  const lines = ['Traceback (most recent call last):'];
+  for (const frame of frames) {
+    lines.push(`  File "${frame.file}", line ${frame.line}, in ${frame.name}`);
+  }
+  lines.push(`${error.name}: ${error.message}`);
+  return lines.join('\n') + '\n';
+}
+```
+
+**`/output/lib/pybytes.mjs`** — `str.encode()` + `repr(bytes)`
+
+```js
+/** Equivalent of Python's `str.encode()` with the default UTF-8 codec. */
+export function encodeUtf8(text) { /* … 1–4 byte encoding, surrogate pairs … */ }
+
+/** Equivalent of `repr()` for a `bytes` object: `b'...'`, `\t\n\r\\`, `\xHH`,
+ *  with the quote switching to `"` when the payload holds `'` but not `"`. */
+export function bytesRepr(bytes) { /* … */ }
+```
+
+**`/output/lib/pyaes/galois.mjs`** — GF(2⁸) arithmetic; S-box and Rcon *computed* at import rather than transcribed
+**`/output/lib/pyaes/aes.mjs`** — FIPS-197 block cipher (key expansion for 128/192/256, `subBytes`/`shiftRows`/`mixColumns`/`addRoundKey`)
+**`/output/lib/pyaes/modes.mjs`** — `AESModeOfOperationCBC`, stateful: each `encrypt` chains off the previous ciphertext block
+**`/output/lib/pyaes/index.mjs`** — package facade re-exporting `AES` and `AESModeOfOperationCBC`
+**`/output/lib/argparse.mjs`** — CPython's two-phase argparse algorithm (classify every token, then consume), 285 lines
+
+## Entry file `/output/test7.mjs`
+
+```js
+import { ArgumentParser, SystemExit } from './lib/argparse.mjs';
+import * as pyaes from './lib/pyaes/index.mjs';
+import { encodeUtf8, bytesRepr } from './lib/pybytes.mjs';
+import { ValueError, addFrame, formatTraceback } from './lib/pyerrors.mjs';
+
+const PROG = 'test7_executable';   // matches the reference's argparse prog
+
+function main() {
+  const parser = new ArgumentParser({ prog: PROG });
+  parser.addArgument('--key',   { required: true });
+  parser.addArgument('--iv',    { required: true });
+  parser.addArgument('--data1', { required: true });
+  parser.addArgument('--data2', { required: true });
+  const args = parser.parseArgs(process.argv.slice(2));
+  // … one CBC object, two chained encrypt() calls, two console.log(bytesRepr(…))
+}
+```
+
+## Verification
+
+I built a differential harness that runs `/workspace/dataset/test7_executable` and `node /output/test7.mjs` on identical argv and compares stdout, exit code, and stderr:
+
+- **482/482** curated cases and **800/800** fuzzed cases match — byte-for-byte on all three streams (the only normalization is the PID in PyInstaller's `[PYI-<pid>:ERROR]` line, which is non-deterministic in the reference itself).
+- All four documented sample cases reproduce exactly.
+- The AES core independently passes the FIPS-197 Appendix C known-answer vectors for 128/192/256-bit keys.
+
+Probing the reference surfaced four behaviors worth flagging, all now matched:
+
+1. **CBC is stateful** — `data2` chains off `ciphertext1`, not the IV.
+2. A `-`-prefixed value is still a value if it's a bare `-`, looks like a negative number, **or contains a space** — this was a genuine bug in my first pass, caught by the fuzzer.
+3. `--` is reported as an unrecognized argument and can never supply an option's value (argparse strips `-*` from the nargs pattern for optionals).
+4. `-hx` prints help and exits 0, but `-h=x` errors — the `=` separator is what distinguishes them.
+
+Error paths are reproduced too: exit 2 with usage for argparse failures, exit 1 with the `ValueError` traceback for bad key/IV/block sizes.
+
+Two notes on judgment calls: `prog` is hardcoded to `test7_executable` (rather than derived from `test7.mjs`) so usage/error text is byte-identical to the reference — flagging it since it's a deliberate deviation from the literal script name. The traceback omits Python's source-echo lines, matching what the executable prints when `test7.py` isn't in the working directory. Constraints hold: `.mjs` throughout, ESM only, relative imports only, no `node:crypto`.
+
+The two scratch harnesses (`/workspace/difftest.mjs`, `/workspace/fuzz.mjs`) are left in place if you want to re-run them; they aren't part of the deliverable.

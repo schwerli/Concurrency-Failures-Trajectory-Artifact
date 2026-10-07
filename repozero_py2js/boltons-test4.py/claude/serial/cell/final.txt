@@ -1,0 +1,27 @@
+Done. Files in `/output`:
+
+```
+lib/ascii_classes.mjs      separator character set
+lib/text_split.mjs         splitPunctWs
+lib/strutils.mjs           slugify
+lib/argparse/errors.mjs    error types + exit codes
+lib/argparse/formatter.mjs usage/help rendering
+lib/argparse/parser.mjs    the parser + I/O
+test4.mjs                  entry point
+```
+
+**Verification:** built a differential harness comparing stdout, stderr, and exit code byte-for-byte against `/workspace/dataset/test4_executable`. **207/207 hand-written cases + 1800/1800 fuzz cases passed.** (Program name normalized, since argparse derives it from `argv[0]`.)
+
+Three findings from black-box probing that a naive port would get wrong:
+
+1. **Backslash does not split.** Every ASCII punctuation char breaks words except `\` — `foo/bar\baz` → `foo_bar\baz`. The reference drops `string.punctuation` into a regex character class unescaped, so the literal `\]` sequence in `...@[\]^...` is read as an *escaped* `]`: the backslash is consumed as an escape and never joins the class. `lib/ascii_classes.mjs:31` models the set directly rather than reproducing the buggy pattern.
+
+2. **Separators are ASCII-only.** NBSP, U+3000, em dash, and guillemets are all ordinary word characters — `a—b` stays `a—b`.
+
+3. **Empty input is not the all-punctuation case.** `--a '!!!'` → `_`, but `--a ''` → empty. Documented at `lib/strutils.mjs:31`.
+
+On lowercasing: I verified `toLowerCase()` agrees with Python's `str.lower()` across 24 awkward cases — Greek Final_Sigma (`ΟΔΟΣ ΣΟΦΙΑΣ` → `οδος_σοφιας`, with `ς` before the delimiter and `σ` at word start), `İ` → `i`+U+0307, titlecase digraphs, and astral Deseret. No fixup table needed. Note this means lowercasing must happen *after* joining, not per word.
+
+Two argparse details worth flagging: `--a -5` is accepted as a value but `--a -x` is not, and Python's `\d` there matches any Unicode digit, so `-٥` is a number too (`parser.mjs:32` uses `\p{Nd}` plus `\n?$` to emulate Python's newline-tolerant `$`). And `--a -- x` errors rather than skipping the `--`, because argparse strips the `-` alternatives out of the nargs pattern for options.
+
+One deliberate omission: `slugify`'s `ascii=True` transliterating mode. It's unreachable from this program, so I couldn't observe it through the executable — shipping an unverified NFKD approximation seemed worse than leaving it out, and it's noted in the docstring.

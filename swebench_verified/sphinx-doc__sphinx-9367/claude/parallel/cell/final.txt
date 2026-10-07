@@ -1,0 +1,33 @@
+Fixed. `visit_Tuple` in `sphinx/pycode/ast.py:215` joined elements unconditionally, so a 1-element tuple lost its trailing comma.
+
+```python
+def visit_Tuple(self, node: ast.Tuple) -> str:
+    if len(node.elts) == 0:
+        return "()"
+    elif len(node.elts) == 1:
+        return "(%s,)" % self.visit(node.elts[0])
+    else:
+        return "(" + ", ".join(self.visit(e) for e in node.elts) + ")"
+```
+
+Plus the test case from the issue at `tests/test_pycode_ast.py:58` and a CHANGES entry under 4.1.0 "Bugs fixed".
+
+**The bug was worse than a missing comma.** Autodoc unparses a signature to a string, and then the py domain re-parses that string (`domains/python.py:188` → `signature_from_str`). The second pass ate the now-redundant parens, so the rendered default became a *semantically different value*:
+
+```
+source: (x=(1,), z=((1,), 2))
+pass 1: (x=(1), z=((1), 2))     ← cosmetic
+pass 2: (x=1,   z=(1, 2))       ← wrong value: int, not tuple
+```
+
+After the fix the round trip is idempotent. Verified end-to-end through the real consumer path, `autodoc_preserve_defaults`: `def func(a=(1,))` rendered `a=(1)` before, `a=(1,)` now.
+
+Verification:
+- 42/42 `test_pycode_ast.py`; 155 passed across ast/inspect/domain_py/pycode_parser; 171 autodoc tests pass.
+- Full suite: 1686 passed, 7 failed — all 7 fail identically on a clean tree (network, ImageMagick, locale/date). Zero regressions.
+
+Two things I checked and deliberately left alone:
+- **Subscripts are unaffected.** `visit_Subscript`'s `is_simple_tuple` guard formats slice elements itself and never calls `visit_Tuple`, so `Tuple[int, str]` and `Tuple[int,]` are unchanged. `Tuple[()]` *does* route through `visit_Tuple` (empty tuples fail the `bool(value.elts)` check), which is why the `len == 0` branch has to stay.
+- **`domains/python.py:149` has a second, independent tuple unparse** that emits no parens at all — so a bare annotation `(int,)` still renders as `int`. That omission is structurally required, since line 146 feeds subscript contents through the same function (it's what makes `Tuple[int, str]` render as `int, str` inside brackets). Fixing it would break annotation rendering, and it's a separate concern from this issue.
+
+Also worth knowing: `x[:, 1]` raises `NotImplementedError: Unable to parse Slice object`, and `x[*a]` likewise for `Starred`. Both are pre-existing (no `visit_Slice`/`visit_Starred`), confirmed failing on a clean tree, and unrelated to tuples.

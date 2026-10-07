@@ -1,0 +1,128 @@
+{
+  "schema_version": 2,
+  "phase": "fixed",
+  "pair_id": "repozero_c2rust/hopscotch-map/tests/test18.cpp/kimi",
+  "task": {
+    "plain_summary_zh": "将 hopscotch-map/tests/test18.cpp 黑盒迁移为 Rust 2021 程序，复现 tsl::hopscotch_map<int,int> 在 reserve、插入顺序整数后输出 size bucket_count overflow_size 的行为。",
+    "acceptance_target_zh": "在 /output 创建无外部 crate 的 Cargo 项目和根目录 test18.rs，命令行参数、数值逻辑和 println 输出必须与给定 C++ 可执行文件字节一致，并通过官方 RepoZero C2Rust 评测。"
+  },
+  "modes": {
+    "parallel": {
+      "solution_passed": true,
+      "evaluation_completed": true,
+      "passed": 39,
+      "total": 39,
+      "rate": 1.0,
+      "wall_seconds": 568.539
+    },
+    "serial": {
+      "solution_passed": true,
+      "evaluation_completed": true,
+      "passed": 39,
+      "total": 39,
+      "rate": 1.0,
+      "wall_seconds": 905.475
+    }
+  },
+  "reconstruction": {
+    "parallel_strategy_zh": "并行主线程先用 C++ 可执行文件探测 bucket_count 边界并形成 0.9 负载因子公式，然后同时分派两个子代理：Agent 0 生成 Rust/Cargo 实现并自测，Agent 1 只读生成 289 行参考表并用 C 程序独立验证公式。主线程把实现和参考表合并，最后用参考表逐行交叉检查。",
+    "serial_strategy_zh": "串行主线程独自探测、实现、编译和验证。它先把规则误判为严格大于 count 的二次幂，写出实现并修复一次 BuildHasher 导入错误；差分测试暴露多个 bucket_count 不匹配后，它再顺序做边界二分，修正为 ceil(count/0.9) 后重建并完成最终验证。",
+    "realized_parallelism_zh": "真实重叠发生在 AgentSwarm 调用期间：Agent 0 的实现和构建验证工作与 Agent 1 的 C++ 参考表生成及公式校验同时运行，二者都是有用模型上下文，且主线程等待两者结果后用参考表验证交付物。",
+    "parallel_workers": 2,
+    "peak_overlapping_useful_workers": 2
+  },
+  "baseline_audit": {
+    "same_task_and_prompt": true,
+    "serial_run_valid": true,
+    "parallel_run_valid": true,
+    "external_or_harness_issues_zh": []
+  },
+  "decision": "retain",
+  "exclusion_code": null,
+  "decision_reason_zh": "保留为并发优势：两边任务和评测相同且都 39/39 通过，串行没有 provider、harness、启动、取消或评测异常；并行存在两个有用子代理的真实重叠，并在不降低质量的情况下把 wall time 从 905.475 秒降到 568.539 秒。",
+  "advantage": {
+    "proposed_dimension_zh": "互补工作并行化",
+    "secondary_mechanism_zh": null,
+    "benefit_kind": "time",
+    "measured_benefit_zh": "并行和串行官方质量同为 39/39、pass rate 1.0；并行 wall time 568.539 秒，串行 905.475 秒，节省 336.936 秒，约为串行用时的 62.79%，降低约 37.21%。",
+    "parallel_action_zh": "并行把不同但都服务交付的工作放到重叠区间：一个子代理实现、构建并自测 Rust 项目，另一个子代理从 C++ 二进制生成大参考表并独立验证公式，主线程随后用该表做最终 289 行交叉检查。",
+    "serial_contrast_zh": "串行只有一个模型上下文，探测、实现、发现差分失败、重新二分阈值、修正公式和最终验证都按顺序发生；它没有在实现时同时准备独立参考表或其它互补交付件。",
+    "mechanism_link_zh": "收益链不是分数更高，而是关键路径压缩：并行在实现产物生成的同时完成独立 oracle/参考表工作，主线程立即组合两者完成最终验证；串行同类调查和修正必须排在实现失败之后，导致更长 wall time。"
+  },
+  "new_pattern_candidate": {
+    "is_candidate": false,
+    "name_zh": null,
+    "mechanism_zh": null,
+    "why_existing_dimensions_fail_zh": null
+  },
+  "evidence": {
+    "parallel": [
+      {
+        "path": "parallel/agent/kimi/sessions/wd_workspace_c52ddf65534b/session_2abfdc04-76e5-47d6-adc2-96e3455054ca/agents/main/wire.jsonl",
+        "line": 32,
+        "summary_zh": "主线程发起 AgentSwarm，将完整 Rust 实现与只读参考表生成分成两个不同子任务。"
+      },
+      {
+        "path": "parallel/agent/kimi/sessions/wd_workspace_c52ddf65534b/session_2abfdc04-76e5-47d6-adc2-96e3455054ca/agents/agent-0/wire.jsonl",
+        "line": 44,
+        "summary_zh": "Agent 0 的自测显示 61 个与 C++ 参考输出比较的案例均无 mismatch。"
+      },
+      {
+        "path": "parallel/agent/kimi/sessions/wd_workspace_c52ddf65534b/session_2abfdc04-76e5-47d6-adc2-96e3455054ca/agents/agent-1/wire.jsonl",
+        "line": 72,
+        "summary_zh": "Agent 1 报告生成 289 行参考表，并用 C 程序验证 f32 公式对 288 个 count 行零 mismatch。"
+      },
+      {
+        "path": "parallel/agent/kimi/sessions/wd_workspace_c52ddf65534b/session_2abfdc04-76e5-47d6-adc2-96e3455054ca/agents/main/wire.jsonl",
+        "line": 41,
+        "summary_zh": "主线程用 Agent 1 的参考表对 /output/test18 做最终 289 行交叉检查，结果 checked=289 mismatches=0。"
+      }
+    ],
+    "serial": [
+      {
+        "path": "serial/agent/kimi/sessions/wd_workspace_c52ddf65534b/session_6292787c-56f8-4542-a416-7b1a8e92858f/agents/main/wire.jsonl",
+        "line": 29,
+        "summary_zh": "串行主线程先形成错误假设，认为 bucket_count 是严格大于 count 的最小二次幂。"
+      },
+      {
+        "path": "serial/agent/kimi/sessions/wd_workspace_c52ddf65534b/session_6292787c-56f8-4542-a416-7b1a8e92858f/agents/main/wire.jsonl",
+        "line": 101,
+        "summary_zh": "串行差分扫测发现多个 bucket_count mismatch，包括 15、31、62、63、127、1000 等计数。"
+      },
+      {
+        "path": "serial/agent/kimi/sessions/wd_workspace_c52ddf65534b/session_6292787c-56f8-4542-a416-7b1a8e92858f/agents/main/wire.jsonl",
+        "line": 145,
+        "summary_zh": "串行在修正公式并重建后，广泛差分扫测最终输出 ALL MATCH。"
+      },
+      {
+        "path": "serial/agent/kimi/sessions/wd_workspace_c52ddf65534b/session_6292787c-56f8-4542-a416-7b1a8e92858f/agents/main/wire.jsonl",
+        "line": 159,
+        "summary_zh": "串行最终报告承认初始假设错误，说明修正后的 0.9 负载因子规则和最终验证覆盖。"
+      }
+    ],
+    "evaluator": [
+      {
+        "path": "parallel/cell/evaluation/summary.json",
+        "line": 3,
+        "summary_zh": "并行官方评测完成且 ok，39 个测试全部通过。"
+      },
+      {
+        "path": "serial/cell/evaluation/summary.json",
+        "line": 3,
+        "summary_zh": "串行官方评测完成且 ok，39 个测试全部通过。"
+      },
+      {
+        "path": "parallel/cell.json",
+        "line": 7,
+        "summary_zh": "并行 cell wall time 为 568.539 秒。"
+      },
+      {
+        "path": "serial/cell.json",
+        "line": 7,
+        "summary_zh": "串行 cell wall time 为 905.475 秒。"
+      }
+    ]
+  },
+  "case_narrative_zh": "本任务要求把 hopscotch_map 的 test18.cpp 黑盒迁移到 Rust，输出必须复现 reserve 后插入顺序整数时的 size、bucket_count 和 overflow_size。并行运行先由主线程探测公式，再让两个子代理同时做互补工作：Agent 0 写出 Rust/Cargo 项目并自测，Agent 1 只读生成 C++ 参考表并独立校验 0.9 负载因子公式，主线程随后合并两者做 289 行最终交叉检查。串行运行没有外部故障，但单一路径先采用错误公式，写完后通过差分失败才继续二分阈值、修正和重测。两边最终官方质量同为 39/39，因此优势不是质量提升；并行 wall time 568.539 秒，相比串行 905.475 秒节省 336.936 秒，且重叠工作直接减少了实现与参考验证串行排队的时间，故保留为互补工作并行化的时间优势。",
+  "confidence": "high"
+}

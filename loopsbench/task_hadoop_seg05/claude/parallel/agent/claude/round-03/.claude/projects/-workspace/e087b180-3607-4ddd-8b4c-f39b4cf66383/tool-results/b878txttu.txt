@@ -1,0 +1,782 @@
+     1	/**
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *
+    10	 *     http://www.apache.org/licenses/LICENSE-2.0
+    11	 *
+    12	 * Unless required by applicable law or agreed to in writing, software
+    13	 * distributed under the License is distributed on an "AS IS" BASIS,
+    14	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    15	 * See the License for the specific language governing permissions and
+    16	 * limitations under the License.
+    17	 */
+    18	package org.apache.hadoop.hdfs.qjournal.client;
+    19	
+    20	import java.io.IOException;
+    21	import java.net.InetSocketAddress;
+    22	import java.net.MalformedURLException;
+    23	import java.net.URI;
+    24	import java.net.URL;
+    25	import java.security.PrivilegedExceptionAction;
+    26	import java.util.concurrent.Callable;
+    27	import java.util.concurrent.ExecutionException;
+    28	import java.util.concurrent.ExecutorService;
+    29	import java.util.concurrent.Executors;
+    30	import java.util.concurrent.LinkedBlockingQueue;
+    31	import java.util.concurrent.ThreadPoolExecutor;
+    32	import java.util.concurrent.TimeUnit;
+    33	
+    34	import org.apache.hadoop.classification.InterfaceAudience;
+    35	import org.apache.hadoop.conf.Configuration;
+    36	import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+    37	import org.apache.hadoop.hdfs.DFSConfigKeys;
+    38	import org.apache.hadoop.hdfs.protocolPB.PBHelper;
+    39	import org.apache.hadoop.hdfs.qjournal.protocol.JournalOutOfSyncException;
+    40	import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocol;
+    41	import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.GetEditLogManifestResponseProto;
+    42	import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.GetJournaledEditsResponseProto;
+    43	import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.GetJournalStateResponseProto;
+    44	import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.NewEpochResponseProto;
+    45	import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.PrepareRecoveryResponseProto;
+    46	import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.SegmentStateProto;
+    47	import org.apache.hadoop.hdfs.qjournal.protocol.RequestInfo;
+    48	import org.apache.hadoop.hdfs.qjournal.protocolPB.QJournalProtocolPB;
+    49	import org.apache.hadoop.hdfs.qjournal.protocolPB.QJournalProtocolTranslatorPB;
+    50	import org.apache.hadoop.hdfs.qjournal.server.GetJournalEditServlet;
+    51	import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
+    52	import org.apache.hadoop.hdfs.server.common.StorageInfo;
+    53	import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
+    54	import org.apache.hadoop.hdfs.server.protocol.RemoteEditLogManifest;
+    55	import org.apache.hadoop.ipc.ProtobufRpcEngine2;
+    56	import org.apache.hadoop.ipc.RPC;
+    57	import org.apache.hadoop.security.SecurityUtil;
+    58	import org.apache.hadoop.util.StopWatch;
+    59	
+    60	import org.apache.hadoop.classification.VisibleForTesting;
+    61	import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
+    62	import org.apache.hadoop.thirdparty.com.google.common.net.InetAddresses;
+    63	import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.FutureCallback;
+    64	import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.Futures;
+    65	import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.ListenableFuture;
+    66	import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.ListeningExecutorService;
+    67	import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.MoreExecutors;
+    68	import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
+    69	import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.UncaughtExceptionHandlers;
+    70	
+    71	/**
+    72	 * Channel to a remote JournalNode using Hadoop IPC.
+    73	 * All of the calls are run on a separate thread, and return
+    74	 * {@link ListenableFuture} instances to wait for their result.
+    75	 * This allows calls to be bound together using the {@link QuorumCall}
+    76	 * class.
+    77	 */
+    78	@InterfaceAudience.Private
+    79	public class IPCLoggerChannel implements AsyncLogger {
+    80	
+    81	  private final Configuration conf;
+    82	  protected final InetSocketAddress addr;
+    83	  private QJournalProtocol proxy;
+    84	
+    85	  /**
+    86	   * Executes tasks submitted to it serially, on a single thread, in FIFO order
+    87	   * (generally used for write tasks that should not be reordered).
+    88	   */
+    89	  private final ListeningExecutorService singleThreadExecutor;
+    90	  /**
+    91	   * Executes tasks submitted to it in parallel with each other and with those
+    92	   * submitted to singleThreadExecutor (generally used for read tasks that can
+    93	   * be safely reordered and interleaved with writes).
+    94	   */
+    95	  private final ListeningExecutorService parallelExecutor;
+    96	  private long ipcSerial = 0;
+    97	  private long epoch = -1;
+    98	  private long committedTxId = HdfsServerConstants.INVALID_TXID;
+    99	  
+   100	  private final String journalId;
+   101	  private final String nameServiceId;
+   102	
+   103	  private final NamespaceInfo nsInfo;
+   104	
+   105	  private URL httpServerURL;
+   106	
+   107	  private final IPCLoggerChannelMetrics metrics;
+   108	  
+   109	  /**
+   110	   * The number of bytes of edits data still in the queue.
+   111	   */
+   112	  private int queuedEditsSizeBytes = 0;
+   113	  
+   114	  /**
+   115	   * The highest txid that has been successfully logged on the remote JN.
+   116	   */
+   117	  private long highestAckedTxId = 0;
+   118	
+   119	  /**
+   120	   * Nanotime of the last time we successfully journaled some edits
+   121	   * to the remote node.
+   122	   */
+   123	  private long lastAckNanos = 0;
+   124	
+   125	  /**
+   126	   * Nanotime of the last time that committedTxId was update. Used
+   127	   * to calculate the lag in terms of time, rather than just a number
+   128	   * of txns.
+   129	   */
+   130	  private long lastCommitNanos = 0;
+   131	  
+   132	  /**
+   133	   * The maximum number of bytes that can be pending in the queue.
+   134	   * This keeps the writer from hitting OOME if one of the loggers
+   135	   * starts responding really slowly. Eventually, the queue
+   136	   * overflows and it starts to treat the logger as having errored.
+   137	   */
+   138	  private final int queueSizeLimitBytes;
+   139	
+   140	  /**
+   141	   * If this logger misses some edits, or restarts in the middle of
+   142	   * a segment, the writer won't be able to write any more edits until
+   143	   * the beginning of the next segment. Upon detecting this situation,
+   144	   * the writer sets this flag to true to avoid sending useless RPCs.
+   145	   */
+   146	  private boolean outOfSync = false;
+   147	  
+   148	  /**
+   149	   * Stopwatch which starts counting on each heartbeat that is sent
+   150	   */
+   151	  private final StopWatch lastHeartbeatStopwatch = new StopWatch();
+   152	  
+   153	  private static final long HEARTBEAT_INTERVAL_MILLIS = 1000;
+   154	
+   155	  private static final long WARN_JOURNAL_MILLIS_THRESHOLD = 1000;
+   156	  
+   157	  static final Factory FACTORY = new AsyncLogger.Factory() {
+   158	    @Override
+   159	    public AsyncLogger createLogger(Configuration conf, NamespaceInfo nsInfo,
+   160	        String journalId, String nameServiceId, InetSocketAddress addr) {
+   161	      return new IPCLoggerChannel(conf, nsInfo, journalId, nameServiceId, addr);
+   162	    }
+   163	  };
+   164	
+   165	  public IPCLoggerChannel(Configuration conf,
+   166	      NamespaceInfo nsInfo,
+   167	      String journalId,
+   168	      InetSocketAddress addr) {
+   169	    this(conf, nsInfo, journalId, null, addr);
+   170	  }
+   171	
+   172	  public IPCLoggerChannel(Configuration conf,
+   173	                          NamespaceInfo nsInfo,
+   174	                          String journalId,
+   175	                          String nameServiceId,
+   176	                          InetSocketAddress addr) {
+   177	    this.conf = conf;
+   178	    this.nsInfo = nsInfo;
+   179	    this.journalId = journalId;
+   180	    this.nameServiceId = nameServiceId;
+   181	    this.addr = addr;
+   182	    this.queueSizeLimitBytes = 1024 * 1024 * conf.getInt(
+   183	        DFSConfigKeys.DFS_QJOURNAL_QUEUE_SIZE_LIMIT_KEY,
+   184	        DFSConfigKeys.DFS_QJOURNAL_QUEUE_SIZE_LIMIT_DEFAULT);
+   185	    
+   186	    singleThreadExecutor = MoreExecutors.listeningDecorator(
+   187	        createSingleThreadExecutor());
+   188	    parallelExecutor = MoreExecutors.listeningDecorator(
+   189	        createParallelExecutor());
+   190	    
+   191	    metrics = IPCLoggerChannelMetrics.create(this);
+   192	  }
+   193	  
+   194	  @Override
+   195	  public synchronized void setEpoch(long epoch) {
+   196	    this.epoch = epoch;
+   197	  }
+   198	  
+   199	  @Override
+   200	  public synchronized void setCommittedTxId(long txid) {
+   201	    Preconditions.checkArgument(txid >= committedTxId,
+   202	        "Trying to move committed txid backwards in client " +
+   203	         "old: %s new: %s", committedTxId, txid);
+   204	    this.committedTxId = txid;
+   205	    this.lastCommitNanos = System.nanoTime();
+   206	  }
+   207	  
+   208	  @Override
+   209	  public void close() {
+   210	    // No more tasks may be submitted after this point.
+   211	    singleThreadExecutor.shutdown();
+   212	    parallelExecutor.shutdown();
+   213	    if (proxy != null) {
+   214	      // TODO: this can hang for quite some time if the client
+   215	      // is currently in the middle of a call to a downed JN.
+   216	      // We should instead do this asynchronously, and just stop
+   217	      // making any more calls after this point (eg clear the queue)
+   218	      RPC.stopProxy(proxy);
+   219	    }
+   220	  }
+   221	  
+   222	  protected QJournalProtocol getProxy() throws IOException {
+   223	    if (proxy != null) return proxy;
+   224	    proxy = createProxy();
+   225	    return proxy;
+   226	  }
+   227	  
+   228	  protected QJournalProtocol createProxy() throws IOException {
+   229	    final Configuration confCopy = new Configuration(conf);
+   230	    
+   231	    // Need to set NODELAY or else batches larger than MTU can trigger 
+   232	    // 40ms nagling delays.
+   233	    confCopy.setBoolean(
+   234	        CommonConfigurationKeysPublic.IPC_CLIENT_TCPNODELAY_KEY,
+   235	        true);
+   236	    
+   237	    RPC.setProtocolEngine(confCopy,
+   238	        QJournalProtocolPB.class, ProtobufRpcEngine2.class);
+   239	    return SecurityUtil.doAsLoginUser(
+   240	        new PrivilegedExceptionAction<QJournalProtocol>() {
+   241	          @Override
+   242	          public QJournalProtocol run() throws IOException {
+   243	            RPC.setProtocolEngine(confCopy,
+   244	                QJournalProtocolPB.class, ProtobufRpcEngine2.class);
+   245	            QJournalProtocolPB pbproxy = RPC.getProxy(
+   246	                QJournalProtocolPB.class,
+   247	                RPC.getProtocolVersion(QJournalProtocolPB.class),
+   248	                addr, confCopy);
+   249	            return new QJournalProtocolTranslatorPB(pbproxy);
+   250	          }
+   251	        });
+   252	  }
+   253	  
+   254	  
+   255	  /**
+   256	   * Separated out for easy overriding in tests.
+   257	   */
+   258	  @VisibleForTesting
+   259	  protected ExecutorService createSingleThreadExecutor() {
+   260	    return Executors.newSingleThreadExecutor(
+   261	        new ThreadFactoryBuilder()
+   262	          .setDaemon(true)
+   263	          .setNameFormat("Logger channel (from single-thread executor) to " +
+   264	              addr)
+   265	          .setUncaughtExceptionHandler(
+   266	              UncaughtExceptionHandlers.systemExit())
+   267	          .build());
+   268	  }
+   269	
+   270	  /**
+   271	   * Separated out for easy overriding in tests.
+   272	   */
+   273	  @VisibleForTesting
+   274	  protected ExecutorService createParallelExecutor() {
+   275	    int numThreads =
+   276	        conf.getInt(DFSConfigKeys.DFS_QJOURNAL_PARALLEL_READ_NUM_THREADS_KEY,
+   277	            DFSConfigKeys.DFS_QJOURNAL_PARALLEL_READ_NUM_THREADS_DEFAULT);
+   278	    ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(numThreads,
+   279	        numThreads, 60L, TimeUnit.SECONDS,
+   280	        new LinkedBlockingQueue<>(),
+   281	        new ThreadFactoryBuilder().setDaemon(true)
+   282	            .setNameFormat("Logger channel (from parallel executor) to " + addr)
+   283	            .setUncaughtExceptionHandler(UncaughtExceptionHandlers.systemExit())
+   284	            .build());
+   285	    threadPoolExecutor.allowCoreThreadTimeOut(true);
+   286	    return threadPoolExecutor;
+   287	  }
+   288	  
+   289	  @Override
+   290	  public URL buildURLToFetchLogs(long segmentTxId) {
+   291	    Preconditions.checkArgument(segmentTxId > 0,
+   292	        "Invalid segment: %s", segmentTxId);
+   293	    Preconditions.checkState(hasHttpServerEndPoint(), "No HTTP/HTTPS endpoint");
+   294	        
+   295	    try {
+   296	      String path = GetJournalEditServlet.buildPath(
+   297	          journalId, segmentTxId, nsInfo, true);
+   298	      return new URL(httpServerURL, path);
+   299	    } catch (MalformedURLException e) {
+   300	      // should never get here.
+   301	      throw new RuntimeException(e);
+   302	    }
+   303	  }
+   304	
+   305	  private synchronized RequestInfo createReqInfo() {
+   306	    Preconditions.checkState(epoch > 0, "bad epoch: " + epoch);
+   307	    return new RequestInfo(journalId, nameServiceId,
+   308	        epoch, ipcSerial++, committedTxId);
+   309	  }
+   310	
+   311	  @VisibleForTesting
+   312	  synchronized long getNextIpcSerial() {
+   313	    return ipcSerial;
+   314	  }
+   315	
+   316	  public synchronized int getQueuedEditsSize() {
+   317	    return queuedEditsSizeBytes;
+   318	  }
+   319	  
+   320	  public InetSocketAddress getRemoteAddress() {
+   321	    return addr;
+   322	  }
+   323	
+   324	  /**
+   325	   * @return true if the server has gotten out of sync from the client,
+   326	   * and thus a log roll is required for this logger to successfully start
+   327	   * logging more edits.
+   328	   */
+   329	  public synchronized boolean isOutOfSync() {
+   330	    return outOfSync;
+   331	  }
+   332	  
+   333	  @VisibleForTesting
+   334	  void waitForAllPendingCalls() throws InterruptedException {
+   335	    try {
+   336	      singleThreadExecutor.submit(new Runnable() {
+   337	        @Override
+   338	        public void run() {
+   339	        }
+   340	      }).get();
+   341	    } catch (ExecutionException e) {
+   342	      // This can't happen!
+   343	      throw new AssertionError(e);
+   344	    }
+   345	  }
+   346	
+   347	  @Override
+   348	  public ListenableFuture<Boolean> isFormatted() {
+   349	    return singleThreadExecutor.submit(new Callable<Boolean>() {
+   350	      @Override
+   351	      public Boolean call() throws IOException {
+   352	        return getProxy().isFormatted(journalId, nameServiceId);
+   353	      }
+   354	    });
+   355	  }
+   356	
+   357	  @Override
+   358	  public ListenableFuture<GetJournalStateResponseProto> getJournalState() {
+   359	    return singleThreadExecutor.submit(new Callable<GetJournalStateResponseProto>() {
+   360	      @Override
+   361	      public GetJournalStateResponseProto call() throws IOException {
+   362	        GetJournalStateResponseProto ret =
+   363	            getProxy().getJournalState(journalId, nameServiceId);
+   364	        constructHttpServerURI(ret);
+   365	        return ret;
+   366	      }
+   367	    });
+   368	  }
+   369	
+   370	  @Override
+   371	  public ListenableFuture<NewEpochResponseProto> newEpoch(
+   372	      final long epoch) {
+   373	    return singleThreadExecutor.submit(new Callable<NewEpochResponseProto>() {
+   374	      @Override
+   375	      public NewEpochResponseProto call() throws IOException {
+   376	        return getProxy().newEpoch(journalId, nameServiceId, nsInfo, epoch);
+   377	      }
+   378	    });
+   379	  }
+   380	  
+   381	  @Override
+   382	  public ListenableFuture<Void> sendEdits(
+   383	      final long segmentTxId, final long firstTxnId,
+   384	      final int numTxns, final byte[] data) {
+   385	    try {
+   386	      reserveQueueSpace(data.length);
+   387	    } catch (LoggerTooFarBehindException e) {
+   388	      return Futures.immediateFailedFuture(e);
+   389	    }
+   390	    
+   391	    // When this batch is acked, we use its submission time in order
+   392	    // to calculate how far we are lagging.
+   393	    final long submitNanos = System.nanoTime();
+   394	    
+   395	    ListenableFuture<Void> ret = null;
+   396	    try {
+   397	      ret = singleThreadExecutor.submit(new Callable<Void>() {
+   398	        @Override
+   399	        public Void call() throws IOException {
+   400	          throwIfOutOfSync();
+   401	
+   402	          long rpcSendTimeNanos = System.nanoTime();
+   403	          try {
+   404	            getProxy().journal(createReqInfo(),
+   405	                segmentTxId, firstTxnId, numTxns, data);
+   406	          } catch (IOException e) {
+   407	            QuorumJournalManager.LOG.warn(
+   408	                "Remote journal " + IPCLoggerChannel.this + " failed to " +
+   409	                "write txns " + firstTxnId + "-" + (firstTxnId + numTxns - 1) +
+   410	                ". Will try to write to this JN again after the next " +
+   411	                "log roll.", e); 
+   412	            synchronized (IPCLoggerChannel.this) {
+   413	              outOfSync = true;
+   414	            }
+   415	            throw e;
+   416	          } finally {
+   417	            long now = System.nanoTime();
+   418	            long rpcTime = TimeUnit.MICROSECONDS.convert(
+   419	                now - rpcSendTimeNanos, TimeUnit.NANOSECONDS);
+   420	            long endToEndTime = TimeUnit.MICROSECONDS.convert(
+   421	                now - submitNanos, TimeUnit.NANOSECONDS);
+   422	            metrics.addWriteEndToEndLatency(endToEndTime);
+   423	            metrics.addWriteRpcLatency(rpcTime);
+   424	            if (rpcTime / 1000 > WARN_JOURNAL_MILLIS_THRESHOLD) {
+   425	              QuorumJournalManager.LOG.warn(
+   426	                  "Took " + (rpcTime / 1000) + "ms to send a batch of " +
+   427	                  numTxns + " edits (" + data.length + " bytes) to " +
+   428	                  "remote journal " + IPCLoggerChannel.this);
+   429	            }
+   430	          }
+   431	          synchronized (IPCLoggerChannel.this) {
+   432	            highestAckedTxId = firstTxnId + numTxns - 1;
+   433	            lastAckNanos = submitNanos;
+   434	          }
+   435	          return null;
+   436	        }
+   437	      });
+   438	    } finally {
+   439	      if (ret == null) {
+   440	        // it didn't successfully get submitted,
+   441	        // so adjust the queue size back down.
+   442	        unreserveQueueSpace(data.length);
+   443	      } else {
+   444	        // It was submitted to the queue, so adjust the length
+   445	        // once the call completes, regardless of whether it
+   446	        // succeeds or fails.
+   447	        Futures.addCallback(ret, new FutureCallback<Void>() {
+   448	          @Override
+   449	          public void onFailure(Throwable t) {
+   450	            unreserveQueueSpace(data.length);
+   451	          }
+   452	
+   453	          @Override
+   454	          public void onSuccess(Void t) {
+   455	            unreserveQueueSpace(data.length);
+   456	          }
+   457	        }, MoreExecutors.directExecutor());
+   458	      }
+   459	    }
+   460	    return ret;
+   461	  }
+   462	
+   463	  private void throwIfOutOfSync()
+   464	      throws JournalOutOfSyncException, IOException {
+   465	    if (isOutOfSync()) {
+   466	      // Even if we're out of sync, it's useful to send an RPC
+   467	      // to the remote node in order to update its lag metrics, etc.
+   468	      heartbeatIfNecessary();
+   469	      throw new JournalOutOfSyncException(
+   470	          "Journal disabled until next roll");
+   471	    }
+   472	  }
+   473	
+   474	  /**
+   475	   * When we've entered an out-of-sync state, it's still useful to periodically
+   476	   * send an empty RPC to the server, such that it has the up to date
+   477	   * committedTxId. This acts as a sanity check during recovery, and also allows
+   478	   * that node's metrics to be up-to-date about its lag.
+   479	   * 
+   480	   * In the future, this method may also be used in order to check that the
+   481	   * current node is still the current writer, even if no edits are being
+   482	   * written.
+   483	   */
+   484	  private void heartbeatIfNecessary() throws IOException {
+   485	    if (lastHeartbeatStopwatch.now(TimeUnit.MILLISECONDS)
+   486	        > HEARTBEAT_INTERVAL_MILLIS || !lastHeartbeatStopwatch.isRunning()) {
+   487	      try {
+   488	        getProxy().heartbeat(createReqInfo());
+   489	      } finally {
+   490	        // Don't send heartbeats more often than the configured interval,
+   491	        // even if they fail.
+   492	        lastHeartbeatStopwatch.reset().start();
+   493	      }
+   494	    }
+   495	  }
+   496	
+   497	  private synchronized void reserveQueueSpace(int size)
+   498	      throws LoggerTooFarBehindException {
+   499	    Preconditions.checkArgument(size >= 0);
+   500	    if (queuedEditsSizeBytes + size > queueSizeLimitBytes &&
+   501	        queuedEditsSizeBytes > 0) {
+   502	      QuorumJournalManager.LOG.warn("Pending edits to " + IPCLoggerChannel.this
+   503	          + " is going to exceed limit size: " + queueSizeLimitBytes
+   504	          + ", current queued edits size: " + queuedEditsSizeBytes
+   505	          + ", will silently drop " + size + " bytes of edits!");
+   506	      throw new LoggerTooFarBehindException();
+   507	    }
+   508	    queuedEditsSizeBytes += size;
+   509	  }
+   510	  
+   511	  private synchronized void unreserveQueueSpace(int size) {
+   512	    Preconditions.checkArgument(size >= 0);
+   513	    queuedEditsSizeBytes -= size;
+   514	  }
+   515	
+   516	  @Override
+   517	  public ListenableFuture<Void> format(final NamespaceInfo nsInfo,
+   518	      final boolean force) {
+   519	    return singleThreadExecutor.submit(new Callable<Void>() {
+   520	      @Override
+   521	      public Void call() throws Exception {
+   522	        getProxy().format(journalId, nameServiceId, nsInfo, force);
+   523	        return null;
+   524	      }
+   525	    });
+   526	  }
+   527	  
+   528	  @Override
+   529	  public ListenableFuture<Void> startLogSegment(final long txid,
+   530	      final int layoutVersion) {
+   531	    return singleThreadExecutor.submit(new Callable<Void>() {
+   532	      @Override
+   533	      public Void call() throws IOException {
+   534	        getProxy().startLogSegment(createReqInfo(), txid, layoutVersion);
+   535	        synchronized (IPCLoggerChannel.this) {
+   536	          if (outOfSync) {
+   537	            outOfSync = false;
+   538	            QuorumJournalManager.LOG.info(
+   539	                "Restarting previously-stopped writes to " +
+   540	                IPCLoggerChannel.this + " in segment starting at txid " +
+   541	                txid);
+   542	          }
+   543	        }
+   544	        return null;
+   545	      }
+   546	    });
+   547	  }
+   548	  
+   549	  @Override
+   550	  public ListenableFuture<Void> finalizeLogSegment(
+   551	      final long startTxId, final long endTxId) {
+   552	    return singleThreadExecutor.submit(new Callable<Void>() {
+   553	      @Override
+   554	      public Void call() throws IOException {
+   555	        throwIfOutOfSync();
+   556	        
+   557	        getProxy().finalizeLogSegment(createReqInfo(), startTxId, endTxId);
+   558	        return null;
+   559	      }
+   560	    });
+   561	  }
+   562	  
+   563	  @Override
+   564	  public ListenableFuture<Void> purgeLogsOlderThan(final long minTxIdToKeep) {
+   565	    return singleThreadExecutor.submit(new Callable<Void>() {
+   566	      @Override
+   567	      public Void call() throws Exception {
+   568	        getProxy().purgeLogsOlderThan(createReqInfo(), minTxIdToKeep);
+   569	        return null;
+   570	      }
+   571	    });
+   572	  }
+   573	
+   574	  @Override
+   575	  public ListenableFuture<GetJournaledEditsResponseProto> getJournaledEdits(
+   576	      long fromTxnId, int maxTransactions) {
+   577	    return parallelExecutor.submit(
+   578	        new Callable<GetJournaledEditsResponseProto>() {
+   579	          @Override
+   580	          public GetJournaledEditsResponseProto call() throws IOException {
+   581	            return getProxy().getJournaledEdits(journalId, nameServiceId,
+   582	                fromTxnId, maxTransactions);
+   583	          }
+   584	        });
+   585	  }
+   586	
+   587	  @Override
+   588	  public ListenableFuture<RemoteEditLogManifest> getEditLogManifest(
+   589	      final long fromTxnId, final boolean inProgressOk) {
+   590	    return parallelExecutor.submit(new Callable<RemoteEditLogManifest>() {
+   591	      @Override
+   592	      public RemoteEditLogManifest call() throws IOException {
+   593	        GetEditLogManifestResponseProto ret = getProxy().getEditLogManifest(
+   594	            journalId, nameServiceId, fromTxnId, inProgressOk);
+   595	        // Update the http port, since we need this to build URLs to any of the
+   596	        // returned logs.
+   597	        constructHttpServerURI(ret);
+   598	        return PBHelper.convert(ret.getManifest());
+   599	      }
+   600	    });
+   601	  }
+   602	
+   603	  @Override
+   604	  public ListenableFuture<PrepareRecoveryResponseProto> prepareRecovery(
+   605	      final long segmentTxId) {
+   606	    return singleThreadExecutor.submit(new Callable<PrepareRecoveryResponseProto>() {
+   607	      @Override
+   608	      public PrepareRecoveryResponseProto call() throws IOException {
+   609	        if (!hasHttpServerEndPoint()) {
+   610	          // force an RPC call so we know what the HTTP port should be if it
+   611	          // haven't done so.
+   612	          GetJournalStateResponseProto ret = getProxy().getJournalState(
+   613	              journalId, nameServiceId);
+   614	          constructHttpServerURI(ret);
+   615	        }
+   616	        return getProxy().prepareRecovery(createReqInfo(), segmentTxId);
+   617	      }
+   618	    });
+   619	  }
+   620	
+   621	  @Override
+   622	  public ListenableFuture<Void> acceptRecovery(
+   623	      final SegmentStateProto log, final URL url) {
+   624	    return singleThreadExecutor.submit(new Callable<Void>() {
+   625	      @Override
+   626	      public Void call() throws IOException {
+   627	        getProxy().acceptRecovery(createReqInfo(), log, url);
+   628	        return null;
+   629	      }
+   630	    });
+   631	  }
+   632	  
+   633	  @Override
+   634	  public ListenableFuture<Void> doPreUpgrade() {
+   635	    return singleThreadExecutor.submit(new Callable<Void>() {
+   636	      @Override
+   637	      public Void call() throws IOException {
+   638	        getProxy().doPreUpgrade(journalId);
+   639	        return null;
+   640	      }
+   641	    });
+   642	  }
+   643	  
+   644	  @Override
+   645	  public ListenableFuture<Void> doUpgrade(final StorageInfo sInfo) {
+   646	    return singleThreadExecutor.submit(new Callable<Void>() {
+   647	      @Override
+   648	      public Void call() throws IOException {
+   649	        getProxy().doUpgrade(journalId, sInfo);
+   650	        return null;
+   651	      }
+   652	    });
+   653	  }
+   654	  
+   655	  @Override
+   656	  public ListenableFuture<Void> doFinalize() {
+   657	    return singleThreadExecutor.submit(new Callable<Void>() {
+   658	      @Override
+   659	      public Void call() throws IOException {
+   660	        getProxy().doFinalize(journalId, nameServiceId);
+   661	        return null;
+   662	      }
+   663	    });
+   664	  }
+   665	  
+   666	  @Override
+   667	  public ListenableFuture<Boolean> canRollBack(final StorageInfo storage,
+   668	      final StorageInfo prevStorage, final int targetLayoutVersion) {
+   669	    return singleThreadExecutor.submit(new Callable<Boolean>() {
+   670	      @Override
+   671	      public Boolean call() throws IOException {
+   672	        return getProxy().canRollBack(journalId, nameServiceId,
+   673	            storage, prevStorage, targetLayoutVersion);
+   674	      }
+   675	    });
+   676	  }
+   677	
+   678	  @Override
+   679	  public ListenableFuture<Void> doRollback() {
+   680	    return singleThreadExecutor.submit(new Callable<Void>() {
+   681	      @Override
+   682	      public Void call() throws IOException {
+   683	        getProxy().doRollback(journalId, nameServiceId);
+   684	        return null;
+   685	      }
+   686	    });
+   687	  }
+   688	
+   689	  @Override
+   690	  public ListenableFuture<Void> discardSegments(final long startTxId) {
+   691	    return singleThreadExecutor.submit(new Callable<Void>() {
+   692	      @Override
+   693	      public Void call() throws IOException {
+   694	        getProxy().discardSegments(journalId, nameServiceId, startTxId);
+   695	        return null;
+   696	      }
+   697	    });
+   698	  }
+   699	
+   700	  @Override
+   701	  public ListenableFuture<Long> getJournalCTime() {
+   702	    return singleThreadExecutor.submit(new Callable<Long>() {
+   703	      @Override
+   704	      public Long call() throws IOException {
+   705	        return getProxy().getJournalCTime(journalId, nameServiceId);
+   706	      }
+   707	    });
+   708	  }
+   709	
+   710	  @Override
+   711	  public String toString() {
+   712	    return InetAddresses.toAddrString(addr.getAddress()) + ':' +
+   713	        addr.getPort();
+   714	  }
+   715	
+   716	  @Override
+   717	  public synchronized void appendReport(StringBuilder sb) {
+   718	    sb.append("Written txid ").append(highestAckedTxId);
+   719	    long behind = getLagTxns();
+   720	    if (behind > 0) {
+   721	      if (lastAckNanos != 0) {
+   722	        long lagMillis = getLagTimeMillis();
+   723	        sb.append(" (" + behind + " txns/" + lagMillis + "ms behind)");
+   724	      } else {
+   725	        sb.append(" (never written");
+   726	      }
+   727	    }
+   728	    if (outOfSync) {
+   729	      sb.append(" (will try to re-sync on next segment)");
+   730	    }
+   731	  }
+   732	  
+   733	  public synchronized long getLagTxns() {
+   734	    return Math.max(committedTxId - highestAckedTxId, 0);
+   735	  }
+   736	  
+   737	  public synchronized long getLagTimeMillis() {
+   738	    return TimeUnit.MILLISECONDS.convert(
+   739	        Math.max(lastCommitNanos - lastAckNanos, 0),
+   740	        TimeUnit.NANOSECONDS);
+   741	  }
+   742	
+   743	  private void constructHttpServerURI(GetEditLogManifestResponseProto ret) {
+   744	    if (ret.hasFromURL()) {
+   745	      URI uri = URI.create(ret.getFromURL());
+   746	      httpServerURL = getHttpServerURI(uri.getScheme(), uri.getPort());
+   747	    } else {
+   748	      httpServerURL = getHttpServerURI("http", ret.getHttpPort());;
+   749	    }
+   750	  }
+   751	
+   752	  private void constructHttpServerURI(GetJournalStateResponseProto ret) {
+   753	    if (ret.hasFromURL()) {
+   754	      URI uri = URI.create(ret.getFromURL());
+   755	      httpServerURL = getHttpServerURI(uri.getScheme(), uri.getPort());
+   756	    } else {
+   757	      httpServerURL = getHttpServerURI("http", ret.getHttpPort());;
+   758	    }
+   759	  }
+   760	
+   761	  /**
+   762	   * Construct the http server based on the response.
+   763	   *
+   764	   * The fromURL field in the response specifies the endpoint of the http
+   765	   * server. However, the address might not be accurate since the server can
+   766	   * bind to multiple interfaces. Here the client plugs in the address specified
+   767	   * in the configuration and generates the URI.
+   768	   */
+   769	  private URL getHttpServerURI(String scheme, int port) {
+   770	    try {
+   771	      return new URL(scheme, addr.getHostName(), port, "");
+   772	    } catch (MalformedURLException e) {
+   773	      // Unreachable
+   774	      throw new RuntimeException(e);
+   775	    }
+   776	  }
+   777	
+   778	  private boolean hasHttpServerEndPoint() {
+   779	   return httpServerURL != null;
+   780	  }
+   781	
+   782	}

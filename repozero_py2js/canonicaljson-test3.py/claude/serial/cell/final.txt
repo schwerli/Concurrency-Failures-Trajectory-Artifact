@@ -1,0 +1,840 @@
+Verified: **331/331** behavioral cases and **1066/1066** numeric-formatting cases match the executable byte-for-byte (stdout, stderr, and exit code).
+
+Here is the code, libraries first.
+
+### `/output/lib/errors.mjs` — Python exception objects + traceback rendering
+
+```javascript
+/**
+ * Minimal re-implementation of the Python exception objects that this program
+ * can surface, plus the CPython-style traceback renderer.
+ */
+
+/** Base class for every emulated Python exception. */
+export class PyException extends Error {
+  constructor(message) { super(message); this.pyName = 'Exception'; }
+  /** `str(exc)` -- the text after the class name in a traceback. */
+  toPyString() { return this.message; }
+}
+
+export class PyValueError extends PyException {
+  constructor(message) { super(message); this.pyName = 'ValueError'; }
+}
+
+export class PyTypeError extends PyException {
+  constructor(message) { super(message); this.pyName = 'TypeError'; }
+}
+
+/** A single rendered traceback frame. */
+export function frame(file, line, name, source = null, anchor = null) {
+  return { file, line, name, source, anchor };
+}
+
+/** Render an uncaught exception the way the CPython interpreter does. */
+export function formatTraceback(exc, frames) {
+  const out = ['Traceback (most recent call last):'];
+  for (const f of frames) {
+    out.push(`  File "${f.file}", line ${f.line}, in ${f.name}`);
+    if (f.source !== null) out.push(`    ${f.source}`);
+    if (f.anchor !== null) out.push(`    ${f.anchor}`);
+  }
+  const text = exc.toPyString();
+  out.push(text ? `${exc.pyName}: ${text}` : exc.pyName);
+  return out.join('\n');
+}
+```
+
+### `/output/lib/pystr.mjs` — `repr(str)`
+
+```javascript
+/**
+ * Python `str` rendering helpers.
+ *
+ * `repr(s)` is needed because argparse interpolates the offending text with
+ * `repr()` when a `type=` conversion fails.
+ */
+
+const SHORT_ESCAPES = new Map([[0x09, '\\t'], [0x0a, '\\n'], [0x0d, '\\r'], [0x5c, '\\\\']]);
+
+/**
+ * True when `repr()` would show the character literally. Python escapes
+ * control, format, surrogate, private-use, unassigned and separator
+ * characters -- with the single exception of the plain space.
+ */
+function isPrintable(ch) {
+  if (ch === ' ') return true;
+  return !/[\p{C}\p{Zl}\p{Zp}\p{Zs}]/u.test(ch);
+}
+
+/** Backslash escape for a non-printable code point, at Python's widths. */
+function escapeCodePoint(cp) {
+  if (cp < 0x100) return `\\x${cp.toString(16).padStart(2, '0')}`;
+  if (cp < 0x10000) return `\\u${cp.toString(16).padStart(4, '0')}`;
+  return `\\U${cp.toString(16).padStart(8, '0')}`;
+}
+
+/** `repr(s)`: single quotes unless the text has a `'` but no `"`. */
+export function pyRepr(text) {
+  const quote = text.includes("'") && !text.includes('"') ? '"' : "'";
+  let body = '';
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    const short = SHORT_ESCAPES.get(cp);
+    if (short !== undefined) body += short;
+    else if (ch === quote) body += `\\${quote}`;
+    else if (isPrintable(ch)) body += ch;
+    else body += escapeCodePoint(cp);
+  }
+  return `${quote}${body}${quote}`;
+}
+```
+
+### `/output/lib/pybytes.mjs` — UTF-8 encoding + `repr(bytes)`
+
+```javascript
+/**
+ * Python `bytes` helpers: UTF-8 encoding and `repr(bytes)`.
+ *
+ * `encode_canonical_json` hands back a bytes object, and the script prints it,
+ * so the exact `b'...'` rendering matters.
+ */
+
+/** `str.encode("utf-8")`. */
+export function encodeUtf8(text) {
+  return new TextEncoder().encode(text);
+}
+
+const ESCAPES = new Map([[0x09, '\\t'], [0x0a, '\\n'], [0x0d, '\\r'], [0x5c, '\\\\']]);
+
+/**
+ * `repr(b)` for a bytes object: single quotes unless the payload contains a
+ * single quote but no double quote; every byte outside printable ASCII becomes
+ * `\xhh`.
+ */
+export function bytesRepr(bytes) {
+  const hasSingle = bytes.includes(0x27);
+  const hasDouble = bytes.includes(0x22);
+  const quote = hasSingle && !hasDouble ? '"' : "'";
+  const quoteByte = quote.charCodeAt(0);
+
+  let body = '';
+  for (const byte of bytes) {
+    const escape = ESCAPES.get(byte);
+    if (escape !== undefined) body += escape;
+    else if (byte === quoteByte) body += `\\${quote}`;
+    else if (byte < 0x20 || byte >= 0x7f) body += `\\x${byte.toString(16).padStart(2, '0')}`;
+    else body += String.fromCharCode(byte);
+  }
+  return `b${quote}${body}${quote}`;
+}
+```
+
+### `/output/lib/pyfloat.mjs` — `float(s)` and `repr(float)` (the numeric core)
+
+```javascript
+/**
+ * Python `float` semantics: string -> double conversion (`float(s)`) and
+ * double -> string conversion (`repr(f)`).
+ *
+ * JavaScript numbers are IEEE-754 doubles, exactly like Python floats, so the
+ * only work here is matching Python's textual conventions on both ends.
+ */
+
+import { pyRepr } from './pystr.mjs';
+
+/**
+ * Marker for "this number is a Python float, not a Python int".
+ *
+ * A bare JS number cannot express the difference between `1` and `1.0`, which
+ * the canonical JSON encoder has to preserve, so callers that know they hold a
+ * float wrap it.
+ */
+export class PyFloat {
+  constructor(value) { this.value = value; }
+  valueOf() { return this.value; }
+}
+
+/** Convenience constructor: `pyFloat(1) -> PyFloat(1.0)`. */
+export function pyFloat(value) { return new PyFloat(value); }
+
+// ---------------------------------------------------------------------------
+// float(str)
+// ---------------------------------------------------------------------------
+
+/**
+ * Numeric value of a Unicode decimal-digit (category Nd) code point.
+ *
+ * Nd runs are always contiguous groups of ten starting at the group's zero,
+ * so walking backwards to the start of the run yields the digit's value.
+ */
+function unicodeDigitValue(cp) {
+  const isDigit = (c) => /\p{Nd}/u.test(String.fromCodePoint(c));
+  if (!isDigit(cp)) return -1;
+  for (let delta = 0; delta <= 9; delta++) {
+    if (!isDigit(cp - delta - 1)) return delta;
+  }
+  return -1;
+}
+
+/**
+ * CPython's `_PyUnicode_TransformDecimalAndSpaceToASCII`: every Unicode
+ * decimal digit becomes its ASCII counterpart and every whitespace character
+ * becomes a plain space. Everything else is passed through untouched.
+ */
+function transformDecimalAndSpaceToAscii(text) {
+  let out = '';
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    if (cp < 0x80) { out += ch; continue; }
+    if (/\s/u.test(ch)) { out += ' '; continue; }
+    const value = unicodeDigitValue(cp);
+    out += value >= 0 ? String(value) : ch;
+  }
+  return out;
+}
+
+// A run of ASCII digits that may contain single underscores between digits,
+// which is exactly what CPython's underscore-aware float parser accepts.
+const DIGITS = '[0-9](?:_?[0-9])*';
+const NUMBER_RE = new RegExp(
+  `^(?:${DIGITS}(?:\\.(?:${DIGITS})?)?|\\.${DIGITS})(?:[eE][+-]?${DIGITS})?$`,
+);
+
+/**
+ * `float(s)` for string input.
+ *
+ * Accepts optional surrounding whitespace, an optional sign, then either a
+ * decimal literal (underscores allowed between digits) or one of the special
+ * words `inf`, `infinity`, `nan` in any case. Overflow saturates to infinity
+ * and underflow to zero, as `strtod` does -- neither is an error.
+ *
+ * @throws {Error} with Python's message when the text is not a valid float.
+ */
+export function pyFloatFromString(text) {
+  const normalized = transformDecimalAndSpaceToAscii(text);
+  // Leading/trailing whitespace is skipped with C's isspace() set; non-ASCII
+  // whitespace already became a plain space in the transform above.
+  const stripped = normalized.replace(/^[ \t\n\r\f\v]+/, '')
+    .replace(/[ \t\n\r\f\v]+$/, '');
+
+  let body = stripped;
+  let sign = 1;
+  if (body.startsWith('+') || body.startsWith('-')) {
+    if (body.startsWith('-')) sign = -1;
+    body = body.slice(1);
+  }
+
+  const lowered = body.toLowerCase();
+  if (lowered === 'inf' || lowered === 'infinity') return sign * Infinity;
+  if (lowered === 'nan') return sign * NaN;
+
+  if (!NUMBER_RE.test(body)) {
+    throw new Error(`could not convert string to float: ${pyRepr(text)}`);
+  }
+
+  // Number() is correctly rounded, like the strtod CPython relies on.
+  return sign * Number(body.replace(/_/g, ''));
+}
+
+// ---------------------------------------------------------------------------
+// repr(float)
+// ---------------------------------------------------------------------------
+
+/**
+ * Split a finite, positive double into its shortest round-tripping decimal
+ * digit string and a decimal point position, mirroring the `digits`/`decpt`
+ * pair that CPython's `format_float_short` works with.
+ *
+ * `Number.prototype.toString` is specified to produce the shortest digit
+ * string that round-trips, so it is the right source for those digits.
+ */
+function decimalDigits(x) {
+  const text = x.toString();
+  let mantissa = text;
+  let exponent = 0;
+
+  const e = text.indexOf('e');
+  if (e >= 0) {
+    mantissa = text.slice(0, e);
+    exponent = Number(text.slice(e + 1));
+  }
+
+  let intPart = mantissa;
+  let fracPart = '';
+  const dot = mantissa.indexOf('.');
+  if (dot >= 0) {
+    intPart = mantissa.slice(0, dot);
+    fracPart = mantissa.slice(dot + 1);
+  }
+
+  let digits = intPart + fracPart;
+  // Position of the decimal point relative to the start of `digits`.
+  let decpt = intPart.length + exponent;
+
+  let lead = 0;
+  while (lead < digits.length - 1 && digits[lead] === '0') {
+    lead += 1;
+    decpt -= 1;
+  }
+  digits = digits.slice(lead).replace(/0+$/, '');
+  if (digits === '') return { digits: '0', decpt: 1 };
+
+  return { digits, decpt };
+}
+
+/** Positional layout, with CPython's "always keep a `.0`" rule applied. */
+function formatFixed(digits, decpt) {
+  if (decpt <= 0) return `0.${'0'.repeat(-decpt)}${digits}`;
+  if (decpt >= digits.length) return `${digits}${'0'.repeat(decpt - digits.length)}.0`;
+  return `${digits.slice(0, decpt)}.${digits.slice(decpt)}`;
+}
+
+/** Scientific layout: one leading digit, signed exponent, at least 2 digits. */
+function formatExponential(digits, decpt) {
+  const mantissa = digits.length > 1 ? `${digits[0]}.${digits.slice(1)}` : digits[0];
+  const exponent = decpt - 1;
+  const sign = exponent < 0 ? '-' : '+';
+  const magnitude = String(Math.abs(exponent)).padStart(2, '0');
+  return `${mantissa}e${sign}${magnitude}`;
+}
+
+/**
+ * `repr(f)` for a Python float.
+ *
+ * Shortest round-tripping digits, rendered positionally unless the decimal
+ * point sits at or before position -4 or beyond position 16, in which case
+ * CPython switches to scientific notation.
+ */
+export function pyFloatRepr(value) {
+  if (Number.isNaN(value)) return 'nan';
+  if (value === Infinity) return 'inf';
+  if (value === -Infinity) return '-inf';
+
+  // Object.is keeps -0.0 distinguishable, which repr() shows as '-0.0'.
+  const negative = value < 0 || Object.is(value, -0);
+  const magnitude = Math.abs(value);
+  if (magnitude === 0) return negative ? '-0.0' : '0.0';
+
+  const { digits, decpt } = decimalDigits(magnitude);
+  const body = (decpt <= -4 || decpt > 16)
+    ? formatExponential(digits, decpt)
+    : formatFixed(digits, decpt);
+
+  return negative ? `-${body}` : body;
+}
+```
+
+### `/output/lib/jsonencoder.mjs` — the serializer
+
+```javascript
+/**
+ * The JSON serializer that `canonicaljson` builds on: an encoder configured
+ * with `ensure_ascii=False`, `allow_nan=False`, `separators=(",", ":")` and
+ * `sort_keys=True`.
+ *
+ * Written from scratch against the observed behaviour of the Python encoder:
+ * every scalar is rendered by the same rules Python uses (`repr` for floats,
+ * exact decimal for ints, minimal string escaping), containers carry no
+ * whitespace, and mapping keys are emitted in code-point order.
+ */
+
+import { PyValueError, PyTypeError } from './errors.mjs';
+import { PyFloat, pyFloatRepr } from './pyfloat.mjs';
+
+/**
+ * `py_encode_basestring`: escape only what JSON requires. With
+ * `ensure_ascii=False` every other character -- including non-ASCII -- is
+ * emitted literally and later UTF-8 encoded.
+ */
+export function encodeString(text) {
+  let out = '"';
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    if (ch === '"') out += '\\"';
+    else if (ch === '\\') out += '\\\\';
+    else if (cp >= 0x20) out += ch;
+    else if (cp === 0x08) out += '\\b';
+    else if (cp === 0x09) out += '\\t';
+    else if (cp === 0x0a) out += '\\n';
+    else if (cp === 0x0c) out += '\\f';
+    else if (cp === 0x0d) out += '\\r';
+    else out += `\\u${cp.toString(16).padStart(4, '0')}`;
+  }
+  return `${out}"`;
+}
+
+/**
+ * `floatstr` with `allow_nan=False`: finite values become `repr(f)`, and the
+ * three out-of-range values are refused the way Python refuses them.
+ */
+export function encodeFloat(value) {
+  if (Number.isFinite(value)) return pyFloatRepr(value);
+  throw new PyValueError(
+    `Out of range float values are not JSON compliant: ${pyFloatRepr(value)}`,
+  );
+}
+
+/** `repr(int)` for a Python int, which has no width limit -- hence BigInt. */
+function encodeInt(value) {
+  return typeof value === 'bigint' ? value.toString() : String(value);
+}
+
+function typeName(value) {
+  if (value === null || value === undefined) return 'NoneType';
+  if (value instanceof PyFloat) return 'float';
+  if (typeof value === 'bigint') return 'int';
+  if (typeof value === 'boolean') return 'bool';
+  if (typeof value === 'number') return Number.isInteger(value) ? 'int' : 'float';
+  if (typeof value === 'string') return 'str';
+  if (Array.isArray(value)) return 'list';
+  if (value instanceof Map) return 'dict';
+  if (typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    if (proto === Object.prototype || proto === null) return 'dict';
+    return value.constructor?.name ?? 'object';
+  }
+  return typeof value;
+}
+
+/**
+ * Compare two strings by code point, the way Python orders `str`.
+ *
+ * JavaScript's `<` compares UTF-16 code units, which disagrees with Python for
+ * astral characters, so the comparison is done on code points explicitly.
+ */
+export function compareByCodePoint(left, right) {
+  const a = Array.from(left);
+  const b = Array.from(right);
+  const shared = Math.min(a.length, b.length);
+  for (let i = 0; i < shared; i++) {
+    const x = a[i].codePointAt(0);
+    const y = b[i].codePointAt(0);
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return a.length - b.length;
+}
+
+/** Normalize a mapping-like value into `[key, value]` pairs. */
+function mappingItems(value) {
+  return value instanceof Map ? [...value.entries()] : Object.entries(value);
+}
+
+/**
+ * `sort_keys=True` key handling: keys are ordered first, then coerced to the
+ * strings JSON needs. Non-string keys are only accepted when Python accepts
+ * them, and mixing types raises the way Python's `sorted()` would.
+ */
+function sortedStringKeys(items) {
+  const prepared = items.map(([key, value]) => {
+    if (typeof key === 'string') return { sortKey: key, name: key, value };
+    if (key === true) return { sortKey: null, name: 'true', value };
+    if (key === false) return { sortKey: null, name: 'false', value };
+    if (key === null || key === undefined) return { sortKey: null, name: 'null', value };
+    if (key instanceof PyFloat) return { sortKey: null, name: encodeFloat(key.value), value };
+    if (typeof key === 'bigint') return { sortKey: null, name: encodeInt(key), value };
+    if (typeof key === 'number') {
+      return {
+        sortKey: null,
+        name: Number.isInteger(key) ? encodeInt(key) : encodeFloat(key),
+        value,
+      };
+    }
+    throw new PyTypeError(
+      `keys must be str, int, float, bool or None, not ${typeName(key)}`,
+    );
+  });
+
+  const strings = prepared.filter((entry) => entry.sortKey !== null);
+  if (strings.length !== 0 && strings.length !== prepared.length) {
+    throw new PyTypeError("'<' not supported between instances of 'str' and 'int'");
+  }
+  if (strings.length === prepared.length) {
+    prepared.sort((a, b) => compareByCodePoint(a.sortKey, b.sortKey));
+  }
+  return prepared;
+}
+
+/**
+ * Serialize `value` to a canonical JSON string: sorted keys, no whitespace,
+ * non-ASCII left as-is.
+ */
+export function encodeToString(value, fallback = null) {
+  const chunks = [];
+  write(value, chunks, fallback);
+  return chunks.join('');
+}
+
+function write(value, out, fallback) {
+  if (value === true) { out.push('true'); return; }
+  if (value === false) { out.push('false'); return; }
+  if (value === null || value === undefined) { out.push('null'); return; }
+  if (typeof value === 'string') { out.push(encodeString(value)); return; }
+  if (value instanceof PyFloat) { out.push(encodeFloat(value.value)); return; }
+  if (typeof value === 'bigint') { out.push(encodeInt(value)); return; }
+  if (typeof value === 'number') {
+    out.push(Number.isInteger(value) ? encodeInt(value) : encodeFloat(value));
+    return;
+  }
+  if (Array.isArray(value)) {
+    out.push('[');
+    value.forEach((item, index) => {
+      if (index > 0) out.push(',');
+      write(item, out, fallback);
+    });
+    out.push(']');
+    return;
+  }
+  if (value instanceof Map || Object.getPrototypeOf(value) === Object.prototype
+      || Object.getPrototypeOf(value) === null) {
+    out.push('{');
+    sortedStringKeys(mappingItems(value)).forEach((entry, index) => {
+      if (index > 0) out.push(',');
+      out.push(encodeString(entry.name), ':');
+      write(entry.value, out, fallback);
+    });
+    out.push('}');
+    return;
+  }
+
+  if (fallback) { write(fallback(value), out, fallback); return; }
+  throw new PyTypeError(`Object of type ${typeName(value)} is not JSON serializable`);
+}
+```
+
+### `/output/lib/canonicaljson.mjs` — the package's public API
+
+```javascript
+/**
+ * Public surface of the `canonicaljson` package, as far as this program uses
+ * it: a canonical encoder that returns UTF-8 bytes.
+ *
+ * Canonical form means no whitespace at all, keys sorted by code point,
+ * non-ASCII characters left unescaped, and NaN/Infinity rejected.
+ */
+
+import { encodeToString } from './jsonencoder.mjs';
+import { encodeUtf8 } from './pybytes.mjs';
+
+/**
+ * `canonicaljson.encode_canonical_json(obj) -> bytes`.
+ *
+ * @param {*} value object graph to encode
+ * @returns {Uint8Array} UTF-8 encoded canonical JSON
+ */
+export function encodeCanonicalJson(value) {
+  return encodeUtf8(encodeToString(value));
+}
+```
+
+### `/output/lib/argparse.mjs` — the CLI parser
+
+```javascript
+/**
+ * A small stand-in for Python's `argparse`, covering the shape of parser this
+ * program builds: long options only, one required option that takes a single
+ * typed value, plus the automatic `-h/--help`.
+ *
+ * The behaviours that matter for compatibility and are reproduced here:
+ *   - `--opt value` and `--opt=value` are both accepted
+ *   - unambiguous long-option prefixes match
+ *   - a token that looks like a negative number is a value, not an option
+ *   - missing required options are reported before unrecognized extras
+ *   - usage goes to stderr and errors exit with status 2; `--help` exits 0
+ */
+
+import { basename } from 'node:path';
+import { pyFloatFromString } from './pyfloat.mjs';
+import { pyRepr } from './pystr.mjs';
+
+/** Argument types, named because argparse puts the name in its error text. */
+export const FLOAT = 'float';
+export const INT = 'int';
+export const STR = 'str';
+
+// argparse's own heuristic for "this looks like a negative number, not a flag".
+const NEGATIVE_NUMBER = /^-\d+$|^-\d*\.\d+$/;
+
+/** Raised by a `type=` conversion; the parser turns it into a usage error. */
+class ArgumentError extends Error {}
+
+export class ArgumentParser {
+  /**
+   * @param {{prog?: string}} [options] `prog` defaults to the script filename,
+   *   matching argparse's `basename(sys.argv[0])`.
+   */
+  constructor(options = {}) {
+    this.prog = options.prog ?? basename(process.argv[1] ?? 'prog');
+    this.actions = [];
+    this.addArgument(['-h', '--help'], {
+      action: 'help',
+      help: 'show this help message and exit',
+    });
+  }
+
+  /**
+   * `parser.add_argument(...)`.
+   *
+   * @param {string|string[]} flags option strings, e.g. `'--a'`
+   * @param {object} [spec] `{type, required, default, action, help, metavar}`
+   */
+  addArgument(flags, spec = {}) {
+    const optionStrings = Array.isArray(flags) ? flags : [flags];
+    const longest = optionStrings.find((flag) => flag.startsWith('--')) ?? optionStrings[0];
+    const dest = longest.replace(/^-+/, '').replace(/-/g, '_');
+    this.actions.push({
+      optionStrings,
+      dest,
+      type: spec.type ?? STR,
+      required: spec.required ?? false,
+      defaultValue: 'default' in spec ? spec.default : null,
+      action: spec.action ?? 'store',
+      help: spec.help ?? null,
+      metavar: spec.metavar ?? dest.toUpperCase(),
+    });
+    return this;
+  }
+
+  /** The `usage: ...` line, terminated by a newline. */
+  formatUsage() {
+    const parts = this.actions.map((action) => {
+      const flag = action.optionStrings[0];
+      if (action.action === 'help') return `[${flag}]`;
+      const invocation = `${flag} ${action.metavar}`;
+      return action.required ? invocation : `[${invocation}]`;
+    });
+    return `usage: ${[this.prog, ...parts].join(' ')}\n`;
+  }
+
+  /** The full `--help` screen. */
+  formatHelp() {
+    const invocations = this.actions.map((action) => (action.action === 'help'
+      ? action.optionStrings.join(', ')
+      : `${action.optionStrings[0]} ${action.metavar}`));
+    // argparse puts help text two columns past the widest invocation, but
+    // never further right than its max_help_position.
+    const width = Math.min(Math.max(...invocations.map((text) => text.length)), 21);
+    const out = [this.formatUsage(), '\noptions:\n'];
+    invocations.forEach((invocation, index) => {
+      const { help } = this.actions[index];
+      if (!help) out.push(`  ${invocation}\n`);
+      else if (invocation.length <= width) out.push(`  ${invocation.padEnd(width + 2)}${help}\n`);
+      else out.push(`  ${invocation}\n${' '.repeat(width + 4)}${help}\n`);
+    });
+    return out.join('');
+  }
+
+  /** `parser.error(message)`: usage plus message on stderr, then exit 2. */
+  error(message) {
+    process.stderr.write(this.formatUsage());
+    process.stderr.write(`${this.prog}: error: ${message}\n`);
+    process.exit(2);
+  }
+
+  /** Look up an action by one of its exact option strings. */
+  findAction(optionString) {
+    return this.actions.find((action) => action.optionStrings.includes(optionString));
+  }
+
+  /** Every option string starting with `head`, for abbreviation matching. */
+  prefixMatches(head) {
+    if (!head.startsWith('--')) return [];
+    const matches = [];
+    for (const action of this.actions) {
+      for (const flag of action.optionStrings) {
+        if (flag.startsWith(head)) matches.push(flag);
+      }
+    }
+    return matches;
+  }
+
+  /**
+   * Decide whether a token is an option, and if so which one.
+   *
+   * Mirrors `_parse_optional`: exact matches win, then `--opt=value`, then
+   * unambiguous prefixes, then the negative-number and embedded-space escape
+   * hatches that let values beginning with `-` through. Returns `null` for a
+   * plain value, or a descriptor whose `unknown` flag marks an option-looking
+   * token that no action claims.
+   */
+  classify(token) {
+    if (!token.startsWith('-')) return null;
+    if (this.findAction(token)) return { optionString: token, explicit: null };
+    if (token.length === 1) return null;
+
+    const cut = token.indexOf('=');
+    const head = cut >= 0 ? token.slice(0, cut) : token;
+    const explicit = cut >= 0 ? token.slice(cut + 1) : null;
+    if (cut >= 0 && this.findAction(head)) return { optionString: head, explicit };
+
+    const matches = this.prefixMatches(head);
+    if (matches.length === 1) return { optionString: matches[0], explicit };
+    if (matches.length > 1) {
+      this.error(`ambiguous option: ${token} could match ${matches.join(', ')}`);
+    }
+
+    if (NEGATIVE_NUMBER.test(token)) return null;
+    if (token.includes(' ')) return null;
+    return { optionString: token, explicit, unknown: true };
+  }
+
+  /** `parser.parse_known_args()`: returns the namespace and leftover tokens. */
+  parseKnownArgs(argv = process.argv.slice(2)) {
+    const namespace = {};
+    for (const action of this.actions) {
+      if (action.action !== 'help') namespace[action.dest] = action.defaultValue;
+    }
+
+    const extras = [];
+    const seen = new Set();
+    let onlyPositional = false;
+
+    for (let i = 0; i < argv.length; i++) {
+      const token = argv[i];
+
+      if (onlyPositional) { extras.push(token); continue; }
+      // The first bare `--` is consumed and turns off option parsing.
+      if (token === '--') { onlyPositional = true; continue; }
+
+      const parsed = this.classify(token);
+      if (parsed === null || parsed.unknown) { extras.push(token); continue; }
+
+      const action = this.findAction(parsed.optionString);
+      if (action.action === 'help') {
+        process.stdout.write(this.formatHelp());
+        process.exit(0);
+      }
+
+      let raw = parsed.explicit;
+      if (raw === null) {
+        const next = i + 1 < argv.length ? argv[i + 1] : null;
+        // The following token is only a value if it is not itself an option.
+        if (next === null || next === '--' || this.classify(next) !== null) {
+          this.error(`argument ${parsed.optionString}: expected one argument`);
+        }
+        raw = next;
+        i += 1;
+      }
+
+      try {
+        namespace[action.dest] = convert(action.type, raw);
+      } catch (err) {
+        if (!(err instanceof ArgumentError)) throw err;
+        this.error(`argument ${parsed.optionString}: ${err.message}`);
+      }
+      seen.add(action.dest);
+    }
+
+    const missing = this.actions
+      .filter((action) => action.required && !seen.has(action.dest))
+      .map((action) => action.optionStrings[0]);
+    if (missing.length > 0) {
+      this.error(`the following arguments are required: ${missing.join(', ')}`);
+    }
+
+    return { namespace, extras };
+  }
+
+  /** `parser.parse_args()`: like the above, but leftovers are a hard error. */
+  parseArgs(argv = process.argv.slice(2)) {
+    const { namespace, extras } = this.parseKnownArgs(argv);
+    if (extras.length > 0) {
+      this.error(`unrecognized arguments: ${extras.join(' ')}`);
+    }
+    return namespace;
+  }
+}
+
+/**
+ * Apply an argparse `type=` conversion, reporting failures with the message
+ * argparse uses: `invalid <type> value: <repr of the text>`.
+ */
+function convert(type, raw) {
+  if (type === STR) return raw;
+  const converter = CONVERTERS[type] ?? (typeof type === 'function' ? type : null);
+  if (converter === null) return raw;
+  const name = typeof type === 'function' ? (type.name || 'value') : type;
+  try {
+    return converter(raw);
+  } catch {
+    throw new ArgumentError(`invalid ${name} value: ${pyRepr(raw)}`);
+  }
+}
+
+const CONVERTERS = {
+  [FLOAT]: pyFloatFromString,
+  [INT]: (raw) => {
+    const text = raw.trim();
+    if (!/^[+-]?(?:[0-9](?:_?[0-9])*)$/.test(text)) throw new Error('not an int');
+    return Number.parseInt(text.replace(/_/g, ''), 10);
+  },
+};
+```
+
+### `/output/test3.mjs` — entry point
+
+```javascript
+#!/usr/bin/env node
+/**
+ * Port of test3.py.
+ *
+ *   parser.add_argument('--a', type=float, required=True)
+ *   print(canonicaljson.encode_canonical_json(args.a))
+ *
+ * The value is a Python float, so the canonical encoding is `repr(float)` and
+ * the printed form is the `repr()` of the resulting bytes object.
+ */
+
+import { ArgumentParser, FLOAT } from './lib/argparse.mjs';
+import { pyFloat } from './lib/pyfloat.mjs';
+import { encodeCanonicalJson } from './lib/canonicaljson.mjs';
+import { bytesRepr } from './lib/pybytes.mjs';
+import { PyException, formatTraceback, frame } from './lib/errors.mjs';
+
+// Frames the interpreter shows for an exception escaping main(). The reference
+// build has no .py sources alongside it, so no frame echoes its source line.
+const TRACEBACK = [
+  frame('test3.py', 15, '<module>'),
+  frame('test3.py', 11, 'main'),
+  frame('canonicaljson/__init__.py', 84, 'encode_canonical_json'),
+  frame('json/encoder.py', 200, 'encode'),
+  frame('json/encoder.py', 258, 'iterencode'),
+];
+
+function main() {
+  // argparse takes prog from basename(sys.argv[0]); the reference program is
+  // invoked as test3_executable, so pin it rather than using this file's name.
+  const parser = new ArgumentParser({ prog: 'test3_executable' });
+  parser.addArgument('--a', { type: FLOAT, required: true });
+  const args = parser.parseArgs();
+
+  const data = pyFloat(args.a);
+  const result = encodeCanonicalJson(data); // Encode float as canonical JSON
+  console.log(bytesRepr(result));
+}
+
+try {
+  main();
+} catch (err) {
+  if (!(err instanceof PyException)) throw err;
+  // Uncaught Python exception: traceback on stderr, exit status 1.
+  process.stderr.write(`${formatTraceback(err, TRACEBACK)}\n`);
+  process.stderr.write(
+    `[PYI-${process.pid}:ERROR] Failed to execute script 'test3' due to unhandled exception!\n`,
+  );
+  process.exit(1);
+}
+```
+
+## Verification
+
+Two harnesses (left in `/workspace/difftest.mjs` and `/workspace/floatsweep.mjs`) diff stdout, stderr, and exit code against the executable for every case:
+
+- **331/331** — the 4 given samples, plus float-literal edge cases (`-0.0`, `5.`, `.5`, `+2.5`, `1_000.5`, Arabic-Indic digits `٣.١`, U+00A0/U+2003 padding, `\x1c` rejection, `nan`/`INF`/`iNfInItY`, `1e309`) and argparse plumbing (`--a=1`, `--a1`, `-a 1`, `--hel` abbreviation, `--`, duplicate `--a`, missing/extra args, `-h`).
+- **1066/1066** — `1e-330`…`1e309` exponent sweep plus 300 random raw bit patterns and subnormals.
+
+The two subtleties worth flagging:
+
+1. **`repr(float)` is not `Number.prototype.toString`.** Python switches to scientific notation when the decimal point falls at or before position −4 or past position 16; JS uses −6 and 21, and never appends `.0`. So `1e15` → `1000000000000000.0`, `1e16` → `1e+16`, `0.00001` → `1e-05` (two-digit exponent). `pyfloat.mjs` extracts the shortest round-tripping digits from `toString` and re-lays them out under Python's rules.
+2. **Two intentional matches to the *executable*, not to source-run CPython:** `prog` is pinned to `test3_executable` (it appears on stdout for `-h`), and traceback frames omit source lines, because the PyInstaller build has no `.py` files to echo. Both are commented at the call site — flip them if you ever want source-CPython parity instead.
+
+`nan`/`inf` inputs reproduce the `ValueError: Out of range float values are not JSON compliant: nan` traceback and exit 1; bad literals exit 2. No external dependencies, no `require`, no `JSON.stringify`/`JSON.parse` — the only non-local import is `node:path`.

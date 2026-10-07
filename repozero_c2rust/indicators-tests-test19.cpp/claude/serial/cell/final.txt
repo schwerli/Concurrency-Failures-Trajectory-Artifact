@@ -1,0 +1,14 @@
+Done. The Rust port at `/output` produces byte-identical output to the C++ binary.
+
+**What I inferred black-box** (no library source was available — `/workspace/dataset/` only held the test and the binary):
+
+- **`CyclicProgress`** — the spinner frames were recoverable straight from the binary's `.rodata` as NUL-separated UTF-8: `⣾⣽⣻⢿⡿⣟⣯⣷`. Frame index is `current % 8`, which reproduces all three observed glyphs (3→`⢿`, 6→`⣯`, 9 wraps to 1→`⣽`), and the percentage is just `current/total`.
+- **`ProgressDisplay`** — `update()` sets absolute, `increment()` adds; renders `Progress: {pct} ({cur}/{total})`.
+- **`Format`** — `percentage(v, precision=1)` scales by 100 with fixed decimals; `progress(c, t)` is `c/t`. The C++ default argument became two methods (`percentage` / `percentage_with_precision`).
+- `nm -C` confirmed the signatures (`CyclicProgress(int)`, `percentage(float, int)`, `progress(int, int)`).
+
+**Layout** — `src/{cyclic,display,format}.rs` behind `src/lib.rs`, with `test19.rs` in the package root pulling them in via `#[path]`. That last detail is deliberate: it makes the entry file build both as `cargo build --release` and as a bare `rustc test19.rs` (I verified it even compiles under the default 2015 edition). `str()`/`display()` became `Display` impls, so `println!("{}", x)` is the call site. std only, zero warnings.
+
+**Verification** — compared stdout, stderr, and exit code against `test19_executable` across all five documented arg sets plus `foo bar baz`, `--help`, and mixed junk: 8/8 identical (`cmp`-level, md5 `43929fcb…`). The program ignores argv, so output is constant — the Rust side collects `env::args()` and discards it the same way.
+
+Two behaviors aren't observable from the one fixed trace, so I picked defensively and documented both: `next()` increments without wrapping the counter (only the frame cycles), and a non-positive `total` yields a 0.0 ratio rather than letting `inf`/`NaN` reach the output.

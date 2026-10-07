@@ -1,0 +1,829 @@
+diff --git a/agent_tests/test_horn_translator.py b/agent_tests/test_horn_translator.py
+new file mode 100644
+index 0000000..927fa96
+--- /dev/null
++++ b/agent_tests/test_horn_translator.py
+@@ -0,0 +1,51 @@
++"""Agent tests for the Horn translator layer."""
++
++from verification.horn_translator import (parse_program, HornEncoder,
++                                          verify_program, Sequence, Assign,
++                                          If, While, Assert)
++from verification.experiments.horn_exp import PROGRAMS
++
++
++def test_parser_all_programs():
++    for name, text in PROGRAMS.items():
++        ast = parse_program(text)
++        assert isinstance(ast, Sequence), name
++
++
++def test_parser_features():
++    ast = parse_program("// comment\nvar x = 1 + 2 * 3; x = x - 1;")
++    assert isinstance(ast.stmts[0], Assign)
++    assert isinstance(ast.stmts[1], Assign)
++    ast = parse_program("var x = 0; while (x < 3) bound 10 { x = x + 1; }")
++    assert isinstance(ast.stmts[1], While)
++    assert ast.stmts[1].bound == 10
++    ast = parse_program(
++        "var x = 0; if (x >= 1 and x != 2 or not (x == 3)) { x = 1; }"
++        " else { x = 2; } assert(x > 0);")
++    assert isinstance(ast.stmts[1], If)
++    assert isinstance(ast.stmts[2], Assert)
++
++
++def test_verify_safe_unsafe():
++    assert verify_program(PROGRAMS["counter"])["safe"] is True
++    assert verify_program(PROGRAMS["branch"])["safe"] is True
++    assert verify_program(PROGRAMS["nested_arith"])["safe"] is True
++    assert verify_program(PROGRAMS["unsafe_loop"])["safe"] is False
++
++
++def test_clause_counts():
++    total = 0
++    for text in PROGRAMS.values():
++        enc = HornEncoder()
++        enc.encode_program(parse_program(text))
++        total += len(enc.clauses)
++        assert enc.to_z3(enc.program_vars) is not None
++    assert total == 25
++
++
++if __name__ == "__main__":
++    test_parser_all_programs()
++    test_parser_features()
++    test_verify_safe_unsafe()
++    test_clause_counts()
++    print("horn_translator tests OK")
+diff --git a/run.sh b/run.sh
+index 09cded7..3ffad72 100755
+--- a/run.sh
++++ b/run.sh
+@@ -9,4 +9,7 @@ python3 -m smt_solver
+ python3 -m fixedpoint
+ 
+ # Layer 3: PDR/Spacer safety verification
+-python3 -m spacer_verifier
+\ No newline at end of file
++python3 -m spacer_verifier
++
++# Layer 4: Imperative-to-Horn translation and verification
++python3 -m verification.experiments.horn_exp
+\ No newline at end of file
+diff --git a/verification/__init__.py b/verification/__init__.py
+new file mode 100644
+index 0000000..2dbabd2
+--- /dev/null
++++ b/verification/__init__.py
+@@ -0,0 +1 @@
++"""Package init for the verification layer (Horn translation, CEGAR)."""
+diff --git a/verification/experiments/__init__.py b/verification/experiments/__init__.py
+new file mode 100644
+index 0000000..fb0c234
+--- /dev/null
++++ b/verification/experiments/__init__.py
+@@ -0,0 +1 @@
++"""Experiment entry points for the verification layer."""
+diff --git a/verification/experiments/horn_exp.py b/verification/experiments/horn_exp.py
+new file mode 100644
+index 0000000..6a256cc
+--- /dev/null
++++ b/verification/experiments/horn_exp.py
+@@ -0,0 +1,79 @@
++"""Experiments for the imperative-to-Horn translator.
++
++Translates and verifies five small programs, reporting:
++  HORN_CLAUSES_GENERATED  - total Horn clauses across all programs
++  HORN_PROGRAMS_VERIFIED  - programs proven safe
++  HORN_PROGRAMS_UNSAFE    - programs with safety violations
++  HORN_LOOP_INVARIANTS    - loops with a successfully extracted invariant
++  HORN_TRANSLATION_TIME   - wall-clock seconds to translate all programs
++"""
++
++import time
++
++from z3 import unsat
++
++from framework import report_result
++from verification.horn_translator import (parse_program, HornEncoder,
++                                          verify_program)
++
++PROGRAMS = {
++    "counter": "var x = 0; while(x < 10) { x = x + 1; } assert(x == 10);",
++    "sum": ("var s = 0; var i = 0; while(i < 5) { s = s + i; i = i + 1; }"
++            " assert(s >= 0);"),
++    "branch": ("var x = 5; if (x > 3) { x = x - 1; } else { x = x + 1; }"
++               " assert(x >= 0);"),
++    "unsafe_loop": ("var x = 0; while(x < 100) { x = x + 2; }"
++                    " assert(x < 50);"),
++    "nested_arith": "var a = 1; var b = 2; a = a + b; b = a * 2; assert(b == 6);",
++}
++
++
++def _count_loop_invariants(name, text):
++    """Count loops whose invariant appears in Spacer's answer (safe only)."""
++    ast = parse_program(text)
++    encoder = HornEncoder()
++    encoder.encode_program(ast)
++    if not encoder.loop_relations:
++        return 0
++    fp = encoder.to_z3(encoder.program_vars)
++    if fp.query(encoder.error_fn) != unsat:
++        return 0
++    answer = str(fp.get_answer())
++    return sum(1 for rel in encoder.loop_relations if rel in answer)
++
++
++def run_horn_experiments():
++    total_clauses = 0
++    verified = 0
++    unsafe = 0
++    invariants = 0
++    translation_time = 0.0
++
++    for name, text in PROGRAMS.items():
++        # translation: parse + encode + Z3 rule construction (no solving)
++        start = time.perf_counter()
++        ast = parse_program(text)
++        encoder = HornEncoder()
++        clauses = encoder.encode_program(ast)
++        encoder.to_z3(encoder.program_vars)
++        translation_time += time.perf_counter() - start
++
++        total_clauses += len(clauses)
++
++        result = verify_program(text)
++        if result["safe"]:
++            verified += 1
++        else:
++            unsafe += 1
++
++        invariants += _count_loop_invariants(name, text)
++
++    report_result("HORN_CLAUSES_GENERATED", total_clauses)
++    report_result("HORN_PROGRAMS_VERIFIED", verified)
++    report_result("HORN_PROGRAMS_UNSAFE", unsafe)
++    report_result("HORN_LOOP_INVARIANTS", invariants)
++    report_result("HORN_TRANSLATION_TIME", f"{translation_time:.2f}")
++
++
++if __name__ == "__main__":
++    run_horn_experiments()
+diff --git a/verification/horn_translator.py b/verification/horn_translator.py
+new file mode 100644
+index 0000000..bc28c01
+--- /dev/null
++++ b/verification/horn_translator.py
+@@ -0,0 +1,652 @@
++"""Imperative-to-Horn-clause translator for verification.
++
++Compiles programs written in a small imperative language into constrained
++Horn clauses (CHCs) over uninterpreted relations, solvable by Z3's Spacer
++fixedpoint engine.  The pipeline is:
++
++    text --parse_program--> AST --HornEncoder--> [HornClause] --to_z3--> CHCs
++
++Language features:
++  - variable declarations      var x = expr;
++  - assignments                x = expr;
++  - conditionals               if (cond) { ... } else { ... }
++  - bounded while loops        while (cond) bound 100 { ... }  (bound optional)
++  - assertions                 assert(cond);
++  - arithmetic + - * ; comparisons < <= == != > >= ; boolean and or not
++  - comments                   // to end of line
++  - blocks                     { stmt* }
++"""
++
++import re
++
++from z3 import (Fixedpoint, Function, BoolSort, IntSort, IntVal,
++                And, Or, Not, FreshConst, unsat)
++
++# ---------------------------------------------------------------------------
++# 1. AST
++# ---------------------------------------------------------------------------
++
++
++class Variable:
++    """Program variable reference."""
++    __slots__ = ("name",)
++
++    def __init__(self, name):
++        self.name = name
++
++    def __repr__(self):
++        return f"Variable({self.name!r})"
++
++
++class Const:
++    """Integer constant."""
++    __slots__ = ("value",)
++
++    def __init__(self, value):
++        self.value = value
++
++    def __repr__(self):
++        return f"Const({self.value})"
++
++
++class BinOp:
++    """Binary operation: + - * < <= == != > >= and or  (unary: not)."""
++    __slots__ = ("op", "left", "right")
++
++    def __init__(self, op, left, right):
++        self.op = op
++        self.left = left
++        self.right = right
++
++    def __repr__(self):
++        return f"BinOp({self.op!r}, {self.left!r}, {self.right!r})"
++
++
++class Assign:
++    """x = expr"""
++    __slots__ = ("var_name", "expr")
++
++    def __init__(self, var_name, expr):
++        self.var_name = var_name
++        self.expr = expr
++
++    def __repr__(self):
++        return f"Assign({self.var_name!r}, {self.expr!r})"
++
++
++class If:
++    __slots__ = ("cond", "then_body", "else_body")
++
++    def __init__(self, cond, then_body, else_body):
++        self.cond = cond
++        self.then_body = then_body      # list of statements
++        self.else_body = else_body      # list of statements
++
++    def __repr__(self):
++        return f"If({self.cond!r}, {self.then_body!r}, {self.else_body!r})"
++
++
++class While:
++    __slots__ = ("cond", "body", "bound")
++
++    def __init__(self, cond, body, bound=None):
++        self.cond = cond
++        self.body = body                # list of statements
++        self.bound = bound              # optional iteration bound (int|None)
++
++    def __repr__(self):
++        return f"While({self.cond!r}, {self.body!r}, bound={self.bound!r})"
++
++
++class Assert:
++    __slots__ = ("cond",)
++
++    def __init__(self, cond):
++        self.cond = cond
++
++    def __repr__(self):
++        return f"Assert({self.cond!r})"
++
++
++class Sequence:
++    __slots__ = ("stmts",)
++
++    def __init__(self, stmts):
++        self.stmts = list(stmts)
++
++    def __repr__(self):
++        return f"Sequence({self.stmts!r})"
++
++
++# ---------------------------------------------------------------------------
++# 2. Recursive-descent parser
++# ---------------------------------------------------------------------------
++
++_TOKEN_RE = re.compile(r"""
++    \s*(?:
++      (?P<comment>//[^\n]*)
++    | (?P<num>\d+)
++    | (?P<name>[A-Za-z_][A-Za-z_0-9]*)
++    | (?P<op><=|>=|==|!=|[(){};=+\-*/<>])
++    )
++""", re.VERBOSE)
++
++_KEYWORDS = {"var", "if", "else", "while", "assert", "bound",
++             "and", "or", "not", "true", "false"}
++
++
++def _tokenize(text):
++    tokens = []
++    pos = 0
++    while pos < len(text):
++        m = _TOKEN_RE.match(text, pos)
++        if not m or m.end() == pos:
++            if text[pos:].strip() == "":
++                break
++            raise SyntaxError(f"tokenize error at {pos}: {text[pos:pos+20]!r}")
++        pos = m.end()
++        if m.group("comment") is not None:
++            continue
++        if m.group("num") is not None:
++            tokens.append(("NUM", int(m.group("num"))))
++        elif m.group("name") is not None:
++            word = m.group("name")
++            tokens.append(("KW", word) if word in _KEYWORDS else ("NAME", word))
++        else:
++            tokens.append(("OP", m.group("op")))
++    tokens.append(("EOF", None))
++    return tokens
++
++
++class _Parser:
++    def __init__(self, tokens):
++        self.tokens = tokens
++        self.pos = 0
++
++    def peek(self):
++        return self.tokens[self.pos]
++
++    def next(self):
++        tok = self.tokens[self.pos]
++        self.pos += 1
++        return tok
++
++    def expect(self, kind, value=None):
++        tok = self.peek()
++        if tok[0] != kind or (value is not None and tok[1] != value):
++            raise SyntaxError(f"expected {kind} {value}, got {tok}")
++        return self.next()
++
++    def at_kw(self, word):
++        return self.peek() == ("KW", word)
++
++    # ---- statements ------------------------------------------------------
++    def parse_program(self):
++        stmts = []
++        while self.peek()[0] != "EOF":
++            stmts.append(self.parse_stmt())
++        return Sequence(stmts)
++
++    def parse_block(self):
++        self.expect("OP", "{")
++        stmts = []
++        while self.peek() != ("OP", "}"):
++            stmts.append(self.parse_stmt())
++        self.expect("OP", "}")
++        return stmts
++
++    def parse_stmt(self):
++        tok = self.peek()
++        if tok == ("KW", "var"):
++            self.next()
++            name = self.expect("NAME")[1]
++            self.expect("OP", "=")
++            expr = self.parse_expr()
++            self.expect("OP", ";")
++            return Assign(name, expr)
++        if tok[0] == "NAME":
++            self.next()
++            self.expect("OP", "=")
++            expr = self.parse_expr()
++            self.expect("OP", ";")
++            return Assign(tok[1], expr)
++        if tok == ("KW", "if"):
++            self.next()
++            self.expect("OP", "(")
++            cond = self.parse_expr()
++            self.expect("OP", ")")
++            then_body = self.parse_block()
++            else_body = []
++            if self.at_kw("else"):
++                self.next()
++                else_body = self.parse_block()
++            return If(cond, then_body, else_body)
++        if tok == ("KW", "while"):
++            self.next()
++            self.expect("OP", "(")
++            cond = self.parse_expr()
++            self.expect("OP", ")")
++            bound = None
++            if self.at_kw("bound"):
++                self.next()
++                bound = self.expect("NUM")[1]
++            body = self.parse_block()
++            return While(cond, body, bound)
++        if tok == ("KW", "assert"):
++            self.next()
++            self.expect("OP", "(")
++            cond = self.parse_expr()
++            self.expect("OP", ")")
++            self.expect("OP", ";")
++            return Assert(cond)
++        raise SyntaxError(f"unexpected token {tok}")
++
++    # ---- expressions (precedence climbing) --------------------------------
++    def parse_expr(self):
++        return self.parse_or()
++
++    def parse_or(self):
++        e = self.parse_and()
++        while self.at_kw("or"):
++            self.next()
++            e = BinOp("or", e, self.parse_and())
++        return e
++
++    def parse_and(self):
++        e = self.parse_not()
++        while self.at_kw("and"):
++            self.next()
++            e = BinOp("and", e, self.parse_not())
++        return e
++
++    def parse_not(self):
++        if self.at_kw("not"):
++            self.next()
++            return BinOp("not", self.parse_not(), None)
++        return self.parse_cmp()
++
++    def parse_cmp(self):
++        e = self.parse_add()
++        tok = self.peek()
++        if tok[0] == "OP" and tok[1] in ("<", "<=", "==", "!=", ">", ">="):
++            self.next()
++            e = BinOp(tok[1], e, self.parse_add())
++        return e
++
++    def parse_add(self):
++        e = self.parse_mul()
++        while self.peek() in (("OP", "+"), ("OP", "-")):
++            op = self.next()[1]
++            e = BinOp(op, e, self.parse_mul())
++        return e
++
++    def parse_mul(self):
++        e = self.parse_unary()
++        while self.peek() == ("OP", "*"):
++            self.next()
++            e = BinOp("*", e, self.parse_unary())
++        return e
++
++    def parse_unary(self):
++        if self.peek() == ("OP", "-"):
++            self.next()
++            return BinOp("-", Const(0), self.parse_unary())
++        return self.parse_primary()
++
++    def parse_primary(self):
++        tok = self.peek()
++        if tok[0] == "NUM":
++            self.next()
++            return Const(tok[1])
++        if tok[0] == "NAME":
++            self.next()
++            return Variable(tok[1])
++        if tok == ("KW", "true"):
++            self.next()
++            return BinOp("==", Const(1), Const(1))
++        if tok == ("KW", "false"):
++            self.next()
++            return BinOp("!=", Const(1), Const(1))
++        if tok == ("OP", "("):
++            self.next()
++            e = self.parse_expr()
++            self.expect("OP", ")")
++            return e
++        raise SyntaxError(f"unexpected token {tok}")
++
++
++def parse_program(text):
++    """Parse program text into a Sequence AST."""
++    return _Parser(_tokenize(text)).parse_program()
++
++
++# ---------------------------------------------------------------------------
++# AST helpers
++# ---------------------------------------------------------------------------
++
++
++def ast_substitute(expr, mapping):
++    """Substitute Variable(name) nodes with ASTs from mapping."""
++    if isinstance(expr, Variable):
++        return mapping.get(expr.name, expr)
++    if isinstance(expr, Const):
++        return expr
++    if isinstance(expr, BinOp):
++        left = ast_substitute(expr.left, mapping)
++        right = ast_substitute(expr.right, mapping) \
++            if expr.right is not None else None
++        return BinOp(expr.op, left, right)
++    raise TypeError(f"cannot substitute in {expr!r}")
++
++
++def ast_vars(expr, acc=None):
++    if acc is None:
++        acc = set()
++    if isinstance(expr, Variable):
++        acc.add(expr.name)
++    elif isinstance(expr, BinOp):
++        ast_vars(expr.left, acc)
++        if expr.right is not None:
++            ast_vars(expr.right, acc)
++    return acc
++
++
++def z3ify(expr, env):
++    """Convert an AST expression to a Z3 expression using env (name -> var)."""
++    if isinstance(expr, Const):
++        return IntVal(expr.value)
++    if isinstance(expr, Variable):
++        return env[expr.name]
++    if isinstance(expr, BinOp):
++        l = z3ify(expr.left, env)
++        r = z3ify(expr.right, env) if expr.right is not None else None
++        if expr.op == "+":
++            return l + r
++        if expr.op == "-":
++            return l - r
++        if expr.op == "*":
++            return l * r
++        if expr.op == "<":
++            return l < r
++        if expr.op == "<=":
++            return l <= r
++        if expr.op == "==":
++            return l == r
++        if expr.op == "!=":
++            return l != r
++        if expr.op == ">":
++            return l > r
++        if expr.op == ">=":
++            return l >= r
++        if expr.op == "and":
++            return And(l, r)
++        if expr.op == "or":
++            return Or(l, r)
++        if expr.op == "not":
++            return Not(l)
++    raise ValueError(f"cannot convert {expr!r} to Z3")
++
++
++# ---------------------------------------------------------------------------
++# 3. Horn clause encoding
++# ---------------------------------------------------------------------------
++
++
++class HornClause:
++    """One constrained Horn clause.
++
++    body_rel: name of the body (pre-state) relation, or None for an
++        initial (fact) clause.
++    guard: AST condition over the pre-state (None means True).
++    updates: {var_name: AST expr over pre-state}; variables not mentioned
++        keep their pre-state value (frame), except in initial clauses where
++        they are unconstrained.
++    head_rel: name of the head (post-state) relation, or 'Error'.
++    """
++    __slots__ = ("body_rel", "guard", "updates", "head_rel")
++
++    def __init__(self, body_rel, guard, updates, head_rel):
++        self.body_rel = body_rel
++        self.guard = guard
++        self.updates = dict(updates)
++        self.head_rel = head_rel
++
++    def __repr__(self):
++        return (f"HornClause({self.body_rel} & {self.guard} & {self.updates}"
++                f" -> {self.head_rel})")
++
++
++def _is_straightline(stmts):
++    return all(isinstance(s, Assign) for s in stmts)
++
++
++def _compose_updates(stmts):
++    """Compose a straight-line statement list into a simultaneous update.
++
++    Returns {var_name: AST over pre-state}.  Sequential assignments are
++    folded with substitution so later assignments see earlier values.
++    """
++    mapping = {}
++    for stmt in stmts:
++        mapping[stmt.var_name] = ast_substitute(stmt.expr, mapping)
++    return mapping
++
++
++class HornEncoder:
++    """Encodes an imperative AST into a list of HornClause objects."""
++
++    ERROR = "Error"
++
++    def __init__(self):
++        self.clauses = []
++        self.relations = []        # relation names in creation order
++        self.loop_relations = []   # loop-head relation names
++        self.program_vars = []
++        self.fp = None
++        self.error_fn = None
++        self._counter = 0
++
++    def _fresh_rel(self):
++        name = f"R{self._counter}"
++        self._counter += 1
++        self.relations.append(name)
++        return name
++
++    # -- top level ---------------------------------------------------------
++    def encode_program(self, ast):
++        """Traverse the AST and produce the Horn clause list."""
++        self.program_vars = self._collect_vars(ast)
++        self.clauses = []
++        self.relations = []
++        self.loop_relations = []
++        stmts = ast.stmts if isinstance(ast, Sequence) else [ast]
++        self._process_stmts(stmts, None)
++        return self.clauses
++
++    def _collect_vars(self, ast):
++        seen, order = set(), []
++
++        def add(name):
++            if name not in seen:
++                seen.add(name)
++                order.append(name)
++
++        def walk_stmt(s):
++            if isinstance(s, Assign):
++                add(s.var_name)
++                for v in sorted(ast_vars(s.expr)):
++                    add(v)
++            elif isinstance(s, If):
++                for v in sorted(ast_vars(s.cond)):
++                    add(v)
++                for t in s.then_body + s.else_body:
++                    walk_stmt(t)
++            elif isinstance(s, While):
++                for v in sorted(ast_vars(s.cond)):
++                    add(v)
++                for t in s.body:
++                    walk_stmt(t)
++            elif isinstance(s, Assert):
++                for v in sorted(ast_vars(s.cond)):
++                    add(v)
++            elif isinstance(s, Sequence):
++                for t in s.stmts:
++                    walk_stmt(t)
++
++        walk_stmt(ast)
++        return order
++
++    def _process_stmts(self, stmts, pre_rel):
++        for stmt in stmts:
++            pre_rel = self._process_stmt(stmt, pre_rel)
++        return pre_rel
++
++    def _process_stmt(self, stmt, pre_rel):
++        if isinstance(stmt, Assign):
++            post_rel = self._fresh_rel()
++            self.clauses.append(self.encode_assignment(stmt, pre_rel, post_rel))
++            return post_rel
++        if isinstance(stmt, If):
++            post_rel = self._fresh_rel()
++            self.clauses.extend(self.encode_branch(stmt, pre_rel, post_rel))
++            return post_rel
++        if isinstance(stmt, While):
++            post_rel, clauses = self.encode_loop(stmt, pre_rel)
++            self.clauses.extend(clauses)
++            return post_rel
++        if isinstance(stmt, Assert):
++            self.clauses.append(self.encode_assertion(stmt, pre_rel))
++            return pre_rel
++        if isinstance(stmt, Sequence):
++            return self._process_stmts(stmt.stmts, pre_rel)
++        raise TypeError(f"unknown statement {stmt!r}")
++
++    # -- encoders ------------------------------------------------------------
++    def encode_assignment(self, assign, pre_rel, post_rel):
++        """post-state equals pre-state with the assigned variable updated."""
++        return HornClause(pre_rel, None, {assign.var_name: assign.expr},
++                          post_rel)
++
++    def encode_branch(self, if_node, pre_rel, post_rel):
++        """Two path clauses: cond/then_body and not(cond)/else_body."""
++        if _is_straightline(if_node.then_body) and \
++                _is_straightline(if_node.else_body):
++            return [
++                HornClause(pre_rel, if_node.cond,
++                           _compose_updates(if_node.then_body), post_rel),
++                HornClause(pre_rel, BinOp("not", if_node.cond, None),
++                           _compose_updates(if_node.else_body), post_rel),
++            ]
++        # general fallback: guard-entry clause + encoded sub-chain
++        clauses = []
++        for cond, body in ((if_node.cond, if_node.then_body),
++                           (BinOp("not", if_node.cond, None),
++                            if_node.else_body)):
++            entry = self._fresh_rel()
++            clauses.append(HornClause(pre_rel, cond, {}, entry))
++            sub_post = self._process_stmts(body, entry)
++            clauses.append(HornClause(sub_post, None, {}, post_rel))
++        return clauses
++
++    def encode_loop(self, while_node, pre_rel):
++        """Recursive Horn clause pair for a loop, plus entry and exit.
++
++        entry:    pre_rel(x)                       => loop_rel(x)
++        body:     loop_rel(x) and cond and body    => loop_rel(x')
++        exit:     loop_rel(x) and not cond         => post_rel(x)
++        Returns (post_rel, clauses).
++        """
++        loop_rel = self._fresh_rel()
++        self.loop_relations.append(loop_rel)
++        post_rel = self._fresh_rel()
++        clauses = [HornClause(pre_rel, None, {}, loop_rel)]
++        if _is_straightline(while_node.body):
++            clauses.append(HornClause(loop_rel, while_node.cond,
++                                      _compose_updates(while_node.body),
++                                      loop_rel))
++        else:
++            entry = self._fresh_rel()
++            clauses.append(HornClause(loop_rel, while_node.cond, {}, entry))
++            body_post = self._process_stmts(while_node.body, entry)
++            clauses.append(HornClause(body_post, None, {}, loop_rel))
++        clauses.append(HornClause(loop_rel,
++                                  BinOp("not", while_node.cond, None),
++                                  {}, post_rel))
++        return post_rel, clauses
++
++    def encode_assertion(self, assert_node, pre_rel):
++        """Safety query: pre_rel(x) and not(assert_cond) => Error."""
++        return HornClause(pre_rel, BinOp("not", assert_node.cond, None),
++                          {}, self.ERROR)
++
++    # -- Z3 conversion --------------------------------------------------------
++    def to_z3(self, program_vars):
++        """Convert all encoded clauses into Z3 Fixedpoint rules.
++
++        Returns the Fixedpoint object with the rules loaded; the Error
++        relation is available as self.error_fn.
++        """
++        n = len(program_vars)
++        fp = Fixedpoint()
++        fp.set(engine='spacer')
++        rel_fns = {name: Function(name, *([IntSort()] * n), BoolSort())
++                   for name in self.relations}
++        error_fn = Function(self.ERROR, BoolSort())
++        for fn in rel_fns.values():
++            fp.register_relation(fn)
++        fp.register_relation(error_fn)
++
++        pre = [FreshConst(IntSort()) for _ in range(n)]
++        post = [FreshConst(IntSort()) for _ in range(n)]
++        for v in pre + post:
++            fp.declare_var(v)
++        env_pre = dict(zip(program_vars, pre))
++
++        for clause in self.clauses:
++            body = []
++            if clause.body_rel is not None:
++                body.append(rel_fns[clause.body_rel](*pre))
++            if clause.guard is not None:
++                body.append(z3ify(clause.guard, env_pre))
++            for i, var in enumerate(program_vars):
++                if var in clause.updates:
++                    body.append(post[i] == z3ify(clause.updates[var], env_pre))
++                elif clause.body_rel is not None:
++                    body.append(post[i] == pre[i])  # frame: unchanged
++            if clause.head_rel == self.ERROR:
++                head = error_fn()
++            else:
++                head = rel_fns[clause.head_rel](*post)
++            fp.rule(head, body)
++
++        self.fp = fp
++        self.error_fn = error_fn
++        return fp
++
++
++# ---------------------------------------------------------------------------
++# 4. Verification flow
++# ---------------------------------------------------------------------------
++
++
++def build_fixedpoint(text):
++    """Parse and encode a program; return (encoder, fixedpoint, error_fn)."""
++    ast = parse_program(text)
++    encoder = HornEncoder()
++    encoder.encode_program(ast)
++    fp = encoder.to_z3(encoder.program_vars)
++    return encoder, fp, encoder.error_fn
++
++
++def verify_program(text):
++    """Parse, encode and verify a program with Spacer.
++
++    Returns {"safe": bool, "num_clauses": int, "num_relations": int}.
++    """
++    encoder, fp, error_fn = build_fixedpoint(text)
++    result = fp.query(error_fn)
++    return {
++        "safe": result == unsat,
++        "num_clauses": len(encoder.clauses),
++        "num_relations": len(encoder.relations) + 1,  # + Error
++    }

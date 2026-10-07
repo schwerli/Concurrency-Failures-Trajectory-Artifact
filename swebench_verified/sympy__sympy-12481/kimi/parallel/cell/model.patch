@@ -1,0 +1,70 @@
+diff --git a/sympy/combinatorics/permutations.py b/sympy/combinatorics/permutations.py
+index 136ed5a47..5229d3f2f 100644
+--- a/sympy/combinatorics/permutations.py
++++ b/sympy/combinatorics/permutations.py
+@@ -801,8 +801,8 @@ class Permutation(Basic):
+     def __new__(cls, *args, **kwargs):
+         """
+         Constructor for the Permutation object from a list or a
+-        list of lists in which all elements of the permutation may
+-        appear only once.
++        list of lists; if the latter, the cycles are applied in
++        order, from left to right, when they are not disjoint.
+ 
+         Examples
+         ========
+@@ -824,6 +824,14 @@ def __new__(cls, *args, **kwargs):
+         >>> Permutation([[4, 5, 6], [0, 1], [19]])
+         Permutation([1, 0, 2, 3, 5, 6, 4], size=20)
+ 
++        If the cycles are not disjoint, they are applied in order,
++        from left to right, and the resulting permutation is returned:
++
++        >>> Permutation([[0, 1], [0, 1]])
++        Permutation([0, 1])
++        >>> Permutation([[0, 1], [1, 2]])
++        Permutation([2, 0, 1])
++
+         All manipulation of permutations assumes that the smallest element
+         is 0 (in keeping with 0-based indexing in Python) so if the 0 is
+         missing when entering a permutation in array form, an error will be
+@@ -897,8 +905,18 @@ def __new__(cls, *args, **kwargs):
+         temp = flatten(args)
+         if has_dups(temp):
+             if is_cycle:
+-                raise ValueError('there were repeated elements; to resolve '
+-                'cycles use Cycle%s.' % ''.join([str(tuple(c)) for c in args]))
++                # the cycles are not disjoint, so the permutation is
++                # computed by applying them in order, left to right
++                aform = list(range(max(temp) + 1))
++                for ci in args:
++                    c = Cycle(*ci)
++                    aform = [c[i] for i in aform]
++                if size and size > len(aform):
++                    # don't allow for truncation of permutation which
++                    # might split a cycle and lead to an invalid aform
++                    # but do allow the permutation size to be increased
++                    aform.extend(list(range(len(aform), size)))
++                return _af_new(aform)
+             else:
+                 raise ValueError('there were repeated elements.')
+         temp = set(temp)
+diff --git a/sympy/combinatorics/tests/test_permutations.py b/sympy/combinatorics/tests/test_permutations.py
+index 7f8cd572e..6e540b967 100644
+--- a/sympy/combinatorics/tests/test_permutations.py
++++ b/sympy/combinatorics/tests/test_permutations.py
+@@ -349,7 +349,13 @@ def test_args():
+     raises(ValueError, lambda: Permutation([[1, 2], 0]))
+            # enclosing brackets needed on 0
+     raises(ValueError, lambda: Permutation([1, 1, 0]))
+-    raises(ValueError, lambda: Permutation([[1], [1, 2]]))
++    # non-disjoint cycles are applied from left to right
++    assert Permutation([[1], [1, 2]]) == Permutation([0, 2, 1])
++    assert Permutation([[0, 1], [0, 1]]) == Permutation([], size=2)
++    assert Permutation([[0, 1], [1, 2]]) == Permutation([2, 0, 1])
++    assert Permutation([[0, 1, 2], [2, 3]]) == \
++        Permutation([[0, 1, 2]])*Permutation([[2, 3]])
++    assert Permutation([[0, 1], [0, 1]], size=5) == Permutation(4)
+     raises(ValueError, lambda: Permutation([4, 5], size=10))  # where are 0-3?
+     # but this is ok because cycles imply that only those listed moved
+     assert Permutation(4, 5) == Permutation([0, 1, 2, 3, 5, 4])

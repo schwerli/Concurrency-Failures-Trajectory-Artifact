@@ -1,0 +1,63 @@
+diff --git a/doc/whats-new.rst b/doc/whats-new.rst
+index 0c9ff5bd..11fdf2fa 100644
+--- a/doc/whats-new.rst
++++ b/doc/whats-new.rst
+@@ -62,6 +62,8 @@ Bug fixes
+   By `Michael Niklas <https://github.com/headtr1ck>`_.
+ - Fix static typing of :py:meth:`xr.polyval` (:issue:`7312`, :pull:`7315`).
+   By `Michael Niklas <https://github.com/headtr1ck>`_.
++- :py:func:`xarray.where` with ``keep_attrs=True`` no longer overwrites or
++  drops attributes of coordinates (:issue:`7220`).
+ 
+ Documentation
+ ~~~~~~~~~~~~~
+diff --git a/xarray/core/computation.py b/xarray/core/computation.py
+index 3f7e8f74..4964e71f 100644
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -258,6 +258,13 @@ def build_output_coords_and_indexes(
+         merged_vars = dict(unpacked_coords.variables)
+         merged_indexes = dict(unpacked_coords.xindexes)
+     else:
++        if callable(combine_attrs):
++            # A callable combine_attrs applies to the operation's variable
++            # attrs, not to per-coordinate merges: passing it through would
++            # overwrite coordinate attrs (e.g. xr.where(..., keep_attrs=True)
++            # would stamp the first argument's variable attrs onto every
++            # coordinate, see GH7220). Fall back to "override" instead.
++            combine_attrs = "override"
+         merged_vars, merged_indexes = merge_coordinates_without_align(
+             coords_list, exclude_dims=exclude_dims, combine_attrs=combine_attrs
+         )
+diff --git a/xarray/tests/test_computation.py b/xarray/tests/test_computation.py
+index da1bd014..1ab94383 100644
+--- a/xarray/tests/test_computation.py
++++ b/xarray/tests/test_computation.py
+@@ -1937,6 +1937,27 @@ def test_where_attrs() -> None:
+     assert actual.attrs == {}
+ 
+ 
++def test_where_attrs_keep_coords() -> None:
++    # regression test for GH7220: keep_attrs=True must not overwrite
++    # coordinate attrs with the variable's (or dataset's global) attrs
++    da = xr.DataArray(
++        np.ones(3),
++        coords={"x": ("x", [1, 2, 3], {"units": "m"})},
++        dims="x",
++        attrs={"units": "s"},
++    )
++
++    actual = xr.where(True, da, da, keep_attrs=True)
++    assert actual.attrs == {"units": "s"}
++    assert actual.x.attrs == {"units": "m"}
++
++    ds = da.to_dataset(name="a")
++    ds.attrs = {"title": "dataset"}
++    actual = xr.where(True, ds, ds, keep_attrs=True)
++    assert actual.attrs == {"title": "dataset"}
++    assert actual.x.attrs == {"units": "m"}
++
++
+ @pytest.mark.parametrize(
+     "use_dask", [pytest.param(False, id="nodask"), pytest.param(True, id="dask")]
+ )

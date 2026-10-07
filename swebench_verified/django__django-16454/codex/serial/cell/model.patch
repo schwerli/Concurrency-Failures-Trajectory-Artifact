@@ -1,0 +1,48 @@
+diff --git a/django/core/management/base.py b/django/core/management/base.py
+index abc6f79a15..31b61ccdaa 100644
+--- a/django/core/management/base.py
++++ b/django/core/management/base.py
+@@ -6,6 +6,7 @@ import argparse
+ import os
+ import sys
+ from argparse import ArgumentParser, HelpFormatter
++from functools import partial
+ from io import TextIOBase
+ 
+ import django
+@@ -71,6 +72,16 @@ class CommandParser(ArgumentParser):
+         else:
+             raise CommandError("Error: %s" % message)
+ 
++    def add_subparsers(self, **kwargs):
++        parser_class = kwargs.get("parser_class")
++        if parser_class is None:
++            # Child parsers must inherit the command-line error mode.
++            kwargs["parser_class"] = partial(
++                type(self),
++                called_from_command_line=self.called_from_command_line,
++            )
++        return super().add_subparsers(**kwargs)
++
+ 
+ def handle_default_options(options):
+     """
+diff --git a/tests/user_commands/tests.py b/tests/user_commands/tests.py
+index e40632385c..1b5e9ca496 100644
+--- a/tests/user_commands/tests.py
++++ b/tests/user_commands/tests.py
+@@ -431,6 +431,14 @@ class CommandRunTests(AdminScriptTestCase):
+     Tests that need to run by simulating the command line, not by call_command.
+     """
+ 
++    def test_subparser_missing_args(self):
++        self.write_settings("settings.py", apps=["user_commands"])
++        out, err = self.run_manage(["subparser", "foo"])
++        self.assertNoOutput(out)
++        self.assertOutput(err, "usage:")
++        self.assertOutput(err, "the following arguments are required: bar")
++        self.assertNotInOutput(err, "Traceback")
++
+     def test_script_prefix_set_in_commands(self):
+         self.write_settings(
+             "settings.py",

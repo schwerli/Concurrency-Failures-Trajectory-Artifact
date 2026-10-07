@@ -1,0 +1,44 @@
+diff --git a/changelog/5440.bugfix.rst b/changelog/5440.bugfix.rst
+new file mode 100644
+index 00000000..1f96282f
+--- /dev/null
++++ b/changelog/5440.bugfix.rst
+@@ -0,0 +1,3 @@
++Fix ``_pytest.capture.EncodedFile.mode`` to not include ``b`` (binary), so code that
++checks the mode to decide whether to write ``bytes`` or ``str`` (e.g. ``youtube-dl``)
++does not fail with ``TypeError`` when pytest is capturing output.
+diff --git a/src/_pytest/capture.py b/src/_pytest/capture.py
+index 25eab7fd..56017113 100644
+--- a/src/_pytest/capture.py
++++ b/src/_pytest/capture.py
+@@ -447,6 +447,10 @@ class EncodedFile(object):
+         """Ensure that file.name is a string."""
+         return repr(self.buffer)
+ 
++    @property
++    def mode(self):
++        return self.buffer.mode.replace("b", "")
++
+     def __getattr__(self, name):
+         return getattr(object.__getattribute__(self, "buffer"), name)
+ 
+diff --git a/testing/test_capture.py b/testing/test_capture.py
+index 5d80eb63..392a14db 100644
+--- a/testing/test_capture.py
++++ b/testing/test_capture.py
+@@ -1461,6 +1461,15 @@ def test_pickling_and_unpickling_encoded_file():
+     pickle.loads(ef_as_str)
+ 
+ 
++def test_encoded_file_mode(tmpdir):
++    # Ensure that EncodedFile.mode does not include "b", so that code which
++    # checks for a binary mode does not write bytes to it (#5440).
++    with tmpdir.join("test_foo").open("wb") as f:
++        ef = capture.EncodedFile(f, "utf-8")
++        assert "b" not in ef.mode
++        assert ef.mode == f.mode.replace("b", "")
++
++
+ def test_global_capture_with_live_logging(testdir):
+     # Issue 3819
+     # capture should work with live cli logging

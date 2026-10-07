@@ -1,0 +1,1206 @@
+########## ./__init__.py
+"""Unit test package for mootdx."""
+########## ./cache/test_file.py
+import datetime
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import freezegun
+import pandas as pd
+
+from mootdx.cache import file_cache
+
+NUM_SAMPLES = 10
+DUMMY_TIME = datetime.datetime(2012, 1, 1, tzinfo=datetime.timezone.utc)
+
+number_of_times_called = 0
+
+
+def sample_function() -> pd.DataFrame:
+    data = {
+        'int': list(range(NUM_SAMPLES)),
+        'str': [str(i) for i in range(NUM_SAMPLES)],
+        'num': [float(i) for i in range(NUM_SAMPLES)],
+    }
+
+    return pd.DataFrame.from_dict(data)
+
+
+class TestCacheFile(unittest.TestCase):
+    def setUp(self) -> None:
+        self.filepath = 'sample.pkl'
+        Path(self.filepath).unlink(missing_ok=True)
+
+    @mock.patch('pandas.DataFrame.to_pickle')
+    def test_caches_if_not_exists(self, mock_file: mock.MagicMock) -> None:
+        wrapped_func = file_cache(self.filepath)(sample_function)
+
+        actual_df = wrapped_func()
+        expected_df = sample_function()
+
+        pd.testing.assert_frame_equal(actual_df, expected_df)
+        mock_file.assert_called_once_with(self.filepath)
+
+    @freezegun.freeze_time(DUMMY_TIME)
+    @mock.patch('os.path.getmtime', return_value=DUMMY_TIME.timestamp())
+    @mock.patch('pandas.DataFrame.to_pickle')
+    def test_does_not_cache_if_not_expired(self, mock_file: mock.MagicMock, mock_getmtime: mock.MagicMock) -> None:
+        refresh_time = 100
+
+        expected_df = sample_function()
+        with mock.patch('pandas.read_pickle', return_value=expected_df):
+            wrapped_func = file_cache(self.filepath, refresh_time=refresh_time)(sample_function)
+
+            actual_df = wrapped_func()
+
+        pd.testing.assert_frame_equal(actual_df, expected_df)
+        mock_file.assert_not_called()
+
+    @freezegun.freeze_time(DUMMY_TIME, as_kwarg='frozen_time')
+    @mock.patch('os.path.getmtime', return_value=DUMMY_TIME.timestamp())
+    @mock.patch('pandas.DataFrame.to_pickle')
+    def test_caches_if_expired(self, mock_file: mock.MagicMock, mock_getmtime: mock.MagicMock,
+                               frozen_time=None) -> None:
+        refresh_time = 100
+        expiration_time = DUMMY_TIME + datetime.timedelta(seconds=refresh_time)
+
+        expected_df = sample_function()
+
+        frozen_time.move_to(expiration_time + datetime.timedelta(seconds=10))
+        with mock.patch('pandas.read_pickle', return_value=expected_df):
+            wrapped_func = file_cache(self.filepath, refresh_time=refresh_time)(sample_function)
+            actual_df = wrapped_func()
+
+        pd.testing.assert_frame_equal(actual_df, expected_df)
+        mock_file.assert_called_once_with(self.filepath)
+########## ./conftest.py
+import pandas
+import pytest
+
+from mootdx.quotes import Quotes
+
+
+def is_empty(obj):
+    if isinstance(obj, pandas.DataFrame):
+        return obj.empty
+
+    return not obj
+
+
+@pytest.fixture()
+def quotes():
+    return Quotes.factory('std')
+
+# @pytest.fixture()
+# def reader():
+#     return Reader.factory("std")
+########## ./financial/__init__.py
+########## ./financial/test_affairs.py
+import glob
+import pytest
+import unittest
+from pathlib import Path
+
+from mootdx.affair import Affair
+from mootdx.logger import logger
+
+
+@pytest.mark.skip(reason='暂时不做重复测试')
+class TestAffair(unittest.TestCase):
+    files = []
+
+    downdir = 'tests/fixtures/tmp'
+
+    def setup_class(self) -> None:
+        logger.debug('setup_class: 获取文件列表')
+        self.files = [x['filename'] for x in Affair.files() if x['filesize'] > 165]
+        Path(self.downdir).is_file() or Path(self.downdir).mkdir()
+
+    def teardown_class(self):
+        logger.debug('teardown_class: 删除测试数据')
+        [Path(x).unlink() for x in glob.glob(f'{self.downdir}/*.*')]
+        Path(self.downdir).rmdir()
+
+    def test_parse_err(self):
+        data = Affair.parse(downdir=self.downdir)
+        self.assertIsNone(data, data)
+
+    def test_parse_one(self):
+        Affair.parse(filename='gpcw20220331.zip', downdir='output')
+        data = Affair.parse(downdir=self.downdir, filename=self.files[1])
+        self.assertIsNotNone(data, data)
+
+    def test_parse_export(self):
+        csv_file = Path(self.downdir, self.files[1] + '.csv')
+        Affair.parse(downdir=self.downdir, filename=self.files[1]).to_csv(csv_file)
+        self.assertTrue(csv_file.exists())
+
+    def test_fetch_one(self):
+        Affair.fetch(downdir=self.downdir, filename=self.files[-1])
+        self.assertTrue(Path(self.downdir, self.files[-1]).exists())
+
+
+if __name__ == '__main__':
+    unittest.main()
+########## ./quotes/__init__.py
+########## ./quotes/test_quotes_base.py
+import unittest
+
+import pytest
+
+from mootdx.quotes import Quotes
+
+
+@pytest.mark.skip(reason='暂时不做重复测试')
+class TestStdQuotes(unittest.TestCase):
+    client = None
+    server = ('39.100.68.59', 7709)
+
+    def test_server(self):
+        client = Quotes.factory(market='std', server=self.server, verbose=2, timeout=10)  # 标准市场
+        assert client.server == self.server
+
+    def test_not_server(self):
+        client = Quotes.factory(market='std', server=None, verbose=2, timeout=10)  # 标准市场
+        assert client.server != self.server
+
+    def test_empty_server(self):
+        client = Quotes.factory(market='std', verbose=2, timeout=10)  # 标准市场
+        assert client.server != self.server
+
+    def test_set_server(self):
+        client = Quotes.factory(market='std', server=self.server, verbose=2, timeout=10)  # 标准市场
+        assert client.server == self.server, self.server
+
+        server = ('112.74.214.43', 7727)
+        client = Quotes.factory(market='ext', server=server, verbose=2, timeout=10)  # 标准市场
+        assert client.server == server, server
+########## ./quotes/test_quotes_ext.py
+import unittest
+
+import pytest
+
+from mootdx.consts import KLINE_DAILY
+from mootdx.quotes import Quotes
+
+
+@pytest.mark.skip(reason='暂时不做测试')
+class TestExtQuotes(unittest.TestCase):
+    client = None
+
+    def setup_class(self):
+        self.client = Quotes.factory(market='ext')
+
+    def teardown_class(self):
+        self.client = None
+
+    def test_markets(self):
+        data = self.client.markets()
+        self.assertEqual(data.empty, False)
+
+    def test_instrument(self):
+        data = self.client.instrument(0, 100)
+        self.assertEqual(data.empty, False)
+
+    def test_instruments(self):
+        data = self.client.instruments()
+        self.assertEqual(data.empty, False)
+
+    def test_quote(self):
+        data = self.client.quote(market=42, symbol='IMCI')
+        self.assertEqual(data.empty, False)
+
+        data = self.client.quote(symbol='42#IMCI')
+        self.assertEqual(data.empty, False)
+
+    def test_minute(self):
+        data = self.client.minute(market=42, symbol='IMCI')
+        self.assertEqual(data.empty, False)
+        data = self.client.minute(symbol='42#IMCI')
+        self.assertEqual(data.empty, False)
+
+    def test_minutes(self):
+        data = self.client.minutes(market=47, symbol='IF1709')
+        self.assertEqual(data.empty, False)
+
+        data = self.client.minutes(market=47, symbol='IF9')
+        self.assertIsNone(data)
+
+    def test_bars(self):
+        data = self.client.bars(market=31, frequency=KLINE_DAILY, symbol='00020')
+        self.assertEqual(data.empty, False)
+
+    def test_transaction(self):
+        data = self.client.transaction(market=47, symbol='IFL0')
+        self.assertEqual(data.empty, False)
+
+        data = self.client.transaction(market=31, symbol='00020')
+        self.assertIsNone(data)
+
+    def test_transactions(self):
+        data = self.client.transactions(market=47, symbol='IFL0', date='20170810', start=1800)
+        self.assertEqual(data.empty, False)
+########## ./quotes/test_quotes_std.py
+import unittest
+from datetime import datetime
+
+import pytest
+
+from mootdx.consts import MARKET_SH
+from mootdx.exceptions import MootdxValidationException
+from mootdx.logger import logger
+from mootdx.quotes import Quotes
+
+
+class TestStdQuotes(unittest.TestCase):
+    client = None
+
+    # 初始化工作
+    def setup_class(self):
+        self.client = Quotes.factory(market='std', timeout=10, verbose=2)  # 标准市场
+        logger.debug('初始化工作')
+
+    # 退出清理工作
+    def teardown_class(self):
+        self.client.client.close()
+        del self.client
+        logger.debug('退出清理工作')
+
+    def test_quotes(self):
+        data = self.client.quotes(symbol='600036')
+        self.assertEqual(data.empty, False)
+
+        data = self.client.quotes(symbol='688597')
+        self.assertEqual(data.empty, False)
+
+        data = self.client.quotes(symbol=['600036', '600016'])
+        self.assertEqual(data.empty, False)
+
+    def test_bars(self):
+        data = self.client.bars(symbol='600036', frequency=9, offset=10)
+        self.assertEqual(data.empty, False)
+
+    def test_index(self):
+        data = self.client.index(frequency=9, market=MARKET_SH, symbol='000001', start=1, offset=2)
+        self.assertEqual(data.empty, False)
+
+    def test_minute(self):
+        today = datetime.now().strftime('%Y%m%d')
+        data0 = self.client.minute(symbol='000001')
+        data1 = self.client.minutes(symbol='000001', date=today)
+        print(today)
+        print(data0)
+        print(data1)
+
+        self.assertTrue(data1.equals(data0))
+
+    def test_minutes(self):
+        data = self.client.minutes(symbol='000001', date='20171010')
+        self.assertEqual(data.empty, False)
+
+    @pytest.mark.skip(reason="待修复")
+    def test_transaction(self):
+        data = self.client.transaction(symbol='600036', start=0, offset=10)
+        self.assertEqual(data.empty, False)
+
+    def test_transactions(self):
+        data = self.client.transactions(symbol='600036', start=0, offset=10, date='20170209')
+        self.assertEqual(data.empty, False)
+
+    def test_F10C(self):
+        data = self.client.F10C(symbol='000001')
+        self.assertTrue(data)
+
+    def test_F10(self):
+        data = self.client.F10(symbol='000001', name='公司概况')
+        self.assertTrue(data)
+
+    def test_xdxr(self):
+        data = self.client.xdxr(symbol='600036')
+        self.assertEqual(data.all().empty, False)
+
+    def test_k(self):
+        data = self.client.k(symbol='000001', begin='2019-07-03', end='2019-07-10')
+        self.assertEqual(data.empty, False)
+
+    def test_get_k_data(self):
+        data = self.client.get_k_data(code='600036', start_date='2007-07-03', end_date='2019-07-10')
+        self.assertEqual(data.empty, False)
+
+    def test_block(self):
+        data = self.client.block()
+        self.assertEqual(data.empty, False)
+
+    def test_finance(self):
+        data = self.client.finance(symbol='000001')
+        self.assertEqual(data.empty, False)
+
+    def test_retry_last_value(self):
+        data = self.client.minutes('159995', '20200130')
+        logger.debug(f'result => {data}')
+        self.assertEqual(data.empty, True)
+
+    @pytest.mark.skip
+    def test_bj_quotes(self):
+        # todo 无法使用 minutes, F10, F10C, transactions
+        # data = self.client.minute(symbol='430090')
+        # self.assertEqual(data.empty, False)
+
+        data = self.client.bars(symbol='430090')
+        self.assertEqual(data.empty, False)
+
+        data = self.client.transaction(symbol='430090')
+        self.assertEqual(data.empty, False)
+
+
+class TestStdRaises(unittest.TestCase):
+    client = None
+
+    # 初始化工作
+    def setup_class(self):
+        self.client = Quotes.factory(market='std', timeout=10, verbose=2)  # 标准市场
+
+    def test_stock_count_raises(self):
+        with pytest.raises(MootdxValidationException) as e:
+            self.client.stock_count(3)
+
+        exec_msg = e.value.args[0]
+        assert exec_msg == '市场代码错误'
+
+    def test_stocks_raises(self):
+        with pytest.raises(MootdxValidationException) as e:
+            self.client.stocks(2)
+
+        exec_msg = e.value.args[0]
+        assert exec_msg == '市场代码错误, 目前只支持沪深市场'
+########## ./reader/__init__.py
+########## ./reader/test_reader_base.py
+import unittest
+
+from mootdx.reader import ReaderBase
+
+
+# @pytest.mark.skip
+class TestReaderBase(unittest.TestCase):
+    def test_find_path(self):
+        reader = ReaderBase('tests/fixtures')
+        result = reader.find_path(symbol='sh000001', subdir='minline', suffix=['lc1', '1'], debug=True)
+        assert ('sh', 'sh000001', ['lc1', '1']) == result, result
+
+    def test_find_path2(self):
+        reader = ReaderBase('tests/fixtures')
+        result = reader.find_path(symbol='000001', subdir='minline', suffix=['lc1', '1'], debug=True)
+        assert ('sz', 'sz000001', ['lc1', '1']) == result, result
+
+    def test_find_path3(self):
+        reader = ReaderBase('tests/fixtures')
+        result = reader.find_path(symbol='34#000001', subdir='minline', suffix=['lc1', '1'], debug=True)
+        assert ('ds', '34#000001', ['lc1', '1']) == result, result
+
+    def test_find_path4(self):
+        reader = ReaderBase('tests/fixtures')
+        result = reader.find_path(symbol='sh000001', subdir='minline', suffix=['lc1', '1'], debug=True)
+        assert ('sh', 'sh000001', ['lc1', '1']) == result, result
+
+    def test_find_path5(self):
+        reader = ReaderBase('tests/fixtures')
+        result = reader.find_path(symbol='SH000001', subdir='minline', suffix=['lc1', '1'], debug=True)
+        assert ('sh', 'sh000001', ['lc1', '1']) == result, result
+
+    def test_find_path6(self):
+        reader = ReaderBase('tests/fixtures')
+        result = reader.find_path(symbol='sz000001', subdir='minline', suffix=['lc1', '1'], debug=True)
+        assert ('sz', 'sz000001', ['lc1', '1']) == result, result
+
+
+if __name__ == '__main__':
+    unittest.main()
+########## ./reader/test_reader_block.py
+import pytest
+
+from mootdx.reader import Reader
+
+tdxdir = 'tests/fixtures'
+
+
+@pytest.fixture(scope='function')
+def reader():
+    return Reader.factory(market='std', tdxdir=tdxdir)
+
+
+@pytest.fixture(scope='function')
+def parse():
+    from mootdx.parse import BaseParse
+
+    return BaseParse(tdxdir=tdxdir)
+
+
+@pytest.mark.parametrize('symbol,expected', [
+    # ("block.dat", "T0002/hq_cache/block.dat"),
+    ('block_gn.dat', 'T0002/hq_cache/block_gn.dat'),
+    ('block_fg.dat', 'T0002/hq_cache/block_fg.dat'),
+    ('block_zs.dat', 'T0002/hq_cache/block_zs.dat'),
+])
+def test_block(reader, symbol, expected):
+    result = reader.block(symbol=symbol, debug=False)
+    assert not result.empty, f'result => {result}'
+
+
+@pytest.mark.parametrize('symbol,expected', [('incon.dat', 'incon.dat')])
+def test_incon(reader, parse, symbol, expected):
+    result = reader.block(symbol=symbol, debug=False)
+    assert result, f'result => {result}'
+
+
+@pytest.mark.parametrize('symbol,expected', [
+    ('hkblock.dat', 'T0002/hq_cache/hkblock.dat'),
+    ('tdxhy.cfg', 'T0002/hq_cache/tdxhy.cfg'),
+    ('tdxzs.cfg', 'T0002/hq_cache/tdxzs.cfg'),
+])
+def test_cfg(parse, symbol, expected):
+    result = parse.cfg(expected)
+    assert not result.empty
+########## ./reader/test_reader_blocknew.py
+import glob
+from pathlib import Path
+
+import pytest
+
+from mootdx.reader import Reader
+
+tdxdir = 'tests/fixtures'
+
+
+def setup_module():
+    blocknew = Path(tdxdir, 'T0002', 'blocknew')
+    blocknew.exists() or blocknew.mkdir(parents=True, exist_ok=True)
+
+
+def teardown_module():
+    parent = Path(tdxdir, 'T0002', 'blocknew', 'blocknew.cfg').parent
+    [Path(x).unlink() for x in glob.glob(f'{parent}/*.*')] and Path(parent).rmdir()
+
+
+@pytest.fixture(scope='function')
+def reader():
+    return Reader.factory(market='std', tdxdir=tdxdir)
+
+
+def test_blocknew_01(reader):
+    result = reader.block_new(name='最优盈利板块', symbol=['600001', '600002', '600003', '600004'])
+    assert result
+    # print(result)
+
+
+def test_blocknew_02(reader):
+    result = reader.block_new(name='最优盈利板块')
+    assert result
+
+    result = reader.block_new()
+    assert not result.empty, result
+########## ./reader/test_reader_ext.py
+import unittest
+
+from mootdx.reader import Reader
+from tests.conftest import is_empty
+
+
+class TestExReader(unittest.TestCase):
+    reader = None
+
+    # 初始化工作
+    def setUp(self):
+        self.reader = Reader.factory(market='ext', tdxdir='tests/fixtures')
+
+    # 退出清理工作
+    def tearDown(self):
+        pass
+
+    # 具体的测试用例，一定要以test开头
+    def test_daily(self):
+        data = self.reader.daily(symbol='4#CF7D0LAO')
+        assert is_empty(data) is False
+
+        data = self.reader.daily(symbol='4#xxx')
+        assert is_empty(data) is True
+
+    def test_minute(self):
+        data = self.reader.minute(symbol='4#CF7D0LAO')
+        assert is_empty(data) is True
+########## ./reader/test_reader_parse.py
+import pytest
+
+from mootdx.reader import StdReader
+from tests.conftest import is_empty
+
+tdxdir = 'tests/fixtures'
+
+
+@pytest.fixture(scope='function')
+def reader():
+    return StdReader(tdxdir)
+
+
+# @pytest.mark.skip
+@pytest.mark.parametrize('symbol,expected', [
+    ('incon.dat', 'T0002/incon.dat'),
+    # ("block.dat", "T0002/hq_cache/block.dat"),
+    ('block_gn.dat', 'T0002/hq_cache/block_gn.dat'),
+    ('block_fg.dat', 'T0002/hq_cache/block_fg.dat'),
+    ('block_zs.dat', 'T0002/hq_cache/block_zs.dat'),
+    ('hkblock.dat', 'T0002/hq_cache/hkblock.dat'),
+    ('tdxhy.cfg', 'T0002/hq_cache/tdxhy.cfg'),
+    ('tdxzs.cfg', 'T0002/hq_cache/tdxzs.cfg'),
+])
+def test_block(reader, symbol, expected):
+    result = reader.block(symbol=symbol, debug=False)
+    assert not is_empty(result), f'result => {symbol}'
+########## ./reader/test_reader_std.py
+import pytest
+
+from mootdx.reader import Reader
+from tests.conftest import is_empty
+
+
+@pytest.fixture()
+def reader():
+    return Reader.factory(market='std', tdxdir='tests/fixtures')
+
+
+@pytest.mark.parametrize(
+    'symbol,adjust,empty', [
+        ('127021', '', False),
+        ('000000', '', True),
+        ('sh881478', '', False),
+        ('881478', '', False),
+        ('688001', 'qfq', False),
+        ('000001', 'qfq', False),
+        ('127021', 'qfq', False),
+    ])
+def test_daily(reader, symbol, adjust, empty):
+    result = reader.daily(symbol=symbol, adjust=adjust)
+    assert is_empty(result) is empty
+
+
+@pytest.mark.parametrize(
+    'symbol,adjust,empty', [
+        ('688001', 'qfq', False),
+        ('000001', 'qfq', False),
+        ('127021', 'qfq', False),
+    ])
+def test_daily_qfq(reader, symbol, adjust, empty):
+    result = reader.daily(symbol=symbol, adjust=adjust)
+    assert is_empty(result) is empty
+
+
+@pytest.mark.parametrize(
+    'symbol,adjust,empty', [
+        ('688001', '02', False),
+        ('000001', 'hfq', False),
+        ('127021', 'hfq', False),
+    ])
+def test_daily_hfq(reader, symbol, adjust, empty):
+    result = reader.daily(symbol=symbol, adjust=adjust)
+    assert is_empty(result) is empty
+
+
+@pytest.mark.parametrize('symbol', ['688001', '688001.5', '688001.loc1'])
+def test_minute(reader, symbol):
+    for suffix in ('1', '5'):
+        result = reader.minute(symbol=symbol, suffix=suffix)
+        assert not result.empty
+########## ./test_adjust.py
+import datetime
+import os
+import time
+import unittest
+from datetime import timedelta
+from pathlib import Path
+
+import pytest
+
+from mootdx import get_config_path
+from mootdx.contrib.adjust import get_adjust_year
+from mootdx.utils.adjust import get_xdxr
+
+
+@pytest.mark.skip(reason='暂时不做重复测试')
+class TestAdjust(unittest.TestCase):
+    def test_adjust_before0(self):
+        data = get_adjust_year(symbol='600000', year='2018', factor='before')
+        self.assertFalse(data.empty)
+
+    def test_adjust_before1(self):
+        data = get_adjust_year(symbol='600000', year='2018', factor='01')
+        self.assertFalse(data.empty)
+
+    def test_adjust_before2(self):
+        data = get_adjust_year(symbol='600000', year='2018', factor='aa')
+        self.assertTrue(data.empty)
+
+    def test_adjust_after0(self):
+        data = get_adjust_year(symbol='600000', year='2018', factor='after')
+        self.assertFalse(data.empty)
+
+    def test_adjust_after1(self):
+        data = get_adjust_year(symbol='600000', year='2018', factor='02')
+        self.assertFalse(data.empty)
+
+
+class TestAdjustUtil(unittest.TestCase):
+    symbol = '600036'
+
+    def setUp(self) -> None:
+        xdxr_file = Path(get_config_path(f'xdxr/{self.symbol}.plk'))
+        xdxr_file.parent.mkdir(exist_ok=True)
+        xdxr_file.unlink(missing_ok=True)
+
+    def tearDown(self) -> None:
+        xdxr_file = Path(get_config_path(f'xdxr/{self.symbol}.plk'))
+        xdxr_file.unlink(missing_ok=True)
+
+    def test_get_xdxr(self):
+        xdxr_file = Path(get_config_path(f'xdxr/{self.symbol}.plk'))
+        self.assertFalse(xdxr_file.exists())
+        get_xdxr(self.symbol)
+        xdxr_time = xdxr_file.stat().st_mtime
+
+        get_xdxr(self.symbol)
+        self.assertTrue(xdxr_file.exists())
+        self.assertEqual(xdxr_file.stat().st_mtime, xdxr_time)
+
+    def test_get_xdxr_expired(self):
+        expire_time = time.mktime((datetime.date.today() + timedelta(days=-1)).timetuple())
+        xdxr_file = Path(get_config_path(f'xdxr/{self.symbol}.plk'))
+
+        get_xdxr(self.symbol)
+
+        os.utime(xdxr_file, (expire_time, expire_time))
+        xdxr_time = xdxr_file.stat().st_mtime
+
+        get_xdxr(self.symbol)
+
+        self.assertTrue(xdxr_file.exists())
+        self.assertNotEqual(xdxr_file.stat().st_mtime, xdxr_time)
+########## ./test_adjust2.py
+import unittest
+
+from mootdx.quotes import Quotes
+
+
+class TestAdjust2(unittest.TestCase):
+    client = None
+
+    # 初始化工作
+    def setup_class(self):
+        self.client = Quotes.factory(market='std', timeout=10)  # 标准市场
+
+    # 退出清理工作
+    def teardown_class(self):
+        self.client.client.close()
+        del self.client
+
+    def test_to_qfq(self):
+        result = self.client.bars(symbol='600036', adjust='qfq')
+        self.assertFalse(result.empty)
+
+    def test_to_hfq(self):
+        result = self.client.bars(symbol='600036', adjust='hfq')
+        self.assertFalse(result.empty)
+########## ./test_affairs.py
+import glob
+import unittest
+from pathlib import Path
+
+import pytest
+
+from mootdx.affair import Affair
+from mootdx.logger import logger
+
+
+@pytest.mark.skip(reason='暂时不做重复测试')
+class TestAffair(unittest.TestCase):
+    files = []
+
+    downdir = 'tests/fixtures/tmp'
+
+    def setup_class(self) -> None:
+        logger.info('获取文件列表')
+        self.files = [x['filename'] for x in Affair.files()]
+        # Path(self.downdir).is_file() or Path(self.downdir).mkdir()
+
+    def teardown_class(self):
+        [Path(x).unlink() for x in glob.glob(f'{self.downdir}/*.*')]
+        Path(self.downdir).rmdir()
+
+    def test_parse_err(self):
+        data = Affair.parse(downdir=self.downdir)
+        self.assertIsNone(data, data)
+
+    def test_parse_one(self):
+        data = Affair.parse(downdir=self.downdir, filename=self.files[1])
+        self.assertIsNotNone(data, data)
+
+    def test_parse_export(self):
+        csv_file = Path(self.downdir, self.files[1] + '.csv')
+        Affair.parse(downdir=self.downdir, filename=self.files[1]).to_csv(csv_file)
+        self.assertTrue(csv_file.exists())
+
+    def test_fetch_one(self):
+        Affair.fetch(downdir=self.downdir, filename=self.files[-1])
+        self.assertTrue(Path(self.downdir, self.files[-1]).exists())
+
+
+if __name__ == '__main__':
+    unittest.main()
+########## ./test_bestip.py
+import logging
+import unittest
+
+from mootdx.logger import logger
+from mootdx.quotes import Quotes
+
+
+@unittest.skip(reason='暂时不做重复测试')
+class TestBestIP(unittest.TestCase):
+    def setup(self):
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.DEBUG)
+
+        logger.addHandler(ch)
+        logger.setLevel(logging.DEBUG)
+
+    def test_normal(self):
+        Quotes.factory(market='std', bestip=True)
+########## ./test_factor.py
+import pytest
+
+from mootdx.logger import logger
+from mootdx.quotes import Quotes
+from mootdx.reader import Reader
+
+
+@pytest.mark.skip(reason='暂时不做重复测试')
+class TestFactor:
+
+    # 初始化工作
+    def setup_class(self):
+        self.client = Quotes.factory(market='std', timeout=10)  # 标准市场
+        self.reader = Reader.factory(market='std', tdxdir='tests/fixtures')
+        logger.debug('初始化工作')
+
+    def test_qfq_factor(self):
+        result = self.client.bars(symbol='600036', adjust='qfq')
+        assert len(result), result
+
+    def test_hfq_factor(self):
+        result = self.client.bars(symbol='600036', adjust='hfq')
+        assert len(result), result
+
+    def test_reader_qfq(self):
+        result = self.reader.daily(symbol='688001', adjust='qfq')
+        assert not result.empty, '股票代码不存在'
+        logger.debug(result.tail())
+
+    def test_reader_hfq(self):
+        result = self.reader.daily(symbol='688001', adjust='hfq')
+        assert not result.empty, '股票代码不存在'
+        logger.debug(result.tail())
+########## ./test_frequency.py
+import pytest
+
+from mootdx.quotes import Quotes
+from mootdx.utils import FREQUENCY
+
+
+@pytest.fixture(scope='function')
+def client():
+    return Quotes.factory(market='std')
+
+
+@pytest.mark.skip(reason='暂时不做重复测试')
+@pytest.mark.parametrize('i,v', [(i, v) for i, v in enumerate(FREQUENCY)])
+def test_to_data_empty(client, i, v):
+    assert all(client.bars(symbol='600036', frequency=i) == client.bars(symbol='600036', frequency=v))
+########## ./test_reconnect.py
+import pytest
+
+
+@pytest.mark.skip(reason='暂时不做重复测试')
+def test_quotes(quotes):
+    quotes.close()
+    assert quotes.xdxr(symbol='600036').empty is False
+########## ./test_useless.py
+import os
+
+import pytest
+
+
+@pytest.fixture(scope='function')
+def remove_dep_cli():
+    os.system('pip uninstall -y click prettytable')
+    yield
+    os.system('pip install click prettytable')
+
+
+@pytest.fixture(scope='function')
+def remove_dep_holiday():
+    os.system('pip uninstall -y py_mini_racer')
+    yield
+    os.system('pip install py_mini_racer')
+
+
+@pytest.mark.skip(reason='暂时不做重复测试')
+def test_dep_command(recwarn, remove_dep_cli):
+    with pytest.raises(SystemExit) as e:
+        from mootdx.__main__ import entry
+        entry()
+
+    assert e.value.args[0] == -1, e.value.args[0]
+    assert len(recwarn) >= 1
+
+    w = recwarn.pop()
+    assert w.category == DeprecationWarning
+
+
+@pytest.mark.skip(reason='暂时不做重复测试')
+def test_dep_holiday(recwarn, remove_dep_holiday):
+    from mootdx.utils.holiday import holiday2
+    holiday2('2022-01-23')
+
+    assert len(recwarn) >= 1
+
+    w = recwarn.pop()
+    assert w.category == DeprecationWarning
+########## ./test_xdxr.py
+import unittest
+from pathlib import Path
+
+from mootdx import get_config_path
+from mootdx.utils.adjust import get_xdxr
+
+
+class XDXRTestCase(unittest.TestCase):
+    symbol = '600000'
+
+    def test_no_cache(self):
+        Path(get_config_path(f'xdxr/{self.symbol}.plk')).unlink()
+        xdxr = get_xdxr(symbol=self.symbol)
+
+        assert xdxr.empty is False
+        assert 'code' in xdxr.columns, xdxr.columns
+
+    def test_cached(self):
+        xdxr = get_xdxr(symbol=self.symbol)
+        xdxr = get_xdxr(symbol=self.symbol)
+
+        assert xdxr.empty is False
+        assert 'code' in xdxr.columns, xdxr.columns
+########## ./tools/__init__.py
+########## ./tools/test_customize.py
+# @Author  : BoPo
+# @Time    : 2022/5/7 13:23
+# @Function:
+import glob
+from pathlib import Path
+
+import pytest
+
+from mootdx.logger import logger
+from mootdx.tools.customize import Customize
+
+tdxdir = 'tests/fixtures'
+
+
+def setup_module():
+    logger.debug('setup_module')
+    blocknew = Path(tdxdir, 'T0002', 'blocknew')
+    blocknew.exists() or blocknew.mkdir(parents=True)
+
+
+def teardown_module():
+    logger.debug('teardown_module')
+    parent = Path(tdxdir, 'T0002', 'blocknew', 'blocknew.cfg').parent
+    [Path(x).unlink() for x in glob.glob(f'{parent}/*.*')] and Path(parent).rmdir()
+
+
+@pytest.fixture(scope='function')
+def custom():
+    logger.debug('custom')
+    return Customize(tdxdir=tdxdir)
+
+
+def test_block_create(custom):
+    # 成功模式
+    assert custom.create(name='龙虎榜', symbol=['600036', '600016'], blk_file='blk_file')
+    assert custom.create(name='优质股', symbol=['600036', '600016'])
+    assert custom.create(name=None, symbol=['600036', '600016'])
+    assert custom.create(name='优质股1', symbol=['600036', '600016'])
+
+    # 异常测试
+    with pytest.raises(Exception):
+        assert custom.create(name='优质股', symbol=['600036', '600016'])
+
+    with pytest.raises(Exception):
+        assert not custom.create(name='优质股2', symbol=[])
+
+    with pytest.raises(Exception):
+        assert not custom.create(name='优质股3', symbol=None)
+
+    with pytest.raises(Exception):
+        assert not custom.create(name='', symbol=None)
+
+    with pytest.raises(Exception):
+        assert not custom.create(name=None, symbol=None)
+
+
+def test_block_update(custom):
+    assert custom.update(name='龙虎榜', symbol=['600036'])
+
+
+def test_block_search(custom):
+    assert custom.search(group=True).empty is False
+    assert custom.search().empty is False
+
+    assert custom.search(name='龙虎榜')
+    assert custom.search(name='龙虎榜', group=True)
+
+
+def test_block_remove(custom):
+    assert custom.remove(name='优质股')
+    assert custom.search(name='优质股') is None
+########## ./tools/test_reversion.py
+import unittest
+
+from mootdx.quotes import Quotes
+from mootdx.tools.reversion import reversion
+from mootdx.utils.adjust import get_xdxr
+
+
+class TestReversion(unittest.TestCase):
+    client = None
+    symbol = '600000'
+
+    # 初始化工作
+    def setup_class(self):
+        self.client = Quotes.factory(market='std', timeout=10)  # 标准市场
+
+    # 退出清理工作
+    def teardown_class(self):
+        self.client.client.close()
+        del self.client
+
+    def test_get_xdxr(self):
+        # data = self.client.bars(symbol=self.symbol)
+        xdxr = get_xdxr(symbol=self.symbol)
+
+        assert xdxr.empty is False
+        assert 'code' in xdxr.columns
+
+    def test_reversion(self):
+        data = self.client.bars(symbol=self.symbol)
+        xdxr = get_xdxr(symbol=self.symbol)
+
+        reversion(self.symbol, data, xdxr, 'qfq')
+        # self.assertFalse(result.empty)
+
+    def test_to_qfq(self):
+        data = self.client.bars(symbol=self.symbol, offset=800)
+        xdxr = get_xdxr(symbol=self.symbol)
+
+        data0 = reversion(self.symbol, data, xdxr, 'qfq')
+        assert data0.empty is False
+
+        data1 = self.client.bars(symbol=self.symbol, offset=800, adjust='Qfq')
+        assert data1.empty is False
+        assert data1.equals(data0)
+
+    def test_to_hfq(self):
+        data = self.client.bars(symbol=self.symbol, offset=800)
+        xdxr = get_xdxr(symbol=self.symbol)
+
+        data0 = reversion(self.symbol, data, xdxr, 'hfq')
+        assert data.empty is False
+
+        data1 = self.client.bars(symbol=self.symbol, offset=800, adjust='HFQ')
+        assert data1.empty is False
+        assert data1.equals(data0)
+########## ./tools/test_tdx2csv.py
+from mootdx.tools.tdx2csv import txt2csv
+
+
+# @pytest.mark.asyncio
+# async def test_covert():
+#     await covert(src="tests/fixtures/export/SH#601005.txt", dst="tests/fixtures/export/SH#601005.csv")
+
+
+def test_success():
+    result = txt2csv(infile='tests/fixtures/export/SH#601003.txt')
+    assert not result.empty
+
+
+def test_exception():
+    assert txt2csv(infile='setup.cfg').empty
+    assert txt2csv(infile='/tmp/1.txt').empty
+########## ./utils/__init__.py
+########## ./utils/test_holiday.py
+from pathlib import Path
+from unittest import TestCase
+
+import pytest
+
+from mootdx import get_config_path
+
+try:
+    import py_mini_racer
+
+    not_mini_racer = False
+except ImportError:
+    not_mini_racer = True
+
+not_mini_racer = True
+
+
+@pytest.mark.skipif(not_mini_racer, reason='py_mini_racer not installed')
+class TestHoliday(TestCase):
+    # 初始化工作
+    # def setUp(self) -> None:
+    #     Path(get_config_path('holiday.plk')).unlink(missing_ok=True)
+
+    def test_holiday_exists(self):
+        from mootdx.utils.holiday import holiday
+        result = holiday('2022-01-23')
+        assert result, result
+
+    def test_holiday_country(self):
+        from mootdx.utils.holiday import holiday
+        assert holiday('2022-01-23', '%Y-%m-%d', '法国')
+        assert not holiday('20220126')
+        assert not holiday('2022-01-26', '%Y-%m-%d', country='巴西')
+
+    def test_holiday_not(self):
+        from mootdx.utils.holiday import holiday
+        result = holiday('2022-01-26')
+        assert result is False, result
+
+    def test_holiday_fmt(self):
+        from mootdx.utils.holiday import holiday
+        assert holiday('2022-01-23', '%Y-%m-%d')
+        assert holiday('20220123', '%Y%m%d')
+
+
+@pytest.mark.skipif(not_mini_racer, reason='py_mini_racer not installed')
+class TestHoliday2(TestCase):
+    def setUp(self) -> None:
+        Path(get_config_path('caches/holidays.plk')).write_text('')
+
+    def test_holiday_not_exists(self):
+        from mootdx.utils.holiday import holiday2
+        assert holiday2('2022-01-23').empty
+
+    def test_holiday_today(self):
+        from mootdx.utils.holiday import holiday2
+        assert not holiday2().empty
+
+    def test_holiday2not(self):
+        from mootdx.utils.holiday import holiday2
+        assert not holiday2('2022-01-26').empty
+
+
+@pytest.mark.skipif(not_mini_racer, reason='py_mini_racer not installed')
+def test_holidays():
+    from mootdx.utils.holiday import holidays
+    assert not holidays().empty
+########## ./utils/test_timer.py
+# import time
+# import unittest
+#
+# from mootdx.cache import timeit
+#
+#
+# @timeit
+# def foo():
+#     time.sleep(0.1)
+#
+#
+# foo()
+# class MyTestCase(unittest.TestCase):
+#     def test_something(self):
+#         self.assertEqual(True, False)  # add assertion here
+#
+#
+# if __name__ == '__main__':
+#     unittest.main()
+########## ./utils/test_utils.py
+import unittest
+from unittest import mock
+
+import pytest
+
+from mootdx.consts import MARKET_BJ
+from mootdx.consts import MARKET_SH
+from mootdx.consts import MARKET_SZ
+from mootdx.utils import get_config_path
+from mootdx.utils import get_stock_market
+from mootdx.utils import md5sum
+from mootdx.utils import to_data
+
+data = [
+    ('600036', MARKET_SH),
+    ('000001', MARKET_SZ),
+    ('430090', MARKET_BJ),
+    ('872925', MARKET_BJ),
+]
+
+
+@pytest.mark.parametrize('symbol,market', data)
+def test_stock_market(symbol, market):
+    assert get_stock_market(symbol) == market
+
+
+class TestMd5sum(unittest.TestCase):
+    def test_md5sum_error(self):
+        self.assertIsNone(md5sum('/ad/sd/sd'))
+
+    def test_md5sum_success(self):
+        self.assertIsNotNone(md5sum('./README.md'))
+
+
+class TestToData(unittest.TestCase):
+    def test_to_data_list(self):
+        self.assertTrue(not to_data([{'aa': 'aa'}]).empty)
+
+    def test_to_data_dict(self):
+        self.assertTrue(not to_data({'abc': 123}).empty)
+
+    def test_to_data_empty(self):
+        self.assertTrue(to_data(None).empty)
+        self.assertTrue(to_data({}).empty)
+        self.assertTrue(to_data([]).empty)
+        self.assertTrue(to_data('aaa').empty)
+        self.assertTrue(to_data(123).empty)
+
+
+class TestConfigPath(unittest.TestCase):
+    @mock.patch('platform.system')
+    def test_platform_windows(self, platform_system):
+        platform_system.return_value = 'Windows'
+        config = get_config_path(config='config.json')
+        self.assertTrue('.mootdx' in config, config)
+
+    @mock.patch('platform.system')
+    def test_platform_linux(self, platform_system):
+        platform_system.return_value = 'Linux'
+        config = get_config_path(config='config.json')
+        self.assertTrue('.mootdx' in config, config)
+
+    @mock.patch('platform.system')
+    def test_platform_Darwin(self, platform_system):
+        platform_system.return_value = 'Darwin'
+        config = get_config_path(config='config.json')
+        self.assertTrue('.mootdx' in config, config)
+
+
+if __name__ == '__main__':
+    unittest.main()

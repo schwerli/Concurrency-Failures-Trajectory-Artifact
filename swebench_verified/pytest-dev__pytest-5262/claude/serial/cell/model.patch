@@ -1,0 +1,57 @@
+diff --git a/changelog/5344.bugfix.rst b/changelog/5344.bugfix.rst
+new file mode 100644
+index 00000000..6ab060ac
+--- /dev/null
++++ b/changelog/5344.bugfix.rst
+@@ -0,0 +1 @@
++Fix ``mode`` of the captured ``sys.stdout``/``sys.stderr`` streams advertising binary mode (for example ``rb+``), even though they only accept text. Code which branches on ``"b" in stream.mode`` no longer writes ``bytes`` to them and fails with ``TypeError``.
+diff --git a/src/_pytest/capture.py b/src/_pytest/capture.py
+index 25eab7fd..56017113 100644
+--- a/src/_pytest/capture.py
++++ b/src/_pytest/capture.py
+@@ -447,6 +447,10 @@ class EncodedFile(object):
+         """Ensure that file.name is a string."""
+         return repr(self.buffer)
+ 
++    @property
++    def mode(self):
++        return self.buffer.mode.replace("b", "")
++
+     def __getattr__(self, name):
+         return getattr(object.__getattribute__(self, "buffer"), name)
+ 
+diff --git a/testing/test_capture.py b/testing/test_capture.py
+index 5d80eb63..9ff3ec8f 100644
+--- a/testing/test_capture.py
++++ b/testing/test_capture.py
+@@ -1452,6 +1452,30 @@ def test_crash_on_closing_tmpfile_py27(testdir):
+     assert "IOError" not in result.stdout.str()
+ 
+ 
++def test_encodedfile_mode_is_not_binary(tmpfile):
++    """EncodedFile only accepts text, so it must not advertise a binary mode (#5344)."""
++    ef = capture.safe_text_dupfile(tmpfile, "wb")
++    assert "b" in tmpfile.mode
++    assert "b" not in ef.mode
++
++
++def test_captured_stdout_mode_is_not_binary(testdir):
++    """Code branching on ``sys.stdout.mode`` must not be told to write bytes (#5344)."""
++    testdir.makepyfile(
++        """
++        import sys
++
++        def test_mode():
++            for stream in (sys.stdout, sys.stderr):
++                assert "b" not in stream.mode
++                stream.write("hello")
++        """
++    )
++    result = testdir.runpytest("--capture=fd")
++    result.stdout.fnmatch_lines(["*1 passed*"])
++    assert result.ret == 0
++
++
+ def test_pickling_and_unpickling_encoded_file():
+     # See https://bitbucket.org/pytest-dev/pytest/pull-request/194
+     # pickle.loads() raises infinite recursion if

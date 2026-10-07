@@ -1,0 +1,80 @@
+diff --git a/lib/matplotlib/axis.py b/lib/matplotlib/axis.py
+index c0e706e2b3..c16458f8e1 100644
+--- a/lib/matplotlib/axis.py
++++ b/lib/matplotlib/axis.py
+@@ -33,6 +33,14 @@ _gridline_param_names = ['grid_' + name
+                          for name in _line_param_names + _line_param_aliases]
+ 
+ 
++def _get_tick_label_color(tick_name, labelcolor=None):
++    if labelcolor is None:
++        labelcolor = mpl.rcParams[f"{tick_name}.labelcolor"]
++    if labelcolor == 'inherit':
++        return mpl.rcParams[f"{tick_name}.color"]
++    return labelcolor
++
++
+ class Tick(martist.Artist):
+     """
+     Abstract base class for the axis ticks, grid lines and labels.
+@@ -119,12 +127,7 @@ class Tick(martist.Artist):
+             pad = mpl.rcParams[f"{name}.{major_minor}.pad"]
+         self._base_pad = pad
+ 
+-        if labelcolor is None:
+-            labelcolor = mpl.rcParams[f"{name}.labelcolor"]
+-
+-        if labelcolor == 'inherit':
+-            # inherit from tick color
+-            labelcolor = mpl.rcParams[f"{name}.color"]
++        labelcolor = _get_tick_label_color(name, labelcolor)
+ 
+         if labelsize is None:
+             labelsize = mpl.rcParams[f"{name}.labelsize"]
+@@ -2255,7 +2258,7 @@ class XAxis(Axis):
+             transform=mtransforms.blended_transform_factory(
+                 self.axes.transAxes, mtransforms.IdentityTransform()),
+             fontsize=mpl.rcParams['xtick.labelsize'],
+-            color=mpl.rcParams['xtick.color'],
++            color=_get_tick_label_color('xtick'),
+         )
+         self.offset_text_position = 'bottom'
+ 
+@@ -2515,7 +2518,7 @@ class YAxis(Axis):
+             transform=mtransforms.blended_transform_factory(
+                 self.axes.transAxes, mtransforms.IdentityTransform()),
+             fontsize=mpl.rcParams['ytick.labelsize'],
+-            color=mpl.rcParams['ytick.color'],
++            color=_get_tick_label_color('ytick'),
+         )
+         self.offset_text_position = 'left'
+ 
+diff --git a/lib/matplotlib/tests/test_axes.py b/lib/matplotlib/tests/test_axes.py
+index 8483ed077b..a6c38c2f3d 100644
+--- a/lib/matplotlib/tests/test_axes.py
++++ b/lib/matplotlib/tests/test_axes.py
+@@ -7811,6 +7811,24 @@ def test_ytickcolor_is_not_yticklabelcolor():
+         assert tick.label1.get_color() == 'blue'
+ 
+ 
++@pytest.mark.parametrize('axis_name', ['x', 'y'])
++@mpl.style.context('default')
++def test_offsettext_labelcolor_is_tick_labelcolor(axis_name):
++    plt.rcParams[f'{axis_name}tick.color'] = 'yellow'
++    plt.rcParams[f'{axis_name}tick.labelcolor'] = 'blue'
++
++    fig, ax = plt.subplots()
++    data = [1.01e9, 1.02e9, 1.03e9]
++    if axis_name == 'x':
++        ax.plot(data, [0, 1, 2])
++    else:
++        ax.plot([0, 1, 2], data)
++
++    fig.canvas.draw()
++    axis = getattr(ax, f'{axis_name}axis')
++    assert axis.get_offset_text().get_color() == 'blue'
++
++
+ @pytest.mark.parametrize('size', [size for size in mfont_manager.font_scalings
+                                   if size is not None] + [8, 10, 12])
+ @mpl.style.context('default')

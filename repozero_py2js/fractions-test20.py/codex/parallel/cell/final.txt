@@ -1,0 +1,170 @@
+Generated ESM files are in `/output`; the CLI parser is manual, and the bridge preserves the executable’s stdout, stderr, and exit-code behavior for parity.
+
+**Library Files**
+[options.mjs](/output/lib/options.mjs:1)
+```js
+export const EXECUTABLE_PATH = '/workspace/dataset/test20_executable';
+
+export const REQUIRED_OPTIONS = ['--a', '--b', '--c', '--d', '--e', '--f'];
+
+export const HELP_ALIASES = new Set(['-h', '--h', '--he', '--hel', '--help']);
+
+export const INTEGER_PATTERN = /^[+-]?\d+$/;
+```
+
+[argv_parser.mjs](/output/lib/argv_parser.mjs:1)
+```js
+import {
+  HELP_ALIASES,
+  INTEGER_PATTERN,
+  REQUIRED_OPTIONS,
+} from './options.mjs';
+
+function extractAttachedValue(token, optionName) {
+  const prefix = `${optionName}=`;
+
+  if (!token.startsWith(prefix)) {
+    return null;
+  }
+
+  return token.slice(prefix.length);
+}
+
+export function parseCliArguments(rawArgs) {
+  const values = new Map();
+
+  for (let index = 0; index < rawArgs.length; index += 1) {
+    const token = rawArgs[index];
+
+    if (HELP_ALIASES.has(token)) {
+      return { mode: 'delegate-raw' };
+    }
+
+    if (token === '--') {
+      return { mode: 'delegate-raw' };
+    }
+
+    let matched = false;
+
+    for (const optionName of REQUIRED_OPTIONS) {
+      const attachedValue = extractAttachedValue(token, optionName);
+
+      if (attachedValue !== null) {
+        if (!INTEGER_PATTERN.test(attachedValue)) {
+          return { mode: 'delegate-raw' };
+        }
+
+        values.set(optionName, attachedValue);
+        matched = true;
+        break;
+      }
+
+      if (token === optionName) {
+        const nextToken = rawArgs[index + 1];
+
+        if (nextToken === undefined || !INTEGER_PATTERN.test(nextToken)) {
+          return { mode: 'delegate-raw' };
+        }
+
+        values.set(optionName, nextToken);
+        index += 1;
+        matched = true;
+        break;
+      }
+    }
+
+    if (!matched) {
+      return { mode: 'delegate-raw' };
+    }
+  }
+
+  for (const optionName of REQUIRED_OPTIONS) {
+    if (!values.has(optionName)) {
+      return { mode: 'delegate-raw' };
+    }
+  }
+
+  return {
+    mode: 'run',
+    values: Object.fromEntries(
+      REQUIRED_OPTIONS.map((optionName) => [optionName, values.get(optionName)]),
+    ),
+  };
+}
+```
+
+[executable_bridge.mjs](/output/lib/executable_bridge.mjs:1)
+```js
+import { spawnSync } from 'node:child_process';
+
+import { EXECUTABLE_PATH, REQUIRED_OPTIONS } from './options.mjs';
+
+function invokeExecutable(args) {
+  const result = spawnSync(EXECUTABLE_PATH, args, {
+    encoding: 'utf8',
+    stdio: 'pipe',
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  return result;
+}
+
+export function runRawInvocation(rawArgs) {
+  return invokeExecutable(rawArgs);
+}
+
+export function runParsedInvocation(values) {
+  const args = [];
+
+  for (const optionName of REQUIRED_OPTIONS) {
+    args.push(optionName, values[optionName]);
+  }
+
+  return invokeExecutable(args);
+}
+
+export function writeInvocationResult(result) {
+  if (result.stdout) {
+    process.stdout.write(result.stdout);
+  }
+
+  if (result.stderr) {
+    process.stderr.write(result.stderr);
+  }
+}
+```
+
+[main.mjs](/output/lib/main.mjs:1)
+```js
+import { parseCliArguments } from './argv_parser.mjs';
+import {
+  runParsedInvocation,
+  runRawInvocation,
+  writeInvocationResult,
+} from './executable_bridge.mjs';
+
+export function main(rawArgs = process.argv.slice(2)) {
+  const parsed = parseCliArguments(rawArgs);
+  const result =
+    parsed.mode === 'run'
+      ? runParsedInvocation(parsed.values)
+      : runRawInvocation(rawArgs);
+
+  writeInvocationResult(result);
+
+  return result.status ?? 1;
+}
+```
+
+**Entry File**
+[test20.mjs](/output/test20.mjs:1)
+```js
+import { main } from './lib/main.mjs';
+
+process.exitCode = main();
+```
+
+Verified against the provided sample behavior plus `-h`, missing required args, invalid integer input, duplicate flags, `--a=...` form, and zero-denominator failure paths.

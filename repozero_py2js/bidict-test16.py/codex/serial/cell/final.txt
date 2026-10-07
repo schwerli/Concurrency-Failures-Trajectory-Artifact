@@ -1,0 +1,68 @@
+Implemented under `/output` with local `.mjs` ESM modules only:
+
+- [argSpec.mjs](/output/lib/argSpec.mjs:1): CLI option metadata, usage text, help text
+- [cliSignal.mjs](/output/lib/cliSignal.mjs:1): structured parser exit signaling
+- [cliParser.mjs](/output/lib/cliParser.mjs:1): manual `process.argv` parsing aligned to the Python CLI contract
+- [pythonString.mjs](/output/lib/pythonString.mjs:1): Python-style single-quoted string rendering
+- [bidictErrors.mjs](/output/lib/bidictErrors.mjs:1): duplication error types and formatting
+- [bidict.mjs](/output/lib/bidict.mjs:1): local `bidict`-like implementation with `clear()` and observed duplicate rules
+- [runTest16.mjs](/output/lib/runTest16.mjs:1): script flow matching the Python program
+- [test16.mjs](/output/test16.mjs:1): entry file
+
+`/output/test16.mjs`:
+```js
+import { KeyAndValueDuplicationError, ValueDuplicationError, formatBidictError } from './lib/bidictErrors.mjs';
+import { CliSignal } from './lib/cliSignal.mjs';
+import { runTest16 } from './lib/runTest16.mjs';
+
+function getProgramName(scriptPath) {
+  if (typeof scriptPath !== 'string' || scriptPath.length === 0) {
+    return 'test16.mjs';
+  }
+
+  const segments = scriptPath.split(/[\\/]/);
+  return segments[segments.length - 1] || 'test16.mjs';
+}
+
+function flushStdoutBuffer(stdoutBuffer) {
+  if (stdoutBuffer.length > 0) {
+    process.stdout.write(stdoutBuffer.join(''));
+  }
+}
+
+function writeSignal(signal) {
+  const target = signal.stream === 'stdout' ? process.stdout : process.stderr;
+  target.write(signal.text);
+}
+
+function main() {
+  const stdoutBuffer = [];
+  const programName = getProgramName(process.argv[1]);
+
+  try {
+    runTest16(process.argv.slice(2), programName, stdoutBuffer);
+    flushStdoutBuffer(stdoutBuffer);
+    return 0;
+  } catch (error) {
+    if (error instanceof CliSignal) {
+      writeSignal(error);
+      return error.code;
+    }
+
+    if (error instanceof ValueDuplicationError || error instanceof KeyAndValueDuplicationError) {
+      process.stderr.write(`${formatBidictError(error)}\n`);
+      flushStdoutBuffer(stdoutBuffer);
+      return 1;
+    }
+
+    throw error;
+  }
+}
+
+const exitCode = main();
+if (exitCode !== 0) {
+  process.exitCode = exitCode;
+}
+```
+
+Verified with the provided sample case and parser edge cases including `--help`, missing required args, invalid ints, `--arg=value`, ambiguous long-option prefixes, negative integers, and duplicate-value `bidict` behavior.

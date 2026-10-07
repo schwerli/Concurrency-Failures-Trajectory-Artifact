@@ -1,0 +1,19 @@
+All 1537 tests pass. Here's the change:
+
+**`django/db/models/base.py:1749`** — `_check_ordering` only accepted *transforms* as a trailing path part, so any trailing *lookup* was misreported as nonexistent:
+
+```python
+                except (FieldDoesNotExist, AttributeError):
+                    if fld is None or (
+                        fld.get_transform(part) is None and fld.get_lookup(part) is None
+                    ):
+```
+
+**Why this is the right spot.** Walking `supply__product__parent__isnull`, the loop resolves the three FKs, then `Product._meta.get_field('isnull')` raises `FieldDoesNotExist`. Because the exception comes from the right side of the assignment, `fld` is never rebound — it still holds `Product.parent`. The guard then asks `fld.get_transform('isnull')`, which returns `None` not because the name is unknown but because `get_transform` filters the registry to `Transform` subclasses (`query_utils.py:193`) and `isnull` registers as `RelatedIsNull`, a `Lookup`. Consulting `get_lookup` too closes exactly that gap. A sweep of every `get_transform` call site in `django/` found this was the only place using the method as validation, so there is no sibling bug to fix.
+
+**Tests** (`tests/invalid_models_tests/test_models.py:896`) — `test_ordering_pointing_to_lookup_not_transform` and `test_ordering_pointing_to_related_model_lookup`, the latter built from the ticket's exact `Stock → Supply → Product → parent` shape. I verified both fail on the unpatched tree with the reporter's verbatim message (`...or lookup 'supply__product__parent__isnull'`) and pass with the fix. Existing E015 guards still fire — `parent__field1__field2` and `field__nonexistent_lookup` remain errors.
+
+Two things I found that you should know, neither introduced here:
+
+- **The ticket's premise doesn't hold in this tree, and the fix is still right.** I expected the accepted ordering to execute, so I ran it: `Stock.objects.order_by('supply__product__parent__isnull')` raises `FieldError: Unsupported lookup 'isnull' for AutoField`. Ordering resolution supports transforms only — `setup_joins` routes leftover names through `try_transform`. The reporter saw results because `find_ordering_name` (`compiler.py:719`) recurses into the related model's default ordering and **silently discards** the tail: I confirmed `order_by('author__isnull')`, `order_by('author')`, and `order_by('author__totally_bogus_name')` produce byte-identical SQL when the target model has `Meta.ordering`. So the check now tolerates some orderings that error or no-op at query time. That's the correct trade for E015 — its message claims the *name* is nonexistent, which is false for a registered lookup, and a lint shouldn't block `manage.py check` on something the ORM accepts. Making the runtime honor lookup-based ordering is a separate, much larger change.
+- **Pre-existing crash, untouched:** `ordering = ('pets__isnull',)` across a *reverse* relation makes `Model.check()` die with `AttributeError: 'ManyToOneRel' object has no attribute 'get_transform'` — `ForeignObjectRel` defines `get_lookup` but not `get_transform`. Same on reverse O2O/M2M and `GenericForeignKey`. It reproduces identically at HEAD since `get_transform` is evaluated first either way. Reordering the operands would mask the `isnull` variant while `pets__lower` still crashed, so I left it alone rather than half-fix it under this ticket — worth its own issue.

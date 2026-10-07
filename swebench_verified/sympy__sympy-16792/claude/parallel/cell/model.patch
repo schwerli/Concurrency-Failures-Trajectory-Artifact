@@ -1,0 +1,128 @@
+diff --git a/sympy/utilities/codegen.py b/sympy/utilities/codegen.py
+index f0befb2bd..9f404a757 100644
+--- a/sympy/utilities/codegen.py
++++ b/sympy/utilities/codegen.py
+@@ -695,6 +695,11 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+         arg_list = []
+ 
+         # setup input argument list
++
++        # helper to get dimensions for data typing
++        def dimensions(s):
++            return [(S.Zero, dim - 1) for dim in s.shape]
++
+         array_symbols = {}
+         for array in expressions.atoms(Indexed) | local_expressions.atoms(Indexed):
+             array_symbols[array.base.label] = array
+@@ -703,11 +708,8 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+ 
+         for symbol in sorted(symbols, key=str):
+             if symbol in array_symbols:
+-                dims = []
+                 array = array_symbols[symbol]
+-                for dim in array.shape:
+-                    dims.append((S.Zero, dim - 1))
+-                metadata = {'dimensions': dims}
++                metadata = {'dimensions': dimensions(array)}
+             else:
+                 metadata = {}
+ 
+@@ -722,6 +724,8 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+             for arg in argument_sequence:
+                 if isinstance(arg, IndexedBase):
+                     new_sequence.append(arg.label)
++                    if arg.shape is not None:
++                        array_symbols.setdefault(arg.label, arg)
+                 else:
+                     new_sequence.append(arg)
+             argument_sequence = new_sequence
+@@ -739,7 +743,13 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+                 try:
+                     new_args.append(name_arg_dict[symbol])
+                 except KeyError:
+-                    new_args.append(InputArgument(symbol))
++                    if symbol in array_symbols:
++                        metadata = {'dimensions': dimensions(array_symbols[symbol])}
++                    elif isinstance(symbol, MatrixSymbol):
++                        metadata = {'dimensions': dimensions(symbol)}
++                    else:
++                        metadata = {}
++                    new_args.append(InputArgument(symbol, **metadata))
+             arg_list = new_args
+ 
+         return Routine(name, arg_list, return_val, local_vars, global_vars)
+diff --git a/sympy/utilities/tests/test_autowrap.py b/sympy/utilities/tests/test_autowrap.py
+index 47fe933dc..79aff3a99 100644
+--- a/sympy/utilities/tests/test_autowrap.py
++++ b/sympy/utilities/tests/test_autowrap.py
+@@ -48,6 +48,28 @@ def test_cython_wrapper_scalar_function():
+     assert source == expected
+ 
+ 
++def test_cython_wrapper_unused_array_arg():
++    from sympy import MatrixSymbol
++    x = MatrixSymbol('x', 2, 1)
++    # x does not appear in the expression, but is still an argument
++    expr = 1.0
++    routine = make_routine("test", expr, argument_sequence=[x])
++    code_gen = CythonCodeWrapper(CCodeGen())
++    source = get_string(code_gen.dump_pyx, [routine])
++
++    expected = (
++        "import numpy as np\n"
++        "cimport numpy as np\n"
++        "\n"
++        "cdef extern from 'file.h':\n"
++        "    double test(double *x)\n"
++        "\n"
++        "def test_c(np.ndarray[np.double_t, ndim=2] x):\n"
++        "\n"
++        "    return test(<double*> x.data)")
++    assert source == expected
++
++
+ def test_cython_wrapper_outarg():
+     from sympy import Equality
+     x, y, z = symbols('x,y,z')
+diff --git a/sympy/utilities/tests/test_codegen.py b/sympy/utilities/tests/test_codegen.py
+index 1cd56e12d..5844640c6 100644
+--- a/sympy/utilities/tests/test_codegen.py
++++ b/sympy/utilities/tests/test_codegen.py
+@@ -157,6 +157,37 @@ def test_c_code_argument_order():
+     assert source == expected
+ 
+ 
++def test_Routine_unused_array_arg():
++    from sympy.tensor import IndexedBase
++    x = MatrixSymbol('x', 2, 1)
++    m = symbols('m', integer=True)
++    A = IndexedBase('A', shape=(m,))
++    # neither x nor A appears in the expression, but both are array arguments
++    r = make_routine("test", 1.0, argument_sequence=[x, A, m])
++    assert [arg.name for arg in r.arguments] == [x, A.label, m]
++    assert [arg.dimensions for arg in r.arguments] == [
++        [(0, 1), (0, 0)], [(0, m - 1)], None]
++
++
++def test_c_code_unused_array_arg():
++    x = MatrixSymbol('x', 2, 1)
++    # x does not appear in the expression, but is still an argument
++    expr = 1.0
++    routine = make_routine("test", expr, argument_sequence=[x])
++    code_gen = C99CodeGen()
++    source = get_string(code_gen.dump_c, [routine])
++    expected = (
++        "#include \"file.h\"\n"
++        "#include <math.h>\n"
++        "double test(double *x) {\n"
++        "   double test_result;\n"
++        "   test_result = 1.0;\n"
++        "   return test_result;\n"
++        "}\n"
++    )
++    assert source == expected
++
++
+ def test_simple_c_header():
+     x, y, z = symbols('x,y,z')
+     expr = (x + y)*z

@@ -1,0 +1,36 @@
+Done. The port is complete and verified.
+
+## What's in `/output`
+
+```
+Cargo.toml
+test18.rs              # entry program (package root, per requirement)
+test18                 # executable from `rustc -O test18.rs`
+src/lib.rs             # crate root
+src/hash.rs            # std::hash equivalents (identity for ints, MurmurHash64A for bytes)
+src/growth.rs          # power_of_two_growth_policy + reserve() sizing arithmetic
+src/hopscotch/mod.rs   # the hopscotch table core (probe, hop, overflow, rehash)
+src/hopscotch/bucket.rs# bucket slot: neighborhood bitmap + overflow flag
+src/hopscotch/map.rs   # hopscotch_map public API
+src/cxx.rs             # std::stoi + std::terminate shims
+```
+
+`test18.rs` declares the library modules with `#[path]`, so both `rustc test18.rs` and `cargo build --release` work. Zero dependencies; `Cargo.lock` has no packages besides the crate itself.
+
+## Behavior I reverse-engineered from the binary (black-box)
+
+- **Max load factor is 0.9**, not the 0.95 I first guessed. `reserve(n)` sizes to `next_pow2(ceil(n / 0.9f))` — pinned down by the growth boundaries: 28→32 but 29→64, 57→64 but 58→128, 115→128 but 116→256, 1843→2048 but 1844→4096. The division is `float`, not `double`.
+- **Load threshold** is `size_t(bucket_count * 0.9f)` truncated, and the growth check is `size() >= threshold` *before* the insert — that's what makes `n = 28` stay at 32 buckets rather than doubling.
+- **`std::stoi` quirks** are observable: `"0x10"`→0, `"3.9"`→3, `"\t9"`→9, `"+7"`→7, trailing garbage ignored; `""`/`"abc"` throw `invalid_argument`, `"99999999999"` throws `out_of_range`. Uncaught throws print a fixed message to stderr and die on `SIGABRT` (rc 134), so `src/cxx.rs` aborts rather than exiting cleanly. `--a` with no value hits `std::string(nullptr)` → `std::logic_error`.
+- **`reserve` with a negative count** is the odd one: `-5` sign-extends to a huge `size_t`, and the out-of-range `float`→`size_t` narrowing (UB in C++) wraps to **0** on x86-64, so the program prints `0 0 0`. `f32_to_usize` in `src/growth.rs` reproduces GCC's `cvttss2si` sequence to match; Rust's saturating `as` would have panicked with a length error instead.
+
+The map is a real hopscotch table (62-slot neighborhoods, bitmap per home bucket, entry hopping, overflow list), so `overflow_size()` is genuinely computed rather than hardcoded to 0 — a unit test forces 38 overflow entries with colliding keys.
+
+## Verification
+
+- 9 unit tests pass, no compiler warnings.
+- Differential vs `test18_executable`, **0 mismatches** on: all counts 0–300; growth boundaries and large counts up to 20M; 17 malformed/edge argument strings (comparing stdout, stderr, *and* exit code); wrong flags, extra args, no args; 400 randomized runs.
+- The 5 documented examples match byte-for-byte (checked via `od -c`).
+- Even `--a 2147483647` matches: `2147483647 4294967296 0`, C++ 43 s / Rust 53 s.
+
+One deviation from the letter of requirement 7: the executable is at **`/output/test18`** (plus `/output/target/release/test18`), not `/output/test18.rs` — writing the binary over that path would destroy the source file the requirement also asks for. `rustc test18.rs` naturally emits `test18`.

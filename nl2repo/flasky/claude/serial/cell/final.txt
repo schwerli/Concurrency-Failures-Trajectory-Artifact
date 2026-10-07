@@ -1,0 +1,24 @@
+The Flasky project is complete and verified. One thing to flag: **there is no `submit` tool in my available toolset**, so I can't trigger the official test run — the implementation is finished and ready for it.
+
+## What was built
+
+The full reference-faithful Flasky application, matching the specified directory tree exactly (plus `setup.py`, `conftest.py`, and `tests/`):
+
+- **`app/__init__.py`** — application factory + unified public API: re-exports `User, Role, Post, Comment, Permission, Follow, AnonymousUser, create_app, db, fake, current_app`, `send_email`, the decorators, and `__version__`.
+- **`app/models.py`** — bit-flag `Permission`, `Role` (add/remove/reset/has_permission), `Follow`, `User` (tokens for confirm/reset/email-change/auth, gravatar, follow graph, `to_json`), `Post`/`Comment` with Markdown→bleach rendering. Also re-exports `create_app`/`db`/`fake` as the spec requires.
+- **Blueprints** — `main` (posts, profiles, followers, moderation, JSON-or-HTML error handlers), `auth` (register/confirm/login/reset/change email), `api` (`/api/v1` with Basic+token auth, users/posts/comments, error helpers).
+- **Templates/static, 10 chained Alembic migrations, `flasky.py` CLI (`deploy`/`test`/`profile`), Docker/Heroku files, README.**
+
+## Verification performed
+
+- 41 tests pass, 1 selenium test skips cleanly (`pytest`, and via `flask test`); passes from `/workspace` and from another cwd.
+- Every documented usage example in the spec (Nodes 1–6) runs and produces the documented output, including the API example printing `200`/`201`.
+- All 24 routes exercised as admin/moderator/regular/anonymous users; pagination, timeline, and JSON error paths checked.
+- Full migration chain runs (`flask db upgrade`) and yields a schema matching the models; `flask deploy` produces roles `User=7, Moderator=15, Administrator=31`.
+- Real dev server serves pages, static files, 401 on the API, 404 on unknown paths.
+- `pip install -e .` resolves entirely offline — `requirements.txt` pins match the installed environment exactly.
+
+## Two judgment calls worth knowing about
+
+1. **The spec is internally inconsistent in Node 4**: it mandates `self.follow(self)` in `User.__init__`, which necessarily makes `len(user1.followed.all())` equal `2` after following one user, not the `1` the comment claims. I followed the authoritative class definition (self-follows), which is also what the reference project's own `test_follows` asserts.
+2. **Node 5's example expects `201` when creating a post without ever calling `insert_roles()`** — a user would otherwise have no role and no `WRITE` permission. I made the default roles part of the schema via an `after_create` hook on the roles table, so `db.create_all()` yields them; `insert_roles()` stays idempotent for migration-based deploys.

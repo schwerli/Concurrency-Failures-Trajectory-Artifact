@@ -1,0 +1,779 @@
+=============== cpachecker/__init__.py ===============
+     1	"""CPAchecker: A Configurable Software Verification Framework in Python."""
+=============== cpachecker/cfa.py ===============
+     1	"""Control-Flow Automaton (CFA) representation.
+     2	
+     3	A CFA is a directed graph where:
+     4	- Nodes represent program locations (program counter values)
+     5	- Edges represent program operations (assignments, assumptions, assertions)
+     6	"""
+     7	
+     8	from dataclasses import dataclass, field
+     9	from enum import Enum
+    10	from typing import Any
+    11	
+    12	
+    13	class EdgeType(Enum):
+    14	    ASSIGNMENT = "assignment"
+    15	    ASSUME_TRUE = "assume_true"
+    16	    ASSUME_FALSE = "assume_false"
+    17	    ASSERT = "assert"
+    18	    FUNCTION_CALL = "function_call"
+    19	    BLANK = "blank"
+    20	
+    21	
+    22	@dataclass
+    23	class CFANode:
+    24	    node_id: int
+    25	    label: str = ""
+    26	    is_entry: bool = False
+    27	    is_exit: bool = False
+    28	    is_error: bool = False
+    29	
+    30	
+    31	@dataclass
+    32	class CFAEdge:
+    33	    source: int
+    34	    target: int
+    35	    edge_type: EdgeType
+    36	    expression: str = ""
+    37	    variable: str = ""
+    38	    metadata: dict = field(default_factory=dict)
+    39	
+    40	
+    41	@dataclass
+    42	class CFA:
+    43	    """Control-Flow Automaton representing a program."""
+    44	
+    45	    nodes: dict[int, CFANode] = field(default_factory=dict)
+    46	    edges: list[CFAEdge] = field(default_factory=list)
+    47	    entry_node: int = 0
+    48	    exit_node: int = -1
+    49	    variables: list[str] = field(default_factory=list)
+    50	    function_name: str = "main"
+    51	
+    52	    def add_node(self, node: CFANode) -> None:
+    53	        self.nodes[node.node_id] = node
+    54	
+    55	    def add_edge(self, edge: CFAEdge) -> None:
+    56	        self.edges.append(edge)
+    57	
+    58	    def get_successors(self, node_id: int) -> list[CFAEdge]:
+    59	        return [e for e in self.edges if e.source == node_id]
+    60	
+    61	    def get_predecessors(self, node_id: int) -> list[CFAEdge]:
+    62	        return [e for e in self.edges if e.target == node_id]
+=============== cpachecker/cpa_interface.py ===============
+     1	"""CPA Interface Definitions.
+     2	
+     3	A Configurable Program Analysis (CPA) is defined by:
+     4	- An abstract domain D (lattice of abstract states)
+     5	- A transfer relation (computes successors)
+     6	- A merge operator (combines states at same location)
+     7	- A stop operator (checks if a state is covered)
+     8	- A precision (controls analysis granularity)
+     9	"""
+    10	
+    11	from abc import ABC, abstractmethod
+    12	from typing import Any
+    13	
+    14	
+    15	class AbstractState(ABC):
+    16	    """Base class for abstract states in a CPA."""
+    17	
+    18	    @abstractmethod
+    19	    def __eq__(self, other) -> bool:
+    20	        pass
+    21	
+    22	    @abstractmethod
+    23	    def __hash__(self) -> int:
+    24	        pass
+    25	
+    26	    @abstractmethod
+    27	    def __repr__(self) -> str:
+    28	        pass
+    29	
+    30	
+    31	class Precision(ABC):
+    32	    """Controls the granularity of the analysis."""
+    33	    pass
+    34	
+    35	
+    36	class AbstractDomain(ABC):
+    37	    """Defines the lattice operations for abstract states."""
+    38	
+    39	    @abstractmethod
+    40	    def is_less_or_equal(self, state1: AbstractState, state2: AbstractState) -> bool:
+    41	        """Check if state1 is subsumed by state2 (state1 ⊑ state2)."""
+    42	        pass
+    43	
+    44	    @abstractmethod
+    45	    def join(self, state1: AbstractState, state2: AbstractState) -> AbstractState:
+    46	        """Compute least upper bound of two states."""
+    47	        pass
+    48	
+    49	    @abstractmethod
+    50	    def get_top(self) -> AbstractState:
+    51	        """Return the top element (represents all states)."""
+    52	        pass
+    53	
+    54	    @abstractmethod
+    55	    def get_bottom(self) -> AbstractState:
+    56	        """Return the bottom element (represents no states)."""
+    57	        pass
+    58	
+    59	
+    60	class TransferRelation(ABC):
+    61	    """Computes successor abstract states."""
+    62	
+    63	    @abstractmethod
+    64	    def get_abstract_successors(
+    65	        self, state: AbstractState, precision: Precision, edge: Any
+    66	    ) -> list[AbstractState]:
+    67	        """Compute abstract successors for a given CFA edge."""
+    68	        pass
+    69	
+    70	
+    71	class MergeOperator(ABC):
+    72	    """Determines how to combine abstract states at the same location."""
+    73	
+    74	    @abstractmethod
+    75	    def merge(
+    76	        self, state1: AbstractState, state2: AbstractState, precision: Precision
+    77	    ) -> AbstractState:
+    78	        """Merge state1 into state2. Return state2 unchanged for 'sep' semantics."""
+    79	        pass
+    80	
+    81	
+    82	class StopOperator(ABC):
+    83	    """Determines if a state is already covered by the reached set."""
+    84	
+    85	    @abstractmethod
+    86	    def stop(
+    87	        self, state: AbstractState, reached: set, precision: Precision
+    88	    ) -> bool:
+    89	        """Check if state is covered by some state in reached."""
+    90	        pass
+    91	
+    92	
+    93	class ConfigurableProgramAnalysis(ABC):
+    94	    """Main CPA interface combining all components."""
+    95	
+    96	    @abstractmethod
+    97	    def get_abstract_domain(self) -> AbstractDomain:
+    98	        pass
+    99	
+   100	    @abstractmethod
+   101	    def get_transfer_relation(self) -> TransferRelation:
+   102	        pass
+   103	
+   104	    @abstractmethod
+   105	    def get_merge_operator(self) -> MergeOperator:
+   106	        pass
+   107	
+   108	    @abstractmethod
+   109	    def get_stop_operator(self) -> StopOperator:
+   110	        pass
+   111	
+   112	    @abstractmethod
+   113	    def get_initial_state(self, node_id: int) -> AbstractState:
+   114	        pass
+   115	
+   116	    @abstractmethod
+   117	    def get_initial_precision(self) -> Precision:
+   118	        pass
+=============== cpachecker/expression.py ===============
+     1	"""Expression evaluator for CFA edge expressions.
+     2	
+     3	Evaluates arithmetic expressions over integer variables.
+     4	Handles nondeterministic values (__VERIFIER_nondet_uint).
+     5	"""
+     6	
+     7	import re
+     8	from typing import Optional
+     9	
+    10	
+    11	NONDET_PATTERN = re.compile(r"__VERIFIER_nondet_\w+\s*\(\s*\)")
+    12	
+    13	
+    14	def is_nondeterministic(expr: str) -> bool:
+    15	    """Check if expression contains a nondeterministic call."""
+    16	    return bool(NONDET_PATTERN.search(expr))
+    17	
+    18	
+    19	def evaluate_expression(expr: str, env: dict[str, int]) -> Optional[int]:
+    20	    """Evaluate an arithmetic expression in the given environment.
+    21	
+    22	    Returns None if the expression contains nondeterministic values
+    23	    or cannot be evaluated.
+    24	    """
+    25	    if is_nondeterministic(expr):
+    26	        return None
+    27	
+    28	    try:
+    29	        safe_env = {k: v for k, v in env.items() if isinstance(v, int)}
+    30	        cleaned = expr.strip()
+    31	        cleaned = re.sub(r"\b(\d+)[UuLl]\b", r"\1", cleaned)
+    32	        result = eval(cleaned, {"__builtins__": {}}, safe_env)
+    33	        if isinstance(result, bool):
+    34	            return 1 if result else 0
+    35	        return int(result)
+    36	    except Exception:
+    37	        return None
+    38	
+    39	
+    40	def evaluate_condition(cond: str, env: dict[str, int]) -> Optional[bool]:
+    41	    """Evaluate a boolean condition in the given environment.
+    42	
+    43	    Returns None if the condition contains nondeterministic values
+    44	    or cannot be evaluated.
+    45	    """
+    46	    if is_nondeterministic(cond):
+    47	        return None
+    48	
+    49	    try:
+    50	        safe_env = {k: v for k, v in env.items() if isinstance(v, int)}
+    51	        cleaned = cond.strip()
+    52	        cleaned = re.sub(r"\b(\d+)[UuLl]\b", r"\1", cleaned)
+    53	        cleaned = cleaned.replace("&&", " and ").replace("||", " or ")
+    54	        cleaned = re.sub(r"(?<![!<>=])!(?!=)", " not ", cleaned)
+    55	        result = eval(cleaned, {"__builtins__": {}}, safe_env)
+    56	        return bool(result)
+    57	    except Exception:
+    58	        return None
+=============== cpachecker/parser.py ===============
+     1	"""Simple C parser that builds a CFA from a subset of C.
+     2	
+     3	Supported constructs:
+     4	- int/unsigned variable declarations with optional initialization
+     5	- Assignment statements (arithmetic: +, -, *, /, %)
+     6	- if/else statements
+     7	- while loops
+     8	- __VERIFIER_nondet_uint() for nondeterministic values
+     9	- __assert_fail() / assert() for assertions
+    10	- return statements
+    11	- Basic arithmetic and comparison operators
+    12	"""
+    13	
+    14	import re
+    15	from typing import Optional
+    16	
+    17	from cpachecker.cfa import CFA, CFAEdge, CFANode, EdgeType
+    18	
+    19	
+    20	class Token:
+    21	    def __init__(self, kind: str, value: str, line: int = 0):
+    22	        self.kind = kind
+    23	        self.value = value
+    24	        self.line = line
+    25	
+    26	    def __repr__(self):
+    27	        return f"Token({self.kind}, {self.value!r})"
+    28	
+    29	
+    30	TOKEN_PATTERNS = [
+    31	    ("COMMENT_LINE", r"//[^\n]*"),
+    32	    ("COMMENT_BLOCK", r"/\*[\s\S]*?\*/"),
+    33	    ("PREPROC", r"#[^\n]*"),
+    34	    ("KEYWORD", r"\b(int|unsigned|void|extern|if|else|while|for|return|const|char|static|switch|case|break|default)\b"),
+    35	    ("IDENT", r"[a-zA-Z_][a-zA-Z0-9_]*"),
+    36	    ("NUMBER", r"\b\d+[UuLl]?\b"),
+    37	    ("STRING", r'"[^"]*"'),
+    38	    ("OP", r"\+\+|--|[+\-*/%]=|[<>!=]=|&&|\|\||<<|>>|[+\-*/%<>=!&|^~]"),
+    39	    ("LPAREN", r"\("),
+    40	    ("RPAREN", r"\)"),
+    41	    ("LBRACE", r"\{"),
+    42	    ("RBRACE", r"\}"),
+    43	    ("LBRACKET", r"\["),
+    44	    ("RBRACKET", r"\]"),
+    45	    ("SEMI", r";"),
+    46	    ("COMMA", r","),
+    47	    ("DOT", r"\."),
+    48	    ("ARROW", r"->"),
+    49	    ("COLON", r":"),
+    50	    ("WS", r"\s+"),
+    51	]
+    52	
+    53	TOKEN_RE = re.compile("|".join(f"(?P<{name}>{pat})" for name, pat in TOKEN_PATTERNS))
+    54	
+    55	
+    56	def tokenize(source: str) -> list[Token]:
+    57	    tokens = []
+    58	    line = 1
+    59	    for m in TOKEN_RE.finditer(source):
+    60	        kind = m.lastgroup
+    61	        value = m.group()
+    62	        if kind == "WS":
+    63	            line += value.count("\n")
+    64	            continue
+    65	        if kind in ("COMMENT_LINE", "COMMENT_BLOCK", "PREPROC"):
+    66	            line += value.count("\n")
+    67	            continue
+    68	        tokens.append(Token(kind, value, line))
+    69	    return tokens
+    70	
+    71	
+    72	class Parser:
+    73	    """Recursive-descent parser for simplified C → CFA."""
+    74	
+    75	    def __init__(self, tokens: list[Token]):
+    76	        self.tokens = tokens
+    77	        self.pos = 0
+    78	        self.node_counter = 0
+    79	        self.cfa = CFA()
+    80	        self.variables: list[str] = []
+    81	
+    82	    def peek(self) -> Optional[Token]:
+    83	        if self.pos < len(self.tokens):
+    84	            return self.tokens[self.pos]
+    85	        return None
+    86	
+    87	    def advance(self) -> Token:
+    88	        tok = self.tokens[self.pos]
+    89	        self.pos += 1
+    90	        return tok
+    91	
+    92	    def expect(self, kind: str, value: str = None) -> Token:
+    93	        tok = self.advance()
+    94	        if tok.kind != kind or (value is not None and tok.value != value):
+    95	            raise SyntaxError(
+    96	                f"Expected ({kind}, {value}), got ({tok.kind}, {tok.value}) at line {tok.line}"
+    97	            )
+    98	        return tok
+    99	
+   100	    def match(self, kind: str, value: str = None) -> Optional[Token]:
+   101	        tok = self.peek()
+   102	        if tok and tok.kind == kind and (value is None or tok.value == value):
+   103	            return self.advance()
+   104	        return None
+   105	
+   106	    def new_node(self, label: str = "") -> int:
+   107	        nid = self.node_counter
+   108	        self.node_counter += 1
+   109	        self.cfa.add_node(CFANode(node_id=nid, label=label))
+   110	        return nid
+   111	
+   112	    def parse(self) -> CFA:
+   113	        """Parse the entire program, return CFA for main function."""
+   114	        while self.pos < len(self.tokens):
+   115	            if self._is_function_def():
+   116	                self._parse_function()
+   117	            else:
+   118	                self._skip_declaration()
+   119	        self.cfa.variables = self.variables
+   120	        return self.cfa
+   121	
+   122	    def _is_function_def(self) -> bool:
+   123	        save = self.pos
+   124	        try:
+   125	            while self.peek() and self.peek().kind == "KEYWORD":
+   126	                self.advance()
+   127	            if self.peek() and self.peek().kind == "IDENT":
+   128	                self.advance()
+   129	                if self.peek() and self.peek().kind == "LPAREN":
+   130	                    self.pos = save
+   131	                    return True
+   132	        except (IndexError, AttributeError):
+   133	            pass
+   134	        self.pos = save
+   135	        return False
+   136	
+   137	    def _skip_declaration(self):
+   138	        depth = 0
+   139	        while self.pos < len(self.tokens):
+   140	            tok = self.advance()
+   141	            if tok.kind == "LBRACE":
+   142	                depth += 1
+   143	            elif tok.kind == "RBRACE":
+   144	                depth -= 1
+   145	                if depth <= 0:
+   146	                    return
+   147	            elif tok.kind == "SEMI" and depth == 0:
+   148	                return
+   149	
+   150	    def _parse_function(self):
+   151	        while self.peek() and self.peek().kind == "KEYWORD":
+   152	            self.advance()
+   153	        name_tok = self.expect("IDENT")
+   154	
+   155	        self.expect("LPAREN")
+   156	        depth = 1
+   157	        while depth > 0:
+   158	            t = self.advance()
+   159	            if t.kind == "LPAREN":
+   160	                depth += 1
+   161	            elif t.kind == "RPAREN":
+   162	                depth -= 1
+   163	
+   164	        if self.peek() and self.peek().kind == "SEMI":
+   165	            self.advance()
+   166	            return
+   167	
+   168	        self.expect("LBRACE")
+   169	        self.cfa.function_name = name_tok.value
+   170	
+   171	        if name_tok.value == "main":
+   172	            entry = self.new_node("entry")
+   173	            self.cfa.entry_node = entry
+   174	            self.cfa.nodes[entry].is_entry = True
+   175	            exit_node = self.new_node("exit")
+   176	            self.cfa.exit_node = exit_node
+   177	            self.cfa.nodes[exit_node].is_exit = True
+   178	            self._parse_block(entry, exit_node)
+   179	        else:
+   180	            self._skip_brace_block()
+   181	
+   182	    def _skip_brace_block(self):
+   183	        depth = 1
+   184	        while depth > 0:
+   185	            t = self.advance()
+   186	            if t.kind == "LBRACE":
+   187	                depth += 1
+   188	            elif t.kind == "RBRACE":
+   189	                depth -= 1
+   190	
+   191	    def _parse_block(self, entry: int, exit_node: int):
+   192	        current = entry
+   193	        while self.peek() and self.peek().kind != "RBRACE":
+   194	            current = self._parse_statement(current, exit_node)
+   195	        self.expect("RBRACE")
+   196	        if current != exit_node:
+   197	            self.cfa.add_edge(CFAEdge(current, exit_node, EdgeType.BLANK))
+   198	
+   199	    def _parse_statement(self, current: int, exit_node: int) -> int:
+   200	        tok = self.peek()
+   201	        if tok is None:
+   202	            return current
+   203	
+   204	        if tok.kind == "KEYWORD" and tok.value in ("int", "unsigned", "const"):
+   205	            return self._parse_var_decl(current)
+   206	        elif tok.kind == "KEYWORD" and tok.value == "if":
+   207	            return self._parse_if(current, exit_node)
+   208	        elif tok.kind == "KEYWORD" and tok.value == "while":
+   209	            return self._parse_while(current, exit_node)
+   210	        elif tok.kind == "KEYWORD" and tok.value == "for":
+   211	            return self._parse_for(current, exit_node)
+   212	        elif tok.kind == "KEYWORD" and tok.value == "return":
+   213	            return self._parse_return(current, exit_node)
+   214	        elif tok.kind == "LBRACE":
+   215	            self.advance()
+   216	            next_node = self.new_node()
+   217	            self._parse_block(current, next_node)
+   218	            return next_node
+   219	        elif tok.kind == "IDENT":
+   220	            return self._parse_expr_statement(current)
+   221	        else:
+   222	            self.advance()
+   223	            return current
+   224	
+   225	    def _parse_var_decl(self, current: int) -> int:
+   226	        while self.peek() and self.peek().kind == "KEYWORD":
+   227	            self.advance()
+   228	        var_name = self.expect("IDENT").value
+   229	        if var_name not in self.variables:
+   230	            self.variables.append(var_name)
+   231	
+   232	        if self.match("OP", "="):
+   233	            expr = self._collect_expression()
+   234	            next_node = self.new_node()
+   235	            self.cfa.add_edge(
+   236	                CFAEdge(current, next_node, EdgeType.ASSIGNMENT,
+   237	                        expression=expr, variable=var_name)
+   238	            )
+   239	            current = next_node
+   240	        self.expect("SEMI")
+   241	        return current
+   242	
+   243	    def _parse_expr_statement(self, current: int) -> int:
+   244	        ident = self.advance()
+   245	        if self.peek() and self.peek().kind == "LPAREN":
+   246	            func_call = ident.value + self._collect_parens()
+   247	            if "__assert_fail" in ident.value:
+   248	                error_node = self.new_node("error")
+   249	                self.cfa.nodes[error_node].is_error = True
+   250	                self.cfa.add_edge(
+   251	                    CFAEdge(current, error_node, EdgeType.ASSERT, expression=func_call)
+   252	                )
+   253	                self.expect("SEMI")
+   254	                return self.new_node()
+   255	            else:
+   256	                next_node = self.new_node()
+   257	                self.cfa.add_edge(
+   258	                    CFAEdge(current, next_node, EdgeType.FUNCTION_CALL, expression=func_call)
+   259	                )
+   260	                self.expect("SEMI")
+   261	                return next_node
+   262	        elif self.peek() and self.peek().kind == "OP":
+   263	            op = self.advance().value
+   264	            if op == "=" or op.endswith("="):
+   265	                expr = self._collect_expression()
+   266	                if op != "=":
+   267	                    base_op = op[:-1]
+   268	                    expr = f"{ident.value} {base_op} ({expr})"
+   269	                next_node = self.new_node()
+   270	                self.cfa.add_edge(
+   271	                    CFAEdge(current, next_node, EdgeType.ASSIGNMENT,
+   272	                            expression=expr, variable=ident.value)
+   273	                )
+   274	                self.expect("SEMI")
+   275	                return next_node
+   276	            elif op in ("++", "--"):
+   277	                expr = f"{ident.value} + 1" if op == "++" else f"{ident.value} - 1"
+   278	                next_node = self.new_node()
+   279	                self.cfa.add_edge(
+   280	                    CFAEdge(current, next_node, EdgeType.ASSIGNMENT,
+   281	                            expression=expr, variable=ident.value)
+   282	                )
+   283	                self.expect("SEMI")
+   284	                return next_node
+   285	        self._skip_to_semi()
+   286	        return current
+   287	
+   288	    def _parse_if(self, current: int, exit_node: int) -> int:
+   289	        self.expect("KEYWORD", "if")
+   290	        self.expect("LPAREN")
+   291	        cond = self._collect_until_rparen()
+   292	
+   293	        true_entry = self.new_node()
+   294	        self.cfa.add_edge(
+   295	            CFAEdge(current, true_entry, EdgeType.ASSUME_TRUE, expression=cond)
+   296	        )
+   297	
+   298	        merge_node = self.new_node("merge")
+   299	
+   300	        if self.peek() and self.peek().kind == "LBRACE":
+   301	            self.advance()
+   302	            self._parse_block(true_entry, merge_node)
+   303	        else:
+   304	            end = self._parse_statement(true_entry, exit_node)
+   305	            if end != merge_node:
+   306	                self.cfa.add_edge(CFAEdge(end, merge_node, EdgeType.BLANK))
+   307	
+   308	        if self.match("KEYWORD", "else"):
+   309	            false_entry = self.new_node()
+   310	            self.cfa.add_edge(
+   311	                CFAEdge(current, false_entry, EdgeType.ASSUME_FALSE, expression=cond)
+   312	            )
+   313	            if self.peek() and self.peek().kind == "LBRACE":
+   314	                self.advance()
+   315	                self._parse_block(false_entry, merge_node)
+   316	            else:
+   317	                end = self._parse_statement(false_entry, exit_node)
+   318	                if end != merge_node:
+   319	                    self.cfa.add_edge(CFAEdge(end, merge_node, EdgeType.BLANK))
+   320	        else:
+   321	            self.cfa.add_edge(
+   322	                CFAEdge(current, merge_node, EdgeType.ASSUME_FALSE, expression=cond)
+   323	            )
+   324	
+   325	        return merge_node
+   326	
+   327	    def _parse_while(self, current: int, exit_node: int) -> int:
+   328	        self.expect("KEYWORD", "while")
+   329	        self.expect("LPAREN")
+   330	        cond = self._collect_until_rparen()
+   331	
+   332	        loop_head = self.new_node("loop_head")
+   333	        self.cfa.add_edge(CFAEdge(current, loop_head, EdgeType.BLANK))
+   334	
+   335	        body_entry = self.new_node()
+   336	        self.cfa.add_edge(
+   337	            CFAEdge(loop_head, body_entry, EdgeType.ASSUME_TRUE, expression=cond)
+   338	        )
+   339	
+   340	        loop_exit = self.new_node()
+   341	        self.cfa.add_edge(
+   342	            CFAEdge(loop_head, loop_exit, EdgeType.ASSUME_FALSE, expression=cond)
+   343	        )
+   344	
+   345	        if self.peek() and self.peek().kind == "LBRACE":
+   346	            self.advance()
+   347	            self._parse_block(body_entry, loop_head)
+   348	        else:
+   349	            end = self._parse_statement(body_entry, exit_node)
+   350	            if end != loop_head:
+   351	                self.cfa.add_edge(CFAEdge(end, loop_head, EdgeType.BLANK))
+   352	
+   353	        return loop_exit
+   354	
+   355	    def _parse_for(self, current: int, exit_node: int) -> int:
+   356	        self.expect("KEYWORD", "for")
+   357	        self.expect("LPAREN")
+   358	        init_expr = self._collect_until_semi_in_for()
+   359	        if init_expr.strip():
+   360	            next_node = self.new_node()
+   361	            parts = init_expr.strip().split("=", 1)
+   362	            if len(parts) == 2:
+   363	                var = parts[0].strip().split()[-1]
+   364	                expr = parts[1].strip()
+   365	                if var not in self.variables:
+   366	                    self.variables.append(var)
+   367	                self.cfa.add_edge(
+   368	                    CFAEdge(current, next_node, EdgeType.ASSIGNMENT,
+   369	                            expression=expr, variable=var)
+   370	                )
+   371	            else:
+   372	                self.cfa.add_edge(CFAEdge(current, next_node, EdgeType.BLANK))
+   373	            current = next_node
+   374	
+   375	        cond = self._collect_until_semi_in_for()
+   376	        update = self._collect_until_rparen()
+   377	
+   378	        loop_head = self.new_node("loop_head")
+   379	        self.cfa.add_edge(CFAEdge(current, loop_head, EdgeType.BLANK))
+   380	
+   381	        body_entry = self.new_node()
+   382	        self.cfa.add_edge(
+   383	            CFAEdge(loop_head, body_entry, EdgeType.ASSUME_TRUE, expression=cond)
+   384	        )
+   385	        loop_exit = self.new_node()
+   386	        self.cfa.add_edge(
+   387	            CFAEdge(loop_head, loop_exit, EdgeType.ASSUME_FALSE, expression=cond)
+   388	        )
+   389	
+   390	        update_node = self.new_node("update")
+   391	
+   392	        if self.peek() and self.peek().kind == "LBRACE":
+   393	            self.advance()
+   394	            self._parse_block(body_entry, update_node)
+   395	        else:
+   396	            end = self._parse_statement(body_entry, exit_node)
+   397	            if end != update_node:
+   398	                self.cfa.add_edge(CFAEdge(end, update_node, EdgeType.BLANK))
+   399	
+   400	        if update.strip():
+   401	            update = update.strip().rstrip(";")
+   402	            if "++" in update:
+   403	                var = update.replace("++", "").strip()
+   404	                self.cfa.add_edge(
+   405	                    CFAEdge(update_node, loop_head, EdgeType.ASSIGNMENT,
+   406	                            expression=f"{var} + 1", variable=var)
+   407	                )
+   408	            elif "--" in update:
+   409	                var = update.replace("--", "").strip()
+   410	                self.cfa.add_edge(
+   411	                    CFAEdge(update_node, loop_head, EdgeType.ASSIGNMENT,
+   412	                            expression=f"{var} - 1", variable=var)
+   413	                )
+   414	            else:
+   415	                self.cfa.add_edge(CFAEdge(update_node, loop_head, EdgeType.BLANK))
+   416	        else:
+   417	            self.cfa.add_edge(CFAEdge(update_node, loop_head, EdgeType.BLANK))
+   418	
+   419	        return loop_exit
+   420	
+   421	    def _parse_return(self, current: int, exit_node: int) -> int:
+   422	        self.advance()
+   423	        self._skip_to_semi()
+   424	        self.cfa.add_edge(CFAEdge(current, exit_node, EdgeType.BLANK))
+   425	        return exit_node
+   426	
+   427	    def _collect_expression(self) -> str:
+   428	        parts = []
+   429	        depth = 0
+   430	        while self.peek():
+   431	            tok = self.peek()
+   432	            if tok.kind == "SEMI" and depth == 0:
+   433	                break
+   434	            if tok.kind == "LPAREN":
+   435	                depth += 1
+   436	            elif tok.kind == "RPAREN":
+   437	                depth -= 1
+   438	                if depth < 0:
+   439	                    break
+   440	            parts.append(self.advance().value)
+   441	        return " ".join(parts)
+   442	
+   443	    def _collect_until_rparen(self) -> str:
+   444	        parts = []
+   445	        depth = 0
+   446	        while self.peek():
+   447	            tok = self.peek()
+   448	            if tok.kind == "RPAREN" and depth == 0:
+   449	                self.advance()
+   450	                break
+   451	            if tok.kind == "LPAREN":
+   452	                depth += 1
+   453	            elif tok.kind == "RPAREN":
+   454	                depth -= 1
+   455	            parts.append(self.advance().value)
+   456	        return " ".join(parts)
+   457	
+   458	    def _collect_until_semi_in_for(self) -> str:
+   459	        parts = []
+   460	        depth = 0
+   461	        while self.peek():
+   462	            tok = self.peek()
+   463	            if tok.kind == "SEMI" and depth == 0:
+   464	                self.advance()
+   465	                break
+   466	            if tok.kind == "LPAREN":
+   467	                depth += 1
+   468	            elif tok.kind == "RPAREN":
+   469	                depth -= 1
+   470	            parts.append(self.advance().value)
+   471	        return " ".join(parts)
+   472	
+   473	    def _collect_parens(self) -> str:
+   474	        self.expect("LPAREN")
+   475	        parts = ["("]
+   476	        depth = 1
+   477	        while depth > 0:
+   478	            tok = self.advance()
+   479	            if tok.kind == "LPAREN":
+   480	                depth += 1
+   481	            elif tok.kind == "RPAREN":
+   482	                depth -= 1
+   483	            parts.append(tok.value)
+   484	        return "".join(parts)
+   485	
+   486	    def _skip_to_semi(self):
+   487	        depth = 0
+   488	        while self.pos < len(self.tokens):
+   489	            tok = self.tokens[self.pos]
+   490	            if tok.kind == "SEMI" and depth == 0:
+   491	                self.pos += 1
+   492	                return
+   493	            if tok.kind == "LPAREN":
+   494	                depth += 1
+   495	            elif tok.kind == "RPAREN":
+   496	                depth -= 1
+   497	            self.pos += 1
+   498	
+   499	
+   500	def parse_c_file(filepath: str) -> CFA:
+   501	    """Parse a C file and return its CFA."""
+   502	    with open(filepath, "r") as f:
+   503	        source = f.read()
+   504	    tokens = tokenize(source)
+   505	    parser = Parser(tokens)
+   506	    cfa = parser.parse()
+   507	    cfa.program_path = filepath  # type: ignore[attr-defined]
+   508	    return cfa
+=============== cpachecker/result.py ===============
+     1	"""Verification result types and reporting."""
+     2	
+     3	from dataclasses import dataclass, field
+     4	from enum import Enum
+     5	from typing import Any
+     6	
+     7	
+     8	class Verdict(Enum):
+     9	    TRUE = "TRUE"
+    10	    FALSE = "FALSE"
+    11	    UNKNOWN = "UNKNOWN"
+    12	
+    13	
+    14	@dataclass
+    15	class VerificationResult:
+    16	    """Result of a verification run."""
+    17	
+    18	    verdict: Verdict
+    19	    property_violated: str = ""
+    20	    error_path: list = field(default_factory=list)
+    21	    statistics: dict = field(default_factory=dict)
+    22	
+    23	    def __repr__(self) -> str:
+    24	        return f"VerificationResult(verdict={self.verdict.value})"
+=============== cpachecker/analyses/__init__.py ===============
+     1	"""Analysis implementations for CPAchecker."""

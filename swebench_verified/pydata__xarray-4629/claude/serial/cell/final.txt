@@ -1,0 +1,17 @@
+Fixed. Your diagnosis was exactly right.
+
+**The change** — `xarray/core/merge.py:504`:
+
+```python
+elif combine_attrs == "override":
+    return dict(variable_attrs[0])   # was: return variable_attrs[0]
+```
+
+`merge_attrs` returned the first object's attrs dict by reference, so the merged result and the first source shared one dict. Every other branch (`no_conflicts`, `identical`) already copied via `dict(...)`; `override` was the odd one out.
+
+**Verification:**
+- Your reproducer now behaves correctly: `xds3.attrs['a'] = 'd'` leaves `xds1.a == 'b'`.
+- The bug also reached `concat` and `combine_by_coords`, which share `merge_attrs` — I confirmed all three paths (Dataset concat, DataArray concat, `combine_by_coords`) are now free of the aliasing.
+- Added a regression test, `test_merge_attrs_override_copy`, and confirmed it genuinely catches the bug: it fails with the fix reverted, passes with it applied.
+- Ran merge/concat/combine/dataset/dataarray suites: 1941 passed. The 6 failures are pre-existing and unrelated (pandas categorical `ImportError`, a cftime calendar message) — identical set on the unmodified tree.
+- Added a `whats-new.rst` bug-fix entry referencing the issue.

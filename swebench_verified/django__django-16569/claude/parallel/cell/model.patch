@@ -1,0 +1,487 @@
+diff --git a/django/forms/formsets.py b/django/forms/formsets.py
+index 235aaf844c..fd4d53a44f 100644
+--- a/django/forms/formsets.py
++++ b/django/forms/formsets.py
+@@ -490,7 +490,9 @@ class BaseFormSet(RenderableFormMixin):
+                     required=False,
+                     widget=self.get_ordering_widget(),
+                 )
+-        if self.can_delete and (self.can_delete_extra or index < initial_form_count):
++        if self.can_delete and (
++            self.can_delete_extra or (index is not None and index < initial_form_count)
++        ):
+             form.fields[DELETION_FIELD_NAME] = BooleanField(
+                 label=_("Delete"),
+                 required=False,
+diff --git a/probe/admin_probe.py b/probe/admin_probe.py
+new file mode 100644
+index 0000000000..8ab45231e1
+--- /dev/null
++++ b/probe/admin_probe.py
+@@ -0,0 +1,50 @@
++import sys
++sys.path.insert(0, "/workspace/probe"); sys.path.insert(0, "/testbed")
++import sweep
++from django.contrib import admin
++from django.contrib.admin.helpers import InlineAdminFormSet
++from django.contrib.admin.sites import AdminSite
++from django.template.loader import render_to_string
++from django.test import RequestFactory
++from django.contrib.auth.models import User
++from probeapp.models import Author, Book
++
++site = AdminSite()
++
++class BookInlineTab(admin.TabularInline):
++    model = Book
++    can_delete = True
++    def get_formset(self, request, obj=None, **kwargs):
++        kwargs["can_delete_extra"] = False
++        return super().get_formset(request, obj, **kwargs)
++
++class BookInlineStacked(BookInlineTab):
++    template = "admin/edit_inline/stacked.html"
++
++class AuthorAdmin(admin.ModelAdmin):
++    inlines = [BookInlineTab, BookInlineStacked]
++
++ma = AuthorAdmin(Author, site)
++rf = RequestFactory()
++req = rf.get("/")
++req.user = User(is_superuser=True, is_staff=True, is_active=True)
++
++from django.db import connection
++with connection.schema_editor() as se:
++    se.create_model(Author); se.create_model(Book)
++a = Author.objects.create(name="A")
++Book.objects.create(author=a, title="B1")
++
++formsets, inlines = ma._create_formsets(req, a, change=True)
++iafs = ma.get_inline_formsets(req, formsets, inlines, a)
++for i, iaf in enumerate(iafs):
++    print("formset", i, "can_delete_extra=", iaf.formset.can_delete_extra,
++          "can_delete=", iaf.formset.can_delete)
++    print("  initial form fields:", sorted(iaf.formset.forms[0].fields))
++    print("  extra form fields:", sorted(iaf.formset.forms[-1].fields))
++    print("  empty_form fields:", sorted(iaf.formset.empty_form.fields))
++    tmpl = iaf.opts.template
++    out = render_to_string(tmpl, {"inline_admin_formset": iaf})
++    print("  rendered OK, len", len(out), "DELETE occurrences:", out.count("-DELETE"))
++    print("  media ok:", bool(iaf.media))
++    print("  fields():", [f["name"] for f in iaf.fields()])
+diff --git a/probe/ast_scan.py b/probe/ast_scan.py
+new file mode 100644
+index 0000000000..105b3c0417
+--- /dev/null
++++ b/probe/ast_scan.py
+@@ -0,0 +1,86 @@
++import ast, os, sys
++
++TARGETS = [
++    "/testbed/django/forms",
++    "/testbed/django/contrib/admin",
++    "/testbed/django/contrib/contenttypes",
++]
++
++RISK_NAMES = {"index", "idx", "i", "position", "pos"}
++
++class V(ast.NodeVisitor):
++    def __init__(self, path, src):
++        self.path = path
++        self.src = src.splitlines()
++        self.none_defaults = set()
++        self.hits = []
++
++    def visit_FunctionDef(self, node):
++        # params defaulting to None
++        args = node.args
++        defaults = args.defaults
++        posargs = args.posonlyargs + args.args
++        nd = set()
++        for a, d in zip(posargs[len(posargs)-len(defaults):], defaults):
++            if isinstance(d, ast.Constant) and d.value is None:
++                nd.add(a.arg)
++        for a, d in zip(args.kwonlyargs, args.kw_defaults):
++            if isinstance(d, ast.Constant) and d.value is None:
++                nd.add(a.arg)
++        # also params documented/assigned None inside
++        for sub in ast.walk(node):
++            if isinstance(sub, ast.Assign):
++                if isinstance(sub.value, ast.Constant) and sub.value.value is None:
++                    for t in sub.targets:
++                        if isinstance(t, ast.Name):
++                            nd.add(t.id)
++        risky = (nd | (RISK_NAMES & {a.arg for a in posargs})) 
++        old = self.none_defaults
++        self.none_defaults = risky
++        self.generic_visit(node)
++        self.none_defaults = old
++    visit_AsyncFunctionDef = visit_FunctionDef
++
++    def _names(self, n):
++        return {x.id for x in ast.walk(n) if isinstance(x, ast.Name)}
++
++    def visit_Compare(self, node):
++        ops = {type(o).__name__ for o in node.ops}
++        if ops & {"Lt", "LtE", "Gt", "GtE"}:
++            names = self._names(node.left)
++            for c in node.comparators:
++                names |= self._names(c)
++            bad = names & self.none_defaults & RISK_NAMES
++            if bad:
++                self.hits.append((node.lineno, "compare", sorted(bad)))
++        self.generic_visit(node)
++
++    def visit_BinOp(self, node):
++        names = self._names(node)
++        bad = names & self.none_defaults & RISK_NAMES
++        if bad:
++            self.hits.append((node.lineno, "arith", sorted(bad)))
++        self.generic_visit(node)
++
++    def visit_Subscript(self, node):
++        names = self._names(node.slice)
++        bad = names & self.none_defaults & RISK_NAMES
++        if bad:
++            self.hits.append((node.lineno, "subscript", sorted(bad)))
++        self.generic_visit(node)
++
++for root in TARGETS:
++    for dirpath, _, files in os.walk(root):
++        for f in files:
++            if not f.endswith(".py"):
++                continue
++            p = os.path.join(dirpath, f)
++            src = open(p, encoding="utf-8").read()
++            try:
++                tree = ast.parse(src)
++            except SyntaxError:
++                continue
++            v = V(p, src)
++            v.visit(tree)
++            for lineno, kind, names in v.hits:
++                print(f"{p}:{lineno} [{kind}] {names}: {src.splitlines()[lineno-1].strip()}")
+diff --git a/probe/prefix_check.py b/probe/prefix_check.py
+new file mode 100644
+index 0000000000..08357deb62
+--- /dev/null
++++ b/probe/prefix_check.py
+@@ -0,0 +1,43 @@
++import sys
++sys.path.insert(0, "/workspace/probe"); sys.path.insert(0, "/testbed")
++import sweep
++from django import forms
++from django.forms import formset_factory
++from django.forms.formsets import BaseFormSet, DELETION_FIELD_NAME, ORDERING_FIELD_NAME
++from django.forms.fields import BooleanField, IntegerField
++from django.utils.translation import gettext_lazy as _
++
++class Choice(forms.Form):
++    choice = forms.CharField()
++
++# restore the PRE-FIX implementation to confirm which entry points crashed
++def old_add_fields(self, form, index):
++    initial_form_count = self.initial_form_count()
++    if self.can_order:
++        if index is not None and index < initial_form_count:
++            form.fields[ORDERING_FIELD_NAME] = IntegerField(
++                label=_("Order"), initial=index + 1, required=False,
++                widget=self.get_ordering_widget())
++        else:
++            form.fields[ORDERING_FIELD_NAME] = IntegerField(
++                label=_("Order"), required=False, widget=self.get_ordering_widget())
++    if self.can_delete and (self.can_delete_extra or index < initial_form_count):
++        form.fields[DELETION_FIELD_NAME] = BooleanField(
++            label=_("Delete"), required=False, widget=self.get_deletion_widget())
++
++FS = formset_factory(Choice, can_delete=True, can_delete_extra=False, extra=0)
++
++for label, fn in [
++    ("empty_form", lambda fs: fs.empty_form),
++    ("media", lambda fs: fs.media),
++    ("is_multipart", lambda fs: fs.is_multipart()),
++]:
++    for name, impl in [("PRE-FIX", old_add_fields), ("POST-FIX", BaseFormSet.add_fields)]:
++        FS.add_fields = impl
++        fs = FS()
++        assert fs.forms == [], fs.forms
++        try:
++            fn(fs)
++            print(f"{name:9} {label:14} OK")
++        except Exception as e:
++            print(f"{name:9} {label:14} {type(e).__name__}: {e}")
+diff --git a/probe/prefix_check2.py b/probe/prefix_check2.py
+new file mode 100644
+index 0000000000..44d6bc2743
+--- /dev/null
++++ b/probe/prefix_check2.py
+@@ -0,0 +1,47 @@
++import sys
++sys.path.insert(0, "/workspace/probe"); sys.path.insert(0, "/testbed")
++import sweep
++from django import forms
++from django.forms import formset_factory
++from django.forms.formsets import DELETION_FIELD_NAME, ORDERING_FIELD_NAME
++from django.forms.fields import BooleanField, IntegerField
++from django.utils.translation import gettext_lazy as _
++
++class Choice(forms.Form):
++    choice = forms.CharField()
++
++def make(fixed):
++    def add_fields(self, form, index):
++        initial_form_count = self.initial_form_count()
++        if self.can_order:
++            if index is not None and index < initial_form_count:
++                form.fields[ORDERING_FIELD_NAME] = IntegerField(
++                    label=_("Order"), initial=index + 1, required=False,
++                    widget=self.get_ordering_widget())
++            else:
++                form.fields[ORDERING_FIELD_NAME] = IntegerField(
++                    label=_("Order"), required=False, widget=self.get_ordering_widget())
++        if fixed:
++            cond = self.can_delete_extra or (index is not None and index < initial_form_count)
++        else:
++            cond = self.can_delete_extra or index < initial_form_count
++        if self.can_delete and cond:
++            form.fields[DELETION_FIELD_NAME] = BooleanField(
++                label=_("Delete"), required=False, widget=self.get_deletion_widget())
++    return add_fields
++
++for label, fn in [
++    ("empty_form", lambda fs: fs.empty_form),
++    ("media", lambda fs: fs.media),
++    ("is_multipart", lambda fs: fs.is_multipart()),
++]:
++    for name, fixed in [("PRE-FIX", False), ("POST-FIX", True)]:
++        FS = formset_factory(Choice, can_delete=True, can_delete_extra=False, extra=0)
++        FS.add_fields = make(fixed)
++        fs = FS()
++        assert fs.forms == []
++        try:
++            fn(fs)
++            print(f"{name:9} {label:14} OK")
++        except Exception as e:
++            print(f"{name:9} {label:14} {type(e).__name__}: {e}")
+diff --git a/probe/probeapp/__init__.py b/probe/probeapp/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/probe/probeapp/models.py b/probe/probeapp/models.py
+new file mode 100644
+index 0000000000..8a9f6aa65c
+--- /dev/null
++++ b/probe/probeapp/models.py
+@@ -0,0 +1,16 @@
++from django.db import models
++from django.contrib.contenttypes.fields import GenericForeignKey
++from django.contrib.contenttypes.models import ContentType
++
++class Author(models.Model):
++    name = models.CharField(max_length=50)
++
++class Book(models.Model):
++    author = models.ForeignKey(Author, models.CASCADE)
++    title = models.CharField(max_length=50)
++
++class Tag(models.Model):
++    content_type = models.ForeignKey(ContentType, models.CASCADE)
++    object_id = models.PositiveIntegerField()
++    content_object = GenericForeignKey()
++    label = models.CharField(max_length=50)
+diff --git a/probe/probeurls.py b/probe/probeurls.py
+new file mode 100644
+index 0000000000..637600f58a
+--- /dev/null
++++ b/probe/probeurls.py
+@@ -0,0 +1 @@
++urlpatterns = []
+diff --git a/probe/run.py b/probe/run.py
+new file mode 100644
+index 0000000000..3df583709c
+--- /dev/null
++++ b/probe/run.py
+@@ -0,0 +1,80 @@
++import itertools, traceback, sys
++sys.path.insert(0, "/workspace/probe")
++sys.path.insert(0, "/testbed")
++import sweep  # configures settings
++
++from django import forms
++from django.forms import formset_factory, modelformset_factory, inlineformset_factory
++from django.contrib.contenttypes.forms import generic_inlineformset_factory
++from probeapp.models import Author, Book, Tag
++
++class Choice(forms.Form):
++    choice = forms.CharField()
++    votes = forms.IntegerField()
++
++failures = []
++
++def probe(label, fn):
++    try:
++        fn()
++    except Exception as e:
++        failures.append((label, traceback.format_exc()))
++
++bools = [True, False]
++for can_order, can_delete, cde, extra, min_num, initial in itertools.product(
++        bools, bools, bools, [0, 1, 2], [0, 1], [None, [{"choice": "a", "votes": 1}]]):
++    FS = formset_factory(Choice, can_order=can_order, can_delete=can_delete,
++                         can_delete_extra=cde, extra=extra, min_num=min_num)
++    tag = f"plain order={can_order} del={can_delete} cde={cde} extra={extra} min={min_num} init={bool(initial)}"
++    def go(FS=FS, initial=initial, tag=tag):
++        fs = FS(initial=initial)
++        fs.empty_form
++        str(fs)
++        fs.is_multipart()
++        fs.media
++        fs.as_p(); fs.as_table(); fs.as_ul(); fs.as_div()
++        str(fs.empty_form)
++    probe(tag, go)
++    # bound
++    def gob(FS=FS, initial=initial, tag=tag):
++        data = {"form-TOTAL_FORMS": "1", "form-INITIAL_FORMS": "0",
++                "form-0-choice": "x", "form-0-votes": "1"}
++        fs = FS(data, initial=initial)
++        fs.empty_form
++        str(fs)
++        fs.is_valid()
++        str(fs.empty_form)
++    probe("bound " + tag, gob)
++
++# model formsets
++for can_order, can_delete, cde, extra in itertools.product(bools, bools, bools, [0, 1]):
++    tag = f"model order={can_order} del={can_delete} cde={cde} extra={extra}"
++    def go(can_order=can_order, can_delete=can_delete, cde=cde, extra=extra):
++        FS = modelformset_factory(Author, fields="__all__", can_order=can_order,
++                                  can_delete=can_delete, can_delete_extra=cde, extra=extra)
++        fs = FS(queryset=Author.objects.none())
++        fs.empty_form; str(fs); fs.media; fs.is_multipart(); str(fs.empty_form)
++    probe(tag, go)
++    def goi(can_order=can_order, can_delete=can_delete, cde=cde, extra=extra):
++        FS = inlineformset_factory(Author, Book, fields="__all__", can_order=can_order,
++                                   can_delete=can_delete, can_delete_extra=cde, extra=extra)
++        fs = FS(instance=Author())
++        fs.empty_form; str(fs); fs.media; fs.is_multipart(); str(fs.empty_form)
++    probe("inline " + tag, goi)
++    def gog(can_order=can_order, can_delete=can_delete, cde=cde, extra=extra):
++        FS = generic_inlineformset_factory(Tag, fields="__all__", can_order=can_order,
++                                           can_delete=can_delete, can_delete_extra=cde, extra=extra)
++        fs = FS(instance=Author())
++        fs.empty_form; str(fs); fs.media; fs.is_multipart(); str(fs.empty_form)
++    probe("generic " + tag, gog)
++
++print("total failures:", len(failures))
++seen = set()
++for label, tb in failures:
++    key = tb.splitlines()[-1]
++    if key in seen:
++        continue
++    seen.add(key)
++    print("="*70)
++    print(label)
++    print(tb)
+diff --git a/probe/sweep.py b/probe/sweep.py
+new file mode 100644
+index 0000000000..a9192c89a0
+--- /dev/null
++++ b/probe/sweep.py
+@@ -0,0 +1,28 @@
++import itertools, traceback, django
++from django.conf import settings
++
++settings.configure(
++    DEBUG=True,
++    DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
++    INSTALLED_APPS=[
++        "django.contrib.contenttypes",
++        "django.contrib.auth",
++        "django.contrib.admin",
++        "django.contrib.sessions",
++        "django.contrib.messages",
++        "probeapp",
++    ],
++    TEMPLATES=[{
++        "BACKEND": "django.template.backends.django.DjangoTemplates",
++        "APP_DIRS": True,
++        "OPTIONS": {"context_processors": [
++            "django.template.context_processors.request",
++            "django.contrib.auth.context_processors.auth",
++            "django.contrib.messages.context_processors.messages",
++        ]},
++    }],
++    ROOT_URLCONF="probeurls",
++    USE_TZ=True,
++    SECRET_KEY="x",
++)
++django.setup()
+diff --git a/tests/forms_tests/tests/test_formsets.py b/tests/forms_tests/tests/test_formsets.py
+index e2c695f0dc..5079b197bb 100644
+--- a/tests/forms_tests/tests/test_formsets.py
++++ b/tests/forms_tests/tests/test_formsets.py
+@@ -1507,6 +1507,20 @@ class FormsFormsetTestCase(SimpleTestCase):
+         self.assertIs(formset._should_delete_form(formset.forms[1]), False)
+         self.assertIs(formset._should_delete_form(formset.forms[2]), False)
+ 
++    def test_disable_delete_extra_formset_forms_empty_form(self):
++        ChoiceFormFormset = formset_factory(
++            form=Choice,
++            can_delete=True,
++            can_delete_extra=False,
++        )
++        formset = ChoiceFormFormset()
++        self.assertNotIn("DELETE", formset.empty_form.fields)
++
++    def test_can_delete_extra_formset_forms_empty_form(self):
++        ChoiceFormFormset = formset_factory(form=Choice, can_delete=True)
++        formset = ChoiceFormFormset()
++        self.assertIn("DELETE", formset.empty_form.fields)
++
+     def test_template_name_uses_renderer_value(self):
+         class CustomRenderer(TemplatesSetting):
+             formset_template_name = "a/custom/formset/template.html"
+diff --git a/tests/generic_relations/test_forms.py b/tests/generic_relations/test_forms.py
+index 00df254745..02ca8fe1ae 100644
+--- a/tests/generic_relations/test_forms.py
++++ b/tests/generic_relations/test_forms.py
+@@ -366,3 +366,4 @@ class GenericInlineFormsetTests(TestCase):
+         self.assertEqual(len(formset), 2)
+         self.assertNotIn("DELETE", formset.forms[0].fields)
+         self.assertNotIn("DELETE", formset.forms[1].fields)
++        self.assertNotIn("DELETE", formset.empty_form.fields)
+diff --git a/tests/model_formsets/tests.py b/tests/model_formsets/tests.py
+index 598dc57e7a..bc82bf79ed 100644
+--- a/tests/model_formsets/tests.py
++++ b/tests/model_formsets/tests.py
+@@ -2303,6 +2303,7 @@ class TestModelFormsetOverridesTroughFormMeta(TestCase):
+         self.assertEqual(len(formset), 2)
+         self.assertIn("DELETE", formset.forms[0].fields)
+         self.assertIn("DELETE", formset.forms[1].fields)
++        self.assertIn("DELETE", formset.empty_form.fields)
+ 
+     def test_modelformset_factory_disable_delete_extra(self):
+         AuthorFormSet = modelformset_factory(
+@@ -2316,6 +2317,7 @@ class TestModelFormsetOverridesTroughFormMeta(TestCase):
+         self.assertEqual(len(formset), 2)
+         self.assertNotIn("DELETE", formset.forms[0].fields)
+         self.assertNotIn("DELETE", formset.forms[1].fields)
++        self.assertNotIn("DELETE", formset.empty_form.fields)
+ 
+     def test_inlineformset_factory_can_delete_extra(self):
+         BookFormSet = inlineformset_factory(
+@@ -2330,6 +2332,7 @@ class TestModelFormsetOverridesTroughFormMeta(TestCase):
+         self.assertEqual(len(formset), 2)
+         self.assertIn("DELETE", formset.forms[0].fields)
+         self.assertIn("DELETE", formset.forms[1].fields)
++        self.assertIn("DELETE", formset.empty_form.fields)
+ 
+     def test_inlineformset_factory_can_not_delete_extra(self):
+         BookFormSet = inlineformset_factory(
+@@ -2344,6 +2347,7 @@ class TestModelFormsetOverridesTroughFormMeta(TestCase):
+         self.assertEqual(len(formset), 2)
+         self.assertNotIn("DELETE", formset.forms[0].fields)
+         self.assertNotIn("DELETE", formset.forms[1].fields)
++        self.assertNotIn("DELETE", formset.empty_form.fields)
+ 
+     def test_inlineformset_factory_passes_renderer(self):
+         from django.forms.renderers import Jinja2

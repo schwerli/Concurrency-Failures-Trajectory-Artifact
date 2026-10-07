@@ -1,0 +1,97 @@
+diff --git a/sphinx/ext/viewcode.py b/sphinx/ext/viewcode.py
+index a7d52a91c..45363aa41 100644
+--- a/sphinx/ext/viewcode.py
++++ b/sphinx/ext/viewcode.py
+@@ -32,6 +32,14 @@ logger = logging.getLogger(__name__)
+ OUTPUT_DIRNAME = '_modules'
+ 
+ 
++def _get_viewcode_only_expr(app: Sphinx) -> str:
++    only_expr = 'html and not singlehtml'
++    if not app.config.viewcode_enable_epub:
++        only_expr += ' and not epub'
++
++    return only_expr
++
++
+ def _get_full_modname(app: Sphinx, modname: str, attribute: str) -> Optional[str]:
+     try:
+         return get_full_modname(modname, attribute)
+@@ -54,10 +62,7 @@ def doctree_read(app: Sphinx, doctree: Node) -> None:
+     env = app.builder.env
+     if not hasattr(env, '_viewcode_modules'):
+         env._viewcode_modules = {}  # type: ignore
+-    if app.builder.name == "singlehtml":
+-        return
+-    if app.builder.name.startswith("epub") and not env.config.viewcode_enable_epub:
+-        return
++    only_expr = _get_viewcode_only_expr(app)
+ 
+     def has_tag(modname: str, fullname: str, docname: str, refname: str) -> bool:
+         entry = env._viewcode_modules.get(modname, None)  # type: ignore
+@@ -116,7 +121,7 @@ def doctree_read(app: Sphinx, doctree: Node) -> None:
+             names.add(fullname)
+             pagename = posixpath.join(OUTPUT_DIRNAME, modname.replace('.', '/'))
+             inline = nodes.inline('', _('[source]'), classes=['viewcode-link'])
+-            onlynode = addnodes.only(expr='html')
++            onlynode = addnodes.only(expr=only_expr)
+             onlynode += addnodes.pending_xref('', inline, reftype='viewcode', refdomain='std',
+                                               refexplicit=False, reftarget=pagename,
+                                               refid=fullname, refdoc=env.docname)
+@@ -182,6 +187,8 @@ def collect_pages(app: Sphinx) -> Generator[Tuple[str, Dict[str, Any], str], Non
+     env = app.builder.env
+     if not hasattr(env, '_viewcode_modules'):
+         return
++    if not app.tags.eval_condition(_get_viewcode_only_expr(app)):
++        return
+     highlighter = app.builder.highlighter  # type: ignore
+     urito = app.builder.get_relative_uri
+ 
+@@ -278,7 +285,7 @@ def collect_pages(app: Sphinx) -> Generator[Tuple[str, Dict[str, Any], str], Non
+ 
+ def setup(app: Sphinx) -> Dict[str, Any]:
+     app.add_config_value('viewcode_import', None, False)
+-    app.add_config_value('viewcode_enable_epub', False, False)
++    app.add_config_value('viewcode_enable_epub', False, 'env')
+     app.add_config_value('viewcode_follow_imported_members', True, False)
+     app.connect('doctree-read', doctree_read)
+     app.connect('env-merge-info', env_merge_info)
+@@ -290,6 +297,6 @@ def setup(app: Sphinx) -> Dict[str, Any]:
+     app.add_event('viewcode-follow-imported')
+     return {
+         'version': sphinx.__display_version__,
+-        'env_version': 1,
++        'env_version': 2,
+         'parallel_read_safe': True
+     }
+diff --git a/tests/test_ext_viewcode.py b/tests/test_ext_viewcode.py
+index 79864095b..f7475d97e 100644
+--- a/tests/test_ext_viewcode.py
++++ b/tests/test_ext_viewcode.py
+@@ -49,6 +49,26 @@ def test_viewcode(app, status, warning):
+             '<span>    &quot;&quot;&quot;</span></div>\n') in result
+ 
+ 
++@pytest.mark.sphinx('html', testroot='ext-viewcode')
++def test_viewcode_is_disabled_for_epub_by_default(app, make_app):
++    app.build()
++
++    epub = make_app('epub', srcdir=app.srcdir)
++    epub.build()
++
++    assert not (epub.outdir / '_modules').exists()
++    assert '_modules/' not in (epub.outdir / 'index.xhtml').read_text()
++
++
++@pytest.mark.sphinx('epub', testroot='ext-viewcode',
++                    confoverrides={'viewcode_enable_epub': True})
++def test_viewcode_epub_enabled(app):
++    app.build()
++
++    assert (app.outdir / '_modules' / 'spam' / 'mod1.xhtml').exists()
++    assert '_modules/spam/mod1.xhtml#func1' in (app.outdir / 'index.xhtml').read_text()
++
++
+ @pytest.mark.sphinx(testroot='ext-viewcode', tags=['test_linkcode'])
+ def test_linkcode(app, status, warning):
+     app.builder.build(['objects'])

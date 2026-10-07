@@ -1,0 +1,77 @@
+diff --git a/lib/matplotlib/axis.py b/lib/matplotlib/axis.py
+index c0e706e2b3..7095ca38fb 100644
+--- a/lib/matplotlib/axis.py
++++ b/lib/matplotlib/axis.py
+@@ -2255,7 +2255,11 @@ class XAxis(Axis):
+             transform=mtransforms.blended_transform_factory(
+                 self.axes.transAxes, mtransforms.IdentityTransform()),
+             fontsize=mpl.rcParams['xtick.labelsize'],
+-            color=mpl.rcParams['xtick.color'],
++            color=(
++                mpl.rcParams['xtick.labelcolor']
++                if mpl.rcParams['xtick.labelcolor'] != 'inherit'
++                else mpl.rcParams['xtick.color']
++            ),
+         )
+         self.offset_text_position = 'bottom'
+ 
+@@ -2515,7 +2519,11 @@ class YAxis(Axis):
+             transform=mtransforms.blended_transform_factory(
+                 self.axes.transAxes, mtransforms.IdentityTransform()),
+             fontsize=mpl.rcParams['ytick.labelsize'],
+-            color=mpl.rcParams['ytick.color'],
++            color=(
++                mpl.rcParams['ytick.labelcolor']
++                if mpl.rcParams['ytick.labelcolor'] != 'inherit'
++                else mpl.rcParams['ytick.color']
++            ),
+         )
+         self.offset_text_position = 'left'
+ 
+diff --git a/lib/matplotlib/tests/test_axes.py b/lib/matplotlib/tests/test_axes.py
+index 8483ed077b..bf68f546bf 100644
+--- a/lib/matplotlib/tests/test_axes.py
++++ b/lib/matplotlib/tests/test_axes.py
+@@ -6801,6 +6801,26 @@ def test_offset_label_color():
+     assert ax.yaxis.get_offset_text().get_color() == 'red'
+ 
+ 
++def test_offset_text_rcparam_color():
++    # Tests issue 25158: the offset text is a tick label, so it follows
++    # *tick.labelcolor, falling back on *tick.color when that is 'inherit'.
++    plt.rcParams.update({'xtick.color': 'yellow', 'ytick.color': 'yellow',
++                         'xtick.labelcolor': 'blue', 'ytick.labelcolor': 'blue'})
++    fig, ax = plt.subplots()
++    ax.plot([1.01e9, 1.02e9, 1.03e9])
++    assert ax.xaxis.get_offset_text().get_color() == 'blue'
++    assert ax.yaxis.get_offset_text().get_color() == 'blue'
++
++
++def test_offset_text_rcparam_color_inherit():
++    # The 'inherit' default must keep resolving to *tick.color.
++    plt.rcParams.update({'xtick.color': 'yellow', 'ytick.color': 'yellow'})
++    fig, ax = plt.subplots()
++    ax.plot([1.01e9, 1.02e9, 1.03e9])
++    assert ax.xaxis.get_offset_text().get_color() == 'yellow'
++    assert ax.yaxis.get_offset_text().get_color() == 'yellow'
++
++
+ def test_offset_text_visible():
+     fig, ax = plt.subplots()
+     ax.plot([1.01e9, 1.02e9, 1.03e9])
+@@ -7799,6 +7819,7 @@ def test_xtickcolor_is_not_xticklabelcolor():
+     for tick in ticks:
+         assert tick.tick1line.get_color() == 'yellow'
+         assert tick.label1.get_color() == 'blue'
++    assert ax.xaxis.get_offset_text().get_color() == 'blue'
+ 
+ 
+ def test_ytickcolor_is_not_yticklabelcolor():
+@@ -7809,6 +7830,7 @@ def test_ytickcolor_is_not_yticklabelcolor():
+     for tick in ticks:
+         assert tick.tick1line.get_color() == 'yellow'
+         assert tick.label1.get_color() == 'blue'
++    assert ax.yaxis.get_offset_text().get_color() == 'blue'
+ 
+ 
+ @pytest.mark.parametrize('size', [size for size in mfont_manager.font_scalings

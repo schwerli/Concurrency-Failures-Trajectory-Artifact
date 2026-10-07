@@ -1,0 +1,60 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index ee45bb941e..1913d2e918 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -763,8 +763,11 @@ class Field(RegisterLookupMixin):
+             if not getattr(cls, self.attname, None):
+                 setattr(cls, self.attname, self.descriptor_class(self))
+         if self.choices is not None:
+-            setattr(cls, 'get_%s_display' % self.name,
+-                    partialmethod(cls._get_FIELD_display, field=self))
++            # Don't override get_FOO_display() defined by the user, e.g. on
++            # the model itself or inherited from a parent class.
++            if not hasattr(cls, 'get_%s_display' % self.name):
++                setattr(cls, 'get_%s_display' % self.name,
++                        partialmethod(cls._get_FIELD_display, field=self))
+ 
+     def get_filter_kwargs_for_object(self, obj):
+         """
+diff --git a/tests/model_fields/models.py b/tests/model_fields/models.py
+index 98b32d0c1e..2552508d52 100644
+--- a/tests/model_fields/models.py
++++ b/tests/model_fields/models.py
+@@ -64,6 +64,13 @@ class WhizIter(models.Model):
+     c = models.IntegerField(choices=iter(Whiz.CHOICES), null=True)
+ 
+ 
++class WhizOverride(models.Model):
++    c = models.IntegerField(choices=Whiz.CHOICES, null=True)
++
++    def get_c_display(self):
++        return 'Overridden'
++
++
+ class WhizIterEmpty(models.Model):
+     c = models.CharField(choices=iter(()), blank=True, max_length=1)
+ 
+diff --git a/tests/model_fields/tests.py b/tests/model_fields/tests.py
+index 0d6e930b06..eb01454a03 100644
+--- a/tests/model_fields/tests.py
++++ b/tests/model_fields/tests.py
+@@ -8,7 +8,7 @@ from django.utils.functional import lazy
+ 
+ from .models import (
+     Bar, Choiceful, Foo, RenamedField, VerboseNameField, Whiz, WhizDelayed,
+-    WhizIter, WhizIterEmpty,
++    WhizIter, WhizIterEmpty, WhizOverride,
+ )
+ 
+ 
+@@ -168,6 +168,10 @@ class GetFieldDisplayTests(SimpleTestCase):
+         self.assertIsInstance(val, str)
+         self.assertEqual(val, 'translated')
+ 
++    def test_overridden_get_FIELD_display(self):
++        """get_FIELD_display() overridden on the model isn't replaced."""
++        self.assertEqual(WhizOverride(c=1).get_c_display(), 'Overridden')
++
+     def test_iterator_choices(self):
+         """
+         get_choices() works with Iterators.

@@ -1,0 +1,44 @@
+diff --git a/changelog/5325.bugfix.rst b/changelog/5325.bugfix.rst
+new file mode 100644
+index 00000000..2ebd55a9
+--- /dev/null
++++ b/changelog/5325.bugfix.rst
+@@ -0,0 +1 @@
++``EncodedFile.mode`` no longer reports the binary mode of the underlying buffer, so tools inspecting it (such as youtube-dl) now correctly write text to captured output instead of failing with a ``TypeError``.
+diff --git a/src/_pytest/capture.py b/src/_pytest/capture.py
+index 25eab7fd..56017113 100644
+--- a/src/_pytest/capture.py
++++ b/src/_pytest/capture.py
+@@ -447,6 +447,10 @@ class EncodedFile(object):
+         """Ensure that file.name is a string."""
+         return repr(self.buffer)
+ 
++    @property
++    def mode(self):
++        return self.buffer.mode.replace("b", "")
++
+     def __getattr__(self, name):
+         return getattr(object.__getattribute__(self, "buffer"), name)
+ 
+diff --git a/testing/test_capture.py b/testing/test_capture.py
+index 5d80eb63..bc8d76ce 100644
+--- a/testing/test_capture.py
++++ b/testing/test_capture.py
+@@ -952,6 +952,17 @@ def test_dupfile_on_textio():
+     assert not hasattr(f, "name")
+ 
+ 
++@needsosdup
++def test_dupfile_mode_no_binary(tmpdir):
++    """Regression test for #5325: mode of the duplicated text file must
++    not be binary, otherwise callers may write bytes to it."""
++    tmpfile = tmpdir.join("test")
++    tmpfile.write("foo")
++    f = tmpfile.open("rb")
++    f = capture.safe_text_dupfile(f, "wb")
++    assert "b" not in f.mode
++
++
+ @contextlib.contextmanager
+ def lsof_check():
+     pid = os.getpid()

@@ -1,0 +1,42 @@
+Migration complete and verified byte-for-byte against the reference binary.
+
+## What's in `/output`
+
+```
+Cargo.toml              # edition 2021, no [dependencies]
+test15.rs               # entry point (package root, as required)
+src/lib.rs              # library crate
+src/url_parser/mod.rs   # module re-exports
+src/url_parser/url.rs   # URL type: from_components, accessors, Display, is_valid
+src/url_parser/cxx_compat.rs  # std::stoi semantics + uncaught-exception abort
+test15                  # executable from `rustc test15.rs`
+```
+
+## Behavior recovered black-box from the binary
+
+The header was absent from the dataset, so I inferred the whole contract by probing `test15_executable`:
+
+| Aspect | Behavior |
+|---|---|
+| **scheme** | ASCII-lowercased byte-wise; no trimming. `"HTTP "` → `"http "`, and non-ASCII bytes (`Ü` = `C3 9C`) pass through untouched |
+| **host** | Stored verbatim — case *is* preserved (`EXAMPLE.COM` stays) |
+| **port** | Clamped: outside `0..=65535` collapses to `-1`. `0` is in range and renders as `:0`; `65536` and `-5` both become `-1` |
+| **path** | Non-empty path gains a leading `/` (`"a/b"` → `"/a/b"`, `" /x"` → `"/ /x"`); empty path stays empty |
+| **query/fragment** | Completely verbatim — no `?`/`#` stripping, so `"?q=1"` renders as `"??q=1"` |
+| **to_string** | The authority is gated on the *scheme*: with no scheme, host **and** port are dropped entirely (`("", "example.com", 80, "/")` → just `"/"`) |
+| **is_valid** | `!host.is_empty() \|\| !path.is_empty()` — scheme, query, and fragment alone never validate. Confirmed against a full 8-row truth table |
+
+Two non-obvious details worth flagging:
+
+- **`is_valid()` ignores the scheme.** `("x", "", 80, "")` returns `0` while `("", "", 80, "/pp")` returns `1` — the opposite of the intuitive "needs scheme and host" rule.
+- **The C++ `main` never catches `std::stoi`.** A non-numeric or overflowing port aborts on `SIGABRT` (exit 134) with libstdc++'s `terminate called after throwing…/  what():  stoi` on stderr and *nothing* on stdout. `cxx_compat::stoi` reproduces strtol parsing (all six C `isspace` chars including `\v`, optional sign, trailing garbage ignored) and that exact failure mode.
+
+## Verification
+
+A differential harness (`/workspace/difftest.rs`, std-only) compares exit status, stdout, and stderr as raw bytes:
+
+**`PASS: all 5518 cases identical (518 fixed + 5000 fuzzed)`**
+
+Coverage includes the 5 documented examples, all argc-underflow paths, a 420-case scheme×host×path matrix, query/fragment combinations, 40 port spellings (i32 boundaries, both abort paths, whitespace forms), and 5000 seeded-random cases. The abort paths were confirmed side-by-side rather than trusted as matching-empty output. 12 library unit tests pass, and the project builds warning-free three ways: `cargo build --release`, `rustc --edition 2021 test15.rs`, and bare `rustc test15.rs` (I used `self::`-qualified module paths so the literal command from the spec works despite rustc defaulting to edition 2015).
+
+One caveat: per requirement 2 I used `std::env::args()`, which panics on non-UTF-8 arguments, whereas the C++ binary handles arbitrary bytes. I verified the byte-level lowercasing logic is correct for such input, so switching to `args_os()` with `OsStrExt` (still std-only) would close that gap if the harness ever passes invalid UTF-8 — say the word and I'll make that change.

@@ -1,0 +1,180 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..75b25b1
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,2 @@
++requirement_patches/
++__pycache__/
+diff --git a/agent_tests/test_smt_solver.py b/agent_tests/test_smt_solver.py
+new file mode 100644
+index 0000000..d25de91
+--- /dev/null
++++ b/agent_tests/test_smt_solver.py
+@@ -0,0 +1,29 @@
++"""Agent tests for the smt_solver layer."""
++
++from smt_solver import count_nqueens_solutions, chromatic_number, schedule_jobs
++from framework import PETERSEN_GRAPH, DIAMOND_DAG
++
++
++def test_nqueens():
++    assert count_nqueens_solutions(4) == 2
++    assert count_nqueens_solutions(8) == 92
++
++
++def test_chromatic():
++    assert chromatic_number(PETERSEN_GRAPH) == 3
++    # DAG with no undirected edges constraint: edges only constrain endpoints
++    assert chromatic_number(DIAMOND_DAG) >= 2
++
++
++def test_schedule():
++    jobs = [("A", 3), ("B", 5), ("C", 2), ("D", 4), ("E", 6), ("F", 1)]
++    assert schedule_jobs(jobs, 3) == 7
++    # single machine: makespan is the sum of durations
++    assert schedule_jobs(jobs, 1) == 21
++
++
++if __name__ == "__main__":
++    test_nqueens()
++    test_chromatic()
++    test_schedule()
++    print("smt_solver tests OK")
+diff --git a/run.sh b/run.sh
+index e0df4f0..c645dec 100755
+--- a/run.sh
++++ b/run.sh
+@@ -1,3 +1,6 @@
+ #!/bin/bash
+ set -e
+-echo "No experiments implemented yet."
++cd "$(dirname "$0")"
++
++# Layer 1: SMT constraint solving toolkit
++python3 -m smt_solver
+diff --git a/smt_solver/__init__.py b/smt_solver/__init__.py
+new file mode 100644
+index 0000000..f7577f7
+--- /dev/null
++++ b/smt_solver/__init__.py
+@@ -0,0 +1,107 @@
++"""SMT-based constraint solving toolkit built on Z3's Python API.
++
++Capabilities:
++  - N-Queens solution enumeration (blocking-clause model enumeration)
++  - Graph chromatic number via iterative k-coloring checks
++  - Job-shop style scheduling with makespan minimization (Z3 Optimize)
++"""
++
++from z3 import Int, Solver, Optimize, And, Or, Distinct, sat
++
++from framework import PETERSEN_GRAPH, report_result
++
++
++def count_nqueens_solutions(n):
++    """Count ALL solutions of the n-queens problem using Z3.
++
++    q_i is the column of the queen in row i.  Constraints:
++      - 0 <= q_i < n
++      - all columns distinct
++      - no two queens on a shared diagonal: |q_i - q_j| != |i - j|
++    Models are enumerated with blocking clauses.
++    """
++    queens = [Int(f"q_{i}") for i in range(n)]
++    s = Solver()
++    for q in queens:
++        s.add(And(0 <= q, q < n))
++    s.add(Distinct(queens))
++    for i in range(n):
++        for j in range(i + 1, n):
++            # |q_i - q_j| != |i - j|  (both diagonal directions)
++            s.add(queens[i] - queens[j] != i - j)
++            s.add(queens[i] - queens[j] != j - i)
++
++    count = 0
++    while s.check() == sat:
++        model = s.model()
++        count += 1
++        # blocking clause: rule out exactly this assignment
++        s.add(Or([q != model[q].as_long() for q in queens]))
++    return count
++
++
++def chromatic_number(graph):
++    """Minimum number of colors so adjacent nodes differ.
++
++    Tries k = 1, 2, ... until the k-coloring encoding is satisfiable.
++    """
++    nodes = graph.nodes
++    k = 0
++    while True:
++        k += 1
++        s = Solver()
++        color = {v: Int(f"c_{v}") for v in nodes}
++        for v in nodes:
++            s.add(And(0 <= color[v], color[v] < k))
++        for u, v in graph.edges:
++            s.add(color[u] != color[v])
++        if s.check() == sat:
++            return k
++
++
++def schedule_jobs(jobs, num_machines):
++    """Minimize the makespan of scheduling jobs on num_machines machines.
++
++    jobs: list of (job_id, duration).  Each job gets a start time, an end
++    time (start + duration) and a machine in [0, num_machines).  Jobs on
++    the same machine may not overlap.  Returns the optimal makespan.
++    """
++    opt = Optimize()
++    starts, ends, machines = {}, {}, {}
++    for job_id, duration in jobs:
++        starts[job_id] = Int(f"start_{job_id}")
++        ends[job_id] = Int(f"end_{job_id}")
++        machines[job_id] = Int(f"mach_{job_id}")
++        opt.add(starts[job_id] >= 0)
++        opt.add(ends[job_id] == starts[job_id] + duration)
++        opt.add(And(0 <= machines[job_id], machines[job_id] < num_machines))
++
++    # non-overlap for jobs sharing a machine
++    ids = [job_id for job_id, _ in jobs]
++    for i in range(len(ids)):
++        for j in range(i + 1, len(ids)):
++            a, b = ids[i], ids[j]
++            opt.add(Or(machines[a] != machines[b],
++                       ends[a] <= starts[b],
++                       ends[b] <= starts[a]))
++
++    makespan = Int("makespan")
++    for job_id, _ in jobs:
++        opt.add(makespan >= ends[job_id])
++    opt.minimize(makespan)
++
++    if opt.check() != sat:
++        raise RuntimeError("scheduling problem unexpectedly unsat")
++    return opt.model()[makespan].as_long()
++
++
++def run_z3_experiments():
++    """Run all SMT-toolkit experiments, reporting KEY: VALUE lines."""
++    report_result("Z3_NQUEENS_8_SOLUTIONS", count_nqueens_solutions(8))
++    report_result("Z3_PETERSEN_CHROMATIC", chromatic_number(PETERSEN_GRAPH))
++    jobs = [("A", 3), ("B", 5), ("C", 2), ("D", 4), ("E", 6), ("F", 1)]
++    report_result("Z3_SCHEDULE_MAKESPAN", schedule_jobs(jobs, 3))
++
++
++if __name__ == "__main__":
++    run_z3_experiments()
+diff --git a/smt_solver/__main__.py b/smt_solver/__main__.py
+new file mode 100644
+index 0000000..6d2cdc1
+--- /dev/null
++++ b/smt_solver/__main__.py
+@@ -0,0 +1,6 @@
++"""Entry point: python3 -m smt_solver"""
++
++from . import run_z3_experiments
++
++if __name__ == "__main__":
++    run_z3_experiments()

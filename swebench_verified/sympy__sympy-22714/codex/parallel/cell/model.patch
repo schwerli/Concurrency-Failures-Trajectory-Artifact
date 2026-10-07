@@ -1,0 +1,74 @@
+diff --git a/sympy/core/tests/test_sympify.py b/sympy/core/tests/test_sympify.py
+index 3e4e9e0189..401dff1fc1 100644
+--- a/sympy/core/tests/test_sympify.py
++++ b/sympy/core/tests/test_sympify.py
+@@ -3,6 +3,7 @@
+ from sympy.core.function import (Function, Lambda)
+ from sympy.core.mul import Mul
+ from sympy.core.numbers import (Float, I, Integer, Rational, pi)
++from sympy.core.parameters import evaluate
+ from sympy.core.power import Pow
+ from sympy.core.singleton import S
+ from sympy.core.symbol import Symbol
+@@ -23,7 +24,7 @@
+ from sympy.external import import_module
+ from sympy.testing.pytest import raises, XFAIL, skip, warns_deprecated_sympy
+ from sympy.utilities.decorator import conserve_mpmath_dps
+-from sympy.geometry import Point, Line
++from sympy.geometry import Point, Point2D, Line
+ from sympy.functions.combinatorial.factorials import factorial, factorial2
+ from sympy.abc import _clash, _clash1, _clash2
+ from sympy.external.gmpy import HAS_GMPY
+@@ -442,6 +443,12 @@ def test_evaluate_false():
+         assert sympify(case, evaluate=False) == result
+ 
+ 
++def test_S_point_with_evaluate_false_context():
++    with evaluate(False):
++        assert Point2D(1, 2) == Point(1, 2)
++        assert S('Point2D(Integer(1),Integer(2))') == Point2D(1, 2)
++
++
+ def test_issue_4133():
+     a = sympify('Integer(4)')
+ 
+diff --git a/sympy/geometry/point.py b/sympy/geometry/point.py
+index 73c20334d0..73e50ffae3 100644
+--- a/sympy/geometry/point.py
++++ b/sympy/geometry/point.py
+@@ -152,7 +152,7 @@ def __new__(cls, *args, **kwargs):
+                         'warn' or 'ignore'.'''))
+         if any(coords[dim:]):
+             raise ValueError('Nonzero coordinates cannot be removed.')
+-        if any(a.is_number and im(a) for a in coords):
++        if any(a.is_number and im(a, evaluate=True) for a in coords):
+             raise ValueError('Imaginary coordinates are not permitted.')
+         if not all(isinstance(a, Expr) for a in coords):
+             raise TypeError('Coordinates must be valid SymPy expressions.')
+diff --git a/sympy/geometry/tests/test_point.py b/sympy/geometry/tests/test_point.py
+index 930d707735..b8493e8019 100644
+--- a/sympy/geometry/tests/test_point.py
++++ b/sympy/geometry/tests/test_point.py
+@@ -1,5 +1,6 @@
+ from sympy.core.basic import Basic
+ from sympy.core.numbers import (I, Rational, pi)
++from sympy.core.parameters import evaluate
+ from sympy.core.singleton import S
+ from sympy.core.symbol import Symbol
+ from sympy.core.sympify import sympify
+@@ -164,6 +165,15 @@ def test_point():
+     assert Point.affine_rank() == -1
+ 
+ 
++def test_point_with_global_evaluate_false():
++    expected = Point2D(1, 2)
++
++    with evaluate(False):
++        assert Point2D(1, 2) == expected
++        assert sympify('Point2D(Integer(1),Integer(2))') == expected
++        raises(ValueError, lambda: Point2D(1, I))
++
++
+ def test_point3D():
+     x = Symbol('x', real=True)
+     y = Symbol('y', real=True)

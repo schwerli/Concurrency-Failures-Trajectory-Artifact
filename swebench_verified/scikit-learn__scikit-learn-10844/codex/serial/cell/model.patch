@@ -1,0 +1,40 @@
+diff --git a/sklearn/metrics/cluster/supervised.py b/sklearn/metrics/cluster/supervised.py
+index a987778ae..0d08fca5f 100644
+--- a/sklearn/metrics/cluster/supervised.py
++++ b/sklearn/metrics/cluster/supervised.py
+@@ -852,7 +852,9 @@ def fowlkes_mallows_score(labels_true, labels_pred, sparse=False):
+     labels_true, labels_pred = check_clusterings(labels_true, labels_pred)
+     n_samples, = labels_true.shape
+ 
++    # Cast to float64 to avoid overflow in the contingency matrix powers.
+     c = contingency_matrix(labels_true, labels_pred, sparse=True)
++    c = c.astype(np.float64)
+     tk = np.dot(c.data, c.data) - n_samples
+     pk = np.sum(np.asarray(c.sum(axis=0)).ravel() ** 2) - n_samples
+     qk = np.sum(np.asarray(c.sum(axis=1)).ravel() ** 2) - n_samples
+diff --git a/sklearn/metrics/cluster/tests/test_supervised.py b/sklearn/metrics/cluster/tests/test_supervised.py
+index 8da03d1e1..53dbd0342 100644
+--- a/sklearn/metrics/cluster/tests/test_supervised.py
++++ b/sklearn/metrics/cluster/tests/test_supervised.py
+@@ -15,7 +15,8 @@ from sklearn.metrics.cluster import v_measure_score
+ 
+ from sklearn.utils import assert_all_finite
+ from sklearn.utils.testing import (
+-        assert_equal, assert_almost_equal, assert_raise_message,
++        assert_equal, assert_almost_equal, assert_no_warnings,
++        assert_raise_message,
+ )
+ from numpy.testing import assert_array_almost_equal
+ 
+@@ -274,3 +275,11 @@ def test_fowlkes_mallows_score_properties():
+     # symmetric and permutation(both together)
+     score_both = fowlkes_mallows_score(labels_b, (labels_a + 2) % 3)
+     assert_almost_equal(score_both, expected)
++
++
++def test_int_overflow_fowlkes_mallows_score():
++    # Test a regression where pk * qk exceeds the platform integer width.
++    labels = np.zeros(70000, dtype=np.int)
++
++    score = assert_no_warnings(fowlkes_mallows_score, labels, labels)
++    assert_almost_equal(score, 1.)

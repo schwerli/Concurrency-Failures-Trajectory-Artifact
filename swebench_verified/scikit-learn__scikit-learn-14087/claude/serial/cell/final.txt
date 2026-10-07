@@ -1,0 +1,24 @@
+Fixed. Two bugs on the `refit=False` path of `LogisticRegressionCV.fit`:
+
+**1. The reported `IndexError` — `sklearn/linear_model/logistic.py:2173`**
+
+```python
+if self.multi_class == 'ovr':   # was: raw parameter
+if multi_class == 'ovr':        # now: resolved value
+```
+
+`multi_class` is resolved by `_check_multi_class` earlier in `fit` (line 2004), where `'auto'` becomes `'ovr'` for binary problems or the liblinear solver. The branch checked the raw attribute instead, so with the default `multi_class='auto'` a binary fit took the multinomial branch and indexed the 3-D per-class `coefs_paths` with 4 indices. The `refit=True` branch a few lines above already used the resolved local correctly — this was the one place that didn't.
+
+**2. A second failure hidden behind the first — line 2183**
+
+Once the indexing was fixed, the same branch died with `TypeError: only integer scalar arrays can be converted to a scalar index`. For non-elasticnet penalties `l1_ratios_` is the plain list `[None]`, and `refit=False` indexes it with an ndarray of per-fold indices (the `refit=True` branch only ever indexes with a scalar, so it was fine). Now the average is only computed for elasticnet; otherwise `l1_ratio_` gets `None`, matching what `refit=True` produces.
+
+**Verification**
+
+- The issue's snippet now fits: `C_=[6.05]`, `coef_` shape `(1, 3)`.
+- Swept 24 combinations of `n_classes` × `multi_class` × `penalty` × `refit` — all give correct `coef_`/`intercept_`/`C_`/`l1_ratio_` shapes and predict.
+- `test_logistic.py`: 176 passed. `test_common.py -k LogisticRegressionCV`: 42 passed.
+- Tests: extended `test_LogisticRegressionCV_no_refit` to parametrize over `penalty` and add `'auto'`, plus a new `test_LogisticRegressionCV_no_refit_binary` for the reported case. Confirmed 4 of these fail on the unpatched module and pass with it — the pre-existing test missed the bug because it always passed `multi_class` explicitly and only used elasticnet.
+- Added a `|Fix|` entry to `doc/whats_new/v0.22.rst`.
+
+One judgement call worth flagging: I credited the changelog entry to the issue reporter (`Tim Sweetser <hacksawjim>`) and used `:issue:` rather than `:pr:` since there's no PR number — adjust that line if you'd rather it name you.

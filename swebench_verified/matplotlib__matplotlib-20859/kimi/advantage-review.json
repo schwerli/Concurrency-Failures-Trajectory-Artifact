@@ -1,0 +1,110 @@
+{
+  "schema_version": 2,
+  "phase": "fixed",
+  "pair_id": "swebench_verified/matplotlib__matplotlib-20859/kimi",
+  "task": {
+    "plain_summary_zh": "修复 Matplotlib 中 SubFigure.legend() 会被 Legend.__init__ 的父对象类型检查拒绝的问题。",
+    "acceptance_target_zh": "调用 subfig.legend() 应能创建并绘制图例，官方 fail-to-pass 测试要求返回的 Legend 仍绑定到该 SubFigure。"
+  },
+  "modes": {
+    "parallel": {
+      "solution_passed": true,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 415.717
+    },
+    "serial": {
+      "solution_passed": false,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 530.113
+    }
+  },
+  "reconstruction": {
+    "parallel_strategy_zh": "并行主上下文先定位到 Legend.__init__ 的 Figure 类型检查，然后把 legend.py 实现修改和 test_figure.py 回归测试拆给两个子上下文。",
+    "serial_strategy_zh": "串行主上下文独自阅读同一代码路径，修改 legend.py，再顺序添加 test_legend.py 回归测试并运行本地验证。",
+    "realized_parallelism_zh": "parallel 中两个子上下文几乎同时启动，agent-0 修改 legend.py，agent-1 写回归测试；serial 没有委托或重叠模型上下文。",
+    "parallel_workers": 2,
+    "peak_overlapping_useful_workers": 2
+  },
+  "baseline_audit": {
+    "same_task_and_prompt": true,
+    "serial_run_valid": true,
+    "parallel_run_valid": true,
+    "external_or_harness_issues_zh": []
+  },
+  "decision": "exclude",
+  "exclusion_code": "ordinary_implementation_variance",
+  "decision_reason_zh": "虽然 parallel 有真实重叠子上下文并且官方通过，serial 也正常完成但未通过；差异来自两条单一路径对 set_figure 语义的不同实现选择，而不是并发测试、优选或互补工作导致的可归因收益。",
+  "advantage": null,
+  "new_pattern_candidate": {
+    "is_candidate": false,
+    "name_zh": null,
+    "mechanism_zh": null,
+    "why_existing_dimensions_fail_zh": null
+  },
+  "evidence": {
+    "parallel": [
+      {
+        "path": "parallel/cell/status.json",
+        "line": 336,
+        "summary_zh": "并行协议记录有一次 AgentSwarm 调用，后续同一段状态记录显示 parallel_used 为 true 且有两个子代理。"
+      },
+      {
+        "path": "parallel/agent/kimi/sessions/wd_workspace_c52ddf65534b/session_f85cdbb3-ae5a-4c3b-92e2-020b3965a061/agents/main/wire.jsonl",
+        "line": 69,
+        "summary_zh": "主上下文发起 AgentSwarm，把 legend.py 修复和回归测试拆成两个非冲突任务。"
+      },
+      {
+        "path": "parallel/cell/model.patch",
+        "line": 28,
+        "summary_zh": "并行补丁把父对象检查改为 FigureBase，但保留 self.set_figure(parent)，这是官方通过的关键实现。"
+      }
+    ],
+    "serial": [
+      {
+        "path": "serial/cell/status.json",
+        "line": 327,
+        "summary_zh": "串行协议记录 agent_swarm_calls 为 0，后续状态显示没有委托、没有子代理、parallel_used 为 false。"
+      },
+      {
+        "path": "serial/agent/kimi/sessions/wd_workspace_c52ddf65534b/session_b613e37a-a05f-4ce2-b078-84737d85132a/agents/main/wire.jsonl",
+        "line": 84,
+        "summary_zh": "串行主上下文明确选择把 figure 设为 root parent.figure，这后来与官方期望不一致。"
+      },
+      {
+        "path": "serial/cell/model.patch",
+        "line": 31,
+        "summary_zh": "串行最终补丁把 FigureBase 分支改成 self.set_figure(parent.figure)，不同于并行的 parent 语义。"
+      }
+    ],
+    "evaluator": [
+      {
+        "path": "parallel/cell/evaluation/summary.json",
+        "line": 70,
+        "summary_zh": "官方评测记录 parallel 的 solution_passed 为 true。"
+      },
+      {
+        "path": "serial/cell/evaluation/summary.json",
+        "line": 70,
+        "summary_zh": "官方评测记录 serial 的 solution_passed 为 false。"
+      },
+      {
+        "path": "serial/cell/evaluation/official-run/logs/run_evaluation/formal-kimi-serial-matplotlib__matplotlib-20859/uiuc-kimi-serial/matplotlib__matplotlib-20859/eval.sh",
+        "line": 31,
+        "summary_zh": "官方测试脚本断言 leg.figure is subfig，这正是串行自测没有覆盖并且其补丁违反的语义。"
+      },
+      {
+        "path": "serial/cell/evaluation/official-run/logs/run_evaluation/formal-kimi-serial-matplotlib__matplotlib-20859/uiuc-kimi-serial/matplotlib__matplotlib-20859/test_output.txt",
+        "line": 378,
+        "summary_zh": "串行官方运行在 test_subfigure_legend 中失败，因为 leg.figure 不是 subfig。"
+      }
+    ]
+  },
+  "case_narrative_zh": "这个任务要求让 Matplotlib 的 SubFigure.legend() 不再因为 Legend.__init__ 只接受 Axes 或 Figure 而抛 TypeError。parallel 主上下文先定位到 FigureBase，然后并发派出两个子上下文：一个改 legend.py，另一个写回归测试；serial 则由单一主上下文顺序完成同类调查、修改和自测。官方结果是 parallel 通过、serial 未通过，且 cell wall time parallel 为 415.717 秒、serial 为 530.113 秒。但质量差异来自具体实现选择：parallel 在 FigureBase 分支保留 set_figure(parent)，serial 改成 set_figure(parent.figure)，其自测还断言 root Figure，正好错过官方要求 leg.figure is subfig 的语义。并发测试工作没有发现或纠正这个差异，也没有同目标多路候选被选择；核心实现加自测完成点相近，串行较长总时长还受后续额外验证等待影响。因此不保留为并发优势案例。",
+  "confidence": "high"
+}

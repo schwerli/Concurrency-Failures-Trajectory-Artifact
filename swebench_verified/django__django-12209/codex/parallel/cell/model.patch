@@ -1,0 +1,171 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index e3b14a41a0..ba9535e80a 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -398,6 +398,9 @@ class ModelState:
+     # explicit (non-auto) PKs. This impacts validation only; it has no effect
+     # on the actual save.
+     adding = True
++    # Tracks whether a non-None PK value was assigned by user code, which is
++    # distinct from a PK value populated by get_default().
++    adding_pk_set_explicitly = False
+     fields_cache = ModelStateFieldsCacheDescriptor()
+ 
+ 
+@@ -409,11 +412,16 @@ class Model(metaclass=ModelBase):
+         opts = self._meta
+         _setattr = setattr
+         _DEFERRED = DEFERRED
++        pk_specified = kwargs.get('pk', NOT_PROVIDED)
++        if pk_specified is NOT_PROVIDED:
++            pk_specified = kwargs.get(opts.pk.attname, kwargs.get(opts.pk.name, NOT_PROVIDED))
++        pk_specified = pk_specified is not NOT_PROVIDED and pk_specified is not None
+ 
+         pre_init.send(sender=cls, args=args, kwargs=kwargs)
+ 
+         # Set up the storage for instance state
+         self._state = ModelState()
++        self._state.initializing = True
+ 
+         # There is a rather weird disparity here; if kwargs, it's set, then args
+         # overrides it. It should be one or the other; don't duplicate the work
+@@ -433,6 +441,8 @@ class Model(metaclass=ModelBase):
+                 if val is _DEFERRED:
+                     continue
+                 _setattr(self, field.attname, val)
++                if field.primary_key:
++                    pk_specified = val is not None
+         else:
+             # Slower, kwargs-ready version.
+             fields_iter = iter(opts.fields)
+@@ -440,6 +450,8 @@ class Model(metaclass=ModelBase):
+                 if val is _DEFERRED:
+                     continue
+                 _setattr(self, field.attname, val)
++                if field.primary_key:
++                    pk_specified = val is not None
+                 kwargs.pop(field.name, None)
+ 
+         # Now we're left with the unprocessed fields that *must* come from
+@@ -499,6 +511,8 @@ class Model(metaclass=ModelBase):
+                     pass
+             for kwarg in kwargs:
+                 raise TypeError("%s() got an unexpected keyword argument '%s'" % (cls.__name__, kwarg))
++        self._state.adding_pk_set_explicitly = pk_specified
++        self._state.initializing = False
+         super().__init__()
+         post_init.send(sender=cls, instance=self)
+ 
+@@ -564,6 +578,17 @@ class Model(metaclass=ModelBase):
+ 
+         self.__dict__.update(state)
+ 
++    def __setattr__(self, name, value):
++        super().__setattr__(name, value)
++        if (
++            name != 'pk' and
++            hasattr(self, '_state') and
++            not getattr(self._state, 'initializing', False) and
++            self._meta.pk.has_default() and
++            name in (self._meta.pk.attname, self._meta.pk.name)
++        ):
++            self._state.adding_pk_set_explicitly = value is not None
++
+     def _get_pk_val(self, meta=None):
+         meta = meta or self._meta
+         return getattr(self, meta.pk.attname)
+@@ -851,8 +876,8 @@ class Model(metaclass=ModelBase):
+         if (
+             not force_insert and
+             self._state.adding and
+-            self._meta.pk.default and
+-            self._meta.pk.default is not NOT_PROVIDED
++            meta.pk.has_default() and
++            not self._state.adding_pk_set_explicitly
+         ):
+             force_insert = True
+         # If possible, try an UPDATE. If that doesn't update anything, do an INSERT.
+diff --git a/tests/fixtures/fixtures/primary_key_uuid.json b/tests/fixtures/fixtures/primary_key_uuid.json
+new file mode 100644
+index 0000000000..2989452f49
+--- /dev/null
++++ b/tests/fixtures/fixtures/primary_key_uuid.json
+@@ -0,0 +1,7 @@
++[
++  {
++    "model": "fixtures.primarykeyuuidmodel",
++    "pk": "550e8400-e29b-41d4-a716-446655440000",
++    "fields": {}
++  }
++]
+diff --git a/tests/fixtures/tests.py b/tests/fixtures/tests.py
+index 02dd38e635..d64f9205da 100644
+--- a/tests/fixtures/tests.py
++++ b/tests/fixtures/tests.py
+@@ -457,6 +457,11 @@ class FixtureLoadingTests(DumpDataAssertMixin, TestCase):
+         self.assertIn('"pk": "%s"' % m1.id, result)
+         self.assertIn('"pk": "%s"' % m2.id, result)
+ 
++    def test_loaddata_with_existing_uuid_primary_key(self):
++        management.call_command('loaddata', 'primary_key_uuid.json', verbosity=0)
++        management.call_command('loaddata', 'primary_key_uuid.json', verbosity=0)
++        self.assertEqual(PrimaryKeyUUIDModel.objects.count(), 1)
++
+     def test_dumpdata_with_file_output(self):
+         management.call_command('loaddata', 'fixture1.json', verbosity=0)
+         self._dumpdata_assert(
+diff --git a/tests/force_insert_update/models.py b/tests/force_insert_update/models.py
+index a98eadb4f9..2f893eadd9 100644
+--- a/tests/force_insert_update/models.py
++++ b/tests/force_insert_update/models.py
+@@ -2,6 +2,8 @@
+ Tests for forcing insert and update queries (instead of Django's normal
+ automatic behavior).
+ """
++import uuid
++
+ from django.db import models
+ 
+ 
+@@ -26,3 +28,8 @@ class SubCounter(Counter):
+ class WithCustomPK(models.Model):
+     name = models.IntegerField(primary_key=True)
+     value = models.IntegerField()
++
++
++class WithDefaultPK(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid.uuid4)
++    name = models.CharField(max_length=100, blank=True)
+diff --git a/tests/force_insert_update/tests.py b/tests/force_insert_update/tests.py
+index 8ffe98ad4f..3b43a98266 100644
+--- a/tests/force_insert_update/tests.py
++++ b/tests/force_insert_update/tests.py
+@@ -3,10 +3,28 @@ from django.test import TestCase
+ 
+ from .models import (
+     Counter, InheritedCounter, ProxyCounter, SubCounter, WithCustomPK,
++    WithDefaultPK,
+ )
+ 
+ 
+ class ForceTests(TestCase):
++    def test_save_with_explicit_pk_and_default(self):
++        obj = WithDefaultPK.objects.create(name='original')
++        obj = WithDefaultPK(pk=obj.pk, name='updated')
++        with self.assertNumQueries(1):
++            obj.save()
++        self.assertEqual(WithDefaultPK.objects.count(), 1)
++        self.assertEqual(WithDefaultPK.objects.get().name, 'updated')
++
++    def test_save_with_explicit_pk_after_instantiation_and_default(self):
++        obj = WithDefaultPK.objects.create(name='original')
++        new = WithDefaultPK(name='updated')
++        new.pk = obj.pk
++        with self.assertNumQueries(1):
++            new.save()
++        self.assertEqual(WithDefaultPK.objects.count(), 1)
++        self.assertEqual(WithDefaultPK.objects.get().name, 'updated')
++
+     def test_force_update(self):
+         c = Counter.objects.create(name="one", value=1)
+ 

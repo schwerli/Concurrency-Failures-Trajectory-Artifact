@@ -1,0 +1,51 @@
+diff --git a/doc/whats_new/v0.21.rst b/doc/whats_new/v0.21.rst
+index e3e3ec9f8..ebc6a69bf 100644
+--- a/doc/whats_new/v0.21.rst
++++ b/doc/whats_new/v0.21.rst
+@@ -207,6 +207,10 @@ Support for Python 3.4 and below has been officially dropped.
+   weights would not be correctly updated in some cases.
+   :issue:`11646` by `Tom Dupre la Tour`_.
+ 
++- |Fix| Fixed a bug in :class:`linear_model.HuberRegressor` that did not
++  accept boolean ``dtype`` in ``fit``.
++  :issue:`13328` by :user:`Saulius Lukauskas <sauliusl>`.
++
+ - |Fix| Fixed the posterior mean, posterior covariance and returned
+   regularization parameters in :class:`linear_model.BayesianRidge`. The
+   posterior mean and the posterior covariance were not the ones computed
+diff --git a/sklearn/linear_model/huber.py b/sklearn/linear_model/huber.py
+index 65c686400..285913684 100644
+--- a/sklearn/linear_model/huber.py
++++ b/sklearn/linear_model/huber.py
+@@ -251,7 +251,8 @@ class HuberRegressor(LinearModel, RegressorMixin, BaseEstimator):
+         self : object
+         """
+         X, y = check_X_y(
+-            X, y, copy=False, accept_sparse=['csr'], y_numeric=True)
++            X, y, copy=False, accept_sparse=['csr'], y_numeric=True,
++            dtype=[np.float64, np.float32])
+         if sample_weight is not None:
+             sample_weight = np.array(sample_weight)
+             check_consistent_length(y, sample_weight)
+diff --git a/sklearn/linear_model/tests/test_huber.py b/sklearn/linear_model/tests/test_huber.py
+index 6a8b26133..1d4bde4d2 100644
+--- a/sklearn/linear_model/tests/test_huber.py
++++ b/sklearn/linear_model/tests/test_huber.py
+@@ -199,3 +199,17 @@ def test_huber_better_r2_score():
+ 
+     # The huber model should also fit poorly on the outliers.
+     assert_greater(ridge_outlier_score, huber_outlier_score)
++
++
++def test_huber_bool():
++    # Test that it does not crash with bool data
++    X, y = make_regression(n_samples=200, n_features=2, noise=4.0,
++                           random_state=0)
++    X_bool = X > 0
++    huber = HuberRegressor()
++    huber.fit(X_bool, y)
++    X_bool_as_float = np.asarray(X_bool, dtype=float)
++    huber_float = HuberRegressor()
++    huber_float.fit(X_bool_as_float, y)
++    assert_array_almost_equal(huber.coef_, huber_float.coef_)
++    assert_almost_equal(huber.intercept_, huber_float.intercept_)

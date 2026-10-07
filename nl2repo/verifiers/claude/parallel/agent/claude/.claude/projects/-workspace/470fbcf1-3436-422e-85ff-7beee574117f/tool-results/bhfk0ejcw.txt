@@ -1,0 +1,745 @@
+    29 self_reward/self_reward.py
+    31 math_python/math_python.py
+    40 gpqa/gpqa.py
+    44 gsm8k/gsm8k.py
+    53 reverse_text/reverse_text.py
+    54 xlam_function_calling/xlam_function_calling.py
+    55 math_group/math_group.py
+    56 summarize_text/summarize_text.py
+    71 doublecheck/doublecheck.py
+    74 wordle/wordle.py
+    96 continuation_quality/continuation_quality.py
+   102 reasoning_gym_env/reasoning_gym_env.py
+   122 mmmu/mmmu.py
+   122 sentence_repeater/sentence_repeater.py
+   122 tool_test/tool_test.py
+   130 toxicity_explanation/toxicity_explanation.py
+   144 simpleqa/simpleqa.py
+   204 wiki_search/wiki_search.py
+   497 xml_tool_env/xml_tool_env.py
+  1098 smolagents_math_tools/smolagents_math_tools.py
+  3144 total
+=====
+########## doublecheck/doublecheck.py
+     1	from typing import Dict, List, Tuple
+     2	
+     3	from datasets import Dataset
+     4	from openai import OpenAI
+     5	
+     6	from verifiers import (
+     7	    Messages,
+     8	    MultiTurnEnv,
+     9	    RewardFunc,
+    10	    State,
+    11	)
+    12	from verifiers.rubrics.math_rubric import MathRubric
+    13	from verifiers.utils.data_utils import load_example_dataset
+    14	
+    15	SIMPLE_PROMPT = """
+    16	Respond in the following format, using careful step-by-step reasoning.
+    17	
+    18	<reasoning>
+    19	...
+    20	</reasoning>
+    21	<answer>
+    22	...
+    23	</answer>
+    24	"""
+    25	
+    26	
+    27	class DoubleCheckEnv(MultiTurnEnv):
+    28	    def __init__(
+    29	        self,
+    30	        client: OpenAI | None = None,
+    31	        model: str | None = None,
+    32	        dataset: Dataset | None = None,
+    33	        eval_dataset: Dataset | None = None,
+    34	        system_prompt: str = SIMPLE_PROMPT,
+    35	        few_shot: List[Dict[str, str]] = [],
+    36	        **kwargs,
+    37	    ):
+    38	        super().__init__(
+    39	            client=client,
+    40	            model=model,
+    41	            dataset=dataset,
+    42	            eval_dataset=eval_dataset,
+    43	            system_prompt=system_prompt,
+    44	            few_shot=few_shot,
+    45	            **kwargs,
+    46	        )
+    47	        self.rubric = MathRubric()
+    48	
+    49	    def get_reward_funcs(self, **kwargs) -> List[RewardFunc]:
+    50	        return self.rubric.get_reward_funcs()
+    51	
+    52	    def get_reward_weights(self, **kwargs) -> List[float]:
+    53	        return self.rubric.get_reward_weights()
+    54	
+    55	    def is_completed(self, messages: Messages, state: State, **kwargs) -> bool:
+    56	        return len(state["responses"]) == 1
+    57	
+    58	    def env_response(
+    59	        self, messages: Messages, state: State, **kwargs
+    60	    ) -> Tuple[Messages, State]:
+    61	        return [{"role": "user", "content": "Are you sure?"}], state
+    62	
+    63	
+    64	def load_environment(
+    65	    dataset_name: str = "math",
+    66	    dataset_split: str = "train",
+    67	    num_train_examples: int = -1,
+    68	):
+    69	    dataset = load_example_dataset(dataset_name, dataset_split, n=num_train_examples)
+    70	    vf_env = DoubleCheckEnv(dataset=dataset, system_prompt=SIMPLE_PROMPT, few_shot=[])
+    71	    return vf_env
+########## xml_tool_env/xml_tool_env.py
+     1	import inspect
+     2	import json
+     3	from typing import Any, Callable, Dict, List, Tuple
+     4	
+     5	from verifiers import (
+     6	    Messages,
+     7	    MultiTurnEnv,
+     8	    RewardFunc,
+     9	    Rubric,
+    10	    State,
+    11	    XMLParser,
+    12	)
+    13	from verifiers.utils.data_utils import load_example_dataset
+    14	
+    15	
+    16	def infer_schema_from_function(func: Callable) -> Dict[str, Any]:
+    17	    """Infers a tool schema from a function's signature and docstring."""
+    18	    sig = inspect.signature(func)
+    19	    doc = inspect.getdoc(func) or ""
+    20	
+    21	    # Parse docstring sections
+    22	    doc_parts = doc.split("\n\n")
+    23	    description = doc_parts[0].strip()
+    24	
+    25	    # Extract examples if present
+    26	    examples = []
+    27	    return_description = ""
+    28	    for part in doc_parts:
+    29	        if part.startswith("Examples:"):
+    30	            examples = [line.strip() for line in part.split("\n")[1:] if line.strip()]
+    31	        elif part.startswith("Returns:"):
+    32	            return_description = part.split("\n")[1].strip()
+    33	
+    34	    return_type = str(
+    35	        sig.return_annotation.__name__
+    36	        if sig.return_annotation != inspect.Parameter.empty
+    37	        else "any"
+    38	    )
+    39	
+    40	    print(f"return_description: {return_description} ({return_type})")
+    41	    # Build args schema
+    42	    args = {}
+    43	    for name, param in sig.parameters.items():
+    44	        param_doc = ""
+    45	        for part in doc_parts:
+    46	            if part.strip().startswith("Args:"):
+    47	                for line in part.split("\n")[1:]:
+    48	                    if line.strip().startswith(f"{name}:"):
+    49	                        param_doc = line.strip()[len(name) + 1 :].strip()
+    50	
+    51	        args[name] = {
+    52	            "type": str(
+    53	                param.annotation.__name__
+    54	                if param.annotation != inspect.Parameter.empty
+    55	                else "any"
+    56	            ),
+    57	            "description": param_doc,
+    58	        }
+    59	        if param.default != inspect.Parameter.empty:
+    60	            args[name]["default"] = param.default
+    61	
+    62	    return {
+    63	        "name": func.__name__,
+    64	        "description": description,
+    65	        "args": args,
+    66	        "returns": return_description + f" ({return_type})",
+    67	        "examples": examples,
+    68	    }
+    69	
+    70	
+    71	def format_tool_descriptions(schemas: List[Dict[str, Any]]) -> str:
+    72	    """Formats tool schemas into a user-friendly description string."""
+    73	    descriptions = []
+    74	    for schema in schemas:
+    75	        desc = [f"{schema['name']}: {schema['description']}"]
+    76	
+    77	        desc.append("\nArguments:")
+    78	        for arg_name, arg_info in schema["args"].items():
+    79	            default = (
+    80	                f" (default: {arg_info['default']})" if "default" in arg_info else ""
+    81	            )
+    82	            desc.append(f"  - {arg_name}: {arg_info['description']}{default}")
+    83	
+    84	        if schema["examples"]:
+    85	            desc.append("\nExamples:")
+    86	            for example in schema["examples"]:
+    87	                desc.append(f"  {example}")
+    88	
+    89	        if schema["returns"]:
+    90	            desc.append(f"\nReturns: {schema['returns']}")
+    91	
+    92	        descriptions.append("\n".join(desc))
+    93	
+    94	    return "\n\n".join(descriptions)
+    95	
+    96	
+    97	class XMLToolRubric(Rubric):
+    98	    def __init__(
+    99	        self,
+   100	        parser: XMLParser = XMLParser(fields=["think", ("tool", "answer")]),
+   101	        env_parser: XMLParser = XMLParser(fields=["result"]),
+   102	        tools: List[Callable] = [],
+   103	    ):
+   104	        super().__init__(parser=parser)
+   105	        self.parser = parser
+   106	        self.env_parser = env_parser
+   107	        self.tools = {
+   108	            tool.__name__ if hasattr(tool, "__name__") else str(tool): tool
+   109	            for tool in tools
+   110	        }
+   111	        self.reward_funcs = [
+   112	            self.correct_answer_reward_func,
+   113	            self.tool_execution_reward_func,
+   114	            self.parser.get_format_reward_func(),
+   115	        ]
+   116	        self.reward_weights = [
+   117	            1.0,
+   118	            0.2,
+   119	            0.2,
+   120	        ]
+   121	        for tool_name in self.tools.keys():
+   122	            self.reward_funcs.append(self.get_named_tool_reward_func(tool_name))
+   123	            self.reward_weights.append(0.0)
+   124	            self.reward_funcs.append(self.get_named_tool_count_reward_func(tool_name))
+   125	            self.reward_weights.append(0.0)
+   126	            self.reward_funcs.append(self.get_named_tool_attempt_reward_func(tool_name))
+   127	            self.reward_weights.append(0.0)
+   128	
+   129	    def evaluate_code(self, code_str, answer, **kwargs) -> float:
+   130	        import io
+   131	        import signal
+   132	        import sys
+   133	        from contextlib import redirect_stdout
+   134	
+   135	        try:
+   136	            test_cases = json.loads(answer)["test_cases"]
+   137	        except Exception:
+   138	            return 0.0
+   139	        # strip ```python and ``` if present at the beginning and end of the code
+   140	        code_str = code_str.strip()
+   141	        if code_str.startswith("```python"):
+   142	            code_str = code_str[9:]
+   143	        elif code_str.startswith("```"):
+   144	            code_str = code_str[3:]
+   145	        if code_str.endswith("```"):
+   146	            code_str = code_str[:-3]
+   147	        code_str = code_str.strip()
+   148	
+   149	        def timeout_handler(signum, frame):
+   150	            raise TimeoutError("Code execution timed out")
+   151	
+   152	        def normalize_output(output):
+   153	            # Normalize line endings and whitespace
+   154	            return "\n".join(line.strip() for line in output.splitlines())
+   155	
+   156	        total_cases = 0
+   157	        passed = 0
+   158	
+   159	        for test in test_cases:
+   160	            output = io.StringIO()
+   161	            sys.stdin = io.StringIO(test["input"])
+   162	            try:
+   163	                signal.signal(signal.SIGALRM, timeout_handler)
+   164	                signal.alarm(10)
+   165	                with redirect_stdout(output):
+   166	                    exec(code_str)
+   167	                signal.alarm(0)
+   168	                actual = normalize_output(output.getvalue())
+   169	                expected = normalize_output(test["output"])
+   170	
+   171	                # Compare each line individually
+   172	                actual_lines = actual.splitlines()
+   173	                expected_lines = expected.splitlines()
+   174	                total_cases += len(expected_lines)
+   175	                for a, e in zip(actual_lines, expected_lines):
+   176	                    if a == e:
+   177	                        passed += 1
+   178	
+   179	            except Exception as e:
+   180	                sys.stdin = sys.__stdin__
+   181	                return 0.0
+   182	            sys.stdin = sys.__stdin__
+   183	
+   184	        return passed / total_cases if total_cases else 0.0
+   185	
+   186	    def correct_answer_reward_func(self, completion, answer, **kwargs) -> float:
+   187	        """Reward function that checks if the final answer matches the expected answer."""
+   188	        response = str(self.parser.parse_answer(completion))
+   189	        return 1.0 if answer == response else 0.0
+   190	
+   191	    def tool_execution_reward_func(
+   192	        self, completion: List[Dict[str, str]], **kwargs
+   193	    ) -> float:
+   194	        """
+   195	        Reward function that checks tool execution success.
+   196	
+   197	        Uses XMLParser to identify proper tool calls.
+   198	        """
+   199	        tool_attempts = 0
+   200	        successful_executions = 0
+   201	
+   202	        # Find assistant messages with tools and their responses
+   203	        for i, msg in enumerate(completion):
+   204	            if msg["role"] == "assistant":
+   205	                # Use parser to check for tool tag
+   206	                parsed = self.parser.parse(msg["content"])
+   207	                if hasattr(parsed, "tool") and parsed.tool is not None:
+   208	                    # Found a properly formatted tool message
+   209	                    if i + 1 < len(completion) and completion[i + 1]["role"] == "user":
+   210	                        tool_attempts += 1
+   211	                        # Check response with env_parser
+   212	                        parsed_response = self.env_parser.parse(
+   213	                            completion[i + 1]["content"]
+   214	                        )
+   215	                        if (
+   216	                            hasattr(parsed_response, "result")
+   217	                            and parsed_response.result is not None
+   218	                            and not parsed_response.result.startswith("Error:")
+   219	                        ):
+   220	                            successful_executions += 1
+   221	
+   222	        # Calculate reward
+   223	        if tool_attempts == 0:
+   224	            return 0.0
+   225	        return successful_executions / tool_attempts
+   226	
+   227	    def get_named_tool_reward_func(self, tool_name: str) -> Callable:
+   228	        """
+   229	        Returns a reward function that checks tool execution success for a specific tool.
+   230	
+   231	        Uses XMLParser to identify proper tool calls.
+   232	        """
+   233	
+   234	        def tool_reward_func(completion: List[Dict[str, str]], **kwargs) -> float:
+   235	            """
+   236	            Reward function that checks execution success for the {tool_name} tool.
+   237	
+   238	            Uses XMLParser to identify proper tool calls for the specified tool.
+   239	            """
+   240	            import json
+   241	
+   242	            tool_attempts = 0
+   243	            successful_executions = 0
+   244	
+   245	            # Find assistant messages with the specific tool and their responses
+   246	            for i, msg in enumerate(completion):
+   247	                if msg["role"] == "assistant":
+   248	                    # Use parser to check for tool tag
+   249	                    parsed = self.parser.parse(msg["content"])
+   250	                    if hasattr(parsed, "tool") and parsed.tool is not None:
+   251	                        try:
+   252	                            command = json.loads(parsed.tool)
+   253	                            if (
+   254	                                isinstance(command, dict)
+   255	                                and command.get("name") == tool_name
+   256	                            ):
+   257	                                # Found a properly formatted tool message for the specific tool
+   258	                                if (
+   259	                                    i + 1 < len(completion)
+   260	                                    and completion[i + 1]["role"] == "user"
+   261	                                ):
+   262	                                    tool_attempts += 1
+   263	                                    # Check response with env_parser
+   264	                                    parsed_response = self.env_parser.parse(
+   265	                                        completion[i + 1]["content"]
+   266	                                    )
+   267	                                    if (
+   268	                                        hasattr(parsed_response, "result")
+   269	                                        and parsed_response.result is not None
+   270	                                        and not parsed_response.result.startswith(
+   271	                                            "Error:"
+   272	                                        )
+   273	                                    ):
+   274	                                        successful_executions += 1
+   275	                        except json.JSONDecodeError:
+   276	                            pass
+   277	
+   278	            # Calculate reward
+   279	            if tool_attempts == 0:
+   280	                return 0.0
+   281	            return successful_executions / tool_attempts
+   282	
+   283	        # Create a function with the dynamic name based on tool_name
+   284	        tool_reward_func.__name__ = f"{tool_name}_reward_func"
+   285	        return tool_reward_func
+   286	
+   287	    def get_named_tool_count_reward_func(self, tool_name: str) -> Callable:
+   288	        """
+   289	        Returns a reward function that counts the number of times the {tool_name} tool is used.
+   290	        """
+   291	
+   292	        def tool_count_reward_func(completion: List[Dict[str, str]], **kwargs) -> float:
+   293	            """
+   294	            Reward function that counts the number of times the {tool_name} tool is used.
+   295	            """
+   296	            import json
+   297	
+   298	            successful_executions = 0.0
+   299	            for i, msg in enumerate(completion):
+   300	                if msg["role"] == "assistant":
+   301	                    parsed = self.parser.parse(msg["content"])
+   302	                    if hasattr(parsed, "tool") and parsed.tool is not None:
+   303	                        try:
+   304	                            command = json.loads(parsed.tool)
+   305	                            if (
+   306	                                isinstance(command, dict)
+   307	                                and command.get("name") == tool_name
+   308	                            ):
+   309	                                # Found a properly formatted tool message for the specific tool
+   310	                                if (
+   311	                                    i + 1 < len(completion)
+   312	                                    and completion[i + 1]["role"] == "user"
+   313	                                ):
+   314	                                    parsed_response = self.env_parser.parse(
+   315	                                        completion[i + 1]["content"]
+   316	                                    )
+   317	                                    if (
+   318	                                        hasattr(parsed_response, "result")
+   319	                                        and parsed_response.result is not None
+   320	                                        and not parsed_response.result.startswith(
+   321	                                            "Error:"
+   322	                                        )
+   323	                                    ):
+   324	                                        successful_executions += 1
+   325	                        except json.JSONDecodeError:
+   326	                            pass
+   327	            return successful_executions
+   328	
+   329	        tool_count_reward_func.__name__ = f"{tool_name}_count_reward_func"
+   330	        return tool_count_reward_func
+   331	
+   332	    def get_named_tool_attempt_reward_func(self, tool_name: str) -> Callable:
+   333	        """
+   334	        Returns a reward function that counts the number of times the {tool_name} tool is used.
+   335	        """
+   336	
+   337	        def tool_attempt_reward_func(
+   338	            completion: List[Dict[str, str]], **kwargs
+   339	        ) -> float:
+   340	            """
+   341	            Reward function that counts the number of times the {tool_name} tool is used.
+   342	            """
+   343	            import json
+   344	
+   345	            attempted_executions = 0.0
+   346	            for i, msg in enumerate(completion):
+   347	                if msg["role"] == "assistant":
+   348	                    parsed = self.parser.parse(msg["content"])
+   349	                    if hasattr(parsed, "tool") and parsed.tool is not None:
+   350	                        try:
+   351	                            command = json.loads(parsed.tool)
+   352	                            if (
+   353	                                isinstance(command, dict)
+   354	                                and command.get("name") == tool_name
+   355	                            ):
+   356	                                attempted_executions += 1
+   357	                        except json.JSONDecodeError:
+   358	                            pass
+   359	            return attempted_executions
+   360	
+   361	        tool_attempt_reward_func.__name__ = f"{tool_name}_attempt_reward_func"
+   362	        return tool_attempt_reward_func
+   363	
+   364	
+   365	class XMLToolEnv(MultiTurnEnv):
+   366	    def __init__(
+   367	        self,
+   368	        tools: List[Callable] = [],
+   369	        system_prompt: str = "",
+   370	        format_prompt: bool = True,
+   371	        parser: XMLParser = XMLParser(fields=["think", ("tool", "answer")]),
+   372	        env_parser: XMLParser = XMLParser(fields=["result"]),
+   373	        max_turns: int = 10,
+   374	        **kwargs,
+   375	    ):
+   376	        rubric = XMLToolRubric(tools=tools, parser=parser, env_parser=env_parser)
+   377	        self.tool_schemas = [infer_schema_from_function(tool) for tool in tools]
+   378	        self.tools = {tool.__name__: tool for tool in tools}
+   379	
+   380	        if format_prompt:
+   381	            tool_descriptions = format_tool_descriptions(self.tool_schemas)
+   382	            formatted_prompt = system_prompt.format(tool_descriptions=tool_descriptions)
+   383	        else:
+   384	            formatted_prompt = system_prompt
+   385	        super().__init__(
+   386	            system_prompt=formatted_prompt,
+   387	            parser=parser,
+   388	            rubric=rubric,
+   389	            max_turns=max_turns,
+   390	            **kwargs,
+   391	        )
+   392	        self.env_parser = env_parser
+   393	
+   394	    def get_reward_funcs(self, **kwargs) -> List[RewardFunc]:
+   395	        return self.rubric.get_reward_funcs()
+   396	
+   397	    def get_reward_weights(self, **kwargs) -> List[float]:
+   398	        return self.rubric.get_reward_weights()
+   399	
+   400	    def is_completed(self, messages: Messages, state: State, **kwargs: Any) -> bool:
+   401	        return self.parser.parse_answer(messages) is not None
+   402	
+   403	    def call_tool(self, tool_json: str, max_chars: int = 1024, **kwargs) -> str:
+   404	        """Call a tool based on JSON command."""
+   405	        try:
+   406	            command = json.loads(tool_json)
+   407	            if not isinstance(command, dict):
+   408	                return 'Error: Tool command must be a JSON object, e.g. \'{"name": "tool_name", "args": {"arg1": "value1", "arg2": "value2"}}\''
+   409	
+   410	            tool_name = command.get("name")
+   411	            if not tool_name:
+   412	                return 'Error: Tool command must specify \'name\', e.g. \'{"name": "tool_name", "args": {"arg1": "value1", "arg2": "value2"}}\''
+   413	
+   414	            if tool_name not in self.tools:
+   415	                return (
+   416	                    f"Error: Unknown tool '{tool_name}. "
+   417	                    + 'Please format your tool call as \'{"name": "tool_name", "args": {"arg1": "value1", "arg2": "value2"}}\''
+   418	                )
+   419	
+   420	            tool_func = self.tools[tool_name]
+   421	            tool_args = command.get("args", {})
+   422	            if isinstance(tool_args, str):
+   423	                tool_schema = next(
+   424	                    (
+   425	                        schema["args"]
+   426	                        for schema in self.tool_schemas
+   427	                        if schema["name"] == tool_name
+   428	                    ),
+   429	                    None,
+   430	                )
+   431	                return f"Error: Arguments for {tool_name} must be a JSON object with schema {tool_schema}, not a string."
+   432	
+   433	            # Call the tool function with arguments
+   434	            result = tool_func(**tool_args)
+   435	            if max_chars > 0 and len(str(result)) > max_chars:
+   436	                result = str(result)[:max_chars] + "..."
+   437	            return str(result)
+   438	        except Exception as e:
+   439	            return (
+   440	                f"Error: {str(e)}. "
+   441	                + 'Please format your tool call as \'{{"name": "tool_name", "args": {{"arg1": "value1", "arg2": "value2"}}}}\''
+   442	            )
+   443	
+   444	    def env_response(
+   445	        self, messages: Messages, state: State, **kwargs
+   446	    ) -> Tuple[Messages, State]:
+   447	        try:
+   448	            parsed = self.parser.parse(messages[-1]["content"])  # type: ignore
+   449	            # Check if we got a valid tool field (not just None from failed parsing)
+   450	            if hasattr(parsed, "tool") and parsed.tool is not None:
+   451	                result = self.call_tool(parsed.tool)
+   452	                if len(result.strip()) > 0:
+   453	                    return [
+   454	                        {
+   455	                            "role": "user",
+   456	                            "content": self.env_parser.format(result=result),
+   457	                        }
+   458	                    ], state
+   459	                else:
+   460	                    return [
+   461	                        {
+   462	                            "role": "user",
+   463	                            "content": "Error: Tool execution returned empty output.",
+   464	                        }
+   465	                    ], state
+   466	        except Exception:
+   467	            pass
+   468	        return [
+   469	            {
+   470	                "role": "user",
+   471	                "content": "Error: Tool command not found or invalid XML format. Please ensure correct formatting.",
+   472	            }
+   473	        ], state
+   474	
+   475	
+   476	def load_environment(
+   477	    dataset_name: str,
+   478	    split: str,
+   479	    tools: List[Callable] = [],
+   480	    system_prompt: str = "",
+   481	    format_prompt: bool = True,
+   482	    parser: XMLParser = XMLParser(fields=["think", ("tool", "answer")]),
+   483	    env_parser: XMLParser = XMLParser(fields=["result"]),
+   484	    max_turns: int = 10,
+   485	    **kwargs,
+   486	) -> XMLToolEnv:
+   487	    dataset = load_example_dataset(name=dataset_name, split=split)
+   488	    return XMLToolEnv(
+   489	        dataset=dataset,
+   490	        tools=tools,
+   491	        system_prompt=system_prompt,
+   492	        format_prompt=format_prompt,
+   493	        parser=parser,
+   494	        env_parser=env_parser,
+   495	        max_turns=max_turns,
+   496	        **kwargs,
+   497	    )
+########## sentence_repeater/sentence_repeater.py
+     1	import random
+     2	from copy import deepcopy
+     3	from difflib import SequenceMatcher
+     4	from typing import List, Tuple
+     5	
+     6	from datasets import Dataset, load_dataset
+     7	
+     8	import verifiers as vf
+     9	from verifiers.types import (
+    10	    Messages,
+    11	    State,
+    12	)
+    13	
+    14	
+    15	def get_sentences(paragraph: str) -> List[str]:
+    16	    """Get first sentences of paragraph (up to 5)."""
+    17	    sentences = paragraph.replace('." ', '". ').split(". ")
+    18	    return sentences[:5]
+    19	
+    20	
+    21	def filter_sentences(sentences: List[str]) -> bool:
+    22	    """Filter paragraphs by number of sentences and sentence length."""
+    23	    if len(sentences) < 5:
+    24	        return False
+    25	    for sentence in sentences:
+    26	        if len(sentence) < 10 or len(sentence) > 500:
+    27	            return False
+    28	    return True
+    29	
+    30	
+    31	index = [("first", 0), ("second", 1), ("third", 2), ("fourth", 3), ("fifth", 4)]
+    32	
+    33	
+    34	def get_sentence_questions(x):
+    35	    sentences = x["sentences"]
+    36	    shuffled_index = deepcopy(index)
+    37	    random.shuffle(shuffled_index)
+    38	    questions_answers = [
+    39	        (
+    40	            f"What's the {shuffled_index[0][0]} sentence of the paragraph?",
+    41	            f'The {shuffled_index[0][0]} sentence of the paragraph is: "{sentences[shuffled_index[0][1]]}"',
+    42	        ),
+    43	        (
+    44	            f"OK how about the {shuffled_index[1][0]} sentence?",
+    45	            f'The {shuffled_index[1][0]} sentence of the paragraph is: "{sentences[shuffled_index[1][1]]}"',
+    46	        ),
+    47	        (
+    48	            f"And the {shuffled_index[2][0]} sentence?",
+    49	            f'The {shuffled_index[2][0]} sentence of the paragraph is: "{sentences[shuffled_index[2][1]]}"',
+    50	        ),
+    51	        (
+    52	            f"What's the {shuffled_index[3][0]} sentence?",
+    53	            f"The {shuffled_index[3][0]} sentence of the paragraph is: {sentences[shuffled_index[3][1]]}",
+    54	        ),
+    55	        (
+    56	            f"OK last one. What's the {shuffled_index[4][0]} sentence?",
+    57	            f"The {shuffled_index[4][0]} sentence of the paragraph is: {sentences[shuffled_index[4][1]]}",
+    58	        ),
+    59	    ]
+    60	    x["task"] = "sentence-repeater"
+    61	    x["info"] = {}
+    62	    x["info"]["questions"] = [q for q, _ in questions_answers]
+    63	    x["info"]["answers"] = [a for _, a in questions_answers]
+    64	    paragraph = ". ".join(sentences)
+    65	    x["prompt"] = [
+    66	        {
+    67	            "role": "user",
+    68	            "content": f'Answer questions about the following paragraph:\n\n"{paragraph}"\n\n{questions_answers[0][0]}',
+    69	        }
+    70	    ]
+    71	    return x
+    72	
+    73	
+    74	class SentenceRepeaterEnv(vf.MultiTurnEnv):
+    75	    def __init__(self, **kwargs):
+    76	        super().__init__(**kwargs)
+    77	
+    78	    def is_completed(self, messages: Messages, state: State, **kwargs) -> bool:
+    79	        return state["turn"] >= len(state["info"]["questions"])
+    80	
+    81	    def env_response(
+    82	        self, messages: Messages, state: State, **kwargs
+    83	    ) -> Tuple[Messages, State]:
+    84	        return [
+    85	            {
+    86	                "role": "user",
+    87	                "content": state["info"]["questions"][state["turn"]],
+    88	            }
+    89	        ], state
+    90	
+    91	
+    92	def load_environment(**kwargs) -> vf.Environment:
+    93	    dataset: Dataset = load_dataset("agentlans/wikipedia-paragraphs", split="train")  # type: ignore
+    94	    dataset = dataset.map(lambda x: {"sentences": get_sentences(x["text"])})
+    95	    dataset = dataset.filter(lambda x: len(x["sentences"]) == 5)
+    96	    dataset = dataset.map(get_sentence_questions)
+    97	    parser = vf.Parser()
+    98	
+    99	    def compare_answers_reward_func(parser, completion, info, **kwargs) -> float:
+   100	        assert isinstance(completion, list)
+   101	        model_answers = [
+   102	            m["content"] for m in parser.get_assistant_messages(completion)
+   103	        ]
+   104	        answers = info["answers"]
+   105	        reward = 0
+   106	        if len(model_answers) != len(answers):
+   107	            return 0
+   108	
+   109	        def similarity(a, b):
+   110	            return SequenceMatcher(None, a, b).ratio()
+   111	
+   112	        for model_answer, answer in zip(model_answers[: len(answers)], answers):
+   113	            reward += similarity(model_answer, answer) / len(answers)
+   114	        return reward
+   115	
+   116	    rubric = vf.Rubric(parser=parser, funcs=[compare_answers_reward_func])
+   117	
+   118	    vf_env = SentenceRepeaterEnv(
+   119	        dataset=dataset, parser=parser, rubric=rubric, **kwargs
+   120	    )
+   121	
+   122	    return vf_env
+########## self_reward/self_reward.py
+     1	import os
+     2	
+     3	from datasets import load_dataset
+     4	from openai import OpenAI
+     5	
+     6	import verifiers as vf
+     7	
+     8	
+     9	def load_environment(
+    10	    dataset_name: str,
+    11	    model_name: str,
+    12	    base_url: str = "http://0.0.0.0:8000/v1",
+    13	    api_key_var: str = "JUDGE_API_KEY",
+    14	):
+    15	    judge_prompt = "Q: {question}\nA: {answer}\nGiven: {response}\nRespond with a score between 0.0 and 1.0."
+    16	    rubric = vf.JudgeRubric(
+    17	        judge_client=OpenAI(base_url=base_url, api_key=os.getenv(api_key_var, "EMPTY")),
+    18	        judge_model=model_name,
+    19	        judge_prompt=judge_prompt,
+    20	    )
+    21	    vf_env = vf.SingleTurnEnv(
+    22	        dataset=load_dataset(
+    23	            dataset_name, data_files="train"
+    24	        ),  # HF dataset with "question" and "answer" columns
+    25	        system_prompt="You are a helpful assistant.",
+    26	        rubric=rubric,
+    27	    )
+    28	
+    29	    return vf_env

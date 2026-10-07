@@ -1,0 +1,127 @@
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..87271690a0 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -143,6 +143,24 @@ class ServerHandler(simple_server.ServerHandler):
+         if self.headers.get("Connection") == "close":
+             self.request_handler.close_connection = True
+ 
++    def write(self, data):
++        """'write()' callable as specified by PEP 3333."""
++        assert type(data) is bytes, "write() argument must be a bytes instance"
++
++        if not self.status:
++            raise AssertionError("write() before start_response()")
++        elif not self.headers_sent:
++            # Preserve the equivalent GET response's headers, including a
++            # computed Content-Length when possible, while omitting the body.
++            self.bytes_sent = len(data)
++            self.send_headers()
++        else:
++            self.bytes_sent += len(data)
++
++        if self.environ.get("REQUEST_METHOD") != "HEAD":
++            self._write(data)
++            self._flush()
++
+     def close(self):
+         self.get_stdin().read()
+         super().close()
+diff --git a/tests/servers/test_basehttp.py b/tests/servers/test_basehttp.py
+index a837505feb..1bfda73f23 100644
+--- a/tests/servers/test_basehttp.py
++++ b/tests/servers/test_basehttp.py
+@@ -15,6 +15,11 @@ class Stub:
+         self.makefile("wb").write(data)
+ 
+ 
++class UnclosableBytesIO(BytesIO):
++    def close(self):
++        pass
++
++
+ class WSGIRequestHandlerTestCase(SimpleTestCase):
+     request_factory = RequestFactory()
+ 
+@@ -79,12 +84,6 @@ class WSGIRequestHandlerTestCase(SimpleTestCase):
+         rfile.write(b"Other_Header: bad\r\n")
+         rfile.seek(0)
+ 
+-        # WSGIRequestHandler closes the output file; we need to make this a
+-        # no-op so we can still read its contents.
+-        class UnclosableBytesIO(BytesIO):
+-            def close(self):
+-                pass
+-
+         wfile = UnclosableBytesIO()
+ 
+         def makefile(mode, *a, **kw):
+@@ -106,6 +105,35 @@ class WSGIRequestHandlerTestCase(SimpleTestCase):
+ 
+         self.assertEqual(body, b"HTTP_SOME_HEADER:good")
+ 
++    def test_head_request_omits_body(self):
++        def test_app(environ, start_response):
++            start_response("200 OK", [("Content-Type", "text/plain")])
++            return [b"Hello world!"]
++
++        rfile = BytesIO()
++        rfile.write(b"HEAD / HTTP/1.1\r\n")
++        rfile.write(b"Host: testserver\r\n")
++        rfile.write(b"\r\n")
++        rfile.seek(0)
++
++        wfile = UnclosableBytesIO()
++
++        def makefile(mode, *a, **kw):
++            if mode == "rb":
++                return rfile
++            elif mode == "wb":
++                return wfile
++
++        request = Stub(makefile=makefile)
++        server = Stub(base_environ={}, get_app=lambda: test_app)
++
++        with self.assertLogs("django.server", "INFO"):
++            WSGIRequestHandler(request, "192.168.0.2", server)
++
++        header_bytes, body = wfile.getvalue().split(b"\r\n\r\n", 1)
++        self.assertIn(b"Content-Length: 12", header_bytes)
++        self.assertEqual(body, b"")
++
+ 
+ class WSGIServerTestCase(SimpleTestCase):
+     request_factory = RequestFactory()
+diff --git a/tests/servers/tests.py b/tests/servers/tests.py
+index 8796db9749..9377f8315d 100644
+--- a/tests/servers/tests.py
++++ b/tests/servers/tests.py
+@@ -192,6 +192,28 @@ class LiveServerViews(LiveServerBase):
+         with self.urlopen("/example_view/") as f:
+             self.assertEqual(f.version, 11)
+ 
++    def test_head_request_omits_body(self):
++        with socket.create_connection(
++            (LiveServerViews.server_thread.host, LiveServerViews.server_thread.port)
++        ) as conn:
++            conn.sendall(
++                b"HEAD /example_view/ HTTP/1.1\r\n"
++                b"Host: testserver\r\n"
++                b"Connection: close\r\n"
++                b"\r\n"
++            )
++            response = b""
++            while True:
++                chunk = conn.recv(1024)
++                if not chunk:
++                    break
++                response += chunk
++
++        header_bytes, body = response.split(b"\r\n\r\n", 1)
++        self.assertIn(b"HTTP/1.1 200 OK", header_bytes)
++        self.assertIn(b"Content-Length: 12", header_bytes)
++        self.assertEqual(body, b"")
++
+     def test_closes_connection_without_content_length(self):
+         """
+         An HTTP 1.1 server is supposed to support keep-alive. Since our

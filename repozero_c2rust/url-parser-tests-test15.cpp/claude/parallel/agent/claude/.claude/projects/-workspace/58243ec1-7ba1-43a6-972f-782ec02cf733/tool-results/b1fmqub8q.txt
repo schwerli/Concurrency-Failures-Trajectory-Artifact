@@ -1,0 +1,1256 @@
+//! Rust port of `url-parser/tests/test15.cpp`.
+//!
+//! Takes six positional arguments — scheme, host, port, path, query, fragment —
+//! builds a `URL` from them with `URL::from_components`, and prints the six
+//! components followed by `to_string()` and `is_valid()`, one per line.
+//!
+//! Build either way; both produce the same binary:
+//!   rustc -O test15.rs      # -> ./test15
+//!   cargo build --release   # -> ./target/release/test15
+
+#[path = "url_parser/mod.rs"]
+mod url_parser;
+
+use url_parser::cstdlib::stoi_or_terminate;
+use url_parser::URL;
+
+fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() < 7 {
+        std::process::exit(1);
+    }
+
+    let scheme = &argv[1];
+    let host = &argv[2];
+    // `test15.cpp` calls `std::stoi` with no `try` block, so a port argument
+    // that is not a number aborts the process instead of reporting an error.
+    let port = stoi_or_terminate(&argv[3]);
+    let path = &argv[4];
+    let query = &argv[5];
+    let fragment = &argv[6];
+
+    let parser = URL::from_components(scheme, host, port, path, query, fragment);
+
+    println!("{}", parser.scheme());
+    println!("{}", parser.host());
+    println!("{}", parser.port());
+    println!("{}", parser.path());
+    println!("{}", parser.query());
+    println!("{}", parser.fragment());
+    println!("{}", parser);
+    // `std::cout << bool` prints 1 or 0, not "true"/"false".
+    println!("{}", i32::from(parser.is_valid()));
+}
+=== url_parser ===
+total 60
+drwxr-xr-x 2 root root  4096 Aug  8 17:11 .
+drwxr-xr-x 5 root root  4096 Aug  8 17:14 ..
+-rw-r--r-- 1 root root  2744 Aug  8 16:58 ascii.rs
+-rw-r--r-- 1 root root  5038 Aug  8 17:02 cstdlib.rs
+-rw-r--r-- 1 root root  2901 Aug  8 17:11 encoding.rs
+-rw-r--r-- 1 root root   983 Aug  8 17:04 mod.rs
+-rw-r--r-- 1 root root  2820 Aug  8 16:58 path.rs
+-rw-r--r-- 1 root root  2597 Aug  8 17:02 query.rs
+-rw-r--r-- 1 root root 20037 Aug  8 17:02 url.rs
+-rw-r--r-- 1 root root  3255 Aug  8 16:59 validation.rs
+--- /output/url_parser/ascii.rs ---
+//! Byte-level character helpers matching the C++ library's internal utilities.
+//!
+//! The C++ code calls `::tolower` on each `unsigned char`. Under the default "C"
+//! locale that maps `A..Z` only and leaves every byte >= 0x80 untouched, so
+//! multi-byte UTF-8 sequences pass through unchanged.
+
+/// ASCII-only lowercase, mirroring `url_parser::to_lower`.
+///
+/// VERIFIED: `"ÉHTTP"` -> `"Éhttp"` and `"HTTPÿ"` -> `"httpÿ"`; the non-ASCII
+/// bytes are preserved, so this must not be a Unicode-aware lowercase.
+pub fn to_lower(input: &str) -> String {
+    let mut out = input.to_owned();
+    out.make_ascii_lowercase();
+    out
+}
+
+/// True for the six characters that C's `isspace` accepts in the "C" locale.
+pub fn is_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// Strips leading and trailing whitespace, mirroring `url_parser::trim`.
+pub fn trim(input: &str) -> &str {
+    let bytes = input.as_bytes();
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && is_space(bytes[start]) {
+        start += 1;
+    }
+    while end > start && is_space(bytes[end - 1]) {
+        end -= 1;
+    }
+    // `start`/`end` only ever land on ASCII whitespace boundaries, so the range
+    // is always on a UTF-8 char boundary.
+    &input[start..end]
+}
+
+/// True for `0-9`, `a-f`, `A-F`, mirroring `url_parser::is_hex`.
+pub fn is_hex(byte: u8) -> bool {
+    byte.is_ascii_hexdigit()
+}
+
+/// Decodes a single hex digit, mirroring `url_parser::hex_to_char`.
+pub fn hex_to_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Encodes the low nibble of `value` as an uppercase hex digit.
+pub fn value_to_hex(value: u8) -> char {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    DIGITS[(value & 0x0f) as usize] as char
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lowercases_only_ascii() {
+        assert_eq!(to_lower("HtTpS"), "https");
+        assert_eq!(to_lower("ÉHTTP"), "Éhttp");
+        assert_eq!(to_lower("HTTPÿ"), "httpÿ");
+        assert_eq!(to_lower("日本"), "日本");
+    }
+
+    #[test]
+    fn trims_c_locale_whitespace() {
+        assert_eq!(trim("  http \t\n"), "http");
+        assert_eq!(trim(""), "");
+        assert_eq!(trim("   "), "");
+        assert_eq!(trim("a b"), "a b");
+    }
+
+    #[test]
+    fn hex_round_trip() {
+        assert_eq!(hex_to_value(b'f'), Some(15));
+        assert_eq!(hex_to_value(b'F'), Some(15));
+        assert_eq!(hex_to_value(b'g'), None);
+        assert_eq!(value_to_hex(0x0a), 'A');
+        assert!(is_hex(b'0') && !is_hex(b'z'));
+    }
+}
+--- /output/url_parser/cstdlib.rs ---
+//! Faithful emulation of the two C++ standard-library behaviours the harness
+//! depends on: `std::stoi` and the runtime's response to an uncaught exception.
+//!
+//! `test15.cpp` calls `std::stoi(argv[3])` outside any `try` block, so a
+//! malformed port argument does not produce a tidy error message — it unwinds
+//! into `std::terminate`, which prints a fixed two-line diagnostic and raises
+//! `SIGABRT`. Both are reproduced byte for byte here.
+
+use std::io::Write;
+
+use super::ascii::is_space;
+
+/// The two exception types `std::stoi` can throw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoiError {
+    /// `std::invalid_argument` — no digits could be consumed.
+    InvalidArgument,
+    /// `std::out_of_range` — the value does not fit in an `int`.
+    OutOfRange,
+}
+
+impl StoiError {
+    /// The fully-qualified C++ type name, as printed by `std::terminate`.
+    pub fn cxx_type_name(self) -> &'static str {
+        match self {
+            StoiError::InvalidArgument => "std::invalid_argument",
+            StoiError::OutOfRange => "std::out_of_range",
+        }
+    }
+}
+
+/// Once the accumulator passes this bound the exact value stops mattering: the
+/// result is already outside `int` range, and clamping keeps the `i64` maths
+/// from overflowing on very long digit runs.
+const ACCUMULATOR_CEILING: i64 = 10_000_000_000;
+
+/// Emulates `std::stoi(str)` with the default base of 10.
+///
+/// Like the underlying `strtol`, this skips leading whitespace, accepts one
+/// optional sign, consumes base-10 digits, and then ignores whatever trails.
+///
+/// VERIFIED against the C++ binary: `"080"` -> 80, `"+80"` -> 80, `" 80"` -> 80,
+/// `"80 "` -> 80, `"8 0"` -> 8, `"80abc"` -> 80, `"80.9"` -> 80, `"0x50"` -> 0,
+/// `"1e3"` -> 1, `"-0"` -> 0, `"  -42xyz"` -> -42; `""`, `"abc"`, `"-"` and
+/// `"+"` raise `invalid_argument`; `"2147483648"`, `"-2147483649"` and
+/// `"99999999999999999999"` raise `out_of_range`.
+pub fn stoi(input: &str) -> Result<i32, StoiError> {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() && is_space(bytes[index]) {
+        index += 1;
+    }
+
+    let mut negative = false;
+    if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-') {
+        negative = bytes[index] == b'-';
+        index += 1;
+    }
+
+    let first_digit = index;
+    let mut accumulator: i64 = 0;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        if accumulator < ACCUMULATOR_CEILING {
+            accumulator = accumulator * 10 + i64::from(bytes[index] - b'0');
+        }
+        index += 1;
+    }
+
+    if index == first_digit {
+        return Err(StoiError::InvalidArgument);
+    }
+
+    let value = if negative { -accumulator } else { accumulator };
+    if value < i64::from(i32::MIN) || value > i64::from(i32::MAX) {
+        return Err(StoiError::OutOfRange);
+    }
+    Ok(value as i32)
+}
+
+/// Reproduces libstdc++'s uncaught-exception death: the fixed diagnostic on
+/// stderr followed by `SIGABRT` (exit status 134 as reported by a shell).
+///
+/// VERIFIED byte for byte, including the two spaces after `what():`:
+/// `terminate called after throwing an instance of 'std::invalid_argument'\n  what():  stoi\n`
+pub fn terminate_uncaught(cxx_type_name: &str, what: &str) -> ! {
+    let mut stderr = std::io::stderr();
+    let _ = write!(
+        stderr,
+        "terminate called after throwing an instance of '{cxx_type_name}'\n  what():  {what}\n"
+    );
+    let _ = stderr.flush();
+    std::process::abort();
+}
+
+/// Parses the harness's port argument, dying exactly as the C++ binary does.
+pub fn stoi_or_terminate(input: &str) -> i32 {
+    match stoi(input) {
+        Ok(value) => value,
+        Err(error) => terminate_uncaught(error.cxx_type_name(), "stoi"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_the_forms_strtol_accepts() {
+        for (input, expected) in [
+            ("80", 80),
+            ("080", 80),
+            ("+80", 80),
+            (" 80", 80),
+            ("\t80", 80),
+            ("80 ", 80),
+            ("8 0", 8),
+            ("80abc", 80),
+            ("80.9", 80),
+            ("0x50", 0),
+            ("1e3", 1),
+            ("-0", 0),
+            ("  -42xyz", -42),
+            ("-1", -1),
+            ("2147483647", i32::MAX),
+            ("-2147483648", i32::MIN),
+        ] {
+            assert_eq!(stoi(input), Ok(expected), "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_inputs_without_digits() {
+        for input in ["", "abc", "-", "+", " ", "x9"] {
+            assert_eq!(
+                stoi(input),
+                Err(StoiError::InvalidArgument),
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_values_outside_int_range() {
+        for input in [
+            "2147483648",
+            "-2147483649",
+            "99999999999999999999",
+            "-99999999999999999999",
+        ] {
+            assert_eq!(stoi(input), Err(StoiError::OutOfRange), "input {input:?}");
+        }
+    }
+}
+--- /output/url_parser/encoding.rs ---
+//! Percent-encoding helpers mirroring `url_parser::url_encode` / `url_decode`.
+//!
+//! Note: `URL::from_components` never touches these — every component it is
+//! handed is stored with its percent-escapes exactly as given (VERIFIED:
+//! `"/a%20b"` stays `"/a%20b"`, `"q=%20&r=a+b"` stays verbatim). They exist for
+//! the query-parameter helpers and for callers that want them.
+
+use super::ascii::{hex_to_value, value_to_hex};
+
+/// Percent-encodes everything outside the RFC 3986 unreserved set
+/// (`ALPHA / DIGIT / "-" / "_" / "." / "~"`), using uppercase hex digits.
+pub fn url_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(value_to_hex(byte >> 4));
+                out.push(value_to_hex(byte));
+            }
+        }
+    }
+    out
+}
+
+/// Reverses [`url_encode`]. A `%` that is not followed by two hex digits is kept
+/// literally, which is what the C++ `is_hex` guard amounts to.
+///
+/// `+` is *not* treated as a space: `url_encode` emits `%20`, so decoding `+`
+/// would not be symmetric.
+pub fn url_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_to_value(bytes[index + 1]), hex_to_value(bytes[index + 2]))
+            {
+                out.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+
+    // Decoded bytes are arbitrary; fall back to replacement chars rather than
+    // failing, since a decoded octet sequence need not be valid UTF-8.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_reserved_characters() {
+        assert_eq!(url_encode("a b"), "a%20b");
+        assert_eq!(url_encode("a/b?c=d&e"), "a%2Fb%3Fc%3Dd%26e");
+        assert_eq!(url_encode("safe-_.~09AZ"), "safe-_.~09AZ");
+    }
+
+    #[test]
+    fn decodes_and_round_trips() {
+        assert_eq!(url_decode("a%20b"), "a b");
+        assert_eq!(url_decode("a%2Fb"), "a/b");
+        assert_eq!(url_decode("a+b"), "a+b");
+        for sample in ["a b", "/x/y?z=1&w=2", "héllo", "100%"] {
+            assert_eq!(url_decode(&url_encode(sample)), sample);
+        }
+    }
+
+    #[test]
+    fn keeps_malformed_escapes_literal() {
+        assert_eq!(url_decode("%zz"), "%zz");
+        assert_eq!(url_decode("%2"), "%2");
+        assert_eq!(url_decode("%"), "%");
+    }
+}
+--- /output/url_parser/mod.rs ---
+//! A `std`-only re-implementation of the C++ `url_parser` library.
+//!
+//! The original library was migrated as a black box: every rule encoded here was
+//! derived by observing the compiled C++ binary, not by reading its source. The
+//! behaviours that the `test15` harness exercises are pinned down exactly, and
+//! each surprising one is called out with a `VERIFIED:` comment next to the code
+//! that implements it.
+
+// This module re-implements the C++ library's whole public surface, while the
+// `test15` harness only drives `from_components`, the accessors, `to_string` and
+// `is_valid`. In a binary crate everything else therefore looks unreachable.
+#![allow(dead_code, unused_imports)]
+
+pub mod ascii;
+pub mod cstdlib;
+pub mod encoding;
+pub mod path;
+pub mod query;
+pub mod url;
+pub mod validation;
+
+pub use encoding::{url_decode, url_encode};
+pub use path::split_path;
+pub use url::{URL, PORT_UNSET};
+pub use validation::{is_host_valid, is_port_valid, is_scheme_valid};
+--- /output/url_parser/path.rs ---
+//! Path helpers mirroring `url_parser::split_path` and `URL::normalize_path`.
+//!
+//! `URL::from_components` deliberately does *not* normalize the path — it only
+//! guarantees a leading slash (see [`crate::url::URL::set_path`]).
+
+/// Splits a path into its non-empty segments, mirroring `url_parser::split_path`.
+///
+/// Empty segments (from leading, trailing or doubled slashes) are dropped:
+/// `"//a//b//"` yields `["a", "b"]`.
+pub fn split_path(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Resolves `.` and `..` segments and collapses repeated slashes.
+///
+/// A leading slash and a trailing slash are both preserved when the input had
+/// one. `..` at the root is discarded rather than escaping above it.
+pub fn normalize_path_string(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+
+    let absolute = path.starts_with('/');
+    let trailing_slash = path.ends_with('/');
+
+    let mut resolved: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                // A relative path has to keep a `..` it cannot resolve, or the
+                // path would silently change meaning.
+                match resolved.last() {
+                    Some(&last) if last != ".." => {
+                        resolved.pop();
+                    }
+                    _ if !absolute => resolved.push(".."),
+                    _ => {}
+                }
+            }
+            other => resolved.push(other),
+        }
+    }
+
+    let mut out = String::with_capacity(path.len());
+    if absolute {
+        out.push('/');
+    }
+    out.push_str(&resolved.join("/"));
+
+    if trailing_slash && !out.ends_with('/') {
+        out.push('/');
+    }
+    if out.is_empty() {
+        out.push_str(if absolute { "/" } else { "." });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_dropping_empty_segments() {
+        assert_eq!(split_path("/a/b"), vec!["a", "b"]);
+        assert_eq!(split_path("//a//b//"), vec!["a", "b"]);
+        assert_eq!(split_path("/"), Vec::<String>::new());
+        assert_eq!(split_path(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn normalizes_dot_segments() {
+        assert_eq!(normalize_path_string("/a/./b"), "/a/b");
+        assert_eq!(normalize_path_string("/a/../b"), "/b");
+        assert_eq!(normalize_path_string("/a/b/.."), "/a");
+        assert_eq!(normalize_path_string("/../a"), "/a");
+        assert_eq!(normalize_path_string("//a//b//"), "/a/b/");
+        assert_eq!(normalize_path_string("/"), "/");
+        assert_eq!(normalize_path_string(""), "");
+        assert_eq!(normalize_path_string("../a"), "../a");
+    }
+}
+--- /output/url_parser/query.rs ---
+//! Query-string helpers backing `URL::query_params`, `get_query_param`,
+//! `add_query_param`, `remove_query_param` and `normalize_query`.
+//!
+//! As with the path, `URL::from_components` stores the query verbatim — VERIFIED:
+//! `"b=2&a=1"` comes back unsorted, `"&&"` is preserved, and a leading `"?"` is
+//! *not* stripped. Nothing here runs unless a caller asks for it.
+
+use super::encoding::{url_decode, url_encode};
+
+/// A decoded `name=value` pair.
+pub type Param = (String, String);
+
+/// Splits a raw query string into decoded pairs.
+///
+/// Empty chunks (from `&&` or a trailing `&`) are skipped. A chunk with no `=`
+/// becomes a name with an empty value.
+pub fn parse_query_string(query: &str) -> Vec<Param> {
+    query
+        .split('&')
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| match chunk.split_once('=') {
+            Some((name, value)) => (url_decode(name), url_decode(value)),
+            None => (url_decode(chunk), String::new()),
+        })
+        .collect()
+}
+
+/// Rebuilds a raw query string from decoded pairs, re-encoding both sides.
+pub fn build_query_string(params: &[Param]) -> String {
+    params
+        .iter()
+        .map(|(name, value)| format!("{}={}", url_encode(name), url_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Canonical form of a query string: empty chunks dropped, pairs sorted by name
+/// (ties keep their original order), everything consistently re-encoded.
+pub fn normalize_query_string(query: &str) -> String {
+    let mut params = parse_query_string(query);
+    params.sort_by(|left, right| left.0.cmp(&right.0));
+    build_query_string(&params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_pairs_and_skips_empties() {
+        assert_eq!(
+            parse_query_string("q=test&page=1"),
+            vec![
+                ("q".to_owned(), "test".to_owned()),
+                ("page".to_owned(), "1".to_owned())
+            ]
+        );
+        assert_eq!(parse_query_string("&&"), Vec::<Param>::new());
+        assert_eq!(parse_query_string(""), Vec::<Param>::new());
+        assert_eq!(
+            parse_query_string("flag"),
+            vec![("flag".to_owned(), String::new())]
+        );
+    }
+
+    #[test]
+    fn decodes_values() {
+        assert_eq!(
+            parse_query_string("q=a%20b"),
+            vec![("q".to_owned(), "a b".to_owned())]
+        );
+    }
+
+    #[test]
+    fn normalizes_by_sorting_names() {
+        assert_eq!(normalize_query_string("b=2&a=1"), "a=1&b=2");
+        assert_eq!(normalize_query_string("a=1&&b=2&"), "a=1&b=2");
+    }
+}
+--- /output/url_parser/url.rs ---
+//! The `URL` value type, mirroring `url_parser::URL` from the C++ library.
+
+use std::fmt;
+
+use super::ascii::{to_lower, trim};
+use super::cstdlib::stoi;
+use super::path::normalize_path_string;
+use super::query::{self, Param};
+use super::validation::{is_port_valid, is_scheme_valid};
+
+/// Sentinel stored when no usable port is available.
+///
+/// VERIFIED: the C++ binary prints `-1` for every out-of-range port argument
+/// (`-100`, `65536`, `i32::MAX`, ...), so the sentinel is observable through the
+/// `port()` accessor and is not merely internal.
+pub const PORT_UNSET: i32 = -1;
+
+/// A parsed URL, built either by [`URL::parse`] or [`URL::from_components`].
+#[derive(Clone, Debug, Eq)]
+pub struct URL {
+    scheme: String,
+    userinfo: String,
+    host: String,
+    port: i32,
+    path: String,
+    query: String,
+    fragment: String,
+    valid: bool,
+}
+
+impl Default for URL {
+    fn default() -> Self {
+        URL {
+            scheme: String::new(),
+            userinfo: String::new(),
+            host: String::new(),
+            port: PORT_UNSET,
+            path: String::new(),
+            query: String::new(),
+            fragment: String::new(),
+            valid: false,
+        }
+    }
+}
+
+/// Equality compares the URL's components. `valid` is a pure function of `host`
+/// and `path`, so leaving it out changes nothing.
+impl PartialEq for URL {
+    fn eq(&self, other: &Self) -> bool {
+        self.scheme == other.scheme
+            && self.userinfo == other.userinfo
+            && self.host == other.host
+            && self.port == other.port
+            && self.path == other.path
+            && self.query == other.query
+            && self.fragment == other.fragment
+    }
+}
+
+impl URL {
+    /// An empty URL with no port.
+    pub fn new() -> Self {
+        URL::default()
+    }
+
+    /// Builds a URL from already-separated components.
+    ///
+    /// This is the entry point `test15` uses. Each component goes through its
+    /// setter, so the scheme is lowercased, the port is range-filtered and the
+    /// path picks up a leading slash; the host, query and fragment are stored
+    /// exactly as handed over.
+    pub fn from_components(
+        scheme: &str,
+        host: &str,
+        port: i32,
+        path: &str,
+        query: &str,
+        fragment: &str,
+    ) -> Self {
+        let mut url = URL::new();
+        url.set_scheme(scheme);
+        url.set_host(host);
+        url.set_port(port);
+        url.set_path(path);
+        url.set_query(query);
+        url.set_fragment(fragment);
+        url
+    }
+
+    /// Parses a URL string of the form
+    /// `scheme://userinfo@host:port/path?query#fragment`.
+    ///
+    /// Every part is optional. `mailto:user@example.com`-style opaque forms are
+    /// recognised when the text before the first `:` is a valid scheme.
+    pub fn parse(input: &str) -> Self {
+        let mut url = URL::new();
+        let mut rest = trim(input);
+
+        // Strip from the right, so a `#` inside the query and a `?` inside the
+        // fragment both land where a browser would put them.
+        if let Some((head, fragment)) = rest.split_once('#') {
+            url.set_fragment(fragment);
+            rest = head;
+        }
+        if let Some((head, query)) = rest.split_once('?') {
+            url.set_query(query);
+            rest = head;
+        }
+
+        let mut authority = None;
+        if let Some(position) = rest.find("://") {
+            url.set_scheme(&rest[..position]);
+            rest = &rest[position + 3..];
+            let (found, remainder) = match rest.find('/') {
+                Some(slash) => (&rest[..slash], &rest[slash..]),
+                None => (rest, ""),
+            };
+            authority = Some(found);
+            rest = remainder;
+        } else if let Some((scheme, remainder)) = rest.split_once(':') {
+            if is_scheme_valid(scheme) {
+                url.set_scheme(scheme);
+                rest = remainder;
+            }
+        }
+
+        if let Some(authority) = authority {
+            let host_and_port = match authority.rsplit_once('@') {
+                Some((userinfo, tail)) => {
+                    url.userinfo = userinfo.to_owned();
+                    tail
+                }
+                None => authority,
+            };
+
+            // In `[::1]:8080` only the colon after the closing bracket is a port
+            // separator; the ones inside belong to the IPv6 literal.
+            let port_separator = match host_and_port.rfind(']') {
+                Some(bracket) => host_and_port[bracket..]
+                    .find(':')
+                    .map(|offset| bracket + offset),
+                None => host_and_port.rfind(':'),
+            };
+
+            match port_separator {
+                Some(colon) => {
+                    url.set_host(&host_and_port[..colon]);
+                    url.set_port(stoi(&host_and_port[colon + 1..]).unwrap_or(PORT_UNSET));
+                }
+                None => url.set_host(host_and_port),
+            }
+        }
+
+        url.set_path(rest);
+        url
+    }
+
+    /// True when `input` parses into a URL that carries an authority or a path.
+    pub fn is_valid_url(input: &str) -> bool {
+        URL::parse(input).is_valid()
+    }
+
+    // ---------------------------------------------------------------- accessors
+
+    pub fn scheme(&self) -> &str {
+        &self.scheme
+    }
+
+    pub fn userinfo(&self) -> &str {
+        &self.userinfo
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> i32 {
+        self.port
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn fragment(&self) -> &str {
+        &self.fragment
+    }
+
+    /// The `userinfo@host:port` portion, with each piece omitted when absent.
+    pub fn authority(&self) -> String {
+        let mut out = String::new();
+        if self.has_userinfo() {
+            out.push_str(&self.userinfo);
+            out.push('@');
+        }
+        out.push_str(&self.host);
+        if self.has_port() {
+            out.push(':');
+            out.push_str(&self.port.to_string());
+        }
+        out
+    }
+
+    // ------------------------------------------------------------------ setters
+
+    /// Stores the scheme lowercased.
+    ///
+    /// VERIFIED: `"HTTP"` is stored as `"http"`, but nothing else is touched —
+    /// `"http:"` stays `"http:"` and `"ht tp"` stays `"ht tp"`, so there is no
+    /// trimming and no separator stripping.
+    pub fn set_scheme(&mut self, scheme: &str) {
+        self.scheme = to_lower(scheme);
+    }
+
+    /// Stores the host verbatim.
+    ///
+    /// VERIFIED: the host is *not* lowercased (`"EXAMPLE.COM"` survives intact,
+    /// unlike the scheme) and is never split — `"h:9090"` stays one host and
+    /// renders as `http://h:9090:80/` when a port is also supplied.
+    pub fn set_host(&mut self, host: &str) {
+        self.host = host.to_owned();
+        self.refresh_valid();
+    }
+
+    /// Stores `port` when it is in range, otherwise [`PORT_UNSET`].
+    pub fn set_port(&mut self, port: i32) {
+        self.port = if is_port_valid(port) { port } else { PORT_UNSET };
+    }
+
+    /// Stores the path, giving a non-empty path a leading slash.
+    ///
+    /// VERIFIED: `"p"` becomes `"/p"` and `"user@example.com"` becomes
+    /// `"/user@example.com"`, while an empty path stays empty rather than
+    /// defaulting to `"/"`. Nothing else is normalized: `"/a/../b"` and
+    /// `"//a//b//"` are stored exactly as given.
+    pub fn set_path(&mut self, path: &str) {
+        self.path = if path.is_empty() || path.starts_with('/') {
+            path.to_owned()
+        } else {
+            format!("/{path}")
+        };
+        self.refresh_valid();
+    }
+
+    /// Stores the query verbatim.
+    ///
+    /// VERIFIED: a leading `"?"` is *not* stripped, so a query of `"?q=1"`
+    /// renders as `...??q=1`.
+    pub fn set_query(&mut self, query: &str) {
+        self.query = query.to_owned();
+    }
+
+    /// Stores the fragment verbatim.
+    ///
+    /// VERIFIED: a leading `"#"` is *not* stripped, so a fragment of `"#f"`
+    /// renders as `...##f`.
+    pub fn set_fragment(&mut self, fragment: &str) {
+        self.fragment = fragment.to_owned();
+    }
+
+    // --------------------------------------------------------------- predicates
+
+    pub fn has_scheme(&self) -> bool {
+        !self.scheme.is_empty()
+    }
+
+    pub fn has_userinfo(&self) -> bool {
+        !self.userinfo.is_empty()
+    }
+
+    pub fn has_host(&self) -> bool {
+        !self.host.is_empty()
+    }
+
+    pub fn has_port(&self) -> bool {
+        self.port != PORT_UNSET
+    }
+
+    pub fn has_path(&self) -> bool {
+        !self.path.is_empty()
+    }
+
+    pub fn has_query(&self) -> bool {
+        !self.query.is_empty()
+    }
+
+    pub fn has_fragment(&self) -> bool {
+        !self.fragment.is_empty()
+    }
+
+    pub fn has_authority(&self) -> bool {
+        self.has_userinfo() || self.has_host() || self.has_port()
+    }
+
+    /// True when the URL carries an authority or a path.
+    ///
+    /// VERIFIED to be exactly `has_host() || has_path()`, and to be independent
+    /// of the *content* of either: a host of `"a b"` or `"!!!"` still reports
+    /// valid, and a scheme on its own does not (`("http", "", -1, "", "", "")`
+    /// reports invalid while `("", "", -1, "/", "", "")` reports valid).
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    fn refresh_valid(&mut self) {
+        self.valid = self.has_host() || self.has_path();
+    }
+
+    // ------------------------------------------------------------- normalization
+
+    /// Lowercases the host. The scheme is already lowercased on the way in.
+    pub fn normalize_case(&mut self) {
+        self.host = to_lower(&self.host);
+    }
+
+    /// Resolves `.` and `..` segments and collapses repeated slashes.
+    pub fn normalize_path(&mut self) {
+        self.path = normalize_path_string(&self.path);
+        self.refresh_valid();
+    }
+
+    /// Sorts query parameters by name and drops empty pairs.
+    pub fn normalize_query(&mut self) {
+        self.query = query::normalize_query_string(&self.query);
+    }
+
+    /// Applies every normalization step.
+    pub fn normalize(&mut self) {
+        self.normalize_case();
+        self.normalize_path();
+        self.normalize_query();
+    }
+
+    // ----------------------------------------------------------- query handling
+
+    /// The query's decoded `name=value` pairs.
+    pub fn parse_query_params(&self) -> Vec<Param> {
+        query::parse_query_string(&self.query)
+    }
+
+    /// Alias of [`URL::parse_query_params`].
+    pub fn query_params(&self) -> Vec<Param> {
+        self.parse_query_params()
+    }
+
+    /// The first value stored under `name`, if any.
+    pub fn get_query_param(&self, name: &str) -> Option<String> {
+        self.parse_query_params()
+            .into_iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    }
+
+    /// Appends `name=value` to the raw query, percent-encoding both sides.
+    pub fn add_query_param(&mut self, name: &str, value: &str) {
+        let mut params = self.parse_query_params();
+        params.push((name.to_owned(), value.to_owned()));
+        self.query = query::build_query_string(&params);
+    }
+
+    /// Drops every pair stored under `name`.
+    pub fn remove_query_param(&mut self, name: &str) {
+        let mut params = self.parse_query_params();
+        params.retain(|(key, _)| key != name);
+        self.query = query::build_query_string(&params);
+    }
+}
+
+impl fmt::Display for URL {
+    /// Renders the URL, mirroring `URL::to_string`.
+    ///
+    /// The scheme gates the whole authority. This looks wrong but is exactly what
+    /// the C++ library does, and `test15` observes it:
+    ///
+    /// - `("", "example.com", 80, "/", "", "")` renders as just `"/"` — a host
+    ///   and port with no scheme are dropped entirely.
+    /// - `("http", "", 80, "/", "", "")` renders as `"http://:80/"` — the `//`
+    ///   and the port survive an empty host.
+    /// - the separator is a literal `"://"`, never a bare `":"`, so
+    ///   `("file", "", -1, "/etc/hosts", ...)` renders as `"file:///etc/hosts"`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.has_scheme() {
+            write!(formatter, "{}://", self.scheme)?;
+            if self.has_userinfo() {
+                write!(formatter, "{}@", self.userinfo)?;
+            }
+            formatter.write_str(&self.host)?;
+            if self.has_port() {
+                write!(formatter, ":{}", self.port)?;
+            }
+        }
+        formatter.write_str(&self.path)?;
+        if self.has_query() {
+            write!(formatter, "?{}", self.query)?;
+        }
+        if self.has_fragment() {
+            write!(formatter, "#{}", self.fragment)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Renders the eight lines `test15` prints, so fixtures read like its output.
+    fn render(scheme: &str, host: &str, port: i32, path: &str, query: &str, fragment: &str) -> String {
+        let url = URL::from_components(scheme, host, port, path, query, fragment);
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            url.scheme(),
+            url.host(),
+            url.port(),
+            url.path(),
+            url.query(),
+            url.fragment(),
+            url,
+            i32::from(url.is_valid()),
+        )
+    }
+
+    #[test]
+    fn matches_the_documented_examples() {
+        assert_eq!(
+            render("http", "example.com", 80, "/", "", ""),
+            "http\nexample.com\n80\n/\n\n\nhttp://example.com:80/\n1\n"
+        );
+        assert_eq!(
+            render("https", "www.google.com", 443, "/search", "q=test", "results"),
+            "https\nwww.google.com\n443\n/search\nq=test\nresults\n\
+             https://www.google.com:443/search?q=test#results\n1\n"
+        );
+        assert_eq!(
+            render("ftp", "ftp.example.org", 21, "/files/document.pdf", "", ""),
+            "ftp\nftp.example.org\n21\n/files/document.pdf\n\n\n\
+             ftp://ftp.example.org:21/files/document.pdf\n1\n"
+        );
+        assert_eq!(
+            render("http", "localhost", 8080, "/api/v1/users", "id=123&name=john", "profile"),
+            "http\nlocalhost\n8080\n/api/v1/users\nid=123&name=john\nprofile\n\
+             http://localhost:8080/api/v1/users?id=123&name=john#profile\n1\n"
+        );
+    }
+
+    #[test]
+    fn scheme_is_lowercased_but_host_is_not() {
+        let url = URL::from_components("HTTP", "EXAMPLE.COM", 8080, "/A/B", "Q=V", "FRAG");
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host(), "EXAMPLE.COM");
+        assert_eq!(url.to_string(), "http://EXAMPLE.COM:8080/A/B?Q=V#FRAG");
+    }
+
+    #[test]
+    fn out_of_range_ports_become_unset_and_vanish_from_to_string() {
+        for port in [-1, -2, -100, i32::MIN, 65536, 70000, i32::MAX] {
+            let url = URL::from_components("http", "h", port, "/", "", "");
+            assert_eq!(url.port(), PORT_UNSET, "port {port}");
+            assert_eq!(url.to_string(), "http://h/", "port {port}");
+        }
+        assert_eq!(
+            URL::from_components("http", "h", 0, "/", "", "").to_string(),
+            "http://h:0/"
+        );
+        assert_eq!(
+            URL::from_components("http", "h", 65535, "/", "", "").to_string(),
+            "http://h:65535/"
+        );
+    }
+
+    #[test]
+    fn the_scheme_gates_the_authority() {
+        assert_eq!(URL::from_components("", "example.com", 80, "/", "", "").to_string(), "/");
+        assert_eq!(URL::from_components("", "h", -1, "", "", "").to_string(), "");
+        assert_eq!(URL::from_components("http", "", 80, "/", "", "").to_string(), "http://:80/");
+        assert_eq!(URL::from_components("http", "", -1, "", "", "").to_string(), "http://");
+        assert_eq!(
+            URL::from_components("file", "", -1, "/etc/hosts", "", "").to_string(),
+            "file:///etc/hosts"
+        );
+        assert_eq!(
+            URL::from_components("mailto", "", -1, "user@example.com", "", "").to_string(),
+            "mailto:///user@example.com"
+        );
+    }
+
+    #[test]
+    fn separator_prefixes_are_not_stripped() {
+        let url = URL::from_components("http", "h", 80, "/", "?q=1", "#f");
+        assert_eq!(url.query(), "?q=1");
+        assert_eq!(url.fragment(), "#f");
+        assert_eq!(url.to_string(), "http://h:80/??q=1##f");
+    }
+
+    #[test]
+    fn path_gains_a_leading_slash_but_is_not_normalized() {
+        assert_eq!(URL::from_components("http", "h", 80, "p", "", "").path(), "/p");
+        assert_eq!(URL::from_components("http", "h", 80, "", "", "").path(), "");
+        assert_eq!(URL::from_components("http", "h", 80, "/a/../b", "", "").path(), "/a/../b");
+        assert_eq!(URL::from_components("http", "h", 80, "//a//b//", "", "").path(), "//a//b//");
+        assert_eq!(URL::from_components("http", "h", 80, "/p?x=1#f", "", "").path(), "/p?x=1#f");
+    }
+
+    #[test]
+    fn is_valid_is_host_or_path_and_ignores_their_content() {
+        assert!(!URL::from_components("", "", 80, "", "", "").is_valid());
+        assert!(!URL::from_components("http", "", -1, "", "q", "f").is_valid());
+        assert!(!URL::from_components("https", "", 443, "", "a=b&c=d", "frag").is_valid());
+        assert!(URL::from_components("", "h", -1, "", "", "").is_valid());
+        assert!(URL::from_components("", "", -1, "/", "", "").is_valid());
+        for hostile in ["a b", "!!!", "-", ".", ":", "@", "%", "a..b", "["] {
+            assert!(URL::from_components("", hostile, -1, "", "", "").is_valid(), "host {hostile:?}");
+            assert!(URL::from_components("", "", -1, hostile, "", "").is_valid(), "path {hostile:?}");
+        }
+    }
+
+    #[test]
+    fn parse_round_trips_a_full_url() {
+        let url = URL::parse("HTTPS://user:pw@Example.COM:8443/a/b?q=1&r=2#top");
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.userinfo(), "user:pw");
+        assert_eq!(url.host(), "Example.COM");
+        assert_eq!(url.port(), 8443);
+        assert_eq!(url.path(), "/a/b");
+        assert_eq!(url.query(), "q=1&r=2");
+        assert_eq!(url.fragment(), "top");
+        assert_eq!(url.to_string(), "https://user:pw@Example.COM:8443/a/b?q=1&r=2#top");
+    }
+
+    #[test]
+    fn parse_handles_ipv6_and_missing_pieces() {
+        let url = URL::parse("http://[::1]:8080/x");
+        assert_eq!(url.host(), "[::1]");
+        assert_eq!(url.port(), 8080);
+
+        let url = URL::parse("http://[::1]/x");
+        assert_eq!(url.host(), "[::1]");
+        assert_eq!(url.port(), PORT_UNSET);
+
+        let url = URL::parse("example.com/foo");
+        assert_eq!(url.host(), "");
+        assert_eq!(url.path(), "/example.com/foo");
+    }
+
+    #[test]
+    fn query_helpers_operate_on_decoded_pairs() {
+        let mut url = URL::from_components("http", "h", 80, "/", "q=a%20b&page=1", "");
+        assert_eq!(url.get_query_param("q").as_deref(), Some("a b"));
+        assert_eq!(url.get_query_param("missing"), None);
+        assert_eq!(url.query_params().len(), 2);
+
+        url.add_query_param("next", "a b");
+        assert_eq!(url.query(), "q=a%20b&page=1&next=a%20b");
+
+        url.remove_query_param("page");
+        assert_eq!(url.query(), "q=a%20b&next=a%20b");
+    }
+
+    #[test]
+    fn normalization_is_opt_in() {
+        let mut url = URL::from_components("HTTP", "EXAMPLE.com", 80, "/a/../b//c", "b=2&a=1", "");
+        assert_eq!(url.host(), "EXAMPLE.com");
+        url.normalize();
+        assert_eq!(url.host(), "example.com");
+        assert_eq!(url.path(), "/b/c");
+        assert_eq!(url.query(), "a=1&b=2");
+    }
+
+    #[test]
+    fn equality_ignores_construction_route() {
+        let built = URL::from_components("http", "h", 80, "/p", "q=1", "f");
+        let parsed = URL::parse("http://h:80/p?q=1#f");
+        assert_eq!(built, parsed);
+        assert_ne!(built, URL::from_components("http", "h", 81, "/p", "q=1", "f"));
+    }
+}
+--- /output/url_parser/validation.rs ---
+//! The free-standing validation predicates exported by the C++ library.
+//!
+//! Only [`is_port_valid`] participates in what `test15` observes: it is the
+//! filter `URL::set_port` applies before storing, so getting its bounds wrong
+//! changes both the printed port and `to_string()`.
+
+/// Accepts a scheme of the RFC 3986 shape `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`.
+pub fn is_scheme_valid(scheme: &str) -> bool {
+    let mut bytes = scheme.bytes();
+    match bytes.next() {
+        Some(first) if first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+/// Accepts a bracketed IPv6 literal, or a dot-separated set of host labels made
+/// of alphanumerics, `-` and `_`, with no empty label and no label starting or
+/// ending in `-`.
+pub fn is_host_valid(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+
+    if let Some(inner) = host.strip_prefix('[') {
+        return match inner.strip_suffix(']') {
+            Some(address) => {
+                !address.is_empty()
+                    && address
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b':' | b'.'))
+            }
+            None => false,
+        };
+    }
+
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    })
+}
+
+/// The range a port must fall in to be stored as given.
+///
+/// VERIFIED against the C++ binary: 0 and 65535 are kept (`to_string()` renders
+/// `":0"` and `":65535"`), while -1, -2, -100, `i32::MIN`, 65536, 70000 and
+/// `i32::MAX` are all replaced by the "unset" sentinel -1. So the bound is
+/// inclusive on both ends and 0 counts as valid.
+pub fn is_port_valid(port: i32) -> bool {
+    (0..=65535).contains(&port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheme_rules() {
+        assert!(is_scheme_valid("http"));
+        assert!(is_scheme_valid("a1+-."));
+        assert!(!is_scheme_valid(""));
+        assert!(!is_scheme_valid("1http"));
+        assert!(!is_scheme_valid("ht tp"));
+        assert!(!is_scheme_valid("ht_tp"));
+    }
+
+    #[test]
+    fn host_rules() {
+        assert!(is_host_valid("example.com"));
+        assert!(is_host_valid("localhost"));
+        assert!(is_host_valid("1.2.3.4"));
+        assert!(is_host_valid("un_der.com"));
+        assert!(is_host_valid("[::1]"));
+        assert!(!is_host_valid(""));
+        assert!(!is_host_valid("a..b"));
+        assert!(!is_host_valid("-bad.com"));
+        assert!(!is_host_valid("bad-.com"));
+        assert!(!is_host_valid("a b"));
+        assert!(!is_host_valid("[::1"));
+    }
+
+    #[test]
+    fn port_bounds_match_the_cxx_binary() {
+        assert!(is_port_valid(0));
+        assert!(is_port_valid(80));
+        assert!(is_port_valid(65535));
+        assert!(!is_port_valid(-1));
+        assert!(!is_port_valid(-2));
+        assert!(!is_port_valid(i32::MIN));
+        assert!(!is_port_valid(65536));
+        assert!(!is_port_valid(i32::MAX));
+    }
+}

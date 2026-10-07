@@ -1,0 +1,1083 @@
+     1	# -*- coding: utf-8 -*-
+     2	"""Layer definitions.
+     3	
+     4	This module defines classes which encapsulate a single layer.
+     5	
+     6	These layers map input activations to output activation with the `fprop`
+     7	method and map gradients with repsect to outputs to gradients with respect to
+     8	their inputs with the `bprop` method.
+     9	
+    10	Some layers will have learnable parameters and so will additionally define
+    11	methods for getting and setting parameter and calculating gradients with
+    12	respect to the layer parameters.
+    13	"""
+    14	
+    15	import numpy as np
+    16	import mlp.initialisers as init
+    17	from mlp import DEFAULT_SEED
+    18	
+    19	class Layer(object):
+    20	    """Abstract class defining the interface for a layer."""
+    21	
+    22	    def fprop(self, inputs):
+    23	        """Forward propagates activations through the layer transformation.
+    24	
+    25	        Args:
+    26	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+    27	
+    28	        Returns:
+    29	            outputs: Array of layer outputs of shape (batch_size, output_dim).
+    30	        """
+    31	        raise NotImplementedError()
+    32	
+    33	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+    34	        """Back propagates gradients through a layer.
+    35	
+    36	        Given gradients with respect to the outputs of the layer calculates the
+    37	        gradients with respect to the layer inputs.
+    38	
+    39	        Args:
+    40	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+    41	            outputs: Array of layer outputs calculated in forward pass of
+    42	                shape (batch_size, output_dim).
+    43	            grads_wrt_outputs: Array of gradients with respect to the layer
+    44	                outputs of shape (batch_size, output_dim).
+    45	
+    46	        Returns:
+    47	            Array of gradients with respect to the layer inputs of shape
+    48	            (batch_size, input_dim).
+    49	        """
+    50	        raise NotImplementedError()
+    51	
+    52	
+    53	class LayerWithParameters(Layer):
+    54	    """Abstract class defining the interface for a layer with parameters."""
+    55	
+    56	    def grads_wrt_params(self, inputs, grads_wrt_outputs):
+    57	        """Calculates gradients with respect to layer parameters.
+    58	
+    59	        Args:
+    60	            inputs: Array of inputs to layer of shape (batch_size, input_dim).
+    61	            grads_wrt_to_outputs: Array of gradients with respect to the layer
+    62	                outputs of shape (batch_size, output_dim).
+    63	
+    64	        Returns:
+    65	            List of arrays of gradients with respect to the layer parameters
+    66	            with parameter gradients appearing in same order in tuple as
+    67	            returned from `get_params` method.
+    68	        """
+    69	        raise NotImplementedError()
+    70	
+    71	    def params_penalty(self):
+    72	        """Returns the parameter dependent penalty term for this layer.
+    73	
+    74	        If no parameter-dependent penalty terms are set this returns zero.
+    75	        """
+    76	        raise NotImplementedError()
+    77	
+    78	    @property
+    79	    def params(self):
+    80	        """Returns a list of parameters of layer.
+    81	
+    82	        Returns:
+    83	            List of current parameter values. This list should be in the
+    84	            corresponding order to the `values` argument to `set_params`.
+    85	        """
+    86	        raise NotImplementedError()
+    87	
+    88	    @params.setter
+    89	    def params(self, values):
+    90	        """Sets layer parameters from a list of values.
+    91	
+    92	        Args:
+    93	            values: List of values to set parameters to. This list should be
+    94	                in the corresponding order to what is returned by `get_params`.
+    95	        """
+    96	        raise NotImplementedError()
+    97	
+    98	class StochasticLayerWithParameters(Layer):
+    99	    """Specialised layer which uses a stochastic forward propagation."""
+   100	
+   101	    def __init__(self, rng=None):
+   102	        """Constructs a new StochasticLayer object.
+   103	
+   104	        Args:
+   105	            rng (RandomState): Seeded random number generator object.
+   106	        """
+   107	        if rng is None:
+   108	            rng = np.random.RandomState(DEFAULT_SEED)
+   109	        self.rng = rng
+   110	
+   111	    def fprop(self, inputs, stochastic=True):
+   112	        """Forward propagates activations through the layer transformation.
+   113	
+   114	        Args:
+   115	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   116	            stochastic: Flag allowing different deterministic
+   117	                forward-propagation mode in addition to default stochastic
+   118	                forward-propagation e.g. for use at test time. If False
+   119	                a deterministic forward-propagation transformation
+   120	                corresponding to the expected output of the stochastic
+   121	                forward-propagation is applied.
+   122	
+   123	        Returns:
+   124	            outputs: Array of layer outputs of shape (batch_size, output_dim).
+   125	        """
+   126	        raise NotImplementedError()
+   127	    def grads_wrt_params(self, inputs, grads_wrt_outputs):
+   128	        """Calculates gradients with respect to layer parameters.
+   129	
+   130	        Args:
+   131	            inputs: Array of inputs to layer of shape (batch_size, input_dim).
+   132	            grads_wrt_to_outputs: Array of gradients with respect to the layer
+   133	                outputs of shape (batch_size, output_dim).
+   134	
+   135	        Returns:
+   136	            List of arrays of gradients with respect to the layer parameters
+   137	            with parameter gradients appearing in same order in tuple as
+   138	            returned from `get_params` method.
+   139	        """
+   140	        raise NotImplementedError()
+   141	
+   142	    def params_penalty(self):
+   143	        """Returns the parameter dependent penalty term for this layer.
+   144	
+   145	        If no parameter-dependent penalty terms are set this returns zero.
+   146	        """
+   147	        raise NotImplementedError()
+   148	
+   149	    @property
+   150	    def params(self):
+   151	        """Returns a list of parameters of layer.
+   152	
+   153	        Returns:
+   154	            List of current parameter values. This list should be in the
+   155	            corresponding order to the `values` argument to `set_params`.
+   156	        """
+   157	        raise NotImplementedError()
+   158	
+   159	    @params.setter
+   160	    def params(self, values):
+   161	        """Sets layer parameters from a list of values.
+   162	
+   163	        Args:
+   164	            values: List of values to set parameters to. This list should be
+   165	                in the corresponding order to what is returned by `get_params`.
+   166	        """
+   167	        raise NotImplementedError()
+   168	
+   169	class StochasticLayer(Layer):
+   170	    """Specialised layer which uses a stochastic forward propagation."""
+   171	
+   172	    def __init__(self, rng=None):
+   173	        """Constructs a new StochasticLayer object.
+   174	
+   175	        Args:
+   176	            rng (RandomState): Seeded random number generator object.
+   177	        """
+   178	        if rng is None:
+   179	            rng = np.random.RandomState(DEFAULT_SEED)
+   180	        self.rng = rng
+   181	
+   182	    def fprop(self, inputs, stochastic=True):
+   183	        """Forward propagates activations through the layer transformation.
+   184	
+   185	        Args:
+   186	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   187	            stochastic: Flag allowing different deterministic
+   188	                forward-propagation mode in addition to default stochastic
+   189	                forward-propagation e.g. for use at test time. If False
+   190	                a deterministic forward-propagation transformation
+   191	                corresponding to the expected output of the stochastic
+   192	                forward-propagation is applied.
+   193	
+   194	        Returns:
+   195	            outputs: Array of layer outputs of shape (batch_size, output_dim).
+   196	        """
+   197	        raise NotImplementedError()
+   198	
+   199	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+   200	        """Back propagates gradients through a layer.
+   201	
+   202	        Given gradients with respect to the outputs of the layer calculates the
+   203	        gradients with respect to the layer inputs. This should correspond to
+   204	        default stochastic forward-propagation.
+   205	
+   206	        Args:
+   207	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   208	            outputs: Array of layer outputs calculated in forward pass of
+   209	                shape (batch_size, output_dim).
+   210	            grads_wrt_outputs: Array of gradients with respect to the layer
+   211	                outputs of shape (batch_size, output_dim).
+   212	
+   213	        Returns:
+   214	            Array of gradients with respect to the layer inputs of shape
+   215	            (batch_size, input_dim).
+   216	        """
+   217	        raise NotImplementedError()
+   218	
+   219	
+   220	class AffineLayer(LayerWithParameters):
+   221	    """Layer implementing an affine tranformation of its inputs.
+   222	
+   223	    This layer is parameterised by a weight matrix and bias vector.
+   224	    """
+   225	
+   226	    def __init__(self, input_dim, output_dim,
+   227	                 weights_initialiser=init.UniformInit(-0.1, 0.1),
+   228	                 biases_initialiser=init.ConstantInit(0.),
+   229	                 weights_penalty=None, biases_penalty=None):
+   230	        """Initialises a parameterised affine layer.
+   231	
+   232	        Args:
+   233	            input_dim (int): Dimension of inputs to the layer.
+   234	            output_dim (int): Dimension of the layer outputs.
+   235	            weights_initialiser: Initialiser for the weight parameters.
+   236	            biases_initialiser: Initialiser for the bias parameters.
+   237	            weights_penalty: Weights-dependent penalty term (regulariser) or
+   238	                None if no regularisation is to be applied to the weights.
+   239	            biases_penalty: Biases-dependent penalty term (regulariser) or
+   240	                None if no regularisation is to be applied to the biases.
+   241	        """
+   242	        self.input_dim = input_dim
+   243	        self.output_dim = output_dim
+   244	        self.weights = weights_initialiser((self.output_dim, self.input_dim))
+   245	        self.biases = biases_initialiser(self.output_dim)
+   246	        self.weights_penalty = weights_penalty
+   247	        self.biases_penalty = biases_penalty
+   248	
+   249	    def fprop(self, inputs):
+   250	        """Forward propagates activations through the layer transformation.
+   251	
+   252	        For inputs `x`, outputs `y`, weights `W` and biases `b` the layer
+   253	        corresponds to `y = W.dot(x) + b`.
+   254	
+   255	        Args:
+   256	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   257	
+   258	        Returns:
+   259	            outputs: Array of layer outputs of shape (batch_size, output_dim).
+   260	        """
+   261	        return self.weights.dot(inputs.T).T + self.biases
+   262	
+   263	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+   264	        """Back propagates gradients through a layer.
+   265	
+   266	        Given gradients with respect to the outputs of the layer calculates the
+   267	        gradients with respect to the layer inputs.
+   268	
+   269	        Args:
+   270	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   271	            outputs: Array of layer outputs calculated in forward pass of
+   272	                shape (batch_size, output_dim).
+   273	            grads_wrt_outputs: Array of gradients with respect to the layer
+   274	                outputs of shape (batch_size, output_dim).
+   275	
+   276	        Returns:
+   277	            Array of gradients with respect to the layer inputs of shape
+   278	            (batch_size, input_dim).
+   279	        """
+   280	        return grads_wrt_outputs.dot(self.weights)
+   281	
+   282	    def grads_wrt_params(self, inputs, grads_wrt_outputs):
+   283	        """Calculates gradients with respect to layer parameters.
+   284	
+   285	        Args:
+   286	            inputs: array of inputs to layer of shape (batch_size, input_dim)
+   287	            grads_wrt_to_outputs: array of gradients with respect to the layer
+   288	                outputs of shape (batch_size, output_dim)
+   289	
+   290	        Returns:
+   291	            list of arrays of gradients with respect to the layer parameters
+   292	            `[grads_wrt_weights, grads_wrt_biases]`.
+   293	        """
+   294	
+   295	        grads_wrt_weights = np.dot(grads_wrt_outputs.T, inputs)
+   296	        grads_wrt_biases = np.sum(grads_wrt_outputs, axis=0)
+   297	
+   298	        if self.weights_penalty is not None:
+   299	            grads_wrt_weights += self.weights_penalty.grad(self.weights)
+   300	
+   301	        if self.biases_penalty is not None:
+   302	            grads_wrt_biases += self.biases_penalty.grad(self.biases)
+   303	
+   304	        return [grads_wrt_weights, grads_wrt_biases]
+   305	
+   306	    def params_penalty(self):
+   307	        """Returns the parameter dependent penalty term for this layer.
+   308	
+   309	        If no parameter-dependent penalty terms are set this returns zero.
+   310	        """
+   311	        params_penalty = 0
+   312	        if self.weights_penalty is not None:
+   313	            params_penalty += self.weights_penalty(self.weights)
+   314	        if self.biases_penalty is not None:
+   315	            params_penalty += self.biases_penalty(self.biases)
+   316	        return params_penalty
+   317	
+   318	    @property
+   319	    def params(self):
+   320	        """A list of layer parameter values: `[weights, biases]`."""
+   321	        return [self.weights, self.biases]
+   322	
+   323	    @params.setter
+   324	    def params(self, values):
+   325	        self.weights = values[0]
+   326	        self.biases = values[1]
+   327	
+   328	    def __repr__(self):
+   329	        return 'AffineLayer(input_dim={0}, output_dim={1})'.format(
+   330	            self.input_dim, self.output_dim)
+   331	
+   332	class BatchNormalizationLayer(StochasticLayerWithParameters):
+   333	    """Layer implementing an affine tranformation of its inputs.
+   334	
+   335	    This layer is parameterised by a weight matrix and bias vector.
+   336	    """
+   337	
+   338	    def __init__(self, input_dim, rng=None):
+   339	        """Initialises a parameterised affine layer.
+   340	
+   341	        Args:
+   342	            input_dim (int): Dimension of inputs to the layer.
+   343	            output_dim (int): Dimension of the layer outputs.
+   344	            weights_initialiser: Initialiser for the weight parameters.
+   345	            biases_initialiser: Initialiser for the bias parameters.
+   346	            weights_penalty: Weights-dependent penalty term (regulariser) or
+   347	                None if no regularisation is to be applied to the weights.
+   348	            biases_penalty: Biases-dependent penalty term (regulariser) or
+   349	                None if no regularisation is to be applied to the biases.
+   350	        """
+   351	        super(BatchNormalizationLayer, self).__init__(rng)
+   352	        self.input_dim = input_dim
+   353	        self.gamma = np.ones(input_dim)
+   354	        self.beta = np.zeros(input_dim)
+   355	        self.epsilon = 0.00001
+   356	        self.cache = None
+   357	
+   358	    def fprop(self, inputs, stochastic=True):
+   359	        """Forward propagates inputs through a layer."""
+   360	        normalised_inputs, inv_std = self._normalise(inputs)
+   361	        # cache intermediate values calculated in the forward pass
+   362	        self.cache = (normalised_inputs, inv_std)
+   363	        return self.gamma * normalised_inputs + self.beta
+   364	
+   365	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+   366	        """Back propagates gradients through a layer.
+   367	
+   368	        Given gradients with respect to the outputs of the layer calculates the
+   369	        gradients with respect to the layer inputs.
+   370	
+   371	        Args:
+   372	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   373	            outputs: Array of layer outputs calculated in forward pass of
+   374	                shape (batch_size, output_dim).
+   375	            grads_wrt_outputs: Array of gradients with respect to the layer
+   376	                outputs of shape (batch_size, output_dim).
+   377	
+   378	        Returns:
+   379	            Array of gradients with respect to the layer inputs of shape
+   380	            (batch_size, input_dim).
+   381	        """
+   382	        normalised_inputs, inv_std = self._normalise(inputs)
+   383	        # gradients with respect to the normalised inputs
+   384	        grads_wrt_normalised = grads_wrt_outputs * self.gamma
+   385	        # the batch mean and variance both depend on every input in the batch
+   386	        # so contribute two further terms to the gradient
+   387	        return inv_std * (
+   388	            grads_wrt_normalised -
+   389	            grads_wrt_normalised.mean(0) -
+   390	            normalised_inputs *
+   391	            (grads_wrt_normalised * normalised_inputs).mean(0)
+   392	        )
+   393	
+   394	    def grads_wrt_params(self, inputs, grads_wrt_outputs):
+   395	        """Calculates gradients with respect to layer parameters.
+   396	
+   397	        Args:
+   398	            inputs: array of inputs to layer of shape (batch_size, input_dim)
+   399	            grads_wrt_to_outputs: array of gradients with respect to the layer
+   400	                outputs of shape (batch_size, output_dim)
+   401	
+   402	        Returns:
+   403	            list of arrays of gradients with respect to the layer parameters
+   404	            `[grads_wrt_gamma, grads_wrt_beta]`.
+   405	        """
+   406	        normalised_inputs, _ = self._normalise(inputs)
+   407	        grads_wrt_gamma = np.sum(grads_wrt_outputs * normalised_inputs, axis=0)
+   408	        grads_wrt_beta = np.sum(grads_wrt_outputs, axis=0)
+   409	        return [grads_wrt_gamma, grads_wrt_beta]
+   410	
+   411	    def _normalise(self, inputs):
+   412	        """Normalises inputs using the statistics of the batch they are in.
+   413	
+   414	        Returns:
+   415	            Tuple `(normalised_inputs, inv_std)` where `inv_std` is the
+   416	            reciprocal of the (epsilon-shifted) per-dimension standard
+   417	            deviation of the batch.
+   418	        """
+   419	        inv_std = 1. / np.sqrt(inputs.var(0) + self.epsilon)
+   420	        return (inputs - inputs.mean(0)) * inv_std, inv_std
+   421	
+   422	    def params_penalty(self):
+   423	        """Returns the parameter dependent penalty term for this layer.
+   424	
+   425	        If no parameter-dependent penalty terms are set this returns zero.
+   426	        """
+   427	        return 0
+   428	
+   429	    @property
+   430	    def params(self):
+   431	        """A list of layer parameter values: `[gammas, betas]`."""
+   432	        return [self.gamma, self.beta]
+   433	
+   434	    @params.setter
+   435	    def params(self, values):
+   436	        self.gamma = values[0]
+   437	        self.beta = values[1]
+   438	
+   439	    def __repr__(self):
+   440	        return 'BatchNormalizationLayer(input_dim={0})'.format(
+   441	            self.input_dim)
+   442	
+   443	
+   444	class SigmoidLayer(Layer):
+   445	    """Layer implementing an element-wise logistic sigmoid transformation."""
+   446	
+   447	    def fprop(self, inputs):
+   448	        """Forward propagates activations through the layer transformation.
+   449	
+   450	        For inputs `x` and outputs `y` this corresponds to
+   451	        `y = 1 / (1 + exp(-x))`.
+   452	
+   453	        Args:
+   454	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   455	
+   456	        Returns:
+   457	            outputs: Array of layer outputs of shape (batch_size, output_dim).
+   458	        """
+   459	        return 1. / (1. + np.exp(-inputs))
+   460	
+   461	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+   462	        """Back propagates gradients through a layer.
+   463	
+   464	        Given gradients with respect to the outputs of the layer calculates the
+   465	        gradients with respect to the layer inputs.
+   466	
+   467	        Args:
+   468	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   469	            outputs: Array of layer outputs calculated in forward pass of
+   470	                shape (batch_size, output_dim).
+   471	            grads_wrt_outputs: Array of gradients with respect to the layer
+   472	                outputs of shape (batch_size, output_dim).
+   473	
+   474	        Returns:
+   475	            Array of gradients with respect to the layer inputs of shape
+   476	            (batch_size, input_dim).
+   477	        """
+   478	        return grads_wrt_outputs * outputs * (1. - outputs)
+   479	
+   480	    def __repr__(self):
+   481	        return 'SigmoidLayer'
+   482	
+   483	class ConvolutionalLayer(LayerWithParameters):
+   484	    """Layer implementing a 2D convolution-based transformation of its inputs.
+   485	    The layer is parameterised by a set of 2D convolutional kernels, a four
+   486	    dimensional array of shape
+   487	        (num_output_channels, num_input_channels, kernel_dim_1, kernel_dim_2)
+   488	    and a bias vector, a one dimensional array of shape
+   489	        (num_output_channels,)
+   490	    i.e. one shared bias per output channel.
+   491	    Assuming no-padding is applied to the inputs so that outputs are only
+   492	    calculated for positions where the kernel filters fully overlap with the
+   493	    inputs, and that unit strides are used the outputs will have spatial extent
+   494	        output_dim_1 = input_dim_1 - kernel_dim_1 + 1
+   495	        output_dim_2 = input_dim_2 - kernel_dim_2 + 1
+   496	    """
+   497	
+   498	    def __init__(self, num_input_channels, num_output_channels,
+   499	                 input_dim_1, input_dim_2,
+   500	                 kernel_dim_1, kernel_dim_2,
+   501	                 kernels_init=init.UniformInit(-0.01, 0.01),
+   502	                 biases_init=init.ConstantInit(0.),
+   503	                 kernels_penalty=None, biases_penalty=None):
+   504	        """Initialises a parameterised convolutional layer.
+   505	        Args:
+   506	            num_input_channels (int): Number of channels in inputs to
+   507	                layer (this may be number of colour channels in the input
+   508	                images if used as the first layer in a model, or the
+   509	                number of output channels, a.k.a. feature maps, from a
+   510	                a previous convolutional layer).
+   511	            num_output_channels (int): Number of channels in outputs
+   512	                from the layer, a.k.a. number of feature maps.
+   513	            input_dim_1 (int): Size of first input dimension of each 2D
+   514	                channel of inputs.
+   515	            input_dim_2 (int): Size of second input dimension of each 2D
+   516	                channel of inputs.
+   517	            kernel_dim_1 (int): Size of first dimension of each 2D channel of
+   518	                kernels.
+   519	            kernel_dim_2 (int): Size of second dimension of each 2D channel of
+   520	                kernels.
+   521	            kernels_intialiser: Initialiser for the kernel parameters.
+   522	            biases_initialiser: Initialiser for the bias parameters.
+   523	            kernels_penalty: Kernel-dependent penalty term (regulariser) or
+   524	                None if no regularisation is to be applied to the kernels.
+   525	            biases_penalty: Biases-dependent penalty term (regulariser) or
+   526	                None if no regularisation is to be applied to the biases.
+   527	        """
+   528	        self.num_input_channels = num_input_channels
+   529	        self.num_output_channels = num_output_channels
+   530	        self.input_dim_1 = input_dim_1
+   531	        self.input_dim_2 = input_dim_2
+   532	        self.kernel_dim_1 = kernel_dim_1
+   533	        self.kernel_dim_2 = kernel_dim_2
+   534	        self.kernels_init = kernels_init
+   535	        self.biases_init = biases_init
+   536	        self.kernels_shape = (
+   537	            num_output_channels, num_input_channels, kernel_dim_1, kernel_dim_2
+   538	        )
+   539	        self.inputs_shape = (
+   540	            None, num_input_channels, input_dim_1, input_dim_2
+   541	        )
+   542	        self.kernels = self.kernels_init(self.kernels_shape)
+   543	        self.biases = self.biases_init(num_output_channels)
+   544	        self.kernels_penalty = kernels_penalty
+   545	        self.biases_penalty = biases_penalty
+   546	
+   547	    def _patches(self, array, kernel_dim_1, kernel_dim_2):
+   548	        """Creates a sliding window view over the last two dimensions.
+   549	
+   550	        Args:
+   551	            array: Array of shape (batch_size, num_channels, dim_1, dim_2).
+   552	            kernel_dim_1: Size of the window in the first spatial dimension.
+   553	            kernel_dim_2: Size of the window in the second spatial dimension.
+   554	
+   555	        Returns:
+   556	            View of shape
+   557	                (batch_size, num_channels, out_dim_1, out_dim_2,
+   558	                 kernel_dim_1, kernel_dim_2)
+   559	            where `out_dim_i = dim_i - kernel_dim_i + 1`, such that
+   560	            `view[b, c, i, j, p, q] == array[b, c, i + p, j + q]`.
+   561	        """
+   562	        batch_size, num_channels, dim_1, dim_2 = array.shape
+   563	        out_dim_1 = dim_1 - kernel_dim_1 + 1
+   564	        out_dim_2 = dim_2 - kernel_dim_2 + 1
+   565	        shape = (batch_size, num_channels, out_dim_1, out_dim_2,
+   566	                 kernel_dim_1, kernel_dim_2)
+   567	        s_b, s_c, s_1, s_2 = array.strides
+   568	        strides = (s_b, s_c, s_1, s_2, s_1, s_2)
+   569	        return np.lib.stride_tricks.as_strided(
+   570	            array, shape=shape, strides=strides, writeable=False)
+   571	
+   572	    def fprop(self, inputs):
+   573	        """Forward propagates activations through the layer transformation.
+   574	        For inputs `x`, outputs `y`, kernels `K` and biases `b` the layer
+   575	        corresponds to `y = conv2d(x, K) + b`.
+   576	        Args:
+   577	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   578	        Returns:
+   579	            outputs: Array of layer outputs of shape (batch_size, output_dim).
+   580	        """
+   581	        inputs = np.ascontiguousarray(inputs)
+   582	        # a convolution (rather than a cross-correlation) flips the kernels
+   583	        # before sliding them across the inputs
+   584	        flipped_kernels = self.kernels[:, :, ::-1, ::-1]
+   585	        patches = self._patches(
+   586	            inputs, self.kernel_dim_1, self.kernel_dim_2)
+   587	        outputs = np.einsum(
+   588	            'bcijpq,ocpq->boij', patches, flipped_kernels, optimize=True)
+   589	        return outputs + self.biases[None, :, None, None]
+   590	
+   591	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+   592	        """Back propagates gradients through a layer.
+   593	        Given gradients with respect to the outputs of the layer calculates the
+   594	        gradients with respect to the layer inputs.
+   595	        Args:
+   596	            inputs: Array of layer inputs of shape
+   597	                (batch_size, num_input_channels, input_dim_1, input_dim_2).
+   598	            outputs: Array of layer outputs calculated in forward pass of
+   599	                shape
+   600	                (batch_size, num_output_channels, output_dim_1, output_dim_2).
+   601	            grads_wrt_outputs: Array of gradients with respect to the layer
+   602	                outputs of shape
+   603	                (batch_size, num_output_channels, output_dim_1, output_dim_2).
+   604	        Returns:
+   605	            Array of gradients with respect to the layer inputs of shape
+   606	            (batch_size, input_dim).
+   607	        """
+   608	        # gradients with respect to the inputs are given by a 'full'
+   609	        # convolution of the gradients with respect to the outputs with the
+   610	        # kernels, which is equivalent to a 'valid' cross-correlation of the
+   611	        # zero-padded output gradients with the (unflipped) kernels
+   612	        pad_1 = self.kernel_dim_1 - 1
+   613	        pad_2 = self.kernel_dim_2 - 1
+   614	        padded_grads = np.zeros(
+   615	            grads_wrt_outputs.shape[:2] +
+   616	            (grads_wrt_outputs.shape[2] + 2 * pad_1,
+   617	             grads_wrt_outputs.shape[3] + 2 * pad_2))
+   618	        padded_grads[
+   619	            :, :,
+   620	            pad_1:pad_1 + grads_wrt_outputs.shape[2],
+   621	            pad_2:pad_2 + grads_wrt_outputs.shape[3]] = grads_wrt_outputs
+   622	        patches = self._patches(
+   623	            padded_grads, self.kernel_dim_1, self.kernel_dim_2)
+   624	        return np.einsum(
+   625	            'boijpq,ocpq->bcij', patches, self.kernels, optimize=True)
+   626	
+   627	    def grads_wrt_params(self, inputs, grads_wrt_outputs):
+   628	        """Calculates gradients with respect to layer parameters.
+   629	        Args:
+   630	            inputs: array of inputs to layer of shape (batch_size, input_dim)
+   631	            grads_wrt_to_outputs: array of gradients with respect to the layer
+   632	                outputs of shape
+   633	                (batch_size, num_output-_channels, output_dim_1, output_dim_2).
+   634	        Returns:
+   635	            list of arrays of gradients with respect to the layer parameters
+   636	            `[grads_wrt_kernels, grads_wrt_biases]`.
+   637	        """
+   638	        inputs = np.ascontiguousarray(inputs)
+   639	        patches = self._patches(
+   640	            inputs, self.kernel_dim_1, self.kernel_dim_2)
+   641	        # gradients with respect to the flipped kernels used in `fprop`
+   642	        grads_wrt_flipped_kernels = np.einsum(
+   643	            'boij,bcijpq->ocpq', grads_wrt_outputs, patches, optimize=True)
+   644	        # ... which need flipping back to give gradients wrt the kernels
+   645	        grads_wrt_kernels = grads_wrt_flipped_kernels[:, :, ::-1, ::-1]
+   646	        grads_wrt_biases = grads_wrt_outputs.sum((0, 2, 3))
+   647	
+   648	        if self.kernels_penalty is not None:
+   649	            grads_wrt_kernels = (
+   650	                grads_wrt_kernels + self.kernels_penalty.grad(self.kernels))
+   651	
+   652	        if self.biases_penalty is not None:
+   653	            grads_wrt_biases = (
+   654	                grads_wrt_biases + self.biases_penalty.grad(self.biases))
+   655	
+   656	        return [grads_wrt_kernels, grads_wrt_biases]
+   657	
+   658	    def params_penalty(self):
+   659	        """Returns the parameter dependent penalty term for this layer.
+   660	        If no parameter-dependent penalty terms are set this returns zero.
+   661	        """
+   662	        params_penalty = 0
+   663	        if self.kernels_penalty is not None:
+   664	            params_penalty += self.kernels_penalty(self.kernels)
+   665	        if self.biases_penalty is not None:
+   666	            params_penalty += self.biases_penalty(self.biases)
+   667	        return params_penalty
+   668	
+   669	    @property
+   670	    def params(self):
+   671	        """A list of layer parameter values: `[kernels, biases]`."""
+   672	        return [self.kernels, self.biases]
+   673	
+   674	    @params.setter
+   675	    def params(self, values):
+   676	        self.kernels = values[0]
+   677	        self.biases = values[1]
+   678	
+   679	    def __repr__(self):
+   680	        return (
+   681	            'ConvolutionalLayer(\n'
+   682	            '    num_input_channels={0}, num_output_channels={1},\n'
+   683	            '    input_dim_1={2}, input_dim_2={3},\n'
+   684	            '    kernel_dim_1={4}, kernel_dim_2={5}\n'
+   685	            ')'
+   686	            .format(self.num_input_channels, self.num_output_channels,
+   687	                    self.input_dim_1, self.input_dim_2, self.kernel_dim_1,
+   688	                    self.kernel_dim_2)
+   689	        )
+   690	
+   691	
+   692	class ReluLayer(Layer):
+   693	    """Layer implementing an element-wise rectified linear transformation."""
+   694	
+   695	    def fprop(self, inputs):
+   696	        """Forward propagates activations through the layer transformation.
+   697	
+   698	        For inputs `x` and outputs `y` this corresponds to `y = max(0, x)`.
+   699	
+   700	        Args:
+   701	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   702	
+   703	        Returns:
+   704	            outputs: Array of layer outputs of shape (batch_size, output_dim).
+   705	        """
+   706	        return np.maximum(inputs, 0.)
+   707	
+   708	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+   709	        """Back propagates gradients through a layer.
+   710	
+   711	        Given gradients with respect to the outputs of the layer calculates the
+   712	        gradients with respect to the layer inputs.
+   713	
+   714	        Args:
+   715	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   716	            outputs: Array of layer outputs calculated in forward pass of
+   717	                shape (batch_size, output_dim).
+   718	            grads_wrt_outputs: Array of gradients with respect to the layer
+   719	                outputs of shape (batch_size, output_dim).
+   720	
+   721	        Returns:
+   722	            Array of gradients with respect to the layer inputs of shape
+   723	            (batch_size, input_dim).
+   724	        """
+   725	        return (outputs > 0) * grads_wrt_outputs
+   726	
+   727	    def __repr__(self):
+   728	        return 'ReluLayer'
+   729	
+   730	class LeakyReluLayer(Layer):
+   731	    """Layer implementing an element-wise rectified linear transformation."""
+   732	    def __init__(self, alpha=0.01):
+   733	        self.alpha = alpha
+   734	
+   735	    def fprop(self, inputs):
+   736	        """Forward propagates activations through the layer transformation.
+   737	
+   738	        For inputs `x` and outputs `y` this corresponds to `y = max(0, x)`.
+   739	        """
+   740	        positive_inputs = np.maximum(inputs, 0.)
+   741	        negative_inputs = np.minimum(inputs, 0.) * self.alpha
+   742	        return positive_inputs + negative_inputs
+   743	
+   744	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+   745	        """Back propagates gradients through a layer.
+   746	
+   747	        Given gradients with respect to the outputs of the layer calculates the
+   748	        gradients with respect to the layer inputs.
+   749	        """
+   750	        positive_gradients = (outputs > 0) * grads_wrt_outputs
+   751	        negative_gradients = self.alpha * (outputs <= 0) * grads_wrt_outputs
+   752	        return positive_gradients + negative_gradients
+   753	
+   754	    def __repr__(self):
+   755	        return 'LeakyReluLayer'
+   756	
+   757	class ELULayer(Layer):
+   758	    """Layer implementing an ELU activation."""
+   759	    def __init__(self, alpha=1.0):
+   760	        self.alpha = alpha
+   761	
+   762	    def fprop(self, inputs):
+   763	        """Forward propagates activations through the layer transformation.
+   764	
+   765	        For inputs `x` and outputs `y` this corresponds to `y = max(0, x)`.
+   766	        """
+   767	        positive_inputs = np.maximum(inputs, 0.)
+   768	        negative_inputs = self.alpha * (np.exp(np.minimum(inputs, 0.)) - 1.)
+   769	        return positive_inputs + negative_inputs
+   770	
+   771	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+   772	        """Back propagates gradients through a layer.
+   773	
+   774	        Given gradients with respect to the outputs of the layer calculates the
+   775	        gradients with respect to the layer inputs.
+   776	        """
+   777	        positive_gradients = (outputs > 0) * grads_wrt_outputs
+   778	        negative_gradients = (outputs + self.alpha) * (outputs <= 0) * \
+   779	            grads_wrt_outputs
+   780	        return positive_gradients + negative_gradients
+   781	
+   782	    def __repr__(self):
+   783	        return 'ELULayer'
+   784	
+   785	class SELULayer(Layer):
+   786	    """Layer implementing an element-wise rectified linear transformation."""
+   787	    #α01 ≈ 1.6733 and λ01 ≈ 1.0507
+   788	    def __init__(self):
+   789	        self.alpha = 1.6733
+   790	        self.lamda = 1.0507
+   791	        self.elu = ELULayer(alpha=self.alpha)
+   792	
+   793	    def fprop(self, inputs):
+   794	        """Forward propagates activations through the layer transformation.
+   795	
+   796	        For inputs `x` and outputs `y` this corresponds to `y = max(0, x)`.
+   797	        """
+   798	        return self.lamda * self.elu.fprop(inputs)
+   799	
+   800	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+   801	        """Back propagates gradients through a layer.
+   802	
+   803	        Given gradients with respect to the outputs of the layer calculates the
+   804	        gradients with respect to the layer inputs.
+   805	        """
+   806	        return self.lamda * self.elu.bprop(
+   807	            inputs, outputs / self.lamda, grads_wrt_outputs)
+   808	
+   809	    def __repr__(self):
+   810	        return 'SELULayer'
+   811	
+   812	class TanhLayer(Layer):
+   813	    """Layer implementing an element-wise hyperbolic tangent transformation."""
+   814	
+   815	    def fprop(self, inputs):
+   816	        """Forward propagates activations through the layer transformation.
+   817	
+   818	        For inputs `x` and outputs `y` this corresponds to `y = tanh(x)`.
+   819	
+   820	        Args:
+   821	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   822	
+   823	        Returns:
+   824	            outputs: Array of layer outputs of shape (batch_size, output_dim).
+   825	        """
+   826	        return np.tanh(inputs)
+   827	
+   828	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+   829	        """Back propagates gradients through a layer.
+   830	
+   831	        Given gradients with respect to the outputs of the layer calculates the
+   832	        gradients with respect to the layer inputs.
+   833	
+   834	        Args:
+   835	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   836	            outputs: Array of layer outputs calculated in forward pass of
+   837	                shape (batch_size, output_dim).
+   838	            grads_wrt_outputs: Array of gradients with respect to the layer
+   839	                outputs of shape (batch_size, output_dim).
+   840	
+   841	        Returns:
+   842	            Array of gradients with respect to the layer inputs of shape
+   843	            (batch_size, input_dim).
+   844	        """
+   845	        return (1. - outputs**2) * grads_wrt_outputs
+   846	
+   847	    def __repr__(self):
+   848	        return 'TanhLayer'
+   849	
+   850	
+   851	class SoftmaxLayer(Layer):
+   852	    """Layer implementing a softmax transformation."""
+   853	
+   854	    def fprop(self, inputs):
+   855	        """Forward propagates activations through the layer transformation.
+   856	
+   857	        For inputs `x` and outputs `y` this corresponds to
+   858	
+   859	            `y = exp(x) / sum(exp(x))`.
+   860	
+   861	        Args:
+   862	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   863	
+   864	        Returns:
+   865	            outputs: Array of layer outputs of shape (batch_size, output_dim).
+   866	        """
+   867	        # subtract max inside exponential to improve numerical stability -
+   868	        # when we divide through by sum this term cancels
+   869	        exp_inputs = np.exp(inputs - inputs.max(-1)[:, None])
+   870	        return exp_inputs / exp_inputs.sum(-1)[:, None]
+   871	
+   872	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+   873	        """Back propagates gradients through a layer.
+   874	
+   875	        Given gradients with respect to the outputs of the layer calculates the
+   876	        gradients with respect to the layer inputs.
+   877	
+   878	        Args:
+   879	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   880	            outputs: Array of layer outputs calculated in forward pass of
+   881	                shape (batch_size, output_dim).
+   882	            grads_wrt_outputs: Array of gradients with respect to the layer
+   883	                outputs of shape (batch_size, output_dim).
+   884	
+   885	        Returns:
+   886	            Array of gradients with respect to the layer inputs of shape
+   887	            (batch_size, input_dim).
+   888	        """
+   889	        return (outputs * (grads_wrt_outputs -
+   890	                           (grads_wrt_outputs * outputs).sum(-1)[:, None]))
+   891	
+   892	    def __repr__(self):
+   893	        return 'SoftmaxLayer'
+   894	
+   895	
+   896	class RadialBasisFunctionLayer(Layer):
+   897	    """Layer implementing projection to a grid of radial basis functions."""
+   898	
+   899	    def __init__(self, grid_dim, intervals=[[0., 1.]]):
+   900	        """Creates a radial basis function layer object.
+   901	
+   902	        Args:
+   903	            grid_dim: Integer specifying how many basis function to use in
+   904	                grid across input space per dimension (so total number of
+   905	                basis functions will be grid_dim**input_dim)
+   906	            intervals: List of intervals (two element lists or tuples)
+   907	                specifying extents of axis-aligned region in input-space to
+   908	                tile basis functions in grid across. For example for a 2D input
+   909	                space spanning [0, 1] x [0, 1] use intervals=[[0, 1], [0, 1]].
+   910	        """
+   911	        num_basis = grid_dim**len(intervals)
+   912	        self.centres = np.array(np.meshgrid(*[
+   913	            np.linspace(low, high, grid_dim) for (low, high) in intervals])
+   914	        ).reshape((len(intervals), -1))
+   915	        self.scales = np.array([
+   916	            [(high - low) * 1. / grid_dim] for (low, high) in intervals])
+   917	        self.grid_dim = grid_dim
+   918	        self.num_basis = num_basis
+   919	
+   920	    def fprop(self, inputs):
+   921	        """Forward propagates activations through the layer transformation.
+   922	
+   923	        Args:
+   924	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   925	
+   926	        Returns:
+   927	            outputs: Array of layer outputs of shape (batch_size, output_dim).
+   928	        """
+   929	        return np.exp(-(inputs[..., None] - self.centres[None, ...])**2 /
+   930	                      self.scales**2).reshape((inputs.shape[0], -1))
+   931	
+   932	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+   933	        """Back propagates gradients through a layer.
+   934	
+   935	        Given gradients with respect to the outputs of the layer calculates the
+   936	        gradients with respect to the layer inputs.
+   937	
+   938	        Args:
+   939	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   940	            outputs: Array of layer outputs calculated in forward pass of
+   941	                shape (batch_size, output_dim).
+   942	            grads_wrt_outputs: Array of gradients with respect to the layer
+   943	                outputs of shape (batch_size, output_dim).
+   944	
+   945	        Returns:
+   946	            Array of gradients with respect to the layer inputs of shape
+   947	            (batch_size, input_dim).
+   948	        """
+   949	        num_basis = self.centres.shape[1]
+   950	        return -2. * (
+   951	            ((inputs[..., None] - self.centres[None, ...]) / self.scales**2) *
+   952	            grads_wrt_outputs.reshape((inputs.shape[0], -1, num_basis)) *
+   953	            outputs.reshape((inputs.shape[0], -1, num_basis))
+   954	        ).sum(-1)
+   955	
+   956	    def __repr__(self):
+   957	        return 'RadialBasisFunctionLayer(grid_dim={0})'.format(self.grid_dim)
+   958	
+   959	class DropoutLayer(StochasticLayer):
+   960	    """Layer which stochastically drops input dimensions in its output."""
+   961	
+   962	    def __init__(self, rng=None, incl_prob=0.5, share_across_batch=True):
+   963	        """Construct a new dropout layer.
+   964	
+   965	        Args:
+   966	            rng (RandomState): Seeded random number generator.
+   967	            incl_prob: Scalar value in (0, 1] specifying the probability of
+   968	                each input dimension being included in the output.
+   969	            share_across_batch: Whether to use same dropout mask across
+   970	                all inputs in a batch or use per input masks.
+   971	        """
+   972	        super(DropoutLayer, self).__init__(rng)
+   973	        assert incl_prob > 0. and incl_prob <= 1.
+   974	        self.incl_prob = incl_prob
+   975	        self.share_across_batch = share_across_batch
+   976	        self._mask = None
+   977	
+   978	    def fprop(self, inputs, stochastic=True):
+   979	        """Forward propagates activations through the layer transformation.
+   980	
+   981	        Args:
+   982	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+   983	            stochastic: Flag allowing different deterministic
+   984	                forward-propagation mode in addition to default stochastic
+   985	                forward-propagation e.g. for use at test time. If False
+   986	                a deterministic forward-propagation transformation
+   987	                corresponding to the expected output of the stochastic
+   988	                forward-propagation is applied.
+   989	
+   990	        Returns:
+   991	            outputs: Array of layer outputs of shape (batch_size, output_dim).
+   992	        """
+   993	        if stochastic:
+   994	            mask_shape = ((1,) + inputs.shape[1:] if self.share_across_batch
+   995	                          else inputs.shape)
+   996	            self._mask = (self.rng.uniform(size=mask_shape) < self.incl_prob)
+   997	            return inputs * self._mask
+   998	        else:
+   999	            return inputs * self.incl_prob
+  1000	
+  1001	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+  1002	        """Back propagates gradients through a layer.
+  1003	
+  1004	        Given gradients with respect to the outputs of the layer calculates the
+  1005	        gradients with respect to the layer inputs. This should correspond to
+  1006	        default stochastic forward-propagation.
+  1007	
+  1008	        Args:
+  1009	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+  1010	            outputs: Array of layer outputs calculated in forward pass of
+  1011	                shape (batch_size, output_dim).
+  1012	            grads_wrt_outputs: Array of gradients with respect to the layer
+  1013	                outputs of shape (batch_size, output_dim).
+  1014	
+  1015	        Returns:
+  1016	            Array of gradients with respect to the layer inputs of shape
+  1017	            (batch_size, input_dim).
+  1018	        """
+  1019	        return grads_wrt_outputs * self._mask
+  1020	
+  1021	    def __repr__(self):
+  1022	        return 'DropoutLayer(incl_prob={0:.1f})'.format(self.incl_prob)
+  1023	
+  1024	class ReshapeLayer(Layer):
+  1025	    """Layer which reshapes dimensions of inputs."""
+  1026	
+  1027	    def __init__(self, output_shape=None):
+  1028	        """Create a new reshape layer object.
+  1029	
+  1030	        Args:
+  1031	            output_shape: Tuple specifying shape each input in batch should
+  1032	                be reshaped to in outputs. This **excludes** the batch size
+  1033	                so the shape of the final output array will be
+  1034	                    (batch_size, ) + output_shape
+  1035	                Similarly to numpy.reshape, one shape dimension can be -1. In
+  1036	                this case, the value is inferred from the size of the input
+  1037	                array and remaining dimensions. The shape specified must be
+  1038	                compatible with the input array shape - i.e. the total number
+  1039	                of values in the array cannot be changed. If set to `None` the
+  1040	                output shape will be set to
+  1041	                    (batch_size, -1)
+  1042	                which will flatten all the inputs to vectors.
+  1043	        """
+  1044	        if output_shape is None:
+  1045	            # default to flattening all non-batch dimensions of the inputs
+  1046	            self.output_shape = (-1,)
+  1047	        elif isinstance(output_shape, (int, np.integer)):
+  1048	            self.output_shape = (int(output_shape),)
+  1049	        else:
+  1050	            self.output_shape = tuple(output_shape)
+  1051	
+  1052	    def fprop(self, inputs):
+  1053	        """Forward propagates activations through the layer transformation.
+  1054	
+  1055	        Args:
+  1056	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+  1057	
+  1058	        Returns:
+  1059	            outputs: Array of layer outputs of shape (batch_size, output_dim).
+  1060	        """
+  1061	        return inputs.reshape((inputs.shape[0],) + self.output_shape)
+  1062	
+  1063	    def bprop(self, inputs, outputs, grads_wrt_outputs):
+  1064	        """Back propagates gradients through a layer.
+  1065	
+  1066	        Given gradients with respect to the outputs of the layer calculates the
+  1067	        gradients with respect to the layer inputs.
+  1068	
+  1069	        Args:
+  1070	            inputs: Array of layer inputs of shape (batch_size, input_dim).
+  1071	            outputs: Array of layer outputs calculated in forward pass of
+  1072	                shape (batch_size, output_dim).
+  1073	            grads_wrt_outputs: Array of gradients with respect to the layer
+  1074	                outputs of shape (batch_size, output_dim).
+  1075	
+  1076	        Returns:
+  1077	            Array of gradients with respect to the layer inputs of shape
+  1078	            (batch_size, input_dim).
+  1079	        """
+  1080	        return grads_wrt_outputs.reshape(inputs.shape)
+  1081	
+  1082	    def __repr__(self):
+  1083	        return 'ReshapeLayer(output_shape={0})'.format(self.output_shape)

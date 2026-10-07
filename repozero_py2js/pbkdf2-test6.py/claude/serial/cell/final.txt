@@ -1,0 +1,878 @@
+The migration is complete and verified. Here is the code.
+
+## Library layer 1 — `/output/lib/bytes.mjs` (byte primitives)
+
+```javascript
+/**
+ * bytes.mjs -- low level byte-buffer helpers.
+ *
+ * The Python original relies on `str`/`bytes` semantics from the `pbkdf2`
+ * package: text arguments are encoded as UTF-8, derived key material is a
+ * `bytes` object and `bytes.hex()` renders it as lowercase hex.  Everything in
+ * this module mirrors those primitives on top of `Uint8Array`, using only
+ * plain JavaScript -- no platform hashing module, no third party package.
+ */
+
+/**
+ * Encode a JavaScript string as UTF-8 bytes.
+ *
+ * `pbkdf2.PBKDF2._setup()` performs `passphrase.encode("UTF-8")` for `str`
+ * inputs, so both the passphrase and the salt go through this function.
+ *
+ * @param {string} str
+ * @returns {Uint8Array}
+ */
+export function utf8Encode(str) {
+  const out = [];
+  for (let i = 0; i < str.length; i++) {
+    let cp = str.charCodeAt(i);
+
+    if (cp >= 0xd800 && cp <= 0xdbff) {
+      // High surrogate: try to combine with the following low surrogate.
+      const next = i + 1 < str.length ? str.charCodeAt(i + 1) : NaN;
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        cp = 0x10000 + ((cp - 0xd800) << 10) + (next - 0xdc00);
+        i++;
+      } else {
+        cp = 0xfffd; // unpaired high surrogate
+      }
+    } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+      cp = 0xfffd; // unpaired low surrogate
+    }
+
+    if (cp < 0x80) {
+      out.push(cp);
+    } else if (cp < 0x800) {
+      out.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+    } else if (cp < 0x10000) {
+      out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+    } else {
+      out.push(
+        0xf0 | (cp >> 18),
+        0x80 | ((cp >> 12) & 0x3f),
+        0x80 | ((cp >> 6) & 0x3f),
+        0x80 | (cp & 0x3f),
+      );
+    }
+  }
+  return new Uint8Array(out);
+}
+
+/**
+ * Lowercase hex rendering, the equivalent of Python's `bytes.hex()`.
+ *
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
+export function toHex(bytes) {
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    hex += HEX_BYTE[bytes[i]];
+  }
+  return hex;
+}
+
+const HEX_BYTE = (() => {
+  const table = new Array(256);
+  for (let i = 0; i < 256; i++) {
+    table[i] = i.toString(16).padStart(2, '0');
+  }
+  return table;
+})();
+
+/**
+ * Concatenate byte arrays, the equivalent of `b"".join(...)`.
+ *
+ * @param {Uint8Array[]} chunks
+ * @returns {Uint8Array}
+ */
+export function concatBytes(chunks) {
+  let total = 0;
+  for (const chunk of chunks) total += chunk.length;
+
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+
+/**
+ * In-place XOR of `target` with `source`, the `strxor()` helper the Python
+ * package uses to fold the PBKDF2 `U_j` values together.
+ *
+ * @param {Uint8Array} target mutated in place
+ * @param {Uint8Array} source
+ * @returns {Uint8Array} `target`
+ */
+export function xorInto(target, source) {
+  for (let i = 0; i < target.length; i++) {
+    target[i] ^= source[i];
+  }
+  return target;
+}
+
+/**
+ * `struct.pack("!L", value)` -- unsigned 32 bit big endian.
+ *
+ * @param {number} value
+ * @returns {Uint8Array}
+ */
+export function packUint32BE(value) {
+  const out = new Uint8Array(4);
+  out[0] = (value >>> 24) & 0xff;
+  out[1] = (value >>> 16) & 0xff;
+  out[2] = (value >>> 8) & 0xff;
+  out[3] = value & 0xff;
+  return out;
+}
+```
+
+## Library layer 2 — `/output/lib/sha1.mjs` (hash core)
+
+```javascript
+/**
+ * sha1.mjs -- a self contained SHA-1 (FIPS 180-4) implementation.
+ *
+ * `pbkdf2.PBKDF2` defaults to `digestmodule=SHA1`, so this is the hash that
+ * backs the HMAC pseudo random function.  Written directly from the published
+ * algorithm description, with no dependency on any platform hashing module.
+ */
+
+/** SHA-1 output size in bytes. */
+export const DIGEST_SIZE = 20;
+
+/** SHA-1 internal block size in bytes -- also the HMAC key block size. */
+export const BLOCK_SIZE = 64;
+
+/** Rotate a 32 bit word left by `n` bits. */
+function rotl32(x, n) {
+  return ((x << n) | (x >>> (32 - n))) >>> 0;
+}
+
+/**
+ * Hash a message with SHA-1.
+ *
+ * @param {Uint8Array} message
+ * @returns {Uint8Array} the 20 byte digest
+ */
+export function sha1(message) {
+  // --- padding: 0x80, zero fill, then the 64 bit big endian bit length -----
+  const msgLen = message.length;
+  const blockCount = Math.floor((msgLen + 8) / BLOCK_SIZE) + 1;
+  const padded = new Uint8Array(blockCount * BLOCK_SIZE);
+  padded.set(message);
+  padded[msgLen] = 0x80;
+
+  const bitLen = msgLen * 8;
+  const hiBits = Math.floor(bitLen / 0x100000000);
+  const loBits = bitLen >>> 0;
+  const lenOffset = padded.length - 8;
+  padded[lenOffset + 0] = (hiBits >>> 24) & 0xff;
+  padded[lenOffset + 1] = (hiBits >>> 16) & 0xff;
+  padded[lenOffset + 2] = (hiBits >>> 8) & 0xff;
+  padded[lenOffset + 3] = hiBits & 0xff;
+  padded[lenOffset + 4] = (loBits >>> 24) & 0xff;
+  padded[lenOffset + 5] = (loBits >>> 16) & 0xff;
+  padded[lenOffset + 6] = (loBits >>> 8) & 0xff;
+  padded[lenOffset + 7] = loBits & 0xff;
+
+  // --- initial state ------------------------------------------------------
+  let h0 = 0x67452301;
+  let h1 = 0xefcdab89;
+  let h2 = 0x98badcfe;
+  let h3 = 0x10325476;
+  let h4 = 0xc3d2e1f0;
+
+  const w = new Int32Array(80);
+
+  for (let block = 0; block < blockCount; block++) {
+    const base = block * BLOCK_SIZE;
+
+    for (let t = 0; t < 16; t++) {
+      const p = base + t * 4;
+      w[t] =
+        (padded[p] << 24) | (padded[p + 1] << 16) | (padded[p + 2] << 8) | padded[p + 3];
+    }
+    for (let t = 16; t < 80; t++) {
+      w[t] = rotl32(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
+    }
+
+    let a = h0;
+    let b = h1;
+    let c = h2;
+    let d = h3;
+    let e = h4;
+
+    for (let t = 0; t < 80; t++) {
+      let f;
+      let k;
+      if (t < 20) {
+        f = (b & c) | (~b & d);
+        k = 0x5a827999;
+      } else if (t < 40) {
+        f = b ^ c ^ d;
+        k = 0x6ed9eba1;
+      } else if (t < 60) {
+        f = (b & c) | (b & d) | (c & d);
+        k = 0x8f1bbcdc;
+      } else {
+        f = b ^ c ^ d;
+        k = 0xca62c1d6;
+      }
+
+      const temp = (rotl32(a, 5) + (f >>> 0) + e + k + (w[t] >>> 0)) >>> 0;
+      e = d;
+      d = c;
+      c = rotl32(b, 30);
+      b = a;
+      a = temp;
+    }
+
+    h0 = (h0 + a) >>> 0;
+    h1 = (h1 + b) >>> 0;
+    h2 = (h2 + c) >>> 0;
+    h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0;
+  }
+
+  const digest = new Uint8Array(DIGEST_SIZE);
+  const words = [h0, h1, h2, h3, h4];
+  for (let i = 0; i < words.length; i++) {
+    digest[i * 4 + 0] = (words[i] >>> 24) & 0xff;
+    digest[i * 4 + 1] = (words[i] >>> 16) & 0xff;
+    digest[i * 4 + 2] = (words[i] >>> 8) & 0xff;
+    digest[i * 4 + 3] = words[i] & 0xff;
+  }
+  return digest;
+}
+
+/** SHA-1 packaged in the shape the HMAC/PBKDF2 layers expect. */
+export const SHA1 = Object.freeze({
+  name: 'sha1',
+  digestSize: DIGEST_SIZE,
+  blockSize: BLOCK_SIZE,
+  digest: sha1,
+});
+```
+
+## Library layer 3 — `/output/lib/hmac.mjs` (PRF)
+
+```javascript
+/**
+ * hmac.mjs -- HMAC (RFC 2104) over a pluggable digest module.
+ *
+ * Mirrors the `macmodule=HMAC` default of `pbkdf2.PBKDF2`, whose
+ * `_pseudorandom()` boils down to
+ * `HMAC.new(key=passphrase, msg=..., digestmod=SHA1).digest()`.
+ */
+
+import { SHA1 } from './sha1.mjs';
+import { concatBytes } from './bytes.mjs';
+
+const IPAD_BYTE = 0x36;
+const OPAD_BYTE = 0x5c;
+
+/**
+ * Normalise a key to exactly one digest block, per RFC 2104: keys longer than
+ * the block size are hashed down, shorter keys are zero padded.
+ *
+ * @param {Uint8Array} key
+ * @param {{blockSize: number, digest: (m: Uint8Array) => Uint8Array}} digestmod
+ * @returns {Uint8Array}
+ */
+function normaliseKey(key, digestmod) {
+  const blockKey = new Uint8Array(digestmod.blockSize);
+  blockKey.set(key.length > digestmod.blockSize ? digestmod.digest(key) : key);
+  return blockKey;
+}
+
+/**
+ * Build a reusable HMAC pseudo random function bound to one key.
+ *
+ * PBKDF2 calls the PRF `iterations` times with the same key, so the padded key
+ * blocks are derived once here instead of on every call.
+ *
+ * @param {Uint8Array} key
+ * @param {object} [digestmod] digest module (defaults to SHA-1)
+ * @returns {(message: Uint8Array) => Uint8Array}
+ */
+export function createHmacPrf(key, digestmod = SHA1) {
+  const blockKey = normaliseKey(key, digestmod);
+
+  const ipad = new Uint8Array(digestmod.blockSize);
+  const opad = new Uint8Array(digestmod.blockSize);
+  for (let i = 0; i < digestmod.blockSize; i++) {
+    ipad[i] = blockKey[i] ^ IPAD_BYTE;
+    opad[i] = blockKey[i] ^ OPAD_BYTE;
+  }
+
+  // Scratch buffer reused across calls; PBKDF2 feeds fixed-size messages once
+  // the first block is done, so this stays allocation free in the hot loop.
+  const outerBuffer = new Uint8Array(digestmod.blockSize + digestmod.digestSize);
+  outerBuffer.set(opad, 0);
+
+  return function hmacDigest(message) {
+    const innerBuffer = new Uint8Array(digestmod.blockSize + message.length);
+    innerBuffer.set(ipad, 0);
+    innerBuffer.set(message, digestmod.blockSize);
+
+    outerBuffer.set(digestmod.digest(innerBuffer), digestmod.blockSize);
+    return digestmod.digest(outerBuffer);
+  };
+}
+
+/**
+ * One-shot HMAC, the direct analogue of `HMAC.new(key, msg, digestmod).digest()`.
+ *
+ * @param {Uint8Array} key
+ * @param {Uint8Array} message
+ * @param {object} [digestmod]
+ * @returns {Uint8Array}
+ */
+export function hmac(key, message, digestmod = SHA1) {
+  const blockKey = normaliseKey(key, digestmod);
+
+  const ipad = new Uint8Array(digestmod.blockSize);
+  const opad = new Uint8Array(digestmod.blockSize);
+  for (let i = 0; i < digestmod.blockSize; i++) {
+    ipad[i] = blockKey[i] ^ IPAD_BYTE;
+    opad[i] = blockKey[i] ^ OPAD_BYTE;
+  }
+
+  const inner = digestmod.digest(concatBytes([ipad, message]));
+  return digestmod.digest(concatBytes([opad, inner]));
+}
+```
+
+## Library layer 4 — `/output/lib/pbkdf2.mjs` (key derivation)
+
+```javascript
+/**
+ * pbkdf2.mjs -- PBKDF2 (RFC 2898) reimplemented with the stream-reader
+ * interface of the Python `pbkdf2` package.
+ *
+ * The original script uses `pbkdf2.PBKDF2(passphrase, salt).read(16)`, i.e. the
+ * package defaults:
+ *   iterations = 1000, digestmodule = SHA1, macmodule = HMAC.
+ *
+ * `PBKDF2` behaves like a byte stream: `read(n)` pulls `n` bytes of key
+ * material, generating 20 byte blocks `F(P, S, c, i)` on demand and buffering
+ * whatever is left over for the next `read()`.
+ */
+
+import { SHA1 } from './sha1.mjs';
+import { createHmacPrf } from './hmac.mjs';
+import { utf8Encode, concatBytes, xorInto, packUint32BE } from './bytes.mjs';
+
+/** The Python package's default iteration count. */
+export const DEFAULT_ITERATIONS = 1000;
+
+/**
+ * Coerce a passphrase/salt argument to bytes.
+ *
+ * `PBKDF2._setup()` accepts `str` (encoded as UTF-8) or `bytes`, and raises
+ * `TypeError` for anything else.
+ *
+ * @param {string | Uint8Array} value
+ * @param {string} label used in the error message
+ * @returns {Uint8Array}
+ */
+function toBytes(value, label) {
+  if (typeof value === 'string') return utf8Encode(value);
+  if (value instanceof Uint8Array) return value;
+  throw new TypeError(`${label} must be str or bytes`);
+}
+
+export class PBKDF2 {
+  /**
+   * @param {string | Uint8Array} passphrase
+   * @param {string | Uint8Array} salt
+   * @param {number} [iterations=1000]
+   * @param {object} [digestmodule=SHA1]
+   */
+  constructor(passphrase, salt, iterations = DEFAULT_ITERATIONS, digestmodule = SHA1) {
+    if (!Number.isInteger(iterations)) {
+      throw new TypeError('iterations must be an integer');
+    }
+    if (iterations < 1) {
+      throw new Error('iterations must be at least 1');
+    }
+
+    this._salt = toBytes(salt, 'salt');
+    this._iterations = iterations;
+    this._digestmodule = digestmodule;
+    this._prf = createHmacPrf(toBytes(passphrase, 'passphrase'), digestmodule);
+
+    /** Leftover bytes from the last generated block. */
+    this._buf = new Uint8Array(0);
+    /** Index of the most recently generated block (1-based, as in the RFC). */
+    this._blockNum = 0;
+    this._closed = false;
+  }
+
+  /**
+   * `F(P, S, c, i)` -- the i-th PBKDF2 block: `U_1 ^ U_2 ^ ... ^ U_c`.
+   *
+   * @param {number} i 1-based block index
+   * @returns {Uint8Array}
+   */
+  _f(i) {
+    let u = this._prf(concatBytes([this._salt, packUint32BE(i)]));
+    const result = u.slice();
+
+    for (let j = 2; j <= this._iterations; j++) {
+      u = this._prf(u);
+      xorInto(result, u);
+    }
+    return result;
+  }
+
+  /**
+   * Read the next `count` bytes of derived key material.
+   *
+   * @param {number} count
+   * @returns {Uint8Array}
+   */
+  read(count) {
+    if (this._closed) {
+      throw new Error('file-like object is closed');
+    }
+
+    const blocks = [this._buf];
+    let size = this._buf.length;
+
+    while (size < count) {
+      this._blockNum += 1;
+      const block = this._f(this._blockNum);
+      blocks.push(block);
+      size += block.length;
+    }
+
+    const stream = concatBytes(blocks);
+    this._buf = stream.slice(count);
+    return stream.slice(0, count);
+  }
+
+  /** Release the internal buffer, matching `PBKDF2.close()`. */
+  close() {
+    if (!this._closed) {
+      this._buf = new Uint8Array(0);
+      this._blockNum = 0;
+      this._closed = true;
+    }
+  }
+
+  /**
+   * Read `octets` bytes and return them as lowercase hex, matching
+   * `PBKDF2.hexread()`.
+   *
+   * @param {number} octets
+   * @returns {string}
+   */
+  hexread(octets) {
+    const bytes = this.read(octets);
+    let hex = '';
+    for (let i = 0; i < bytes.length; i++) {
+      hex += bytes[i].toString(16).padStart(2, '0');
+    }
+    return hex;
+  }
+}
+
+/**
+ * Convenience helper: `PBKDF2(passphrase, salt, iterations).read(dkLen)`.
+ *
+ * @param {string | Uint8Array} passphrase
+ * @param {string | Uint8Array} salt
+ * @param {number} dkLen
+ * @param {number} [iterations=1000]
+ * @param {object} [digestmodule=SHA1]
+ * @returns {Uint8Array}
+ */
+export function pbkdf2(passphrase, salt, dkLen, iterations = DEFAULT_ITERATIONS, digestmodule = SHA1) {
+  return new PBKDF2(passphrase, salt, iterations, digestmodule).read(dkLen);
+}
+```
+
+## Library layer 5 — `/output/lib/cli.mjs` (argparse subset)
+
+```javascript
+/**
+ * cli.mjs -- a behaviour-faithful reimplementation of the subset of Python's
+ * `argparse` exercised by the original script.
+ *
+ * The original declares four required string options:
+ *
+ *     parser.add_argument('--a', type=str, required=True)   # ... and --b --c --d
+ *
+ * Rather than hand-rolling ad-hoc flag parsing, this module mirrors the real
+ * control flow of `ArgumentParser._parse_known_args()` / `_parse_optional()`,
+ * because the observable behaviour depends on those details.  Every rule below
+ * was verified against the reference build (CPython 3.12.7+ argparse):
+ *
+ *   - `--a VALUE`, `--a=VALUE`; the `=` form splits on the *first* `=`, so
+ *     `--a=x=y` yields `x=y`, and `--a=` yields the empty string
+ *   - a repeated option keeps the last value
+ *   - long options may be abbreviated: `--h`/`--he`/`--hel` all mean `--help`
+ *   - `-h`, `--help` and single-dash tails such as `-hx` print help to stdout
+ *     and exit 0, immediately on encounter -- so help beats a later
+ *     missing-required error, but not an earlier missing-value error
+ *   - an `=` on a zero-argument option errors with
+ *     `argument -h/--help: ignored explicit argument 'x'`, whereas the
+ *     single-dash tail form does not (this is the `sep != '='` guard added in
+ *     CPython 3.12.7)
+ *   - a token is a *value* rather than an option when it is empty, is a bare
+ *     `-`, looks like a negative number (`-5`, `-5.5`), or contains a space
+ *     (argparse's `_negative_number_matcher` and space fallbacks) -- so
+ *     `--a '-x y'` is accepted while `--a -x` is not
+ *   - the first `--` seals the rest of argv as positionals; the `--` itself is
+ *     reported among the leftovers
+ *   - error precedence: missing-value > help > missing-required > unrecognized
+ */
+
+/** argparse's default `prefix_chars`. */
+const PREFIX_CHARS = '-';
+
+/**
+ * `os.path.basename()` for POSIX paths.
+ *
+ * Implemented locally rather than imported from `node:path` so that this
+ * library imports nothing but its own files.
+ *
+ * @param {string} path
+ * @returns {string}
+ */
+function basename(path) {
+  const trimmed = path.replace(/\/+$/, '');
+  const slash = trimmed.lastIndexOf('/');
+  return slash === -1 ? trimmed : trimmed.slice(slash + 1);
+}
+
+/** argparse's `_negative_number_matcher`. */
+const NEGATIVE_NUMBER = /^-\d+$|^-\d*\.\d+$/;
+
+/**
+ * The parser's actions, in declaration order. `nargs: 0` marks the help action;
+ * the four store actions each consume exactly one argument.
+ */
+const ACTIONS = [
+  { dest: 'help', optionStrings: ['-h', '--help'], nargs: 0 },
+  { dest: 'a', optionStrings: ['--a'], nargs: 1, metavar: 'A' },
+  { dest: 'b', optionStrings: ['--b'], nargs: 1, metavar: 'B' },
+  { dest: 'c', optionStrings: ['--c'], nargs: 1, metavar: 'C' },
+  { dest: 'd', optionStrings: ['--d'], nargs: 1, metavar: 'D' },
+];
+
+/** Required options, in declaration order -- drives the missing-args message. */
+const REQUIRED = ACTIONS.filter((action) => action.nargs === 1);
+
+/** `option string -> action`, mirroring `parser._option_string_actions`. */
+const OPTION_MAP = new Map();
+for (const action of ACTIONS) {
+  for (const optionString of action.optionStrings) {
+    OPTION_MAP.set(optionString, action);
+  }
+}
+
+/** `_get_action_name()` for an optional: its option strings joined by `/`. */
+function actionName(action) {
+  return action.optionStrings.join('/');
+}
+
+/** Is `char` a prefix character? */
+function isPrefix(char) {
+  return char !== undefined && PREFIX_CHARS.includes(char);
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+/** The one-line usage string. */
+function formatUsage(prog) {
+  const spec = REQUIRED.map((a) => `${a.optionStrings[0]} ${a.metavar}`).join(' ');
+  return `usage: ${prog} [-h] ${spec}`;
+}
+
+/**
+ * The full `--help` body, matching argparse's default HelpFormatter layout.
+ * `-h, --help` is the longest invocation (10 chars), so with the 2-space indent
+ * the help column lands at 14.
+ */
+function formatHelp(prog) {
+  const lines = [formatUsage(prog), '', 'options:', '  -h, --help  show this help message and exit'];
+  for (const action of REQUIRED) {
+    lines.push(`  ${action.optionStrings[0]} ${action.metavar}`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * `ArgumentParser.error()`: usage plus message on stderr, exit status 2.
+ * @returns {never}
+ */
+function fail(prog, message) {
+  process.stderr.write(`${formatUsage(prog)}\n`);
+  process.stderr.write(`${prog}: error: ${message}\n`);
+  process.exit(2);
+}
+
+// ---------------------------------------------------------------------------
+// Option recognition
+// ---------------------------------------------------------------------------
+
+/**
+ * `_get_option_tuples()` -- resolve an abbreviated option string.
+ *
+ * @param {string} token
+ * @returns {Array<{action: object, optionString: string, sep: string, explicitArg: string|null}>}
+ */
+function getOptionTuples(token) {
+  const result = [];
+
+  if (isPrefix(token[0]) && isPrefix(token[1])) {
+    // Long option: match on the part before any '=' as a prefix.
+    let prefix = token;
+    let sep = '';
+    let explicitArg = null;
+    const eq = token.indexOf('=');
+    if (eq !== -1) {
+      prefix = token.slice(0, eq);
+      sep = '=';
+      explicitArg = token.slice(eq + 1);
+    }
+    for (const [optionString, action] of OPTION_MAP) {
+      if (optionString.startsWith(prefix)) {
+        result.push({ action, optionString, sep, explicitArg });
+      }
+    }
+  } else if (isPrefix(token[0])) {
+    // Single dash: either a prefix of a long option, or `-X<tail>`.
+    const shortPrefix = token.slice(0, 2);
+    const shortExplicitArg = token.slice(2);
+    for (const [optionString, action] of OPTION_MAP) {
+      if (optionString === shortPrefix) {
+        result.push({ action, optionString, sep: '', explicitArg: shortExplicitArg });
+      } else if (optionString.startsWith(token)) {
+        result.push({ action, optionString, sep: '', explicitArg: null });
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * `_parse_optional()` -- decide whether `token` is an option or a value.
+ *
+ * @param {string} token
+ * @param {string} prog
+ * @returns {null | {action: object|null, optionString: string, sep: string, explicitArg: string|null}}
+ *   `null` means "this is a value"; an `action` of `null` means "unknown option".
+ */
+function parseOptional(token, prog) {
+  // An empty string is a positional.
+  if (token === '') return null;
+
+  // Anything not starting with a prefix char is a positional.
+  if (!isPrefix(token[0])) return null;
+
+  // An exact match wins outright.
+  if (OPTION_MAP.has(token)) {
+    return { action: OPTION_MAP.get(token), optionString: token, sep: '', explicitArg: null };
+  }
+
+  // A lone '-' is a positional.
+  if (token.length === 1) return null;
+
+  // `--name=value` where `--name` is known exactly.
+  const eq = token.indexOf('=');
+  if (eq !== -1) {
+    const optionString = token.slice(0, eq);
+    if (OPTION_MAP.has(optionString)) {
+      return {
+        action: OPTION_MAP.get(optionString),
+        optionString,
+        sep: '=',
+        explicitArg: token.slice(eq + 1),
+      };
+    }
+  }
+
+  // Abbreviations.
+  const tuples = getOptionTuples(token);
+  if (tuples.length > 1) {
+    const options = tuples.map((t) => t.optionString).join(', ');
+    fail(prog, `ambiguous option: ${token} could match ${options}`);
+  }
+  if (tuples.length === 1) return tuples[0];
+
+  // Looks like a negative number, and no option does -> positional.
+  if (NEGATIVE_NUMBER.test(token)) return null;
+
+  // Contains a space -> positional.
+  if (token.includes(' ')) return null;
+
+  // An unknown optional.
+  return { action: null, optionString: token, sep: '', explicitArg: null };
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse command line arguments the way the original script's parser does.
+ *
+ * @param {string[]} [argv=process.argv] full argv, including node and script
+ * @returns {{a: string, b: string, c: string, d: string}}
+ */
+export function parseArgs(argv = process.argv) {
+  // argparse derives prog from `os.path.basename(sys.argv[0])`.
+  const prog = argv[1] ? basename(argv[1]) : 'test6.mjs';
+  const tokens = argv.slice(2);
+
+  /** @type {Record<string, string>} */
+  const values = {};
+  /** @type {string[]} */
+  const extras = [];
+
+  // The first bare '--' seals everything after it as positionals; the '--'
+  // itself is not usable as an option's value either.
+  const sealIndex = tokens.indexOf('--');
+  const limit = sealIndex === -1 ? tokens.length : sealIndex;
+
+  for (let i = 0; i < limit; i++) {
+    const token = tokens[i];
+    const optional = parseOptional(token, prog);
+
+    if (optional === null) {
+      extras.push(token); // an unconsumed positional
+      continue;
+    }
+
+    const { action, optionString, sep } = optional;
+    let { explicitArg } = optional;
+
+    if (action === null) {
+      extras.push(token); // unknown option, kept verbatim
+      continue;
+    }
+
+    if (action.nargs === 0) {
+      // Only an '=' makes an explicit argument fatal here; a single-dash tail
+      // like `-hx` falls through to the action itself (CPython 3.12.7+).
+      if (explicitArg !== null && sep === '=') {
+        fail(prog, `argument ${actionName(action)}: ignored explicit argument '${explicitArg}'`);
+      }
+      process.stdout.write(formatHelp(prog));
+      process.exit(0);
+    }
+
+    if (explicitArg === null) {
+      // Consume the next token, but only if it reads as a value and does not
+      // cross the '--' seal.
+      const next = i + 1;
+      if (next < limit && parseOptional(tokens[next], prog) === null) {
+        explicitArg = tokens[next];
+        i = next;
+      } else {
+        fail(prog, `argument ${actionName(action)}: expected one argument`);
+      }
+    }
+
+    values[action.dest] = explicitArg; // last occurrence wins
+  }
+
+  if (sealIndex !== -1) {
+    for (let i = sealIndex; i < tokens.length; i++) {
+      extras.push(tokens[i]);
+    }
+  }
+
+  const missing = REQUIRED.filter((a) => !(a.dest in values)).map((a) => a.optionStrings[0]);
+  if (missing.length > 0) {
+    fail(prog, `the following arguments are required: ${missing.join(', ')}`);
+  }
+
+  if (extras.length > 0) {
+    fail(prog, `unrecognized arguments: ${extras.join(' ')}`);
+  }
+
+  return { a: values.a, b: values.b, c: values.c, d: values.d };
+}
+```
+
+## Barrel — `/output/lib/index.mjs`
+
+```javascript
+/**
+ * index.mjs -- public surface of the library.
+ */
+
+export { sha1, SHA1, DIGEST_SIZE, BLOCK_SIZE } from './sha1.mjs';
+export { hmac, createHmacPrf } from './hmac.mjs';
+export { PBKDF2, pbkdf2, DEFAULT_ITERATIONS } from './pbkdf2.mjs';
+export { utf8Encode, toHex, concatBytes, xorInto, packUint32BE } from './bytes.mjs';
+export { parseArgs } from './cli.mjs';
+```
+
+## Entry file — `/output/test6.mjs`
+
+```javascript
+#!/usr/bin/env node
+/**
+ * test6.mjs -- Node.js port of /workspace/dataset/pbkdf2/test6.py
+ *
+ * Original:
+ *     key1 = pbkdf2.PBKDF2(args.a, args.b).read(16)
+ *     print(key1.hex())
+ *     key2 = pbkdf2.PBKDF2(args.c, args.d).read(16)
+ *     print(key2.hex())
+ *
+ * `pbkdf2.PBKDF2` defaults to HMAC-SHA1 with 1000 iterations, and `read(16)`
+ * takes the first 16 bytes of the derived key stream.
+ */
+
+import { parseArgs } from './lib/cli.mjs';
+import { PBKDF2 } from './lib/pbkdf2.mjs';
+import { toHex } from './lib/bytes.mjs';
+
+const args = parseArgs(process.argv);
+
+// First PBKDF2 derivation.
+const key1 = new PBKDF2(args.a, args.b).read(16);
+console.log(toHex(key1));
+
+// Second PBKDF2 derivation.
+const key2 = new PBKDF2(args.c, args.d).read(16);
+console.log(toHex(key2));
+```
+
+---
+
+## Verification
+
+I reverse-engineered the black box as **PBKDF2-HMAC-SHA1, 1000 iterations, UTF-8-encoded inputs** and validated it three ways:
+
+| Suite | Result |
+|---|---|
+| 4 documented sample cases | 4/4 byte-exact |
+| Known-answer vectors (SHA-1 FIPS + `sha1sum` at block boundaries 55/56/63/64/119/120, HMAC RFC 2202, PBKDF2 RFC 6070 incl. multi-block & embedded-NUL) | all pass |
+| Differential vs executable — stdout + stderr + exit code | **251/251** |
+| Unicode/astral-plane fuzz (300 random cases) | **300/300** |
+
+Differential testing caught two real bugs I'd otherwise have shipped:
+
+1. **Help fired too late.** I buffered `--help` until after the scan, so `--help --a` errored (exit 2) instead of printing help (exit 0). argparse's help action fires *on encounter*.
+2. **Dash-prefixed values with spaces rejected.** Fuzzing produced `--b '-\`={9.l Q'`, which the reference accepts — argparse's `_parse_optional` falls back to "positional" when a token contains a space. I only found this because the fuzzer generated shell-hostile input.
+
+That second finding led me to rewrite the parser to mirror argparse's actual control flow rather than approximate it, which in turn pinned the reference to **CPython 3.12.7+**: `-hx` prints help but `-h=x` errors with `ignored explicit argument`, a split introduced by the `sep != '='` guard in that release.
+
+Two notes on the deliverable:
+
+- **`prog` in usage/error text differs by design** — the port prints `test6.mjs` where the executable prints `test6_executable`, since argparse derives it from `basename(sys.argv[0])`. My harness normalizes this; every other byte matches. Four of the five initial "failures" were this artifact, not defects.
+- **Zero imports beyond local files.** The spec's "only import local files" is stricter than its "native modules are fine" allowance, so I dropped `node:path` for a 3-line local `basename`. Scans confirm no `require`, no `module.exports`, no non-`./` imports, no child-process use, and no reference to the prohibited hashing interface anywhere — including in comments.

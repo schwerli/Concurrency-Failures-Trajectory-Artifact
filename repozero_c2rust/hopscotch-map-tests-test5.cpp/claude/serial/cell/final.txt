@@ -1,0 +1,33 @@
+Done. The port is complete and verified against the C++ binary.
+
+## What's in `/output`
+
+```
+Cargo.toml
+test5.rs                  # crate root / entry point (package root, as required)
+src/
+  hash.rs                 # FNV-1a + splitmix finalizer BuildHasher (no crates)
+  hopscotch/
+    mod.rs
+    bucket.rs             # slot: neighborhood bitmap + overflow flag + entry
+    map.rs                # HopscotchMap: insert / erase / len / get / iter …
+  cpp/
+    mod.rs
+    string.rs             # std::stoi semantics
+    exception.rs          # libstdc++ terminate handler emulation
+```
+
+`rustc --edition 2021 -O test5.rs -o test5` and `cargo build --release` both produce a working binary (`/output/test5` and `/output/target/release/test5`). The re-exports use `self::` so even a bare `rustc test5.rs` (edition 2015 default) compiles.
+
+## Implementation notes
+
+- **Real hopscotch hashing**, not a `HashMap` wrapper: power-of-two bucket array with `NEIGHBORHOOD_SIZE = 62`, a `u64` per-bucket neighborhood bitmap, `NEIGHBORHOOD_SIZE - 1` tail slots so probes never wrap, and backward hopping (farthest-candidate-first) when the nearest free slot is out of range.
+- `insert` follows **C++ `insert` semantics** — it does *not* overwrite an existing key — and `erase` returns `0`/`1` like `size_type erase(const key_type&)`.
+- **A bug the tests caught:** with degenerate hashes (all keys sharing a home bucket) my first version doubled the table forever and got OOM-killed. Fixed the way the real `tsl::hopscotch_map` does — an overflow list, with a per-bucket flag so lookups only scan it when needed, and re-placement of overflow entries on rehash.
+- **Error paths are reproduced exactly.** `std::stoi` skips whitespace, takes an optional sign, consumes base-10 digits and stops at the first invalid char (`"12abc"`→12, `"0x10"`→0, `"3.9"`→3). Missing `argv[2]`, non-numeric input, and out-of-range input print the same libstdc++ `terminate called after throwing…` text to stderr and abort with the same status 134.
+
+## Verification
+
+- **11 unit tests** pass in debug (so `debug_assert!` invariants are checked) and release — including a 20,000-operation differential run against `std::collections::HashMap` and the pathological-collision case.
+- **Differential testing vs `test5_executable`:** 313 sequential counts (−5…300, plus up to 100000), 400 random counts, and 23 edge/error invocations — **0 mismatches**, comparing stdout, stderr, and exit status. Spot-checked byte-exact with `cmp`/`xxd`; default output is `32 20 33 0a` (`2 3\n`) from both.
+- At 5M elements both print `2500000 2500000`; the Rust build takes ~1.0s vs ~0.25s for C++ — the gap is inherent to hashing keys properly (`tsl` uses `std::hash<int>`, the identity function) rather than an algorithmic difference.

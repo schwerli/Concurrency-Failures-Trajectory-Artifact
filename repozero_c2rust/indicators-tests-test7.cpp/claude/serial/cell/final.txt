@@ -1,0 +1,28 @@
+Done. The port is byte-for-byte identical to the C++ binary across 3,599 differential test cases (stdout, stderr, and exit code).
+
+## Project layout (`/output`)
+
+```
+Cargo.toml                        [[bin]] test7 -> test7.rs
+test7.rs                          entry point (package root, as required)
+src/indicators/mod.rs             ProgressDisplay + Percentage
+src/indicators/progress_display.rs
+src/indicators/percentage.rs
+src/cxx/mod.rs                    std::stoi port
+src/cxx/stoi.rs
+test7                             compiled executable
+```
+
+Zero dependencies, `std` only. Builds both ways: `rustc test7.rs` and `cargo build --release` — the sources avoid edition-specific path syntax so the plain `rustc` invocation (which defaults to edition 2015) works too, while Cargo builds it as edition 2021.
+
+## Two behaviors that black-box probing caught
+
+**1. The percentage is `float`, not `double`.** With `progress=2147483647`, the C++ binary prints `1073741824.0%`, not the mathematically correct `1073741823.5%`. That rounding is only explicable by an `f32` intermediate, so `ProgressDisplay::percentage` computes `current as f32 / total as f32 * 100.0`. A `f64` implementation would have passed all five documented examples and silently diverged at scale.
+
+**2. No clamping, and the counter wraps.** `increment` pushes past `total` (199 → `112.0% (224/200)`) and `update` accepts negatives (`-2.5% (-5/200)`), so I used `wrapping_add` on an `i32` to mirror `int` overflow at `INT_MAX`.
+
+## `std::stoi` fidelity
+
+`str::parse::<i32>()` would have been wrong on six observable inputs. `std::stoi` is `strtol` + range checks, so I ported it: skips leading whitespace, accepts `+`, stops at the first non-digit and discards the rest (`"12abc"`→12, `"0x10"`→0, `"6.9"`→6), and throws on no-digits/out-of-range. The uncaught-exception path reproduces libstdc++'s two-line terminate report on stderr and calls `process::abort()` for the same SIGABRT/134 status.
+
+One note on requirement 7: it asks for "an executable at `/output/test7.rs`", but that path is the Rust source. I built the executable from it as `/output/test7` (plus `/output/target/release/test7`); the two are byte-identical in output. Say the word if you wanted the binary at some other path.

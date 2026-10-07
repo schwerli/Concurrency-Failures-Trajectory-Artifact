@@ -1,0 +1,73 @@
+diff --git a/CHANGES b/CHANGES
+index 6c2761c53..147737902 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -46,6 +46,8 @@ Features added
+   ``:meta public:`` in info-field-list
+ * #7487: autodoc: Allow to generate docs for singledispatch functions by
+   py:autofunction
++* #4826: autodoc: Support signatures of overloaded functions and methods in
++  docstring when :confval:`autodoc_docstring_signature` is enabled
+ * #7143: autodoc: Support final classes and methods
+ * #7384: autodoc: Support signatures defined by ``__new__()``, metaclasses and
+   builtin base classes
+diff --git a/sphinx/ext/autodoc/__init__.py b/sphinx/ext/autodoc/__init__.py
+index f8e4be999..588d29ddc 100644
+--- a/sphinx/ext/autodoc/__init__.py
++++ b/sphinx/ext/autodoc/__init__.py
+@@ -1044,6 +1044,7 @@ class DocstringSignatureMixin:
+                           RemovedInSphinx40Warning, stacklevel=2)
+         docstrings = self.get_doc()
+         self._new_docstrings = docstrings[:]
++        self._signatures = []  # type: List[str]
+         result = None
+         for i, doclines in enumerate(docstrings):
+             # no lines in docstring, no match
+@@ -1062,9 +1063,30 @@ class DocstringSignatureMixin:
+                     valid_names.extend(cls.__name__ for cls in self.object.__mro__)
+             if base not in valid_names:
+                 continue
++
++            # collect the signatures of the overloads following the first one
++            signatures = [(args, retann)]  # type: List[Tuple[str, str]]
++            for line in doclines[1:]:
++                match = py_ext_sig_re.match(line)
++                if match:
++                    exmod, path, base, _args, _retann = match.groups()
++                    if base in valid_names:
++                        signatures.append((_args, _retann))
++                        continue
++                break
++
++            # the first signature is used as the primary signature, and the
++            # remaining ones are rendered as additional signature lines
++            args, retann = signatures[0]
++            for _args, _retann in signatures[1:]:
++                sig = "(%s)" % _args if _args is not None else ''
++                if _retann:
++                    sig += " -> %s" % _retann
++                self._signatures.append(sig)
++
+             # re-prepare docstring to ignore more leading indentation
+             tab_width = self.directive.state.document.settings.tab_width  # type: ignore
+-            self._new_docstrings[i] = prepare_docstring('\n'.join(doclines[1:]),
++            self._new_docstrings[i] = prepare_docstring('\n'.join(doclines[len(signatures):]),
+                                                         tabsize=tab_width)
+             result = args, retann
+             # don't look any further
+@@ -1088,7 +1110,14 @@ class DocstringSignatureMixin:
+             result = self._find_signature()
+             if result is not None:
+                 self.args, self.retann = result
+-        return super().format_signature(**kwargs)  # type: ignore
++
++        sig = super().format_signature(**kwargs)  # type: ignore
++
++        if getattr(self, '_signatures', None):
++            # append the signatures of the overloaded functions/methods
++            sig = "\n".join([sig] + self._signatures)
++
++        return sig
+ 
+ 
+ class DocstringStripSignatureMixin(DocstringSignatureMixin):

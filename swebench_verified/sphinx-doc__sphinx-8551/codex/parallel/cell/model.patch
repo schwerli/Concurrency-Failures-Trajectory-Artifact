@@ -1,0 +1,58 @@
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+index 79d7e4f46..8df78f708 100644
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -1233,6 +1233,10 @@ class PythonDomain(Domain):
+             if mod.docname in docnames:
+                 self.modules[modname] = mod
+ 
++    def process_field_xref(self, pnode: pending_xref) -> None:
++        pnode['py:module'] = self.env.ref_context.get('py:module')
++        pnode['py:class'] = self.env.ref_context.get('py:class')
++
+     def find_obj(self, env: BuildEnvironment, modname: str, classname: str,
+                  name: str, type: str, searchmode: int = 0
+                  ) -> List[Tuple[str, ObjectEntry]]:
+diff --git a/tests/test_domain_py.py b/tests/test_domain_py.py
+index 2dc97bed9..4de2af0f2 100644
+--- a/tests/test_domain_py.py
++++ b/tests/test_domain_py.py
+@@ -508,6 +508,38 @@ def test_pydata(app):
+     assert domain.objects['example.var'] == ('index', 'example.var', 'data')
+ 
+ 
++@pytest.mark.sphinx(freshenv=True)
++def test_pyfield_xrefs_resolve_in_currentmodule(app):
++    text = (".. py:class:: mod.A\n"
++            ".. py:class:: mod.submod.A\n"
++            "\n"
++            ".. py:currentmodule:: mod\n"
++            ".. py:function:: mod_func()\n"
++            "   :param A a:\n"
++            "   :rtype: A\n"
++            "\n"
++            ".. py:currentmodule:: mod.submod\n"
++            ".. py:function:: submod_func()\n"
++            "   :param A a:\n"
++            "   :rtype: A\n")
++    doctree = restructuredtext.parse(app, text)
++    refnodes = list(doctree.traverse(pending_xref))
++    assert len(refnodes) == 4
++    assert [node['py:module'] for node in refnodes] == [
++        'mod', 'mod', 'mod.submod', 'mod.submod',
++    ]
++
++    domain = app.env.get_domain('py')
++    resolved = [
++        domain.resolve_xref(app.env, 'index', app.builder, node['reftype'],
++                            node['reftarget'], node, nodes.Text(node.astext()))
++        for node in refnodes
++    ]
++    assert [node['refid'] for node in resolved] == [
++        'mod.A', 'mod.A', 'mod.submod.A', 'mod.submod.A',
++    ]
++
++
+ def test_pyfunction(app):
+     text = (".. py:function:: func1\n"
+             ".. py:module:: example\n"

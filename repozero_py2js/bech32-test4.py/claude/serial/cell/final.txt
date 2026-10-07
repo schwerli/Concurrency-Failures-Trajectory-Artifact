@@ -1,0 +1,137 @@
+Migration complete and verified. Here is the code.
+
+## Library layer 1 — Python runtime semantics
+
+**`/output/lib/pyerrors.mjs`** — exception types so the entry point can reproduce Python's final traceback line.
+
+```js
+export class PyError extends Error {
+  constructor(pyName, message) { super(message); this.pyName = pyName; }
+}
+export class PyValueError extends PyError {
+  constructor(message) { super('ValueError', message); }
+}
+export class PyIndexError extends PyError {
+  constructor(message) { super('IndexError', message); }
+}
+```
+
+**`/output/lib/pytypes.mjs`** — `repr()` and `int()`. `int()` accepts surrounding whitespace, a sign and PEP 515 underscores (so `--c '1, 2'` works, `--c 0x10` raises `ValueError` exactly as Python does).
+
+```js
+import { PyValueError } from './pyerrors.mjs';
+
+const REPR_ESCAPES = new Map([['\\','\\\\'],['\n','\\n'],['\r','\\r'],['\t','\\t']]);
+
+export function pyRepr(value) {
+  const quote = value.includes("'") && !value.includes('"') ? '"' : "'";
+  let out = '';
+  for (const ch of value) {
+    if (REPR_ESCAPES.has(ch)) out += REPR_ESCAPES.get(ch);
+    else if (ch === quote) out += '\\' + ch;
+    else out += ch;
+  }
+  return quote + out + quote;
+}
+
+const WHITESPACE = /^\s+|\s+$/g;
+const INT_LITERAL = /^[+-]?[0-9](?:_?[0-9])*$/;
+
+export function pyInt(text) {
+  const stripped = text.replace(WHITESPACE, '');
+  if (!INT_LITERAL.test(stripped)) {
+    throw new PyValueError(`invalid literal for int() with base 10: ${pyRepr(text)}`);
+  }
+  return Number(stripped.replace(/_/g, ''));
+}
+```
+
+## Library layer 2 — argparse
+
+**`/output/lib/argparse.mjs`** — see `/output/lib/argparse.mjs:1`. Reproduces required options, `type=int`, `-h/--help`, prefix abbreviation, negative-number values (`--b -1` is a value, not a flag), `--` as an option terminator, and argparse's error precedence: **type errors → required-missing → unrecognized**.
+
+## Library layer 3 — bech32 core
+
+**`/output/lib/charset.mjs`**
+
+```js
+import { PyIndexError } from './pyerrors.mjs';
+
+export const CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+
+export function charsetAt(index) {
+  const resolved = index < 0 ? CHARSET.length + index : index;
+  if (!Number.isInteger(resolved) || resolved < 0 || resolved >= CHARSET.length) {
+    throw new PyIndexError('string index out of range');
+  }
+  return CHARSET[resolved];
+}
+
+export function charsetIndexOf(ch) { return CHARSET.indexOf(ch); }
+```
+
+**`/output/lib/checksum.mjs`** — `bech32Polymod`, `bech32HrpExpand`, `bech32VerifyChecksum`, `bech32CreateChecksum`. All intermediates stay under 2³¹, so plain JS bitwise operators are exact.
+
+**`/output/lib/convertbits.mjs`** — `convertBits(data, fromBits, toBits, pad)`. The range test is `value >= 2 ** fromBits` rather than a shift, so inputs beyond 32 bits (`--c 99999999999999999999`) reject cleanly instead of wrapping.
+
+**`/output/lib/bech32.mjs`** — `bech32Encode` / `bech32Decode`, plus the validation rules I measured from the executable.
+
+**`/output/lib/segwit.mjs`** — `encode` / `decode`; **`/output/lib/index.mjs`** — barrel re-export.
+
+## Entry point
+
+**`/output/test4.mjs`**
+
+```js
+import { basename } from 'node:path';
+import { ArgumentParser } from './lib/argparse.mjs';
+import { pyInt } from './lib/pytypes.mjs';
+import { PyError } from './lib/pyerrors.mjs';
+import { encode } from './lib/segwit.mjs';
+
+function main() {
+  const parser = new ArgumentParser({ prog: basename(process.argv[1]) });
+  parser.addArgument('--a', { type: String, required: true });                  // HRP
+  parser.addArgument('--b', { type: pyInt, typeName: 'int', required: true });  // Witness version
+  parser.addArgument('--c', { type: String, required: true });                  // Witness program
+  const args = parser.parseArgs(process.argv.slice(2));
+
+  const witprog = args.c.split(',').map(pyInt);
+  const result = encode(args.a, args.b, witprog);
+  console.log(result === null ? 'None' : result);
+}
+
+try { main(); } catch (err) {
+  if (err instanceof PyError) {
+    process.stderr.write('Traceback (most recent call last):\n');
+    process.stderr.write(`${err.pyName}: ${err.message}\n`);
+    process.exit(1);
+  }
+  throw err;
+}
+```
+
+## Behaviours recovered by probing the executable
+
+Three findings contradicted what the stock reference implementation would do, and I only caught them by differential testing:
+
+1. **This is bech32 1.1.0 — plain Bech32 for *every* witness version, not Bech32m.** My first version switched to Bech32m for `witver != 0`; the data body matched but all six checksum chars were wrong. My initial evidence for Bech32m (witver 0 vs 1 producing different tails) was confounded — that difference came entirely from `data[0]`.
+2. **The HRP limit is 83 chars, and there is no 90-char total limit.** A 143-character address encodes fine; an 84-char HRP returns `None`. I isolated this with three different program lengths to prove the limit is on the HRP, not the total.
+3. **`CHARSET[witver]` is indexed before validation, with Python's negative indexing.** So `--b -1` … `--b -32` encode and are then rejected by the round-trip check (`None`, exit 0), while `--b 32` or `--b -33` raise `IndexError` and exit 1.
+
+## Verification
+
+| Suite | Result |
+|---|---|
+| 4 documented cases, `cmp` byte-for-byte | **4/4 identical** (incl. trailing newline) |
+| `difftest.sh` — 154 curated stdout+exit cases | 152 pass, 2 = `--help` prog name |
+| `difftest_stderr.sh` — 34 stderr+exit cases | 27 pass, 7 = traceback frames |
+| `fuzz.sh` — 800 randomized cases | **800/800** |
+| Valid-space sweep — 4 HRPs × 6 versions × 5 lengths | **120/120** |
+
+Two caveats, both inherent rather than fixable:
+
+- **`--help` prints `usage: test4.mjs …`** where the executable prints `test4_executable`. argparse derives `prog` from `argv[0]`, so the Python *source* would itself print `test4.py`. I kept the faithful `basename(argv[1])` derivation; the structure and wording are otherwise identical.
+- **Tracebacks match on exit code (1) and the exception line** (`ValueError: invalid literal for int() with base 10: ''`), but not the intermediate `File "test4.py", line N` frames. Byte-exact stderr is impossible regardless: the executable's final line embeds a PID (`[PYI-6951:ERROR]` vs `[PYI-6954:ERROR]` on two runs of the *same* input).
+
+Constraints checked mechanically: pure ESM, `.mjs` throughout, zero npm imports (only local `./*.mjs` plus `node:path`), and no `require`/`module.exports`/`Uint8Array`/`DataView` anywhere. The three verification scripts are left in `/output` alongside the library.

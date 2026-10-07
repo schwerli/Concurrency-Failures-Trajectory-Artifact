@@ -1,0 +1,1097 @@
+============================== notebooks/02_Single_layer_models.ipynb
+--- cell 1 ---
+import numpy as np
+seed = 27092016 
+rng = np.random.RandomState(seed)
+--- cell 3 ---
+size = 1000
+a = np.arange(size)
+b = np.ones(size)
+--- cell 5 ---
+%%timeit -n 100 -r 3
+c = np.empty(size)
+for i in range(size):
+    c[i] = a[i] + b[i]
+--- cell 7 ---
+%%timeit -n 100 -r 3
+c = a + b
+--- cell 9 ---
+def fprop(inputs, weights, biases):
+    """Forward propagates activations through the layer transformation.
+
+    For inputs `x`, outputs `y`, weights `W` and biases `b` the layer
+    corresponds to `y = W x + b`.
+
+    Args:
+        inputs: Array of layer inputs of shape (batch_size, input_dim).
+        weights: Array of weight parameters of shape 
+            (output_dim, input_dim).
+        biases: Array of bias parameters of shape (output_dim, ).
+
+    Returns:
+        outputs: Array of layer outputs of shape (batch_size, output_dim).
+    """
+    return inputs.dot(weights.T) + biases
+--- cell 11 ---
+inputs = np.array([[0., -1., 2.], [-6., 3., 1.]])
+weights = np.array([[2., -3., -1.], [-5., 7., 2.]])
+biases = np.array([5., -3.])
+true_outputs = np.array([[6., -6.], [-17., 50.]])
+
+if not np.allclose(fprop(inputs, weights, biases), true_outputs):
+    print('Wrong outputs computed.')
+else:
+    print('All outputs correct!')
+--- cell 13 ---
+# Initiliase arrays with arbitrary values
+A = np.arange(9).reshape((3, 3))
+B = np.ones((3, 3)) * 2
+a = np.array([-1., 0., 1.])
+b = np.array([0.1, 0.2, 0.3])
+print(A.dot(B))  # Matrix-matrix product
+print(B.dot(A))  # Reversed product of above A.dot(B) != B.dot(A) in general
+print(A.dot(b))  # Matrix-vector product
+print(b.dot(A))  # Again A.dot(b) != b.dot(A) unless A is symmetric i.e. A == A.T
+print(a.dot(b))  # Vector-vector scalar product
+--- cell 15 ---
+# Initiliase arrays with arbitrary values
+A = np.arange(6).reshape((3, 2))
+b = np.array([0.1, 0.2])
+c = np.array([-1., 0., 1.])
+print(A + b)  # Add b elementwise to all rows of A
+print((A.T + c).T)  # Add b elementwise to all columns of A
+print(A * b)  # Multiply each row of A elementise by b 
+--- cell 18 ---
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from mlp.data_providers import CCPPDataProvider
+%matplotlib notebook
+
+data_provider = CCPPDataProvider(
+    which_set='train',
+    input_dims=[0, 1],
+    batch_size=5000, 
+    max_num_batches=1, 
+    shuffle_order=False
+)
+
+input_dim, output_dim = 2, 1
+
+inputs, targets = data_provider.next()
+--- cell 20 ---
+weights_init_range = 0.5
+biases_init_range = 0.1
+
+# Randomly initialise weights matrix
+weights = rng.uniform(
+    low=-weights_init_range, 
+    high=weights_init_range, 
+    size=(output_dim, input_dim)
+)
+
+#  Randomly initialise biases vector
+biases = rng.uniform(
+    low=-biases_init_range, 
+    high=biases_init_range, 
+    size=output_dim
+)
+# Calculate predicted model outputs
+outputs = fprop(inputs, weights, biases)
+
+# Plot target and predicted outputs against inputs on same axis
+fig = plt.figure(figsize=(8, 8))
+ax = fig.add_subplot(111, projection='3d')
+ax.plot(inputs[:, 0], inputs[:, 1], targets[:, 0], 'r.', ms=2)
+ax.plot(inputs[:, 0], inputs[:, 1], outputs[:, 0], 'b.', ms=2)
+ax.set_xlabel('Input dim 1')
+ax.set_ylabel('Input dim 2')
+ax.set_zlabel('Output')
+ax.legend(['Targets', 'Predictions'], frameon=False)
+fig.tight_layout()
+--- cell 22 ---
+def error(outputs, targets):
+    """Calculates error function given a batch of outputs and targets.
+
+    Args:
+        outputs: Array of model outputs of shape (batch_size, output_dim).
+        targets: Array of target outputs of shape (batch_size, output_dim).
+
+    Returns:
+        Scalar error function value.
+    """
+    return 0.5 * ((outputs - targets)**2).sum() / outputs.shape[0]
+    
+def error_grad(outputs, targets):
+    """Calculates gradient of error function with respect to model outputs.
+
+    Args:
+        outputs: Array of model outputs of shape (batch_size, output_dim).
+        targets: Array of target outputs of shape (batch_size, output_dim).
+
+    Returns:
+        Gradient of error function with respect to outputs.
+        This will be an array of shape (batch_size, output_dim).
+    """
+    return (outputs - targets) / outputs.shape[0]
+--- cell 24 ---
+outputs = np.array([[1., 2.], [-1., 0.], [6., -5.], [-1., 1.]])
+targets = np.array([[0., 1.], [3., -2.], [7., -3.], [1., -2.]])
+true_error = 5.
+true_error_grad = np.array([[0.25, 0.25], [-1., 0.5], [-0.25, -0.5], [-0.5, 0.75]])
+
+if not error(outputs, targets) == true_error:
+    print('Error calculated incorrectly.')
+elif not np.allclose(error_grad(outputs, targets), true_error_grad):
+    print('Error gradient calculated incorrectly.')
+else:
+    print('Error function and gradient computed correctly!')
+--- cell 26 ---
+def grads_wrt_params(inputs, grads_wrt_outputs):
+    """Calculates gradients with respect to model parameters.
+
+    Args:
+        inputs: array of inputs to model of shape (batch_size, input_dim)
+        grads_wrt_to_outputs: array of gradients of with respect to the model
+            outputs of shape (batch_size, output_dim).
+
+    Returns:
+        list of arrays of gradients with respect to the model parameters
+        `[grads_wrt_weights, grads_wrt_biases]`.
+    """
+    grads_wrt_weights = grads_wrt_outputs.T.dot(inputs)
+    grads_wrt_biases = grads_wrt_outputs.sum(0)
+    return [grads_wrt_weights, grads_wrt_biases]
+--- cell 28 ---
+inputs = np.array([[1., 2., 3.], [-1., 4., -9.]])
+grads_wrt_outputs = np.array([[-1., 1.], [2., -3.]])
+true_grads_wrt_weights = np.array([[-3., 6., -21.], [4., -10., 30.]])
+true_grads_wrt_biases = np.array([1., -2.])
+
+grads_wrt_weights, grads_wrt_biases = grads_wrt_params(
+    inputs, grads_wrt_outputs)
+
+if not np.allclose(true_grads_wrt_weights, grads_wrt_weights):
+    print('Gradients with respect to weights incorrect.')
+elif not np.allclose(true_grads_wrt_biases, grads_wrt_biases):
+    print('Gradients with respect to biases incorrect.')
+else:
+    print('All parameter gradients calculated correctly!')
+--- cell 30 ---
+from mlp.layers import AffineLayer
+from mlp.errors import SumOfSquaredDiffsError
+from mlp.models import SingleLayerModel
+from mlp.initialisers import UniformInit, ConstantInit
+from mlp.learning_rules import GradientDescentLearningRule
+from mlp.optimisers import Optimiser
+import logging
+
+# Seed a random number generator
+seed = 27092016 
+rng = np.random.RandomState(seed)
+
+# Set up a logger object to print info about the training run to stdout
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+logger.handlers = [logging.StreamHandler()]
+
+# Create data provider objects for the CCPP training set
+train_data = CCPPDataProvider('train', [0, 1], batch_size=100, rng=rng)
+input_dim, output_dim = 2, 1
+
+# Create a parameter initialiser which will sample random uniform values
+# from [-0.1, 0.1]
+param_init = UniformInit(-0.1, 0.1, rng=rng)
+
+# Create our single layer model
+layer = AffineLayer(input_dim, output_dim, param_init, param_init)
+model = SingleLayerModel(layer)
+
+# Initialise the error object
+error = SumOfSquaredDiffsError()
+
+# Use a basic gradient descent learning rule with a small learning rate
+learning_rule = GradientDescentLearningRule(learning_rate=1e-2)
+
+# Use the created objects to initialise a new Optimiser instance.
+optimiser = Optimiser(model, error, learning_rule, train_data)
+
+# Run the optimiser for 5 epochs (full passes through the training set)
+# printing statistics every epoch.
+stats, keys, _ = optimiser.train(num_epochs=10, stats_interval=1)
+
+# Plot the change in the error over training.
+fig = plt.figure(figsize=(8, 4))
+ax = fig.add_subplot(111)
+ax.plot(np.arange(1, stats.shape[0] + 1), stats[:, keys['error(train)']])
+ax.set_xlabel('Epoch number')
+ax.set_ylabel('Error')
+--- cell 32 ---
+data_provider = CCPPDataProvider(
+    which_set='train',
+    input_dims=[0, 1],
+    batch_size=5000, 
+    max_num_batches=1, 
+    shuffle_order=False
+)
+
+inputs, targets = data_provider.next()
+
+# Calculate predicted model outputs
+outputs = model.fprop(inputs)[-1]
+
+# Plot target and predicted outputs against inputs on same axis
+fig = plt.figure(figsize=(8, 8))
+ax = fig.add_subplot(111, projection='3d')
+ax.plot(inputs[:, 0], inputs[:, 1], targets[:, 0], 'r.', ms=2)
+ax.plot(inputs[:, 0], inputs[:, 1], outputs[:, 0], 'b.', ms=2)
+ax.set_xlabel('Input dim 1')
+ax.set_ylabel('Input dim 2')
+ax.set_zlabel('Output')
+ax.legend(['Targets', 'Predictions'], frameon=False)
+fig.tight_layout()
+--- cell 35 ---
+from ipywidgets import interact
+%matplotlib inline
+
+def setup_figure():
+    # create figure and axes
+    fig = plt.figure(figsize=(12, 6))
+    ax1 = fig.add_axes([0., 0., 0.5, 1.], projection='3d')
+    ax2 = fig.add_axes([0.6, 0.1, 0.4, 0.8])
+    # set axes properties
+    ax2.spines['right'].set_visible(False)
+    ax2.spines['top'].set_visible(False)
+    ax2.yaxis.set_ticks_position('left')
+    ax2.xaxis.set_ticks_position('bottom')
+    ax2.set_yscale('log')
+    ax1.set_xlim((-2, 2))
+    ax1.set_ylim((-2, 2))
+    ax1.set_zlim((-2, 2))
+    #set axes labels and title
+    ax1.set_title('Parameter trajectories over training')
+    ax1.set_xlabel('Weight 1')
+    ax1.set_ylabel('Weight 2')
+    ax1.set_zlabel('Bias')
+    ax2.set_title('Batch errors over training')
+    ax2.set_xlabel('Batch update number')
+    ax2.set_ylabel('Batch error')
+    return fig, ax1, ax2
+
+def visualise_training(n_epochs=1, batch_size=200, log_lr=-1., n_inits=5,
+                       w_scale=1., b_scale=1., elev=30., azim=0.):
+    fig, ax1, ax2 = setup_figure()
+    # create seeded random number generator
+    rng = np.random.RandomState(1234)
+    # create data provider
+    data_provider = CCPPDataProvider(
+        input_dims=[0, 1],
+        batch_size=batch_size, 
+        shuffle_order=False,
+    )
+    learning_rate = 10 ** log_lr
+    n_batches = data_provider.num_batches
+    weights_traj = np.empty((n_inits, n_epochs * n_batches + 1, 1, 2))
+    biases_traj = np.empty((n_inits, n_epochs * n_batches + 1, 1))
+    errors_traj = np.empty((n_inits, n_epochs * n_batches))
+    # randomly initialise parameters
+    weights = rng.uniform(-w_scale, w_scale, (n_inits, 1, 2))
+    biases = rng.uniform(-b_scale, b_scale, (n_inits, 1))
+    # store initial parameters
+    weights_traj[:, 0] = weights
+    biases_traj[:, 0] = biases
+    # iterate across different initialisations
+    for i in range(n_inits):
+        # iterate across epochs
+        for e in range(n_epochs):
+            # iterate across batches
+            for b, (inputs, targets) in enumerate(data_provider):
+                outputs = fprop(inputs, weights[i], biases[i])
+                errors_traj[i, e * n_batches + b] = error(outputs, targets)
+                grad_wrt_outputs = error_grad(outputs, targets)
+                weights_grad, biases_grad = grads_wrt_params(inputs, grad_wrt_outputs)
+                weights[i] -= learning_rate * weights_grad
+                biases[i] -= learning_rate * biases_grad
+                weights_traj[i, e * n_batches + b + 1] = weights[i]
+                biases_traj[i, e * n_batches + b + 1] = biases[i]
+    # choose a different color for each trajectory
+    colors = plt.cm.jet(np.linspace(0, 1, n_inits))
+    # plot all trajectories
+    for i in range(n_inits):
+        lines_1 = ax1.plot(
+            weights_traj[i, :, 0, 0], 
+            weights_traj[i, :, 0, 1], 
+            biases_traj[i, :, 0], 
+            '-', c=colors[i], lw=2)
+        lines_2 = ax2.plot(
+            np.arange(n_batches * n_epochs),
+            errors_traj[i],
+            c=colors[i]
+        )
+    ax1.view_init(elev, azim)
+    plt.show()
+
+w = interact(
+    visualise_training,
+    elev=(-90, 90, 2),
+    azim=(-180, 180, 2), 
+    n_epochs=(1, 5), 
+    batch_size=(100, 1000, 100),
+    log_lr=(-3., 1.),
+    w_scale=(0., 2.),
+    b_scale=(0., 2.),
+    n_inits=(1, 10)
+)
+
+for child in w.widget.children:
+    child.layout.width = '100%'
+============================== notebooks/03_Multiple_layer_models.ipynb
+--- cell 2 ---
+import numpy as np
+import matplotlib.pyplot as plt
+import logging
+from mlp.layers import AffineLayer, SoftmaxLayer, SigmoidLayer
+from mlp.errors import CrossEntropyError, CrossEntropySoftmaxError
+from mlp.models import SingleLayerModel, MultipleLayerModel
+from mlp.initialisers import UniformInit
+from mlp.learning_rules import GradientDescentLearningRule
+from mlp.data_providers import MNISTDataProvider
+from mlp.optimisers import Optimiser
+%matplotlib inline
+plt.style.use('ggplot')
+
+# Seed a random number generator
+seed = 6102016 
+rng = np.random.RandomState(seed)
+
+# Set up a logger object to print info about the training run to stdout
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+logger.handlers = [logging.StreamHandler()]
+
+# Create data provider objects for the MNIST data set
+train_data = MNISTDataProvider('train', rng=rng)
+valid_data = MNISTDataProvider('valid', rng=rng)
+input_dim, output_dim = 784, 10
+--- cell 4 ---
+def train_model_and_plot_stats(
+        model, error, learning_rule, train_data, valid_data, num_epochs, stats_interval):
+
+    # As well as monitoring the error over training also monitor classification
+    # accuracy i.e. proportion of most-probable predicted classes being equal to targets
+    data_monitors={'acc': lambda y, t: (y.argmax(-1) == t.argmax(-1)).mean()}
+
+    # Use the created objects to initialise a new Optimiser instance.
+    optimiser = Optimiser(
+        model, error, learning_rule, train_data, valid_data, data_monitors)
+
+    # Run the optimiser for 5 epochs (full passes through the training set)
+    # printing statistics every epoch.
+    stats, keys, run_time = optimiser.train(num_epochs=num_epochs, stats_interval=stats_interval)
+
+    # Plot the change in the validation and training set error over training.
+    fig_1 = plt.figure(figsize=(8, 4))
+    ax_1 = fig_1.add_subplot(111)
+    for k in ['error(train)', 'error(valid)']:
+        ax_1.plot(np.arange(1, stats.shape[0]) * stats_interval, 
+                  stats[1:, keys[k]], label=k)
+    ax_1.legend(loc=0)
+    ax_1.set_xlabel('Epoch number')
+
+    # Plot the change in the validation and training set accuracy over training.
+    fig_2 = plt.figure(figsize=(8, 4))
+    ax_2 = fig_2.add_subplot(111)
+    for k in ['acc(train)', 'acc(valid)']:
+        ax_2.plot(np.arange(1, stats.shape[0]) * stats_interval, 
+                  stats[1:, keys[k]], label=k)
+    ax_2.legend(loc=0)
+    ax_2.set_xlabel('Epoch number')
+    
+    return stats, keys, run_time, fig_1, ax_1, fig_2, ax_2
+--- cell 8 ---
+# Set training run hyperparameters
+batch_size = 100  # number of data points in a batch
+init_scale = 0.01  # scale for random parameter initialisation
+learning_rate = 0.1  # learning rate for gradient descent
+num_epochs = 100  # number of training epochs to perform
+stats_interval = 5  # epoch interval between recording and printing stats
+
+# Reset random number generator and data provider states on each run
+# to ensure reproducibility of results
+rng.seed(seed)
+train_data.reset()
+valid_data.reset()
+
+# Alter data-provider batch size
+train_data.batch_size = batch_size 
+valid_data.batch_size = batch_size
+
+# Create a parameter initialiser which will sample random uniform values
+# from [-init_scale, init_scale]
+param_init = UniformInit(-init_scale, init_scale, rng=rng)
+
+# Create affine + softmax model
+model = MultipleLayerModel([
+    AffineLayer(input_dim, output_dim, param_init, param_init),
+    SoftmaxLayer()
+])
+
+# Initialise a cross entropy error object
+error = CrossEntropyError()
+
+# Use a basic gradient descent learning rule
+learning_rule = GradientDescentLearningRule(learning_rate=learning_rate)
+
+_ = train_model_and_plot_stats(
+    model, error, learning_rule, train_data, valid_data, num_epochs, stats_interval)
+--- cell 10 ---
+# Set training run hyperparameters
+batch_size = 100  # number of data points in a batch
+init_scale = 0.1  # scale for random parameter initialisation
+learning_rate = 0.1  # learning rate for gradient descent
+num_epochs = 100  # number of training epochs to perform
+stats_interval = 5  # epoch interval between recording and printing stats
+
+# Reset random number generator and data provider states on each run
+# to ensure reproducibility of results
+rng.seed(seed)
+train_data.reset()
+valid_data.reset()
+
+# Alter data-provider batch size
+train_data.batch_size = batch_size 
+valid_data.batch_size = batch_size
+
+# Create a parameter initialiser which will sample random uniform values
+# from [-init_scale, init_scale]
+param_init = UniformInit(-init_scale, init_scale, rng=rng)
+
+# Create affine + softmax model
+model = MultipleLayerModel([
+    AffineLayer(input_dim, output_dim, param_init, param_init),
+    SoftmaxLayer()
+])
+
+# Initialise a cross entropy error object
+error = CrossEntropyError()
+
+# Use a basic gradient descent learning rule
+learning_rule = GradientDescentLearningRule(learning_rate=learning_rate)
+
+_ = train_model_and_plot_stats(
+    model, error, learning_rule, train_data, valid_data, num_epochs, stats_interval)
+--- cell 12 ---
+# Set training run hyperparameters
+batch_size = 100  # number of data points in a batch
+init_scale = 0.5  # scale for random parameter initialisation
+learning_rate = 0.1  # learning rate for gradient descent
+num_epochs = 100  # number of training epochs to perform
+stats_interval = 5  # epoch interval between recording and printing stats
+
+# Reset random number generator and data provider states on each run
+# to ensure reproducibility of results
+rng.seed(seed)
+train_data.reset()
+valid_data.reset()
+
+# Alter data-provider batch size
+train_data.batch_size = batch_size 
+valid_data.batch_size = batch_size
+
+# Create a parameter initialiser which will sample random uniform values
+# from [-init_scale, init_scale]
+param_init = UniformInit(-init_scale, init_scale, rng=rng)
+
+# Create affine + softmax model
+model = MultipleLayerModel([
+    AffineLayer(input_dim, output_dim, param_init, param_init),
+    SoftmaxLayer()
+])
+
+# Initialise a cross entropy error object
+error = CrossEntropyError()
+
+# Use a basic gradient descent learning rule
+learning_rule = GradientDescentLearningRule(learning_rate=learning_rate)
+
+_ = train_model_and_plot_stats(
+    model, error, learning_rule, train_data, valid_data, num_epochs, stats_interval)
+--- cell 16 ---
+# Set training run hyperparameters
+batch_size = 100  # number of data points in a batch
+init_scale = 0.1  # scale for random parameter initialisation
+learning_rate = 0.05  # learning rate for gradient descent
+num_epochs = 100  # number of training epochs to perform
+stats_interval = 5  # epoch interval between recording and printing stats
+
+# Reset random number generator and data provider states on each run
+# to ensure reproducibility of results
+rng.seed(seed)
+train_data.reset()
+valid_data.reset()
+
+# Alter data-provider batch size
+train_data.batch_size = batch_size 
+valid_data.batch_size = batch_size
+
+# Create a parameter initialiser which will sample random uniform values
+# from [-init_scale, init_scale]
+param_init = UniformInit(-init_scale, init_scale, rng=rng)
+
+# Create affine + softmax model
+model = MultipleLayerModel([
+    AffineLayer(input_dim, output_dim, param_init, param_init),
+    SoftmaxLayer()
+])
+
+# Initialise a cross entropy error object
+error = CrossEntropyError()
+
+# Use a basic gradient descent learning rule
+learning_rule = GradientDescentLearningRule(learning_rate=learning_rate)
+
+_ = train_model_and_plot_stats(
+    model, error, learning_rule, train_data, valid_data, num_epochs, stats_interval)
+--- cell 18 ---
+# Set training run hyperparameters
+batch_size = 100  # number of data points in a batch
+init_scale = 0.1  # scale for random parameter initialisation
+learning_rate = 0.1  # learning rate for gradient descent
+num_epochs = 100  # number of training epochs to perform
+stats_interval = 5  # epoch interval between recording and printing stats
+
+# Reset random number generator and data provider states on each run
+# to ensure reproducibility of results
+rng.seed(seed)
+train_data.reset()
+valid_data.reset()
+
+# Alter data-provider batch size
+train_data.batch_size = batch_size 
+valid_data.batch_size = batch_size
+
+# Create a parameter initialiser which will sample random uniform values
+# from [-init_scale, init_scale]
+param_init = UniformInit(-init_scale, init_scale, rng=rng)
+
+# Create affine + softmax model
+model = MultipleLayerModel([
+    AffineLayer(input_dim, output_dim, param_init, param_init),
+    SoftmaxLayer()
+])
+
+# Initialise a cross entropy error object
+error = CrossEntropyError()
+
+# Use a basic gradient descent learning rule
+learning_rule = GradientDescentLearningRule(learning_rate=learning_rate)
+
+_ = train_model_and_plot_stats(
+    model, error, learning_rule, train_data, valid_data, num_epochs, stats_interval)
+--- cell 20 ---
+# Set training run hyperparameters
+batch_size = 100  # number of data points in a batch
+init_scale = 0.1  # scale for random parameter initialisation
+learning_rate = 0.2  # learning rate for gradient descent
+num_epochs = 100  # number of training epochs to perform
+stats_interval = 5  # epoch interval between recording and printing stats
+
+# Reset random number generator and data provider states on each run
+# to ensure reproducibility of results
+rng.seed(seed)
+train_data.reset()
+valid_data.reset()
+
+# Alter data-provider batch size
+train_data.batch_size = batch_size 
+valid_data.batch_size = batch_size
+
+# Create a parameter initialiser which will sample random uniform values
+# from [-init_scale, init_scale]
+param_init = UniformInit(-init_scale, init_scale, rng=rng)
+
+# Create affine + softmax model
+model = MultipleLayerModel([
+    AffineLayer(input_dim, output_dim, param_init, param_init),
+    SoftmaxLayer()
+])
+
+# Initialise a cross entropy error object
+error = CrossEntropyError()
+
+# Use a basic gradient descent learning rule
+learning_rule = GradientDescentLearningRule(learning_rate=learning_rate)
+
+_ = train_model_and_plot_stats(
+    model, error, learning_rule, train_data, valid_data, num_epochs, stats_interval)
+--- cell 22 ---
+# Set training run hyperparameters
+batch_size = 100  # number of data points in a batch
+init_scale = 0.1  # scale for random parameter initialisation
+learning_rate = 0.5  # learning rate for gradient descent
+num_epochs = 100  # number of training epochs to perform
+stats_interval = 5  # epoch interval between recording and printing stats
+
+# Reset random number generator and data provider states on each run
+# to ensure reproducibility of results
+rng.seed(seed)
+train_data.reset()
+valid_data.reset()
+
+# Alter data-provider batch size
+train_data.batch_size = batch_size 
+valid_data.batch_size = batch_size
+
+# Create a parameter initialiser which will sample random uniform values
+# from [-init_scale, init_scale]
+param_init = UniformInit(-init_scale, init_scale, rng=rng)
+
+# Create affine + softmax model
+model = MultipleLayerModel([
+    AffineLayer(input_dim, output_dim, param_init, param_init),
+    SoftmaxLayer()
+])
+
+# Initialise a cross entropy error object
+error = CrossEntropyError()
+
+# Use a basic gradient descent learning rule
+learning_rule = GradientDescentLearningRule(learning_rate=learning_rate)
+
+_ = train_model_and_plot_stats(
+    model, error, learning_rule, train_data, valid_data, num_epochs, stats_interval)
+--- cell 25 ---
+# Set training run hyperparameters
+batch_size = 100  # number of data points in a batch
+init_scale = 0.1  # scale for random parameter initialisation
+learning_rate = 0.1  # learning rate for gradient descent
+num_epochs = 100  # number of training epochs to perform
+stats_interval = 5  # epoch interval between recording and printing stats
+
+# Reset random number generator and data provider states on each run
+# to ensure reproducibility of results
+rng.seed(seed)
+train_data.reset()
+valid_data.reset()
+
+# Alter data-provider batch size
+train_data.batch_size = batch_size 
+valid_data.batch_size = batch_size
+
+# Create a parameter initialiser which will sample random uniform values
+# from [-init_scale, init_scale]
+param_init = UniformInit(-init_scale, init_scale, rng=rng)
+
+# Create affine model (outputs are logs of unnormalised class probabilities)
+model = SingleLayerModel(
+    AffineLayer(input_dim, output_dim, param_init, param_init)
+)
+
+# Initialise the error object
+error = CrossEntropySoftmaxError()
+
+# Use a basic gradient descent learning rule
+learning_rule = GradientDescentLearningRule(learning_rate=learning_rate)
+
+_ = train_model_and_plot_stats(
+    model, error, learning_rule, train_data, valid_data, num_epochs, stats_interval)
+--- cell 28 ---
+# disable logging by setting handler to dummy object
+logger.handlers = [logging.NullHandler()]
+--- cell 30 ---
+# Set training run hyperparameters
+batch_size = 100  # number of data points in a batch
+num_epochs = 10  # number of training epochs to perform
+stats_interval = 5  # epoch interval between recording and printing stats
+learning_rate = 0.2  # learning rate for gradient descent
+
+init_scales = [0.1, 0.2, 0.5, 1.]  # scale for random parameter initialisation
+final_errors_train = []
+final_errors_valid = []
+final_accs_train = []
+final_accs_valid = []
+
+for init_scale in init_scales:
+
+    print('-' * 80)
+    print('learning_rate={0:.2f} init_scale={1:.2f}'
+          .format(learning_rate, init_scale))
+    print('-' * 80)
+    # Reset random number generator and data provider states on each run
+    # to ensure reproducibility of results
+    rng.seed(seed)
+    train_data.reset()
+    valid_data.reset()
+
+    # Alter data-provider batch size
+    train_data.batch_size = batch_size 
+    valid_data.batch_size = batch_size
+
+    # Create a parameter initialiser which will sample random uniform values
+    # from [-init_scale, init_scale]
+    param_init = UniformInit(-init_scale, init_scale, rng=rng)
+
+    # Create a model with two affine layers
+    hidden_dim = 100
+    model = MultipleLayerModel([
+        AffineLayer(input_dim, hidden_dim, param_init, param_init),
+        SigmoidLayer(),
+        AffineLayer(hidden_dim, output_dim, param_init, param_init)
+    ])
+
+    # Initialise a cross entropy error object
+    error = CrossEntropySoftmaxError()
+
+    # Use a basic gradient descent learning rule
+    learning_rule = GradientDescentLearningRule(learning_rate=learning_rate)
+
+    stats, keys, run_time, fig_1, ax_1, fig_2, ax_2 = train_model_and_plot_stats(
+        model, error, learning_rule, train_data, valid_data, num_epochs, stats_interval)
+
+    plt.show()
+
+    print('    final error(train) = {0:.2e}'.format(stats[-1, keys['error(train)']]))
+    print('    final error(valid) = {0:.2e}'.format(stats[-1, keys['error(valid)']]))
+    print('    final acc(train)   = {0:.2e}'.format(stats[-1, keys['acc(train)']]))
+    print('    final acc(valid)   = {0:.2e}'.format(stats[-1, keys['acc(valid)']]))
+    print('    run time per epoch = {0:.2f}'.format(run_time * 1. / num_epochs))
+
+    final_errors_train.append(stats[-1, keys['error(train)']])
+    final_errors_valid.append(stats[-1, keys['error(valid)']])
+    final_accs_train.append(stats[-1, keys['acc(train)']])
+    final_accs_valid.append(stats[-1, keys['acc(valid)']])
+--- cell 31 ---
+j = 0
+print('| init_scale | final error(train) | final error(valid) | final acc(train) | final acc(valid) |')
+print('|------------|--------------------|--------------------|------------------|------------------|')
+for init_scale in init_scales:
+    print('| {0:.1f}        | {1:.2e}           | {2:.2e}           |  {3:.2f}            | {4:.2f}             |'
+          .format(init_scale, 
+                  final_errors_train[j], final_errors_valid[j],
+                  final_accs_train[j], final_accs_valid[j]))
+    j += 1
+--- cell 33 ---
+# Set training run hyperparameters
+batch_size = 100  # number of data points in a batch
+num_epochs = 10  # number of training epochs to perform
+stats_interval = 5  # epoch interval between recording and printing stats
+learning_rate = 0.2  # learning rate for gradient descent
+
+init_scales = [0.1, 0.2, 0.5, 1.]  # scale for random parameter initialisation
+final_errors_train = []
+final_errors_valid = []
+final_accs_train = []
+final_accs_valid = []
+
+for init_scale in init_scales:
+
+    print('-' * 80)
+    print('learning_rate={0:.2f} init_scale={1:.2f}'
+          .format(learning_rate, init_scale))
+    print('-' * 80)
+    # Reset random number generator and data provider states on each run
+    # to ensure reproducibility of results
+    rng.seed(seed)
+    train_data.reset()
+    valid_data.reset()
+
+    # Alter data-provider batch size
+    train_data.batch_size = batch_size 
+    valid_data.batch_size = batch_size
+
+    # Create a parameter initialiser which will sample random uniform values
+    # from [-init_scale, init_scale]
+    param_init = UniformInit(-init_scale, init_scale, rng=rng)
+
+    # Create a model with three affine layers
+    hidden_dim = 100
+    model = MultipleLayerModel([
+        AffineLayer(input_dim, hidden_dim, param_init, param_init),
+        SigmoidLayer(),
+        AffineLayer(hidden_dim, hidden_dim, param_init, param_init),
+        SigmoidLayer(),
+        AffineLayer(hidden_dim, output_dim, param_init, param_init)
+    ])
+
+    # Initialise a cross entropy error object
+    error = CrossEntropySoftmaxError()
+
+    # Use a basic gradient descent learning rule
+    learning_rule = GradientDescentLearningRule(learning_rate=learning_rate)
+
+    stats, keys, run_time, fig_1, ax_1, fig_2, ax_2 = train_model_and_plot_stats(
+        model, error, learning_rule, train_data, valid_data, num_epochs, stats_interval)
+
+    plt.show()
+
+    print('    final error(train) = {0:.2e}'.format(stats[-1, keys['error(train)']]))
+    print('    final error(valid) = {0:.2e}'.format(stats[-1, keys['error(valid)']]))
+    print('    final acc(train)   = {0:.2e}'.format(stats[-1, keys['acc(train)']]))
+    print('    final acc(valid)   = {0:.2e}'.format(stats[-1, keys['acc(valid)']]))
+    print('    run time per epoch = {0:.2f}'.format(run_time * 1. / num_epochs))
+    
+    final_errors_train.append(stats[-1, keys['error(train)']])
+    final_errors_valid.append(stats[-1, keys['error(valid)']])
+    final_accs_train.append(stats[-1, keys['acc(train)']])
+    final_accs_valid.append(stats[-1, keys['acc(valid)']])
+--- cell 34 ---
+j = 0
+print('| init_scale | final error(train) | final error(valid) | final acc(train) | final acc(valid) |')
+print('|------------|--------------------|--------------------|------------------|------------------|')
+for init_scale in init_scales:
+    print('| {0:.1f}        | {1:.2e}           | {2:.2e}           |  {3:.2f}            | {4:.2f}             |'
+          .format(init_scale, 
+                  final_errors_train[j], final_errors_valid[j],
+                  final_accs_train[j], final_accs_valid[j]))
+    j += 1
+--- cell 36 ---
+# Set training run hyperparameters
+batch_size = 100  # number of data points in a batch
+num_epochs = 100  # number of training epochs to perform
+stats_interval = 5  # epoch interval between recording and printing stats
+learning_rate = 0.2  # learning rate for gradient descent
+
+init_scales = [0.1, 0.2, 0.5, 1.]  # scale for random parameter initialisation
+final_errors_train = []
+final_errors_valid = []
+final_accs_train = []
+final_accs_valid = []
+
+for init_scale in init_scales:
+
+    print('-' * 80)
+    print('learning_rate={0:.2f} init_scale={1:.2f}'
+          .format(learning_rate, init_scale))
+    print('-' * 80)
+    # Reset random number generator and data provider states on each run
+    # to ensure reproducibility of results
+    rng.seed(seed)
+    train_data.reset()
+    valid_data.reset()
+
+    # Alter data-provider batch size
+    train_data.batch_size = batch_size 
+    valid_data.batch_size = batch_size
+
+    # Create a parameter initialiser which will sample random uniform values
+    # from [-init_scale, init_scale]
+    param_init = UniformInit(-init_scale, init_scale, rng=rng)
+
+    # Create a model with four affine layers
+    hidden_dim = 100
+    model = MultipleLayerModel([
+        AffineLayer(input_dim, hidden_dim, param_init, param_init),
+        SigmoidLayer(),
+        AffineLayer(hidden_dim, hidden_dim, param_init, param_init),
+        SigmoidLayer(),
+        AffineLayer(hidden_dim, hidden_dim, param_init, param_init),
+        SigmoidLayer(),
+        AffineLayer(hidden_dim, output_dim, param_init, param_init)
+    ])
+
+    # Initialise a cross entropy error object
+    error = CrossEntropySoftmaxError()
+
+    # Use a basic gradient descent learning rule
+    learning_rule = GradientDescentLearningRule(learning_rate=learning_rate)
+
+    stats, keys, run_time, fig_1, ax_1, fig_2, ax_2 = train_model_and_plot_stats(
+        model, error, learning_rule, train_data, valid_data, num_epochs, stats_interval)
+
+    plt.show()
+
+    print('    final error(train) = {0:.2e}'.format(stats[-1, keys['error(train)']]))
+    print('    final error(valid) = {0:.2e}'.format(stats[-1, keys['error(valid)']]))
+    print('    final acc(train)   = {0:.2e}'.format(stats[-1, keys['acc(train)']]))
+    print('    final acc(valid)   = {0:.2e}'.format(stats[-1, keys['acc(valid)']]))
+    print('    run time per epoch = {0:.2f}'.format(run_time * 1. / num_epochs))
+
+    final_errors_train.append(stats[-1, keys['error(train)']])
+    final_errors_valid.append(stats[-1, keys['error(valid)']])
+    final_accs_train.append(stats[-1, keys['acc(train)']])
+    final_accs_valid.append(stats[-1, keys['acc(valid)']])
+--- cell 37 ---
+j = 0
+print('| init_scale | final error(train) | final error(valid) | final acc(train) | final acc(valid) |')
+print('|------------|--------------------|--------------------|------------------|------------------|')
+for init_scale in init_scales:
+    print('| {0:.1f}        | {1:.2e}           | {2:.2e}           |  {3:.2f}            | {4:.2f}             |'
+          .format(init_scale, 
+                  final_errors_train[j], final_errors_valid[j],
+                  final_accs_train[j], final_accs_valid[j]))
+    j += 1
+--- cell 39 ---
+# Set training run hyperparameters
+batch_size = 100  # number of data points in a batch
+num_epochs = 100  # number of training epochs to perform
+stats_interval = 5  # epoch interval between recording and printing stats
+learning_rate = 0.2  # learning rate for gradient descent
+
+init_scales = [0.1, 0.2, 0.5, 1.]  # scale for random parameter initialisation
+final_errors_train = []
+final_errors_valid = []
+final_accs_train = []
+final_accs_valid = []
+
+for init_scale in init_scales:
+
+    print('-' * 80)
+    print('learning_rate={0:.2f} init_scale={1:.2f}'
+          .format(learning_rate, init_scale))
+    print('-' * 80)
+    # Reset random number generator and data provider states on each run
+    # to ensure reproducibility of results
+    rng.seed(seed)
+    train_data.reset()
+    valid_data.reset()
+
+    # Alter data-provider batch size
+    train_data.batch_size = batch_size 
+    valid_data.batch_size = batch_size
+
+    # Create a parameter initialiser which will sample random uniform values
+    # from [-init_scale, init_scale]
+    param_init = UniformInit(-init_scale, init_scale, rng=rng)
+
+    # Create a model with five affine layers
+    hidden_dim = 100
+    model = MultipleLayerModel([
+        AffineLayer(input_dim, hidden_dim, param_init, param_init),
+        SigmoidLayer(),
+        AffineLayer(hidden_dim, hidden_dim, param_init, param_init),
+        SigmoidLayer(),
+        AffineLayer(hidden_dim, hidden_dim, param_init, param_init),
+        SigmoidLayer(),
+        AffineLayer(hidden_dim, hidden_dim, param_init, param_init),
+        SigmoidLayer(),
+        AffineLayer(hidden_dim, output_dim, param_init, param_init)
+    ])
+
+    # Initialise a cross entropy error object
+    error = CrossEntropySoftmaxError()
+
+    # Use a basic gradient descent learning rule
+    learning_rule = GradientDescentLearningRule(learning_rate=learning_rate)
+
+    stats, keys, run_time, fig_1, ax_1, fig_2, ax_2 = train_model_and_plot_stats(
+        model, error, learning_rule, train_data, valid_data, num_epochs, stats_interval)
+
+    plt.show()
+
+    print('    final error(train) = {0:.2e}'.format(stats[-1, keys['error(train)']]))
+    print('    final error(valid) = {0:.2e}'.format(stats[-1, keys['error(valid)']]))
+    print('    final acc(train)   = {0:.2e}'.format(stats[-1, keys['acc(train)']]))
+    print('    final acc(valid)   = {0:.2e}'.format(stats[-1, keys['acc(valid)']]))
+    print('    run time per epoch = {0:.2f}'.format(run_time * 1. / num_epochs))
+
+    final_errors_train.append(stats[-1, keys['error(train)']])
+    final_errors_valid.append(stats[-1, keys['error(valid)']])
+    final_accs_train.append(stats[-1, keys['acc(train)']])
+    final_accs_valid.append(stats[-1, keys['acc(valid)']])
+--- cell 40 ---
+j = 0
+print('| init_scale | final error(train) | final error(valid) | final acc(train) | final acc(valid) |')
+print('|------------|--------------------|--------------------|------------------|------------------|')
+for init_scale in init_scales:
+    print('| {0:.1f}        | {1:.2e}           | {2:.2e}           |  {3:.2f}            | {4:.2f}             |'
+          .format(init_scale, 
+                  final_errors_train[j], final_errors_valid[j],
+                  final_accs_train[j], final_accs_valid[j]))
+    j += 1
+--- cell 43 ---
+import numpy as np
+from mlp.layers import Layer
+
+class TanhLayer(Layer):
+    """Layer implementing an element-wise hyperbolic tangent transformation."""
+
+    def fprop(self, inputs):
+        """Forward propagates activations through the layer transformation.
+
+        For inputs `x` and outputs `y` this corresponds to `y = tanh(x)`.
+        """
+        return np.tanh(inputs)
+
+    def bprop(self, inputs, outputs, grads_wrt_outputs):
+        """Back propagates gradients through a layer.
+
+        Given gradients with respect to the outputs of the layer calculates the
+        gradients with respect to the layer inputs.
+        """
+        return (1. - outputs**2) * grads_wrt_outputs
+
+    def __repr__(self):
+        return 'TanhLayer'
+    
+
+class ReluLayer(Layer):
+    """Layer implementing an element-wise rectified linear transformation."""
+
+    def fprop(self, inputs):
+        """Forward propagates activations through the layer transformation.
+
+        For inputs `x` and outputs `y` this corresponds to `y = max(0, x)`.
+        """
+        return np.maximum(inputs, 0.)
+
+    def bprop(self, inputs, outputs, grads_wrt_outputs):
+        """Back propagates gradients through a layer.
+
+        Given gradients with respect to the outputs of the layer calculates the
+        gradients with respect to the layer inputs.
+        """
+        return (outputs > 0) * grads_wrt_outputs
+
+    def __repr__(self):
+        return 'ReluLayer'
+--- cell 45 ---
+test_inputs = np.array([[0.1, -0.2, 0.3], [-0.4, 0.5, -0.6]])
+test_grads_wrt_outputs = np.array([[5., 10., -10.], [-5., 0., 10.]])
+test_tanh_outputs = np.array(
+    [[ 0.09966799, -0.19737532,  0.29131261],
+     [-0.37994896,  0.46211716, -0.53704957]])
+test_tanh_grads_wrt_inputs = np.array(
+    [[ 4.95033145,  9.61042983, -9.15136962],
+     [-4.27819393,  0.,          7.11577763]])
+tanh_layer = TanhLayer()
+tanh_outputs = tanh_layer.fprop(test_inputs)
+all_correct = True
+if not tanh_outputs.shape == test_tanh_outputs.shape:
+    print('TanhLayer.fprop returned array with wrong shape.')
+    all_correct = False
+elif not np.allclose(test_tanh_outputs, tanh_outputs):
+    print('TanhLayer.fprop calculated incorrect outputs.')
+    all_correct = False
+tanh_grads_wrt_inputs = tanh_layer.bprop(
+    test_inputs, tanh_outputs, test_grads_wrt_outputs)
+if not tanh_grads_wrt_inputs.shape == test_tanh_grads_wrt_inputs.shape:
+    print('TanhLayer.bprop returned array with wrong shape.')
+    all_correct = False
+elif not np.allclose(tanh_grads_wrt_inputs, test_tanh_grads_wrt_inputs):
+    print('TanhLayer.bprop calculated incorrect gradients with respect to inputs.')
+    all_correct = False
+if all_correct:
+    print('Outputs and gradients calculated correctly for TanhLayer.')
+--- cell 46 ---
+test_inputs = np.array([[0.1, -0.2, 0.3], [-0.4, 0.5, -0.6]])
+test_grads_wrt_outputs = np.array([[5., 10., -10.], [-5., 0., 10.]])
+test_relu_outputs = np.array([[0.1, 0., 0.3], [0., 0.5, 0.]])
+test_relu_grads_wrt_inputs = np.array([[5., 0., -10.], [-0., 0., 0.]])
+relu_layer = ReluLayer()
+relu_outputs = relu_layer.fprop(test_inputs)
+all_correct = True
+if not relu_outputs.shape == test_relu_outputs.shape:
+    print('ReluLayer.fprop returned array with wrong shape.')
+    all_correct = False
+elif not np.allclose(test_relu_outputs, relu_outputs):
+    print('ReluLayer.fprop calculated incorrect outputs.')
+    all_correct = False
+relu_grads_wrt_inputs = relu_layer.bprop(
+    test_inputs, relu_outputs, test_grads_wrt_outputs)
+if not relu_grads_wrt_inputs.shape == test_relu_grads_wrt_inputs.shape:
+    print('ReluLayer.bprop returned array with wrong shape.')
+    all_correct = False
+elif not np.allclose(relu_grads_wrt_inputs, test_relu_grads_wrt_inputs):
+    print('ReluLayer.bprop calculated incorrect gradients with respect to inputs.')
+    all_correct = False
+if all_correct:
+    print('Outputs and gradients calculated correctly for ReluLayer.')

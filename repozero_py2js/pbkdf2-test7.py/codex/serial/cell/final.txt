@@ -1,0 +1,296 @@
+Files were written to `/output` and verified against `/workspace/dataset/test7_executable` for the provided samples and multiple CLI edge cases.
+
+[argparse.mjs](/output/lib/cli/argparse.mjs)
+```js
+import { basename } from 'node:path';
+
+const NEGATIVE_NUMBER_PATTERN = /^-\d+$|^-\d*\.\d+$/;
+
+export class HelpRequested extends Error {
+  constructor(programName) {
+    super('help requested');
+    this.name = 'HelpRequested';
+    this.programName = programName;
+  }
+}
+
+export class UsageError extends Error {
+  constructor(programName, detail) {
+    super(detail);
+    this.name = 'UsageError';
+    this.programName = programName;
+    this.detail = detail;
+  }
+}
+
+function isNegativeNumberLike(token) {
+  return NEGATIVE_NUMBER_PATTERN.test(token);
+}
+
+function isOptionLike(token) {
+  return token === '--' || token.startsWith('--') || (token.startsWith('-') && !isNegativeNumberLike(token));
+}
+
+function isShortHelpCluster(token) {
+  return token.length > 2 && token.startsWith('-h') && !token.startsWith('-h=');
+}
+
+function getNextValue(tokens, index, optionName, programName) {
+  const value = tokens[index + 1];
+
+  if (value === undefined || isOptionLike(value)) {
+    throw new UsageError(programName, `argument ${optionName}: expected one argument`);
+  }
+
+  return {
+    nextIndex: index + 1,
+    value,
+  };
+}
+
+export function getProgramName(argv) {
+  return basename(argv[1] ?? 'test7.mjs');
+}
+
+export function formatUsage(programName) {
+  return `usage: ${programName} [-h] --a A --b B --c C`;
+}
+
+export function formatHelp(programName) {
+  return `${formatUsage(programName)}\n\noptions:\n  -h, --help  show this help message and exit\n  --a A\n  --b B\n  --c C\n`;
+}
+
+export function formatUsageError(programName, detail) {
+  return `${formatUsage(programName)}\n${programName}: error: ${detail}\n`;
+}
+
+export function parseArguments(argv) {
+  const programName = getProgramName(argv);
+  const tokens = argv.slice(2);
+  const values = {
+    a: undefined,
+    b: undefined,
+    c: undefined,
+  };
+  const unknown = [];
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+
+    if (token === '--') {
+      unknown.push(...tokens.slice(index));
+      break;
+    }
+
+    if (token.startsWith('--help=')) {
+      throw new UsageError(
+        programName,
+        `argument -h/--help: ignored explicit argument '${token.slice('--help='.length)}'`,
+      );
+    }
+
+    if (token.startsWith('-h=')) {
+      throw new UsageError(
+        programName,
+        `argument -h/--help: ignored explicit argument '${token.slice('-h='.length)}'`,
+      );
+    }
+
+    if (token === '--help' || token === '-h' || isShortHelpCluster(token)) {
+      throw new HelpRequested(programName);
+    }
+
+    if (token.startsWith('--a=')) {
+      values.a = token.slice('--a='.length);
+      continue;
+    }
+
+    if (token === '--a') {
+      const parsed = getNextValue(tokens, index, '--a', programName);
+      values.a = parsed.value;
+      index = parsed.nextIndex;
+      continue;
+    }
+
+    if (token.startsWith('--b=')) {
+      values.b = token.slice('--b='.length);
+      continue;
+    }
+
+    if (token === '--b') {
+      const parsed = getNextValue(tokens, index, '--b', programName);
+      values.b = parsed.value;
+      index = parsed.nextIndex;
+      continue;
+    }
+
+    if (token.startsWith('--c=')) {
+      values.c = token.slice('--c='.length);
+      continue;
+    }
+
+    if (token === '--c') {
+      const parsed = getNextValue(tokens, index, '--c', programName);
+      values.c = parsed.value;
+      index = parsed.nextIndex;
+      continue;
+    }
+
+    unknown.push(token);
+  }
+
+  const missing = [];
+
+  if (values.a === undefined) {
+    missing.push('--a');
+  }
+
+  if (values.b === undefined) {
+    missing.push('--b');
+  }
+
+  if (values.c === undefined) {
+    missing.push('--c');
+  }
+
+  if (missing.length > 0) {
+    throw new UsageError(programName, `the following arguments are required: ${missing.join(', ')}`);
+  }
+
+  if (unknown.length > 0) {
+    throw new UsageError(programName, `unrecognized arguments: ${unknown.join(' ')}`);
+  }
+
+  return values;
+}
+```
+
+[encoding.mjs](/output/lib/crypto/encoding.mjs)
+```js
+export function toUtf8Buffer(value) {
+  if (Buffer.isBuffer(value)) {
+    return Buffer.from(value);
+  }
+
+  return Buffer.from(String(value), 'utf8');
+}
+```
+
+[hmac.mjs](/output/lib/crypto/hmac.mjs)
+```js
+import { createHmac } from 'node:crypto';
+
+export const SHA1_DIGEST = 'sha1';
+export const SHA1_DIGEST_SIZE = 20;
+
+export function hmacSha1(key, data) {
+  return createHmac(SHA1_DIGEST, key).update(data).digest();
+}
+
+export function xorInto(target, source) {
+  for (let index = 0; index < target.length; index += 1) {
+    target[index] ^= source[index];
+  }
+
+  return target;
+}
+```
+
+[pbkdf2.mjs](/output/lib/crypto/pbkdf2.mjs)
+```js
+import { toUtf8Buffer } from './encoding.mjs';
+import { hmacSha1, xorInto, SHA1_DIGEST_SIZE } from './hmac.mjs';
+
+export const DEFAULT_ITERATIONS = 1000;
+
+function encodeBlockIndex(blockIndex) {
+  const blockBuffer = Buffer.allocUnsafe(4);
+  blockBuffer.writeUInt32BE(blockIndex, 0);
+  return blockBuffer;
+}
+
+function deriveBlock(passphrase, salt, iterations, blockIndex) {
+  let block = hmacSha1(passphrase, Buffer.concat([salt, encodeBlockIndex(blockIndex)]));
+  const result = Buffer.from(block);
+
+  for (let round = 1; round < iterations; round += 1) {
+    block = hmacSha1(passphrase, block);
+    xorInto(result, block);
+  }
+
+  return result;
+}
+
+export class PBKDF2 {
+  constructor(passphrase, salt, iterations = DEFAULT_ITERATIONS) {
+    this.passphrase = toUtf8Buffer(passphrase);
+    this.salt = toUtf8Buffer(salt);
+    this.iterations = iterations;
+    this.blockIndex = 1;
+    this.pending = Buffer.alloc(0);
+  }
+
+  read(size) {
+    if (!Number.isInteger(size) || size < 0) {
+      throw new RangeError('size must be a non-negative integer');
+    }
+
+    const output = Buffer.alloc(size);
+    let written = 0;
+
+    while (written < size) {
+      if (this.pending.length === 0) {
+        this.pending = deriveBlock(this.passphrase, this.salt, this.iterations, this.blockIndex);
+        this.blockIndex += 1;
+      }
+
+      const chunkSize = Math.min(size - written, this.pending.length);
+      this.pending.copy(output, written, 0, chunkSize);
+      this.pending = this.pending.subarray(chunkSize);
+      written += chunkSize;
+    }
+
+    return output;
+  }
+}
+
+export function deriveKey(passphrase, salt, size, iterations = DEFAULT_ITERATIONS) {
+  return new PBKDF2(passphrase, salt, iterations).read(size);
+}
+
+export { SHA1_DIGEST_SIZE };
+```
+
+[test7.mjs](/output/test7.mjs)
+```js
+#!/usr/bin/env node
+
+import { formatHelp, formatUsageError, HelpRequested, parseArguments, UsageError } from './lib/cli/argparse.mjs';
+import { PBKDF2 } from './lib/crypto/pbkdf2.mjs';
+
+function main(argv) {
+  const args = parseArguments(argv);
+
+  const key1 = new PBKDF2(args.a, args.b).read(24);
+  process.stdout.write(`${key1.toString('hex')}\n`);
+
+  const key2 = new PBKDF2(args.a, args.c).read(24);
+  process.stdout.write(`${key2.toString('hex')}\n`);
+}
+
+try {
+  main(process.argv);
+} catch (error) {
+  if (error instanceof HelpRequested) {
+    process.stdout.write(formatHelp(error.programName));
+    process.exit(0);
+  }
+
+  if (error instanceof UsageError) {
+    process.stderr.write(formatUsageError(error.programName, error.detail));
+    process.exit(2);
+  }
+
+  throw error;
+}
+```

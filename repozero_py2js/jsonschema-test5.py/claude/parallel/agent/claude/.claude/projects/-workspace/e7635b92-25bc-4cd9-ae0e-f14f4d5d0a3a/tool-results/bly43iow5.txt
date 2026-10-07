@@ -1,0 +1,204 @@
+true                                                                           | 1                          => out="0\n"   # A1 baseline: schema true => 0
+false                                                                          | 1                          => out="1\n"   # A2 baseline: schema false => exactly 1
+{}                                                                             | 1                          => out="0\n"   # A3 baseline: {} => 0
+{"required":["x","y","z"],"minProperties":5,"maxProperties":1,"type":"string"} | {"a":1,"b":2}              => out="6\n"   # A4 BASELINE 6-error schema (required x3 + minProperties + maxProperties + type) used as combinator branch payload
+{"anyOf":[{"type":"string"},{"type":"integer"}]}                               | 1                          => out="0\n"   # B1 anyOf 1 of 2 matches => 0
+{"anyOf":[{"type":"string"},{"type":"boolean"}]}                               | 1                          => out="1\n"   # B2 anyOf none matches => 1
+{"anyOf":[{"type":"string"},{"type":"boolean"},{"type":"array"}]}              | 1                          => out="1\n"   # B3 anyOf none matches, 3 branches => still 1
+{"anyOf":[{"type":"integer"},{"type":"number"},{"minimum":0}]}                 | 1                          => out="0\n"   # B4 anyOf 3 matching => 0
+{"anyOf":[{"required":["x","y","z"],"minProperties":5,"maxProperties":1,"type" | {"a":1,"b":2}              => out="1\n"   # B5 branch worth 6 errors + branch worth 1 => 1 (context NOT counted)
+{"anyOf":[{"required":["x","y","z"],"minProperties":5,"maxProperties":1,"type" | {"a":1,"b":2}              => out="1\n"   # B6 12 sub-errors => 1
+{"anyOf":[{"properties":{"a":{"type":"string"},"b":{"type":"integer"}}},{"prop | {"a":1,"b":"x"}            => out="1\n"   # B7 2 branches x 2 nested property errors => 1
+{"anyOf":[]}                                                                   | 1                          => out="1\n"   # B8 anyOf:[] => 1
+{"anyOf":{}}                                                                   | 1                          => out="1\n"   # B9 anyOf:{} (empty iterable) => 1
+{"anyOf":[{}]}                                                                 | 1                          => out="0\n"   # B10 anyOf:[{}] => 0
+{"anyOf":[false]}                                                              | 1                          => out="1\n"   # B11 anyOf:[false] => 1
+{"anyOf":[false,false]}                                                        | 1                          => out="1\n"   # B12 anyOf:[false,false] => 1
+{"anyOf":[true,false]}                                                         | 1                          => out="0\n"   # B13 anyOf:[true,false] => 0
+{"anyOf":[false,true]}                                                         | 1                          => out="0\n"   # B14 anyOf:[false,true] => 0 (later match still counts)
+{"anyOf":[{"type":"string"},{"type":"boolean"}],"type":"string"}               | 1                          => out="2\n"   # B15 failing anyOf + failing sibling type => 2
+{"anyOf":[{"type":"integer"}],"type":"string"}                                 | 1                          => out="1\n"   # B16 passing anyOf + failing sibling => 1
+{"anyOf":[true,5]}                                                             | 1                          => out="0\n"   # B17 anyOf SHORT-CIRCUITS on first valid: malformed later branch never touched => 0
+{"anyOf":[5,true]}                                                             | 1                          => EXIT 1   # B18 malformed FIRST branch -> EXIT 1
+{"anyOf":[false,5]}                                                            | 1                          => EXIT 1   # B19 branch0 fails then malformed branch1 -> EXIT 1
+{"anyOf":[true,{"properties":{"a":5}}]}                                        | 1                          => out="0\n"   # B20 short-circuit skips malformed nested subschema => 0
+{"anyOf":[true,{"$ref":"#"}]}                                                  | 1                          => out="0\n"   # B21 short-circuit skips self-recursive $ref => 0
+{"anyOf":[{"$ref":"#"}]}                                                       | 1                          => EXIT 1   # B22 self-recursive $ref evaluated -> RecursionError EXIT 1
+{"anyOf":[{"$ref":"#/definitions/nope"}]}                                      | 1                          => EXIT 1   # B23 unresolvable $ref inside anyOf -> EXIT 1
+{"anyOf":[{"const":2,"type":"nope"}]}                                          | 1                          => EXIT 1   # B24 anyOf fully materializes each branch: unknown type reached -> EXIT 1
+{"anyOf":[{"anyOf":[{"type":"string"},{"type":"boolean"}]},{"type":"array"}]}  | 1                          => out="1\n"   # B25 nested anyOf all failing => 1
+{"anyOf":[{"anyOf":[]}]}                                                       | 1                          => out="1\n"   # B26 inner anyOf:[] always errors => 1
+{"anyOf":[{"allOf":[false,false,false]}]}                                      | 1                          => out="1\n"   # B27 single branch worth 3 errors => 1
+{"anyOf":[{"not":{}},{"not":{}}]}                                              | 1                          => out="1\n"   # B28 anyOf of two always-failing not => 1
+{"anyOf":[{"oneOf":[true,true]},{"oneOf":[]}]}                                 | 1                          => out="1\n"   # B29 anyOf of two always-failing oneOf => 1
+{"anyOf":null}                                                                 | 1                          => EXIT 1   # B30 anyOf:null -> TypeError EXIT 1
+{"items":{"anyOf":[false,false]}}                                              | [1,2,3]                    => out="3\n"   # B31 3 items x collapsed anyOf => 3
+{"oneOf":[{"type":"string"},{"type":"boolean"}]}                               | 1                          => out="1\n"   # C1 oneOf none valid => 1
+{"oneOf":[{"type":"string"},{"type":"integer"}]}                               | 1                          => out="0\n"   # C2 oneOf exactly one valid => 0
+{"oneOf":[{"type":"integer"},{"type":"number"}]}                               | 1                          => out="1\n"   # C3 oneOf TWO valid => 1 ('is valid under each of')
+{"oneOf":[{"type":"integer"},{"type":"number"},{"minimum":0}]}                 | 1                          => out="1\n"   # C4 oneOf THREE valid => still 1 (never 2)
+{"oneOf":[{"type":"integer"},{"type":"integer"}]}                              | 1                          => out="1\n"   # C5 duplicate identical VALID branches => 1
+{"oneOf":[{"type":"string"},{"type":"string"}]}                                | 1                          => out="1\n"   # C6 duplicate identical FAILING branches => 1
+{"oneOf":[{"type":"integer"},{"type":"string"},{"minimum":0}]}                 | 1                          => out="1\n"   # C7 valid at idx0 and idx2, invalid idx1 => 1
+{"oneOf":[{"type":"string"},{"type":"boolean"},{"type":"integer"}]}            | 1                          => out="0\n"   # C8 valid only at last index => 0
+{"oneOf":[{"type":"string"},{"type":"integer"},{"type":"number"},{"minimum":0} | 1                          => out="1\n"   # C9 1 invalid then 3 valid => 1
+{"oneOf":[{"type":"string"},{"required":["x","y","z"],"minProperties":5,"maxPr | 1                          => out="0\n"   # C10 heavy failing branches then exactly one valid => 0
+{"oneOf":[]}                                                                   | 1                          => out="1\n"   # C11 oneOf:[] => 1 (unlike allOf:[])
+{"oneOf":{}}                                                                   | 1                          => out="1\n"   # C12 oneOf:{} => 1
+{"oneOf":[{},{}]}                                                              | 1                          => out="1\n"   # C13 oneOf:[{},{}] both valid => 1
+{"oneOf":[true,true]}                                                          | 1                          => out="1\n"   # C14 => 1
+{"oneOf":[true,false]}                                                         | 1                          => out="0\n"   # C15 => 0
+{"oneOf":[false,true]}                                                         | 1                          => out="0\n"   # C16 => 0
+{"oneOf":[false,false]}                                                        | 1                          => out="1\n"   # C17 => 1
+{"oneOf":[true,true,true]}                                                     | 1                          => out="1\n"   # C18 3 valid => 1
+{"oneOf":[{"required":["x","y","z"],"minProperties":5,"maxProperties":1,"type" | {"a":1,"b":2}              => out="1\n"   # C19 12 sub-errors, none valid => 1
+{"oneOf":[{"required":["x"],"type":"array"},{"required":["y","z"],"type":"numb | {"a":1,"b":2}              => out="1\n"   # C20 branches with required+type failures (2 and 3 errors) => 1
+{"oneOf":[{"anyOf":[false]},{"allOf":[false,false]}]}                          | 1                          => out="1\n"   # C21 branches worth 1 and 2 => 1
+{"oneOf":[{"not":{}},{"not":{}}]}                                              | 1                          => out="1\n"   # C22 both branches always fail => 1
+{"oneOf":[{"type":"string"},{"type":"boolean"}],"type":"string"}               | 1                          => out="2\n"   # C23 oneOf none valid + failing sibling => 2
+{"oneOf":[{"type":"integer"},{"type":"number"}],"type":"string"}               | 1                          => out="2\n"   # C24 oneOf 2-valid + failing sibling => 2
+{"properties":{"a":{"oneOf":[{"type":"integer"},{"type":"number"}]}}}          | {"a":1}                    => out="1\n"   # C25 oneOf 2-valid nested under properties => 1
+{"oneOf":[{"type":"integer"},{"type":"number"}]}                               | 1.0                        => out="1\n"   # C26 draft7: 1.0 is BOTH integer and number => 2 valid => 1
+{"oneOf":[{"type":"integer"},{"type":"number"}]}                               | 1.5                        => out="0\n"   # C27 1.5 only number => 0
+{"oneOf":[{"const":1},{"const":true}]}                                         | true                       => out="0\n"   # C28 True does NOT equal 1 in jsonschema => exactly one valid => 0
+{"oneOf":[{"const":1},{"const":true}]}                                         | 1                          => out="0\n"   # C29 1 does NOT equal True => exactly one valid => 0
+{"oneOf":[5,true]}                                                             | 1                          => EXIT 1   # C30 malformed first branch -> EXIT 1
+{"oneOf":[true,5]}                                                             | 1                          => EXIT 1   # C31 oneOf does NOT short-circuit: post-match is_valid pass touches malformed branch -> EXIT 1
+{"oneOf":[true,{"$ref":"#"}]}                                                  | 1                          => EXIT 1   # C32 post-match pass hits self-ref -> EXIT 1 (contrast B21)
+{"oneOf":[true,{"allOf":[false,5]}]}                                           | 1                          => out="0\n"   # C33 post-match pass is LAZY (is_valid stops at first error) => 0, no EXIT
+{"oneOf":[{"allOf":[false,5]},true]}                                           | 1                          => EXIT 1   # C34 pre-match branch fully materialized -> EXIT 1 (contrast C33)
+{"oneOf":[false,{"allOf":[false,5]}]}                                          | 1                          => EXIT 1   # C35 no early match: every branch materialized -> EXIT 1
+{"oneOf":null}                                                                 | 1                          => EXIT 1   # C36 oneOf:null -> EXIT 1
+{"allOf":[{"type":"string"},{"type":"boolean"}]}                               | 1                          => out="2\n"   # D1 allOf 2 failing branches x 1 error => 2
+{"allOf":[{"required":["x","y","z"],"minProperties":5,"maxProperties":1,"type" | {"a":1,"b":2}              => out="12\n"   # D2 allOf N*M: 2 branches x 6 errors => 12
+{"allOf":[{"type":"integer"},{"type":"string"}]}                               | 1                          => out="1\n"   # D3 1 valid 1 failing => 1
+{"allOf":[{"type":"string"},{"type":"string"}]}                                | 1                          => out="2\n"   # D4 duplicate identical failing branches counted twice => 2
+{"allOf":[]}                                                                   | 1                          => out="0\n"   # D5 allOf:[] => 0
+{"allOf":{}}                                                                   | 1                          => out="0\n"   # D6 allOf:{} => 0
+{"allOf":[true,true]}                                                          | 1                          => out="0\n"   # D7 => 0
+{"allOf":[false]}                                                              | 1                          => out="1\n"   # D8 allOf with false schema => 1
+{"allOf":[false,false,false]}                                                  | 1                          => out="3\n"   # D9 3x false => 3
+{"allOf":[{"allOf":[{"type":"string"},{"minimum":5}]},{"type":"boolean"}]}     | 1                          => out="3\n"   # D10 nested allOf: 2 inner + 1 outer => 3
+{"allOf":[{"allOf":[false,false]},{"allOf":[false,false]}]}                    | 1                          => out="4\n"   # D11 allOf multiplies: 2x2 => 4
+{"allOf":[{"anyOf":[{"type":"string"},{"type":"boolean"}]},{"type":"string"}]} | 1                          => out="2\n"   # D12 anyOf inside allOf collapses to 1, + 1 => 2
+{"allOf":[{"anyOf":[]},{"anyOf":[]}]}                                          | 1                          => out="2\n"   # D13 two empty anyOf inside allOf => 2
+{"allOf":[{"oneOf":[true,true]},{"oneOf":[]},{"anyOf":[]}]}                    | 1                          => out="3\n"   # D14 three collapsing failures => 3
+{"allOf":[{"not":{}},{"not":{}}]}                                              | 1                          => out="2\n"   # D15 allOf of two not => 2
+{"allOf":[{"properties":{"a":{"type":"string"},"b":{"type":"integer"}}},{"prop | {"a":1,"b":"x"}            => out="4\n"   # D16 allOf x properties: 2 branches x 2 props => 4 (contrast B7 => 1)
+{"allOf":[{"type":"string"}],"type":"boolean"}                                 | 1                          => out="2\n"   # D17 allOf + failing sibling => 2
+{"allOf":[{"allOf":[{"allOf":[{"allOf":[{"allOf":[{"allOf":[false]}]}]}]}]}]}  | 1                          => out="1\n"   # D18 6-deep nested allOf around false => 1
+{"allOf":[false,5]}                                                            | 1                          => EXIT 1   # D19 allOf never short-circuits: later malformed branch evaluated -> EXIT 1
+{"allOf":[null]}                                                               | 1                          => EXIT 1   # D20 allOf:[null] -> EXIT 1
+{"allOf":"ab"}                                                                 | 1                          => EXIT 1   # D21 allOf:'ab' iterates characters -> EXIT 1
+{"allOf":{"a":true}}                                                           | 1                          => EXIT 1   # D22 allOf:{...} iterates KEYS (string 'a' as subschema) -> EXIT 1
+{"allOf":null}                                                                 | 1                          => EXIT 1   # D23 allOf:null -> EXIT 1
+{"properties":{"a":{"allOf":[{"type":"string"},{"minimum":5}]}}}               | {"a":1}                    => out="2\n"   # D24 nested allOf errors propagate individually => 2
+{"items":{"allOf":[false,false]}}                                              | [1,2,3]                    => out="6\n"   # D25 3 items x 2 => 6
+{"additionalProperties":{"allOf":[false,false]}}                               | {"a":1,"b":2,"c":3}        => out="6\n"   # D26 3 additional props x 2 => 6
+{"not":{"type":"string"}}                                                      | "a"                        => out="1\n"   # E1 not: instance valid under subschema => exactly 1
+{"not":{"type":"string"}}                                                      | 1                          => out="0\n"   # E2 not: instance invalid under subschema => 0
+{"not":{}}                                                                     | 1                          => out="1\n"   # E3 not:{} => 1
+{"not":true}                                                                   | 1                          => out="1\n"   # E4 not:true => 1
+{"not":false}                                                                  | 1                          => out="0\n"   # E5 not:false => 0
+{"not":{"required":["x","y","z"],"minProperties":5,"maxProperties":1,"type":"s | {"a":1,"b":2}              => out="0\n"   # E6 not over 6-error subschema => 0
+{"not":{"type":"object"}}                                                      | {"a":1,"b":2}              => out="1\n"   # E7 not over passing subschema => 1 (never more)
+{"not":{"not":{}}}                                                             | 1                          => out="0\n"   # E8 not depth2 => 0
+{"not":{"not":{"not":{}}}}                                                     | 1                          => out="1\n"   # E9 not depth3 => 1
+{"not":{"not":{"not":{"not":{}}}}}                                             | 1                          => out="0\n"   # E10 not depth4 => 0 (parity)
+{"not":{"not":{"type":"string"}}}                                              | "a"                        => out="0\n"   # E11 double not, inner matches => 0
+{"not":{"not":{"type":"string"}}}                                              | 1                          => out="1\n"   # E12 double not, inner fails => 1
+{"not":{"anyOf":[]}}                                                           | 1                          => out="0\n"   # E13 not over always-erroring anyOf:[] => 0
+{"not":{"allOf":[]}}                                                           | 1                          => out="1\n"   # E14 not over always-valid allOf:[] => 1
+{"not":{"oneOf":[true,true]}}                                                  | 1                          => out="0\n"   # E15 not over oneOf with 2 valid (always errors) => 0
+{"not":{"oneOf":[true,false]}}                                                 | 1                          => out="1\n"   # E16 not over valid oneOf => 1
+{"not":{"if":true,"then":false}}                                               | 1                          => out="0\n"   # E17 not over always-failing if/then => 0
+{"not":{"if":false,"then":false}}                                              | 1                          => out="1\n"   # E18 not over if-fails-no-else (always valid) => 1
+{"not":{"if":true}}                                                            | 1                          => out="1\n"   # E19 not over if-without-then => 1
+{"not":{"unknownKeyword":123}}                                                 | 1                          => out="1\n"   # E20 not over schema of only unknown keywords => 1
+{"not":{"enum":[1]}}                                                           | true                       => out="0\n"   # E21 True not equal 1 => enum fails => not passes => 0
+{"not":{"enum":[true]}}                                                        | true                       => out="1\n"   # E22 enum matches => 1
+{"not":{},"type":"string"}                                                     | 1                          => out="2\n"   # E23 not + failing sibling => 2
+{"not":5}                                                                      | 1                          => EXIT 1   # E24 not:5 -> EXIT 1
+{"not":[]}                                                                     | 1                          => EXIT 1   # E25 not:[] -> EXIT 1
+{"not":{"allOf":[false,5]}}                                                    | 1                          => out="0\n"   # E26 not is LAZY (is_valid = first error only): malformed branch1 never reached => 0
+{"not":{"allOf":[5,false]}}                                                    | 1                          => EXIT 1   # E27 malformed branch first -> EXIT 1
+{"not":{"allOf":[{"const":2},5]}}                                              | 1                          => out="0\n"   # E28 lazy across allOf branches => 0
+{"not":{"anyOf":[{"allOf":[false,5]}]}}                                        | 1                          => EXIT 1   # E29 anyOf inside not still materializes its branches -> EXIT 1
+{"not":{"anyOf":[{"const":2}],"type":"nope"}}                                  | 1                          => out="0\n"   # E30 first keyword errors => later bad 'type' never evaluated => 0
+{"not":{"anyOf":[{"const":1}],"type":"nope"}}                                  | 1                          => EXIT 1   # E31 first keyword passes => bad 'type' reached -> EXIT 1
+{"not":{"const":2,"type":"nope"}}                                              | 1                          => out="0\n"   # E32 keyword eval order = schema key order: const first => 0
+{"not":{"type":"nope","const":2}}                                              | 1                          => EXIT 1   # E33 same keywords reordered -> EXIT 1
+{"not":{"minimum":0,"type":"nope"}}                                            | 1                          => EXIT 1   # E34 minimum passes on 1 => bad type reached -> EXIT 1
+{"not":{"minimum":0,"type":"nope"}}                                            | -1                         => out="0\n"   # E35 same schema, minimum fails on -1 => 0 (exception is DATA dependent)
+{"not":{"properties":{"2":5,"1":false}}}                                       | {"1":1,"2":2}              => EXIT 1   # E36 properties visited in INSERTION order '2','1' -> malformed hit -> EXIT 1
+{"not":{"properties":{"1":false,"2":5}}}                                       | {"1":1,"2":2}              => out="0\n"   # E37 reordered: '1' errors first => 0
+{"not":{"type":"nope"}}                                                        | 1                          => EXIT 1   # E38 unknown type inside not -> EXIT 1
+{"if":{"type":"object"},"then":{"required":["x","y","z"]}}                     | {"a":1,"b":2}              => out="3\n"   # F1 if passes, then yields 3 => 3 (then errors are top-level, not collapsed)
+{"if":{"type":"object"},"then":{"required":["x","y","z"],"minProperties":5,"ma | {"a":1,"b":2}              => out="6\n"   # F2 then worth 6 => 6
+{"if":{"type":"string"},"else":{"type":"array","minProperties":5}}             | {"a":1,"b":2}              => out="2\n"   # F3 if fails, else yields 2 => 2
+{"if":{"type":"object"},"else":false}                                          | {"a":1,"b":2}              => out="0\n"   # F4 if passes, no then, else ignored => 0
+{"if":{"type":"string"},"then":false}                                          | {"a":1,"b":2}              => out="0\n"   # F5 if fails, no else, then ignored => 0
+{"if":{"type":"object"},"then":{"type":"object"}}                              | {"a":1,"b":2}              => out="0\n"   # F6 if passes, then passes => 0
+{"if":true,"then":false}                                                       | 1                          => out="1\n"   # F7 if:true => then applies => 1
+{"if":false,"else":false}                                                      | 1                          => out="1\n"   # F8 if:false => else applies => 1
+{"if":false,"then":false}                                                      | 1                          => out="0\n"   # F9 if:false, only then present => 0
+{"if":true,"else":false}                                                       | 1                          => out="0\n"   # F10 if:true, only else present => 0
+{"if":true,"then":false,"else":false}                                          | 1                          => out="1\n"   # F11 both present, only then applies => 1
+{"if":false,"then":false,"else":false}                                         | 1                          => out="1\n"   # F12 both present, only else applies => 1
+{"if":{},"then":false}                                                         | 1                          => out="1\n"   # F13 if:{} always passes => 1
+{"if":true,"then":true}                                                        | 1                          => out="0\n"   # F14 then:true => 0
+{"if":true}                                                                    | 1                          => out="0\n"   # F15 if alone (passing) => 0
+{"if":false}                                                                   | 1                          => out="0\n"   # F16 if alone (failing) => 0
+{"then":{"type":"string"},"else":{"type":"string"}}                            | 1                          => out="0\n"   # F17 then+else WITHOUT if => 0 (both ignored)
+{"then":false}                                                                 | 1                          => out="0\n"   # F18 then:false alone => 0
+{"else":false}                                                                 | 1                          => out="0\n"   # F19 else:false alone => 0
+{"allOf":[{"if":true,"then":false}],"else":false}                              | 1                          => out="1\n"   # F20 orphan else at outer level ignored => 1
+{"if":{"required":["x","y","z"],"minProperties":5,"maxProperties":1,"type":"st | {"a":1,"b":2}              => out="0\n"   # F21 if-schema worth 6 errors: none surface, no else => 0
+{"if":{"required":["x","y","z"],"minProperties":5,"maxProperties":1,"type":"st | {"a":1,"b":2}              => out="1\n"   # F22 same if, else:false => 1 (if's own errors stay hidden)
+{"if":{"anyOf":[]},"then":false,"else":false}                                  | 1                          => out="1\n"   # F23 if-subschema always errors => else => 1
+{"if":{"not":{}},"then":false,"else":{"allOf":[false,false,false]}}            | 1                          => out="3\n"   # F24 if always fails => else worth 3 => 3
+{"if":{"allOf":[]},"then":{"allOf":[false,false,false]},"else":false}          | 1                          => out="3\n"   # F25 if always passes => then worth 3 => 3
+{"if":{"if":true,"then":false},"then":false,"else":false}                      | 1                          => out="1\n"   # F26 if whose own if/then fails => else => 1
+{"if":true,"then":{"if":true,"then":false}}                                    | 1                          => out="1\n"   # F27 nested if inside then => 1
+{"if":true,"then":{"properties":{"a":{"allOf":[false,false]}}}}                | {"a":1}                    => out="2\n"   # F28 then with nested 2 errors => 2
+{"if":true,"then":{"type":"string"},"properties":{"a":false}}                  | {"a":1}                    => out="2\n"   # F29 then error + sibling properties error => 2
+{"if":{"type":"object"},"then":false,"type":"string"}                          | {"a":1,"b":2}              => out="2\n"   # F30 if/then + failing sibling type => 2
+{"if":5,"then":false}                                                          | 1                          => EXIT 1   # F31 if:5 -> EXIT 1
+{"if":null,"then":false}                                                       | 1                          => EXIT 1   # F32 if:null -> EXIT 1
+{"if":{"type":"nope"},"then":true}                                             | 1                          => EXIT 1   # F33 unknown type in if -> EXIT 1
+{"if":true,"then":[]}                                                          | 1                          => EXIT 1   # F34 then:[] with passing if -> EXIT 1
+{"if":false,"then":[]}                                                         | 1                          => out="0\n"   # F35 then:[] never descended when if fails => 0
+{"if":true,"then":null}                                                        | 1                          => EXIT 1   # F36 then:null with passing if -> EXIT 1
+{"if":true,"else":null}                                                        | 1                          => out="0\n"   # F37 else:null never descended => 0
+{"if":{"allOf":[false,5]},"then":true}                                         | 1                          => out="0\n"   # F38 if is LAZY: malformed branch1 never reached => 0
+{"if":{"allOf":[false,5]},"else":false}                                        | 1                          => out="1\n"   # F39 same lazy if, else applies => 1
+{"if":{"const":1,"type":"nope"},"then":true}                                   | 1                          => EXIT 1   # F40 if: const passes so bad type reached -> EXIT 1
+{"if":{"const":1,"type":"nope"},"then":true}                                   | 2                          => out="0\n"   # F41 same schema, const fails first => 0
+{"allOf":[false],"anyOf":[false],"oneOf":[false,false],"not":{},"if":true,"the | 1                          => out="5\n"   # G1 five combinators at one level => 5
+{"anyOf":[false],"not":{},"if":true,"then":false,"allOf":[false,false],"oneOf" | 1                          => out="6\n"   # G2 anyOf1 + not1 + then1 + allOf2 + oneOf1 => 6
+{"required":["x"],"anyOf":[false]}                                             | {"a":1,"b":2}              => out="2\n"   # G3 combinator + required sibling => 2
+{"properties":{"a":{"allOf":[{"anyOf":[{"type":"string"},{"type":"boolean"}]}, | {"a":1}                    => out="2\n"   # G4 anyOf in allOf in properties => 2
+{"properties":{"a":{"oneOf":[{"type":"string"},{"type":"boolean"}]},"b":{"oneO | {"a":1,"b":2}              => out="2\n"   # G5 oneOf-none-valid + oneOf-two-valid under two props => 2
+{"properties":{"a":{"properties":{"b":{"anyOf":[false,false,false]}},"required | {"a":{"b":1}}              => out="3\n"   # G6 deep: collapsed anyOf 1 + 2 required => 3
+{"items":[{"anyOf":[false]},{"allOf":[false,false]}]}                          | [1,2]                      => out="3\n"   # G7 items array-form: 1 + 2 => 3
+{"$ref":"#/definitions/x","anyOf":[false],"definitions":{"x":{"type":"integer" | 1                          => out="0\n"   # G8 draft7 $ref suppresses sibling anyOf => 0
+{"$ref":"#/definitions/t","if":true,"then":false,"not":{},"definitions":{"t":t | 1                          => out="0\n"   # G9 $ref suppresses sibling if/then and not => 0
+{"allOf":[{"$ref":"#/definitions/f"}],"definitions":{"f":false}}               | 1                          => out="1\n"   # G10 $ref to false schema inside allOf => 1
+{"allOf":[{"$ref":"#/definitions/x","type":"string"}],"definitions":{"x":{"typ | 1                          => out="0\n"   # G11 $ref sibling type ignored inside allOf branch => 0
+{"definitions":{"x":false}}                                                    | 1                          => out="0\n"   # G12 definitions alone never validates => 0
+{"definitions":{"x":{"anyOf":[{"$ref":"#/definitions/x"}]}},"$ref":"#/definiti | 1                          => EXIT 1   # G13 infinite recursive ref -> EXIT 1
+{"allof":[false],"anyof":[false],"NOT":{}}                                     | 1                          => out="0\n"   # G14 keywords case-sensitive; unknown ignored => 0
+{"anyOf":[false],"anyOf":[true]}                                               | 1                          => out="0\n"   # G15 duplicate JSON key: LAST wins => 0
+{"const":2,"type":"nope"}                                                      | 1                          => EXIT 1   # G16 top level always materializes every keyword -> EXIT 1 (contrast E32)
+{"type":"nope"}                                                                | 1                          => EXIT 1   # G17 unknown type name -> EXIT 1
+{"anyOf":[true,{"$ref":"#/definitions/nope"}]}                                 | 1                          => out="0\n"   # G18 short-circuit hides unresolvable ref => 0
+{"oneOf":[true,{"$ref":"#/definitions/nope"}]}                                 | 1                          => EXIT 1   # G19 oneOf post-match pass resolves it -> EXIT 1
+{"anyOf":[{"type":"string"},{"type":"boolean"}]}                               | NaN                        => out="1\n"   # G20 python json accepts bare NaN; NaN is a number => 1
+{"not":{"type":"number"}}                                                      | Infinity                   => out="1\n"   # G21 bare Infinity accepted and is a number => 1
+{"anyOf":[{"type":"integer"},{"type":"number"}]}                               | true                       => out="1\n"   # G22 bool is NOT integer/number => 1
+{"contains":{"allOf":[false,false]}}                                           | [1,2]                      => out="1\n"   # G23 contains also collapses: 2 items x 2 errors => 1
+{"contains":true}                                                              | []                         => out="1\n"   # G24 contains on empty array => 1
+{"allOf":[{"allOf":[{"allOf":[{"allOf":[{"allOf":[{"allOf":[{"allOf":[{"allOf" | 1                          => out="1\n"   # G25 20-deep nested allOf => 1 (Python survives ~450 deep, RecursionError EXIT by 500)
+{"not":{"not":{"not":{"not":{"not":{}}}}}}                                     | 1                          => out="1\n"   # G26 not depth5 => 1 (Python survives depth 300, RecursionError EXIT by 400)
+
+202 cases -> /workspace/probe/observed/combinators.json

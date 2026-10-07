@@ -1,0 +1,40 @@
+      "sha": "c71dc825105c7400fdb19b49c400fd14e81fd8ea",
+        "message": "Add test: SAMPLE / SAMPLE OFFSET survive the serialized-plan round-trip\n\nAddress review: the changelog claims a fix for both FINAL and SAMPLE under\n`serialize_query_plan = 1`, but the regression in\n04509_hash_table_sizes_stats_table_functions only exercised FINAL. Add\n04612_serialize_query_plan_table_function_sample: a MergeTree table with\n`SAMPLE BY intHash32(k)` read via `cluster('test_shard_localhost', merge(...))`\nwith `serialize_query_plan = 1, prefer_localhost_replica = 0`, covering the\nfull read, `SAMPLE 1/2`, and `SAMPLE 1/2 OFFSET 1/2`. The sampling is\ndeterministic, so the reference pins the exact counts (10000 / 4972 / 5028;\nthe two complementary samples partition the table). If `resolveStorages`\ndropped `sample_size` / `sample_offset` on the worker, both sampled reads\nwould return 10000.",
+          "sha": "2269d745800cbd7237794bd3997b3e5ba4602a97"
+          "sha": "f2bc3168cca87acec3bed582614b007e4abb3a6f"
+      "sha": "20dea4f5e66f9829e32a856802e9f3a2100b7632",
+        "message": "Isolate 00180_no_seek_avoiding_when_reading_from_cache from other cache users\n\nThe test asserts that its measured query reads entirely from the filesystem\ncache, but the table is created with `CREATE TABLE hits_s3_sampled AS\ntest.hits_s3`, so it inherits `storage_policy = 's3_cache'`: the single 200 MiB\ncache shared by everything on the server. Background merges of `test.hits_s3`\nwrite through that cache and can fill it with file segments held open by a\n`FileSegmentsHolder`, which are not releasable. The warm-up queries' space\nreservation then finds nothing to evict, silently continues without caching, and\nthe measured query reads from S3, so `CachedReadBufferReadFromSourceBytes` is\nnon-zero. `SYSTEM CLEAR FILESYSTEM CACHE` does not help, since it is\n`removeAllReleasable` and skips held segments.\n\nGive the table a private inline cache disk instead, keyed on\n`$CLICKHOUSE_DATABASE` so the disk name is unique per run and the test stays\nparallel-safe, and scope the cache clear to that cache. The assertion, the\nreference file and the tags are unchanged.\n\n`04695_filesystem_cache_wait_for_concurrent_download_timeout.sh` was isolated\nthe same way in eca7e2270696c02 for this same mechanism.\n\nThe explicit `ENGINE = MergeTree` is required. Without it, `setEngine` calls\n`inheritStorageFromSource`, whose `mergeStorageSettings` appends the source's\n`storage_policy` next to the new `disk` setting, and `loadFromQuery` then throws\n`storage_policy and disk cannot be specified at the same time`. With the engine\ngiven explicitly that path is skipped, while columns and the PARTITION BY /\nORDER BY / SAMPLE BY clauses are still copied from the source table.\n\nValidated by reproducing the failure mode locally with a concurrent workload\nthat keeps the shared cache full of held segments, confirmed by a global cache\nclear leaving 229.68 MiB across 46 segments resident. Runs of the real test file\nunder that workload: 2 of 20 passed before this change, 50 of 50 after. With the\nsame query and settings against a cold cache the asserted counters are 4607579\nand 7944923, and against the warm private cache both are 0, so the assertion\nstill catches the regression it exists for.\n\nCloses: https://github.com/ClickHouse/ClickHouse/issues/114213",
+          "sha": "818aec27dce589469b39b55f5b266196cdb7f1f1"
+          "sha": "106a589824ffda289c008302d270f1e7da1c731b"
+      "sha": "af647baeb2ac1f1c4448b5916430441427aaa208",
+        "message": "Merge pull request #43315 from ClickHouse/fix-merge-sample-by\n\nFix `SAMPLE BY` with Merge tables",
+          "sha": "261e836eff12b768d1fe5e2a42eab8451cb2a5e3"
+          "sha": "f3c16ec8ede13091e5d5af6da947883c7faaea80"
+          "sha": "77eddd702ad1f8e36d5b46e1709c1fe3b1f2750e"
+      "sha": "e4d47539abfdd2d30356cbe042e7c585131aeb05",
+        "message": "Merge pull request #54477 from azat/view-sampling\n\nSupport SAMPLE BY for VIEW",
+          "sha": "fa3dc5dd19cc333d73ed31bea5d15247e517d0de"
+          "sha": "0625bbb3efac07114c2518e8bb46082dd0a01ffc"
+          "sha": "5535c7462dd7ff719f84d3b5e52fa028152338bf"
+      "sha": "d6aa3cdb4cf2200f24293ba41145c1b58e45c0b0",
+        "message": "Merge pull request #55357 from ClickHouse/revert-54477-view-sampling\n\nRevert \"Support SAMPLE BY for VIEW\"",
+          "sha": "62d8ac9d8b05202160a987906cca2174b1b0b7fd"
+          "sha": "831969abf923ff68edb9e4be7184cf65e491b3df"
+          "sha": "eac4e3e915ed28cf3eb342999d8a5ad9a9d4d54d"
+      "sha": "77eddd702ad1f8e36d5b46e1709c1fe3b1f2750e",
+        "message": "Merge branch 'master' into fix-merge-sample-by",
+          "sha": "10fad33f39dfad96e63fd9240aa6028b76563b9e"
+          "sha": "380da87a65caaa96a53938bae6b02ce1ed103049"
+          "sha": "0b4e643c2764543911b0b4c0c3745846af05742e"
+      "sha": "95c1bb977d96077ba358e90af8afab7df9b98adf",
+        "message": "Merge branch 'master' into fix-merge-sample-by",
+          "sha": "d6461a9b02f0f4aa31373d243a9ed05dc94e2c30"
+          "sha": "9af9ef3916ece48ac1dbc17aa706740152e55511"
+          "sha": "a29c5b9e3a4e6f8db36e92697eceed001c48b882"
+      "sha": "b1a74af44d496ccc81caee93cb08b7dddc0f2fb7",
+        "message": "Merge pull request #30180 from CurtizJ/remove-sample-by\n\nAllow to remove `SAMPLE BY` expression",
+          "sha": "5276e2bf06b3fbd5362336bdd1f1cef413da41e0"
+          "sha": "4c5104b30d3df4241679ac5de56ac30a797cbef5"
+          "sha": "1131a3ebe8056071b6a3aad19f88e53d90cc5ab9"
+      "sha": "bb15b577537e4b23a9f441ffc52c5e4d62582885",
+        "message": "Merge pull request #30016 from ucasfl/sample-by-tuple\n\nFix  crash of sample by tuple()",

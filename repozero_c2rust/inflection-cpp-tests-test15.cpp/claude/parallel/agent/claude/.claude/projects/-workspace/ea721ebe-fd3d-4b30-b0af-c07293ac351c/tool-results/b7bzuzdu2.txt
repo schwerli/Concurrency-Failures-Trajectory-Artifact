@@ -1,0 +1,788 @@
+===== test15.rs =====
+     1	//! Port of `tests/test15.cpp`.
+     2	//!
+     3	//! Mirrors the original driver statement for statement: fifteen `Inflector`
+     4	//! calls over at most the first five command-line arguments, all buffered into a
+     5	//! vector and printed before the three trailing `argv[1]` lines.
+     6	//!
+     7	//! Builds either way:
+     8	//!   * `cargo build --release` (as the `test15` binary), or
+     9	//!   * `rustc -O test15.rs` from this directory, thanks to the `#[path]` below.
+    10	
+    11	#[path = "src/inflection/mod.rs"]
+    12	mod inflection;
+    13	
+    14	use inflection::cli;
+    15	use inflection::Inflector;
+    16	
+    17	fn main() {
+    18	    Inflector::initialize();
+    19	
+    20	    let argv = cli::argv();
+    21	    let argc = argv.len();
+    22	
+    23	    // 15 API calls
+    24	    let mut results: Vec<Vec<u8>> = Vec::new();
+    25	
+    26	    let mut i = 1;
+    27	    while i < argc && i <= 5 {
+    28	        let word = &argv[i];
+    29	
+    30	        results.push(Inflector::pluralize(word));
+    31	        results.push(Inflector::camelize(word));
+    32	        if i % 2 == 0 {
+    33	            results.push(Inflector::underscore(word));
+    34	        }
+    35	
+    36	        i += 1;
+    37	    }
+    38	
+    39	    // Print every buffered result.
+    40	    for result in &results {
+    41	        let _ = cli::write_line(result);
+    42	    }
+    43	
+    44	    // The remaining calls, bringing the total to 15.
+    45	    if argc > 1 {
+    46	        let _ = cli::write_bool_line(Inflector::is_plural(&argv[1]));
+    47	        let _ = cli::write_bool_line(Inflector::is_singular(&argv[1]));
+    48	
+    49	        let mut qualified = b"Module::".to_vec();
+    50	        qualified.extend_from_slice(&argv[1]);
+    51	        let _ = cli::write_line(&Inflector::demodulize(&qualified));
+    52	    }
+    53	}
+===== src/lib.rs =====
+     1	//! Pure-`std` Rust re-implementation of the `inflection` C++ library surface
+     2	//! exercised by `tests/test15.cpp`.
+     3	//!
+     4	//! The C++ original operates on `std::string`, i.e. on raw bytes, with the
+     5	//! process running under the default `"C"` locale. Every routine here therefore
+     6	//! works on `&[u8]`/`Vec<u8>` rather than `str`/`String`: it is the only way to
+     7	//! reproduce the original byte-for-byte, because
+     8	//!
+     9	//!   * `std::toupper`/`std::tolower` in the `"C"` locale only touch ASCII, so
+    10	//!     multi-byte UTF-8 sequences must pass through untouched, and
+    11	//!   * `Inflector::demodulize` slices at a byte offset and can therefore split a
+    12	//!     UTF-8 sequence, producing output that is not valid UTF-8 at all.
+    13	//!
+    14	//! Convenience `&str` wrappers are provided for callers that know their input is
+    15	//! ASCII-safe.
+    16	
+    17	pub mod inflection;
+    18	
+    19	pub use crate::inflection::inflector::Inflector;
+===== src/inflection/ascii.rs =====
+     1	//! ASCII-only case mapping.
+     2	//!
+     3	//! The C++ original calls `std::toupper`/`std::tolower`/`std::isupper` on the
+     4	//! individual `char`s of a `std::string`. Nothing in the program ever calls
+     5	//! `setlocale`, so those run in the `"C"` locale, where the mapping is the
+     6	//! identity for every byte outside `a-z`/`A-Z` — including every byte of a
+     7	//! multi-byte UTF-8 sequence.
+     8	//!
+     9	//! Verified against the reference binary: `underscore("ÉCOLE")` yields the bytes
+    10	//! `C3 89 5F 63 5F 6F 5F 6C 5F 65` — the two bytes of `É` are neither uppercased
+    11	//! nor treated as an uppercase letter (no `_` is inserted for them), while the
+    12	//! following ASCII `C` is.
+    13	
+    14	/// Equivalent of `std::toupper(c)` in the `"C"` locale.
+    15	#[inline]
+    16	pub fn to_upper(byte: u8) -> u8 {
+    17	    if byte.is_ascii_lowercase() {
+    18	        byte - (b'a' - b'A')
+    19	    } else {
+    20	        byte
+    21	    }
+    22	}
+    23	
+    24	/// Equivalent of `std::tolower(c)` in the `"C"` locale.
+    25	#[inline]
+    26	pub fn to_lower(byte: u8) -> u8 {
+    27	    if byte.is_ascii_uppercase() {
+    28	        byte + (b'a' - b'A')
+    29	    } else {
+    30	        byte
+    31	    }
+    32	}
+    33	
+    34	/// Equivalent of `std::isupper(c)` in the `"C"` locale.
+    35	#[inline]
+    36	pub fn is_upper(byte: u8) -> bool {
+    37	    byte.is_ascii_uppercase()
+    38	}
+    39	
+    40	#[cfg(test)]
+    41	mod tests {
+    42	    use super::*;
+    43	
+    44	    #[test]
+    45	    fn ascii_letters_map() {
+    46	        assert_eq!(to_upper(b'a'), b'A');
+    47	        assert_eq!(to_lower(b'Z'), b'z');
+    48	        assert!(is_upper(b'Q'));
+    49	        assert!(!is_upper(b'q'));
+    50	    }
+    51	
+    52	    #[test]
+    53	    fn everything_else_is_identity() {
+    54	        for byte in 0u8..=255 {
+    55	            if !byte.is_ascii_alphabetic() {
+    56	                assert_eq!(to_upper(byte), byte, "to_upper({byte:#04x})");
+    57	                assert_eq!(to_lower(byte), byte, "to_lower({byte:#04x})");
+    58	                assert!(!is_upper(byte), "is_upper({byte:#04x})");
+    59	            }
+    60	        }
+    61	    }
+    62	}
+===== src/inflection/cli.rs =====
+     1	//! Process plumbing: raw-byte access to `argv` and a `std::endl`-equivalent
+     2	//! line writer.
+     3	
+     4	use std::io::{self, Write};
+     5	
+     6	/// `argv` as raw byte strings, program name included at index 0 — so
+     7	/// `argv().len()` is C's `argc` and `argv()[1]` is C's `argv[1]`.
+     8	///
+     9	/// `std::env::args_os()` is used rather than `std::env::args()` because the
+    10	/// latter panics on arguments that are not valid UTF-8, whereas the C++ program
+    11	/// happily passes such bytes through `std::string`. For UTF-8 arguments the two
+    12	/// are equivalent.
+    13	pub fn argv() -> Vec<Vec<u8>> {
+    14	    std::env::args_os().map(|arg| os_string_bytes(&arg)).collect()
+    15	}
+    16	
+    17	#[cfg(unix)]
+    18	fn os_string_bytes(arg: &std::ffi::OsString) -> Vec<u8> {
+    19	    use std::os::unix::ffi::OsStrExt;
+    20	    arg.as_os_str().as_bytes().to_vec()
+    21	}
+    22	
+    23	#[cfg(not(unix))]
+    24	fn os_string_bytes(arg: &std::ffi::OsString) -> Vec<u8> {
+    25	    arg.to_string_lossy().into_owned().into_bytes()
+    26	}
+    27	
+    28	/// Write `bytes` followed by `\n`, the equivalent of
+    29	/// `std::cout << bytes << std::endl`.
+    30	///
+    31	/// Raw bytes rather than `println!("{}", …)` because `Inflector::demodulize` can
+    32	/// return a fragment of a UTF-8 sequence, which no Rust string type can hold.
+    33	/// For valid UTF-8 the emitted bytes are identical to `println!`'s.
+    34	///
+    35	/// Rust's stdout handle is line-buffered, so the trailing `\n` flushes the line
+    36	/// just as `std::endl` does. That matters: the reference program can abort part
+    37	/// way through, and everything printed beforehand must already have reached the
+    38	/// pipe.
+    39	pub fn write_line(bytes: &[u8]) -> io::Result<()> {
+    40	    let mut stdout = io::stdout();
+    41	    stdout.write_all(bytes)?;
+    42	    stdout.write_all(b"\n")
+    43	}
+    44	
+    45	/// `std::cout << some_bool << std::endl` — `operator<<` renders `bool` as `1`/`0`
+    46	/// unless `std::boolalpha` is set, which the driver never does.
+    47	pub fn write_bool_line(value: bool) -> io::Result<()> {
+    48	    write_line(if value { b"1" } else { b"0" })
+    49	}
+===== src/inflection/cxx_string.rs =====
+     1	//! Small pieces of `std::string` semantics that the port has to reproduce
+     2	//! exactly, including one failure mode.
+     3	//!
+     4	//! `Inflector::demodulize` is implemented in the original as a `rfind` followed
+     5	//! by `substr`. For some inputs the computed offset runs past the end of the
+     6	//! string, and `std::string::substr` then throws `std::out_of_range`. Nothing
+     7	//! catches it, so the C++ program dies via `std::terminate` -> `abort()`: the
+     8	//! runtime prints a fixed two-line diagnostic on stderr and the process is
+     9	//! killed by `SIGABRT` (shell status 134). Any stdout already written has been
+    10	//! flushed by then, because the driver uses `std::endl`.
+    11	//!
+    12	//! `substr_from` reproduces all of that.
+    13	
+    14	use std::io::{self, Write};
+    15	
+    16	/// `std::string::rfind(char)` — byte offset of the last occurrence.
+    17	#[inline]
+    18	pub fn rfind_byte(haystack: &[u8], needle: u8) -> Option<usize> {
+    19	    haystack.iter().rposition(|byte| *byte == needle)
+    20	}
+    21	
+    22	/// `s.substr(pos)` — the tail of `s` starting at byte offset `pos`.
+    23	///
+    24	/// `pos == s.len()` is legal and yields the empty string; `pos > s.len()` is the
+    25	/// `std::out_of_range` case and terminates the process exactly as the C++
+    26	/// program does.
+    27	#[inline]
+    28	pub fn substr_from(s: &[u8], pos: usize) -> &[u8] {
+    29	    if pos > s.len() {
+    30	        terminate_substr_out_of_range(pos, s.len());
+    31	    }
+    32	    &s[pos..]
+    33	}
+    34	
+    35	/// Reproduce libstdc++'s uncaught-exception death for `substr`.
+    36	///
+    37	/// The message text and the `SIGABRT` exit are byte-identical to the reference
+    38	/// binary's, which was captured as:
+    39	///
+    40	/// ```text
+    41	/// terminate called after throwing an instance of 'std::out_of_range'
+    42	///   what():  basic_string::substr: __pos (which is 9) > this->size() (which is 8)
+    43	/// ```
+    44	fn terminate_substr_out_of_range(pos: usize, size: usize) -> ! {
+    45	    // std::endl already flushed every stdout line the driver produced; make sure
+    46	    // the same is true here before the abort discards buffers.
+    47	    let _ = io::stdout().flush();
+    48	
+    49	    let mut stderr = io::stderr();
+    50	    let _ = stderr.write_all(
+    51	        b"terminate called after throwing an instance of 'std::out_of_range'\n",
+    52	    );
+    53	    let _ = stderr.write_all(
+    54	        format!(
+    55	            "  what():  basic_string::substr: __pos (which is {pos}) \
+    56	             > this->size() (which is {size})\n"
+    57	        )
+    58	        .as_bytes(),
+    59	    );
+    60	    let _ = stderr.flush();
+    61	
+    62	    // Raises SIGABRT, matching `std::terminate` (shell exit status 134).
+    63	    std::process::abort()
+    64	}
+    65	
+    66	#[cfg(test)]
+    67	mod tests {
+    68	    use super::*;
+    69	
+    70	    #[test]
+    71	    fn rfind_finds_the_last_match() {
+    72	        assert_eq!(rfind_byte(b"Module::cat", b':'), Some(7));
+    73	        assert_eq!(rfind_byte(b"Module::a:b", b':'), Some(9));
+    74	        assert_eq!(rfind_byte(b"nocolon", b':'), None);
+    75	        assert_eq!(rfind_byte(b"", b':'), None);
+    76	    }
+    77	
+    78	    #[test]
+    79	    fn substr_at_end_is_empty() {
+    80	        assert_eq!(substr_from(b"abc", 3), b"");
+    81	        assert_eq!(substr_from(b"abc", 1), b"bc");
+    82	    }
+    83	}
+===== src/inflection/inflector.rs =====
+     1	//! `inflection::Inflector` — the API surface used by `test15.cpp`.
+     2	//!
+     3	//! Every rule below was derived by black-box probing of the reference binary;
+     4	//! see the per-function notes for the observations that pin each one down.
+     5	
+     6	use crate::inflection::ascii;
+     7	use crate::inflection::cxx_string::{rfind_byte, substr_from};
+     8	use crate::inflection::uncountable::{
+     9	    is_uncountable, PLURAL_SUFFIXES, PLURAL_WORDS, SINGULAR_SUFFIXES,
+    10	};
+    11	
+    12	/// Stateless namespace type mirroring the C++ `Inflector` class.
+    13	pub struct Inflector;
+    14	
+    15	impl Inflector {
+    16	    /// `Inflector::initialize()`.
+    17	    ///
+    18	    /// The rule tables in this port are compile-time constants, so there is
+    19	    /// nothing to build up front. Kept so the call site mirrors the original.
+    20	    pub fn initialize() {}
+    21	
+    22	    /// Append `s`, unless the word is uncountable or empty.
+    23	    ///
+    24	    /// The reference implementation applies no suffix rules whatsoever — no
+    25	    /// `-y`/`-ies`, no `-s`/`-es`, no irregulars:
+    26	    /// `box -> boxs`, `city -> citys`, `bus -> buss`, `cats -> catss`,
+    27	    /// `person -> persons`, `child -> childs`, `mouse -> mouses`.
+    28	    /// The only departures are the ten uncountable words and the empty string,
+    29	    /// which maps to the empty string rather than to `"s"`.
+    30	    pub fn pluralize(word: &[u8]) -> Vec<u8> {
+    31	        if word.is_empty() || is_uncountable(word) {
+    32	            return word.to_vec();
+    33	        }
+    34	
+    35	        let mut plural = Vec::with_capacity(word.len() + 1);
+    36	        plural.extend_from_slice(word);
+    37	        plural.push(b's');
+    38	        plural
+    39	    }
+    40	
+    41	    /// Drop `_` separators, uppercasing whatever byte follows a run of them.
+    42	    ///
+    43	    /// Lower camel case: the first byte is never touched unless the input itself
+    44	    /// starts with `_`. `hello_world -> helloWorld`, `Hello_World -> HelloWorld`,
+    45	    /// `hello__world -> helloWorld`, `_hello -> Hello`, `hello_ -> hello`,
+    46	    /// `a_b_c -> aBC`, `1_2 -> 12`, `_ -> ""`.
+    47	    ///
+    48	    /// `_` is the *only* separator — `-`, ` `, `.`, `/` and `:` are copied
+    49	    /// verbatim, so `active_record/errors -> activeRecord/errors`.
+    50	    pub fn camelize(word: &[u8]) -> Vec<u8> {
+    51	        let mut camel = Vec::with_capacity(word.len());
+    52	        let mut capitalize_next = false;
+    53	
+    54	        for &byte in word {
+    55	            if byte == b'_' {
+    56	                capitalize_next = true;
+    57	            } else if capitalize_next {
+    58	                camel.push(ascii::to_upper(byte));
+    59	                capitalize_next = false;
+    60	            } else {
+    61	                camel.push(byte);
+    62	            }
+    63	        }
+    64	
+    65	        camel
+    66	    }
+    67	
+    68	    /// Lowercase every ASCII uppercase byte, prefixing `_` unless it is the very
+    69	    /// first byte of the input.
+    70	    ///
+    71	    /// `HelloWorld -> hello_world`, `ABC -> a_b_c`, `A -> a`,
+    72	    /// `camelCase99Test -> camel_case99_test`.
+    73	    ///
+    74	    /// The guard is on the *byte index*, not on "output is empty" and not on
+    75	    /// "the previous byte was a separator". That distinction is observable and
+    76	    /// was confirmed: `_A -> __a` (not `_a`), `A_B -> a__b`, ` A -> " _a"`,
+    77	    /// `ActiveRecord::Errors -> active_record::_errors`.
+    78	    pub fn underscore(word: &[u8]) -> Vec<u8> {
+    79	        let mut underscored = Vec::with_capacity(word.len() + word.len() / 2);
+    80	
+    81	        for (index, &byte) in word.iter().enumerate() {
+    82	            if ascii::is_upper(byte) {
+    83	                if index > 0 {
+    84	                    underscored.push(b'_');
+    85	                }
+    86	                underscored.push(ascii::to_lower(byte));
+    87	            } else {
+    88	                underscored.push(byte);
+    89	            }
+    90	        }
+    91	
+    92	        underscored
+    93	    }
+    94	
+    95	    /// True when the word looks like an English plural.
+    96	    ///
+    97	    /// The reference implementation reads as a case-sensitive, ASCII-only
+    98	    /// simplification of the classic Rails singular-rule table, reduced to the
+    99	    /// handful of tests whose effects are observable:
+   100	    ///
+   101	    /// * The uncountable words are never plural, matched whole-word — so
+   102	    ///   `series`/`species`/`jeans` report singular while `miniseries`,
+   103	    ///   `subspecies` and `myjeans` report plural.
+   104	    /// * Anything ending in `news` is singular, matched as a *suffix*
+   105	    ///   (`news`, `goodnews`, `znews`), and this beats the `s` test below.
+   106	    /// * Otherwise a word is plural if it ends in `s`, `ta`, `ia`, `mice`,
+   107	    ///   `lice`, `octopi` or `viri`, or if it is exactly `oxen`.
+   108	    ///
+   109	    /// Two consequences worth calling out, both verified:
+   110	    ///
+   111	    /// * There is no morphology behind the `s` test, so `bus`, `glass`,
+   112	    ///   `analysis`, `axis`, `crisis`, `status`, `alias`, `this`, `yes` and even
+   113	    ///   `ss` all report plural.
+   114	    /// * Everything is case-sensitive and ASCII-only: `cats -> 1` but
+   115	    ///   `CATS -> 0`, `catS -> 0`, `S -> 0`; `Data -> 1` but `DATA -> 0`;
+   116	    ///   `news -> 0` but `News -> 1`; `mice -> 1` but `Mice -> 0`.
+   117	    pub fn is_plural(word: &[u8]) -> bool {
+   118	        if is_uncountable(word) {
+   119	            return false;
+   120	        }
+   121	        if SINGULAR_SUFFIXES
+   122	            .iter()
+   123	            .any(|suffix| word.ends_with(suffix))
+   124	        {
+   125	            return false;
+   126	        }
+   127	        if PLURAL_SUFFIXES.iter().any(|suffix| word.ends_with(suffix)) {
+   128	            return true;
+   129	        }
+   130	
+   131	        PLURAL_WORDS.iter().any(|plural| *plural == word)
+   132	    }
+   133	
+   134	    /// Exact complement of [`Inflector::is_plural`].
+   135	    ///
+   136	    /// Confirmed over every probed input, including the empty string
+   137	    /// (`isPlural("") == 0`, `isSingular("") == 1`) and the exception set
+   138	    /// (`isPlural("news") == 0`, `isSingular("news") == 1`).
+   139	    pub fn is_singular(word: &[u8]) -> bool {
+   140	        !Self::is_plural(word)
+   141	    }
+   142	
+   143	    /// Strip everything up to and including the last `:`, then one byte more.
+   144	    ///
+   145	    /// The original is `path.substr(path.rfind(':') + 2)`: `rfind` lands on the
+   146	    /// *second* colon of a `::` separator, so the `+ 2` skips that colon plus one
+   147	    /// byte of the name — an off-by-one that is plainly visible in the reference
+   148	    /// output (`demodulize("Module::cat") == "at"`, not `"cat"`).
+   149	    ///
+   150	    /// The competing reading `substr(rfind("::") + 3)` produces the same answer
+   151	    /// for `Module::cat` but is ruled out by `Module::a:b`, where it would yield
+   152	    /// `":b"` while the binary yields `""`.
+   153	    ///
+   154	    /// Two consequences are load-bearing:
+   155	    ///
+   156	    /// * The offset can land in the middle of a UTF-8 sequence, so the result is
+   157	    ///   a byte slice that need not be valid UTF-8. `demodulize("Module::é")`
+   158	    ///   really does emit the lone byte `0xA9`.
+   159	    /// * The offset can run past the end, in which case `substr` throws and the
+   160	    ///   process aborts — see [`substr_from`].
+   161	    pub fn demodulize(path: &[u8]) -> Vec<u8> {
+   162	        match rfind_byte(path, b':') {
+   163	            Some(pos) => substr_from(path, pos + 2).to_vec(),
+   164	            // Unreachable from `test15`, which always prepends `"Module::"`.
+   165	            None => path.to_vec(),
+   166	        }
+   167	    }
+   168	}
+   169	
+   170	/// `&str`-based conveniences for callers whose data is known to be ASCII-safe.
+   171	///
+   172	/// [`Inflector::demodulize`] is deliberately absent: its result can be invalid
+   173	/// UTF-8, so it has no lossless `String` form.
+   174	impl Inflector {
+   175	    pub fn pluralize_str(word: &str) -> String {
+   176	        to_string(Self::pluralize(word.as_bytes()))
+   177	    }
+   178	
+   179	    pub fn camelize_str(word: &str) -> String {
+   180	        to_string(Self::camelize(word.as_bytes()))
+   181	    }
+   182	
+   183	    pub fn underscore_str(word: &str) -> String {
+   184	        to_string(Self::underscore(word.as_bytes()))
+   185	    }
+   186	
+   187	    pub fn is_plural_str(word: &str) -> bool {
+   188	        Self::is_plural(word.as_bytes())
+   189	    }
+   190	
+   191	    pub fn is_singular_str(word: &str) -> bool {
+   192	        Self::is_singular(word.as_bytes())
+   193	    }
+   194	}
+   195	
+   196	/// None of the three `*_str` helpers can break a UTF-8 sequence: `pluralize`
+   197	/// only appends ASCII, and `camelize`/`underscore` only ever rewrite bytes that
+   198	/// are ASCII letters. So the conversion back is infallible in practice.
+   199	fn to_string(bytes: Vec<u8>) -> String {
+   200	    String::from_utf8(bytes).unwrap_or_else(|error| {
+   201	        String::from_utf8_lossy(error.as_bytes()).into_owned()
+   202	    })
+   203	}
+   204	
+   205	#[cfg(test)]
+   206	mod tests {
+   207	    use super::*;
+   208	
+   209	    fn plural(word: &str) -> String {
+   210	        Inflector::pluralize_str(word)
+   211	    }
+   212	    fn camel(word: &str) -> String {
+   213	        Inflector::camelize_str(word)
+   214	    }
+   215	    fn under(word: &str) -> String {
+   216	        Inflector::underscore_str(word)
+   217	    }
+   218	    fn demod(path: &str) -> Vec<u8> {
+   219	        Inflector::demodulize(path.as_bytes())
+   220	    }
+   221	
+   222	    #[test]
+   223	    fn pluralize_just_appends_s() {
+   224	        for (input, expected) in [
+   225	            ("cat", "cats"),
+   226	            ("dog", "dogs"),
+   227	            ("person", "persons"),
+   228	            ("child", "childs"),
+   229	            ("mouse", "mouses"),
+   230	            ("box", "boxs"),
+   231	            ("city", "citys"),
+   232	            ("bus", "buss"),
+   233	            ("cats", "catss"),
+   234	            ("news", "newss"),
+   235	            ("goldfish", "goldfishs"),
+   236	        ] {
+   237	            assert_eq!(plural(input), expected, "pluralize({input})");
+   238	        }
+   239	    }
+   240	
+   241	    #[test]
+   242	    fn pluralize_respects_uncountables_case_sensitively() {
+   243	        for word in [
+   244	            "equipment",
+   245	            "information",
+   246	            "rice",
+   247	            "money",
+   248	            "species",
+   249	            "series",
+   250	            "fish",
+   251	            "sheep",
+   252	            "jeans",
+   253	            "police",
+   254	        ] {
+   255	            assert_eq!(plural(word), word, "pluralize({word})");
+   256	        }
+   257	        assert_eq!(plural("Fish"), "Fishs");
+   258	        assert_eq!(plural("FISH"), "FISHs");
+   259	        assert_eq!(plural("fishes"), "fishess");
+   260	    }
+   261	
+   262	    #[test]
+   263	    fn pluralize_empty_stays_empty() {
+   264	        assert_eq!(plural(""), "");
+   265	    }
+   266	
+   267	    #[test]
+   268	    fn camelize_rules() {
+   269	        for (input, expected) in [
+   270	            ("hello_world", "helloWorld"),
+   271	            ("Hello_World", "HelloWorld"),
+   272	            ("hello__world", "helloWorld"),
+   273	            ("_hello", "Hello"),
+   274	            ("hello_", "hello"),
+   275	            ("HELLO_WORLD", "HELLOWORLD"),
+   276	            ("helloWorld", "helloWorld"),
+   277	            ("hello world", "hello world"),
+   278	            ("hello-world", "hello-world"),
+   279	            ("a_b_c", "aBC"),
+   280	            ("_", ""),
+   281	            ("__", ""),
+   282	            ("1_2", "12"),
+   283	            ("foo_Bar", "fooBar"),
+   284	            ("active_record/errors", "activeRecord/errors"),
+   285	            ("", ""),
+   286	        ] {
+   287	            assert_eq!(camel(input), expected, "camelize({input})");
+   288	        }
+   289	    }
+   290	
+   291	    #[test]
+   292	    fn underscore_rules() {
+   293	        for (input, expected) in [
+   294	            ("HelloWorld", "hello_world"),
+   295	            ("helloWorld", "hello_world"),
+   296	            ("ActiveRecord::Errors", "active_record::_errors"),
+   297	            ("HTMLParser", "h_t_m_l_parser"),
+   298	            ("XMLHttpRequest", "x_m_l_http_request"),
+   299	            ("Hello World", "hello _world"),
+   300	            ("ABC", "a_b_c"),
+   301	            ("A", "a"),
+   302	            ("Ab", "ab"),
+   303	            ("AbC", "ab_c"),
+   304	            ("camelCase99Test", "camel_case99_test"),
+   305	            // The index-0 guard, not an "output is empty" guard.
+   306	            ("_A", "__a"),
+   307	            ("A_B", "a__b"),
+   308	            ("99Test", "99_test"),
+   309	            ("", ""),
+   310	        ] {
+   311	            assert_eq!(under(input), expected, "underscore({input})");
+   312	        }
+   313	    }
+   314	
+   315	    #[test]
+   316	    fn case_mapping_leaves_non_ascii_alone() {
+   317	        assert_eq!(under("ÉCOLE").as_bytes(), b"\xc3\x89_c_o_l_e");
+   318	        assert_eq!(camel("a_é").as_bytes(), "aé".as_bytes());
+   319	        assert_eq!(plural("café"), "cafés");
+   320	    }
+   321	
+   322	    #[test]
+   323	    fn plurality_predicates() {
+   324	        for (word, is_plural) in [
+   325	            // Bare trailing-`s`, no morphology.
+   326	            ("cat", false),
+   327	            ("cats", true),
+   328	            ("bus", true),
+   329	            ("glass", true),
+   330	            ("analysis", true),
+   331	            ("axis", true),
+   332	            ("crisis", true),
+   333	            ("status", true),
+   334	            ("alias", true),
+   335	            ("this", true),
+   336	            ("ss", true),
+   337	            ("s", true),
+   338	            // Uncountables, matched whole-word.
+   339	            ("series", false),
+   340	            ("species", false),
+   341	            ("jeans", false),
+   342	            ("fish", false),
+   343	            ("miniseries", true),
+   344	            ("subspecies", true),
+   345	            ("myjeans", true),
+   346	            // `news` as a suffix, beating the `s` rule.
+   347	            ("news", false),
+   348	            ("goodnews", false),
+   349	            ("znews", false),
+   350	            ("newsy", false),
+   351	            // Latin `-a` plurals: only `ta` and `ia`.
+   352	            ("data", true),
+   353	            ("media", true),
+   354	            ("criteria", true),
+   355	            ("beta", true),
+   356	            ("iota", true),
+   357	            ("ta", true),
+   358	            ("ia", true),
+   359	            ("alpha", false),
+   360	            ("lambda", false),
+   361	            ("banana", false),
+   362	            ("a", false),
+   363	            ("curricula", false),
+   364	            ("phenomena", false),
+   365	            // `mice`/`lice`/`octopi`/`viri` suffixes.
+   366	            ("mice", true),
+   367	            ("lice", true),
+   368	            ("slice", true),
+   369	            ("twice", false),
+   370	            ("ice", false),
+   371	            ("octopi", true),
+   372	            ("zoctopi", true),
+   373	            ("octopiz", false),
+   374	            ("viri", true),
+   375	            ("cacti", false),
+   376	            ("alumni", false),
+   377	            // `oxen`, anchored at both ends.
+   378	            ("oxen", true),
+   379	            ("boxen", false),
+   380	            ("oxenabc", false),
+   381	            ("men", false),
+   382	            ("children", false),
+   383	            // Case sensitivity.
+   384	            ("News", true),
+   385	            ("NEWS", false),
+   386	            ("CATS", false),
+   387	            ("catS", false),
+   388	            ("S", false),
+   389	            ("Data", true),
+   390	            ("DATA", false),
+   391	            ("Mice", false),
+   392	            ("Oxen", false),
+   393	            ("Jeans", true),
+   394	            ("", false),
+   395	        ] {
+   396	            assert_eq!(Inflector::is_plural_str(word), is_plural, "isPlural({word})");
+   397	            assert_eq!(
+   398	                Inflector::is_singular_str(word),
+   399	                !is_plural,
+   400	                "isSingular({word})"
+   401	            );
+   402	        }
+   403	    }
+   404	
+   405	    #[test]
+   406	    fn demodulize_skips_one_byte_too_many() {
+   407	        assert_eq!(demod("Module::cat"), b"at");
+   408	        assert_eq!(demod("Module::person"), b"erson");
+   409	        assert_eq!(demod("Module::ab"), b"b");
+   410	        assert_eq!(demod("Module::a"), b"");
+   411	        // rfind(':') lands on the *last* colon anywhere in the string.
+   412	        assert_eq!(demod("Module::a:b"), b"");
+   413	        assert_eq!(demod("Module::A::B"), b"");
+   414	        assert_eq!(demod("Module::::a"), b"");
+   415	        // Byte slicing, so the result can be invalid UTF-8.
+   416	        assert_eq!(demod("Module::é"), b"\xa9");
+   417	        // No colon at all: returned unchanged (unreachable from test15).
+   418	        assert_eq!(demod("nocolon"), b"nocolon");
+   419	    }
+   420	}
+===== src/inflection/mod.rs =====
+     1	//! The `inflection` namespace.
+     2	
+     3	// The tree is shared by the library target and, via `#[path]`, by the `test15`
+     4	// binary. The binary only needs the byte-level API, so the `&str` conveniences
+     5	// and a few helpers read as dead there.
+     6	#![allow(dead_code)]
+     7	
+     8	pub mod ascii;
+     9	pub mod cli;
+    10	pub mod cxx_string;
+    11	pub mod inflector;
+    12	pub mod uncountable;
+    13	
+    14	pub use inflector::Inflector;
+===== src/inflection/uncountable.rs =====
+     1	//! The uncountable-word table consulted by `Inflector::pluralize`.
+     2	//!
+     3	//! Determined by black-box probing of the reference binary: of several hundred
+     4	//! candidate mass nouns only these ten are returned unchanged by `pluralize`,
+     5	//! and the lookup is an exact, case-sensitive, whole-string comparison
+     6	//! (`fish` -> `fish` but `Fish` -> `Fishs`, `goldfish` -> `goldfishs`).
+     7	//!
+     8	//! This is exactly the classic default uncountable list.
+     9	
+    10	/// Words `pluralize` leaves untouched.
+    11	pub const UNCOUNTABLE: [&[u8]; 10] = [
+    12	    b"equipment",
+    13	    b"information",
+    14	    b"rice",
+    15	    b"money",
+    16	    b"species",
+    17	    b"series",
+    18	    b"fish",
+    19	    b"sheep",
+    20	    b"jeans",
+    21	    b"police",
+    22	];
+    23	
+    24	/// Exact, case-sensitive, whole-string membership test.
+    25	pub fn is_uncountable(word: &[u8]) -> bool {
+    26	    UNCOUNTABLE.iter().any(|entry| *entry == word)
+    27	}
+    28	
+    29	/// Suffixes that make a word count as already-plural.
+    30	///
+    31	/// Found by brute force: every 1-3 byte suffix was tested against five
+    32	/// different prefixes, and `s`, `ta` and `ia` are the only ones that trigger.
+    33	/// `mice`/`lice`/`octopi`/`viri` were then found by testing longer plural forms.
+    34	/// All of them are genuine *suffix* tests, not whole-word ones —
+    35	/// `slice`, `zoctopi`, `zviri` and `miniseries` all report plural.
+    36	pub const PLURAL_SUFFIXES: [&[u8]; 7] = [
+    37	    b"s",
+    38	    b"ta",
+    39	    b"ia",
+    40	    b"mice",
+    41	    b"lice",
+    42	    b"octopi",
+    43	    b"viri",
+    44	];
+    45	
+    46	/// Suffixes that keep a word singular even though a [`PLURAL_SUFFIXES`] entry
+    47	/// also matches.
+    48	///
+    49	/// `news` ends in `s` yet reports singular, and so does anything else ending in
+    50	/// `news` (`goodnews`, `znews`). Note this is *not* the uncountable table:
+    51	/// `pluralize("news")` really is `"newss"`.
+    52	pub const SINGULAR_SUFFIXES: [&[u8]; 1] = [b"news"];
+    53	
+    54	/// Whole words that count as plural without matching any suffix rule.
+    55	///
+    56	/// `oxen` alone: `boxen`, `oxenz` and `oxenabc` all report singular, so the
+    57	/// match is anchored at both ends.
+    58	pub const PLURAL_WORDS: [&[u8]; 1] = [b"oxen"];
+    59	
+    60	#[cfg(test)]
+    61	mod tests {
+    62	    use super::*;
+    63	
+    64	    #[test]
+    65	    fn membership_is_exact_and_case_sensitive() {
+    66	        assert!(is_uncountable(b"fish"));
+    67	        assert!(is_uncountable(b"police"));
+    68	        assert!(!is_uncountable(b"Fish"));
+    69	        assert!(!is_uncountable(b"FISH"));
+    70	        assert!(!is_uncountable(b"goldfish"));
+    71	        assert!(!is_uncountable(b"fishes"));
+    72	        assert!(!is_uncountable(b"fish "));
+    73	        assert!(!is_uncountable(b""));
+    74	        assert!(!is_uncountable(b"news"));
+    75	        // Whole-word, so a longer word containing one is not uncountable.
+    76	        assert!(!is_uncountable(b"miniseries"));
+    77	        assert!(!is_uncountable(b"subspecies"));
+    78	        assert!(!is_uncountable(b"myjeans"));
+    79	    }
+    80	}

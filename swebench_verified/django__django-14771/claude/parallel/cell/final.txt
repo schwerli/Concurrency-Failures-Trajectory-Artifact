@@ -1,0 +1,32 @@
+Pre-existing — fails identically on a clean tree. Unrelated to this change.
+
+## Summary
+
+Fixed the auto-reloader dropping `-X` options when it respawns the child process.
+
+**`django/utils/autoreload.py:222`** — `get_child_arguments()` forwarded `-W` warning options but nothing from `sys._xoptions`:
+
+```python
+args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions]
+if sys.implementation.name == 'cpython':
+    args.extend(
+        f'-X{key}' if value is True else f'-X{key}={value}'
+        for key, value in sys._xoptions.items()
+    )
+```
+
+Three details that drove the shape:
+- **`value is True`, not truthiness.** CPython stores bare `-X utf8` as the boolean `True` and `-X a=b` as the string `'b'`. A truthiness test would collapse `a='b'` into a bare `-Xutf8`-style token and lose the value. The `is True` check also happens to handle `-X qux=` (empty string → correctly re-emitted as `-Xqux=`).
+- **CPython guard.** `sys._xoptions` is a CPython implementation detail, matching the ticket's "(for cpython implementation)".
+- **Placement in `args`.** This reaches the `-m`, `-script.py`, and plain-script branches but deliberately bypasses the Windows `.exe` entrypoint branch, which returns `[exe_entrypoint, *sys.argv[1:]]`. That wrapper takes no interpreter options — a `-Xutf8` there would land in `sys.argv` and be parsed as a management-command argument.
+
+**`tests/utils_tests/test_autoreload.py`** — added `test_xoptions`, plus `@mock.patch('sys._xoptions', {})` to the other eight `TestChildArguments` tests and to `RestartWithReloaderTests.patch_autoreload`. Those aren't decorative: without them, 8 tests fail when the suite itself is run under `python -X utf8 -X dev`, since real interpreter state leaks into the exact-argv assertions.
+
+**Verification:**
+- New test fails without the source fix, passes with it (non-vacuous).
+- Suite passes both normally and under `python -X utf8 -X dev -X pycache_prefix=...`.
+- End-to-end repro of the ticket: a real reloader-spawned child went from `_xoptions={}` (option silently dropped) to `_xoptions={'utf8': True}`, with child argv `[python, '-Xutf8', 'manage.py', 'runserver']`.
+- Round-trip check across 13 real option combinations (`utf8`, `dev`, `pycache_prefix`, `tracemalloc=3`, `int_max_str_digits`, `-X qux=`, mixed `-W`/`-X`, none): 0 failures. `-X dev` is the interesting one — it also injects `-Wdefault` into `warnoptions`, and both flags forward correctly.
+- 892/893 tests pass across `utils_tests`, `admin_scripts`, `template_tests.test_autoreloader`, `i18n.tests`. The one error (`i18n.tests.WatchForTranslationChangesTests.test_i18n_app_dirs`, a `tests.i18n.sampleproject` import failure) reproduces on a clean checkout and is unrelated.
+
+One edge case I found and deliberately left alone: `python -X "" manage.py runserver` yields `{'': True}`, which reconstructs to a bare `-X` token that then swallows the following argv element, so the child exits 2. It's a pathological input, and upstream Django's fix doesn't guard it either — flagging it rather than adding unrequested divergence. Say the word if you'd like it handled.

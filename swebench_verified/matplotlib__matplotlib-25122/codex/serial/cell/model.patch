@@ -1,0 +1,71 @@
+diff --git a/lib/matplotlib/mlab.py b/lib/matplotlib/mlab.py
+index 3552904c3d..cb8e524337 100644
+--- a/lib/matplotlib/mlab.py
++++ b/lib/matplotlib/mlab.py
+@@ -378,6 +378,7 @@ def _spectral_helper(x, y=None, NFFT=None, Fs=None, detrend_func=None,
+     if len(window) != NFFT:
+         raise ValueError(
+             "The window length must match the data's first dimension")
++    coherent_gain = window.sum()
+ 
+     result = _stride_windows(x, NFFT, noverlap)
+     result = detrend(result, detrend_func, axis=0)
+@@ -395,12 +396,12 @@ def _spectral_helper(x, y=None, NFFT=None, Fs=None, detrend_func=None,
+     elif mode == 'psd':
+         result = np.conj(result) * result
+     elif mode == 'magnitude':
+-        result = np.abs(result) / np.abs(window).sum()
++        result = np.abs(result) / np.abs(coherent_gain)
+     elif mode == 'angle' or mode == 'phase':
+         # we unwrap the phase later to handle the onesided vs. twosided case
+         result = np.angle(result)
+     elif mode == 'complex':
+-        result /= np.abs(window).sum()
++        result /= coherent_gain
+ 
+     if mode == 'psd':
+ 
+@@ -427,7 +428,7 @@ def _spectral_helper(x, y=None, NFFT=None, Fs=None, detrend_func=None,
+             result /= (np.abs(window)**2).sum()
+         else:
+             # In this case, preserve power in the segment, not amplitude
+-            result /= np.abs(window).sum()**2
++            result /= np.abs(coherent_gain)**2
+ 
+     t = np.arange(NFFT/2, len(x) - NFFT/2 + 1, NFFT - noverlap)/Fs
+ 
+diff --git a/lib/matplotlib/tests/test_mlab.py b/lib/matplotlib/tests/test_mlab.py
+index 86beb5c8c8..702a6a9471 100644
+--- a/lib/matplotlib/tests/test_mlab.py
++++ b/lib/matplotlib/tests/test_mlab.py
+@@ -96,6 +96,30 @@ def test_window():
+     assert_array_equal(np.hanning(len(ones)), mlab.window_hanning(ones))
+ 
+ 
++def test_spectral_helper_negative_window_correction():
++    x = np.ones(8)
++    window = np.array([1, -0.25, 0.5, -0.25, 1, -0.25, 0.5, -0.25])
++    kwargs = dict(
++        x=x, NFFT=len(x), Fs=1, detrend_func=mlab.detrend_none,
++        window=window, noverlap=0, pad_to=len(x), sides='twosided',
++        scale_by_freq=False)
++
++    complex_spec, freqs, _ = mlab._spectral_helper(mode='complex', **kwargs)
++    magnitude_spec, magnitude_freqs, _ = mlab._spectral_helper(
++        mode='magnitude', **kwargs)
++    psd_spec, psd_freqs, _ = mlab._spectral_helper(mode='psd', y=x, **kwargs)
++
++    assert_array_equal(magnitude_freqs, freqs)
++    assert_array_equal(psd_freqs, freqs)
++
++    zero_idx = np.flatnonzero(freqs == 0)
++    assert_allclose(complex_spec[zero_idx, 0], 1)
++    assert_allclose(magnitude_spec[zero_idx, 0], 1)
++    assert_allclose(psd_spec[zero_idx, 0], 1)
++    assert_allclose(np.abs(complex_spec), magnitude_spec)
++    assert_allclose(np.abs(complex_spec)**2, psd_spec.real)
++
++
+ class TestDetrend:
+     def setup_method(self):
+         np.random.seed(0)

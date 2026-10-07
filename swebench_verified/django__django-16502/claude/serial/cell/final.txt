@@ -1,0 +1,19 @@
+Done. The fix is in `django/core/servers/basehttp.py:150`:
+
+```python
+def finish_response(self):
+    if self.environ["REQUEST_METHOD"] == "HEAD":
+        if not self.headers_sent:
+            self.send_headers()
+        self.close()
+    else:
+        super().finish_response()
+```
+
+`wsgiref`'s `BaseHandler.finish_response()` unconditionally iterates the app's result and writes it, so `runserver` returned bodies for HEAD. The override sends the headers a GET would have sent, then stops. It deliberately doesn't call `finish_content()`, which would default `Content-Length` to `"0"` and misreport the size of streaming responses.
+
+Verified against a real `runserver` with `curl -I`: headers only, no body, for a plain `HttpResponse`, a `StreamingHttpResponse`, and a `FileResponse`. `Content-Length` is preserved when the app set it (RFC-correct for HEAD), and a raw-socket test of pipelined HEAD → HEAD → GET confirms keep-alive still works with no broken-pipe noise in the log.
+
+Two regression tests added to `tests/servers/tests.py`. Both fail without the fix — the first with `BadStatusLine: example viewHTTP/1.1 200 OK`, which is precisely the connection desync the ticket describes.
+
+Two notes on the test run: `servers.test_basehttp.test_strips_underscore_headers` fails, but it fails identically on a clean checkout — the sandbox has an empty `HTTP_PROXY` env var that leaks into the WSGI environ. And `black` wants a blank line after the module docstring in `tests/servers/tests.py`; that's a newer-Black style rule than this repo targets, not from my edit. I left both alone. I also skipped a release note, matching recent bugfix commits in this repo.

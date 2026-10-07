@@ -1,0 +1,15 @@
+`String` now satisfies `expr.func(*expr.args) == expr`.
+
+**What was wrong:** `String` declares `not_in_args = ['text']`, so `text` never reaches `Basic.__new__` and `String('foo').args == ()`. Since `func` was the class itself, `expr.func(*expr.args)` became `String()`, which raised `TypeError: No value for 'text' given and attribute has no default`.
+
+**The fix** (`sympy/codegen/ast.py:872`): keep `text` out of `args` — it's a plain `str`, and putting a non-`Basic` into `Basic.args` would break traversal/sympification — and instead make `String` a genuine atom:
+
+- `class String(Atom, Token)` — it already advertised `is_Atom = True`, so it now also gets `Atom`'s `matches`/`xreplace`/`doit`/`sort_key`/`class_key`.
+- `func` returns `lambda: self`, so the zero-arg rebuild `expr.func(*expr.args)` reconstructs the object. Commented as removable once `Atom` grows a suitable `func`.
+- `kwargs()` returns `{}` to match the empty `args`, keeping `expr.func(**expr.kwargs()) == expr` valid too.
+
+Subclasses `QuotedString`, `Comment` and the `Signifier`-style user subclasses inherit the behavior; `text`, `str()`, `repr()`, equality and hashing are unchanged (`Token._hashable_content` uses `__slots__`, not `args`).
+
+Verified: the invariance holds for `String`/`QuotedString`/`Comment`; `sympy/codegen` (82 passed, 3 xfail), `sympy/printing` + `sympy/parsing` + `sympy/utilities/tests/test_codegen.py` (1105 passed), `sympy/core` (1864 passed), and all codegen doctests pass. The one `xpassed` in `test_args.py` (`BaseCovarDerivativeOp`) is pre-existing — I confirmed it on a stashed clean tree.
+
+I also added `assert st.func(*st.args) == st` to `test_String` in `sympy/codegen/tests/test_ast.py:270`.

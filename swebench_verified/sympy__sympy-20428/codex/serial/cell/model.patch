@@ -1,0 +1,81 @@
+diff --git a/sympy/polys/densearith.py b/sympy/polys/densearith.py
+index bce08bb356..7f7a88b10a 100644
+--- a/sympy/polys/densearith.py
++++ b/sympy/polys/densearith.py
+@@ -269,7 +269,7 @@ def dup_mul_ground(f, c, K):
+     if not c or not f:
+         return []
+     else:
+-        return [ cf * c for cf in f ]
++        return dup_strip([ cf * c for cf in f ])
+ 
+ 
+ def dmp_mul_ground(f, c, u, K):
+@@ -291,7 +291,7 @@ def dmp_mul_ground(f, c, u, K):
+ 
+     v = u - 1
+ 
+-    return [ dmp_mul_ground(cf, c, v, K) for cf in f ]
++    return dmp_strip([ dmp_mul_ground(cf, c, v, K) for cf in f ], u)
+ 
+ 
+ def dup_quo_ground(f, c, K):
+diff --git a/sympy/polys/tests/test_densearith.py b/sympy/polys/tests/test_densearith.py
+index 55b2f47ba6..f94455656e 100644
+--- a/sympy/polys/tests/test_densearith.py
++++ b/sympy/polys/tests/test_densearith.py
+@@ -39,7 +39,8 @@
+ )
+ 
+ from sympy.polys.specialpolys import f_polys
+-from sympy.polys.domains import FF, ZZ, QQ
++from sympy.polys.domains import FF, ZZ, QQ, EX
++from sympy.abc import x
+ 
+ from sympy.testing.pytest import raises
+ 
+@@ -180,6 +181,10 @@ def test_dup_mul_ground():
+     assert dup_mul_ground(f, ZZ(0), ZZ) == dup_normal([], ZZ)
+     assert dup_mul_ground(f, ZZ(2), ZZ) == dup_normal([2, 4, 6], ZZ)
+ 
++    f = [EX(1/x - 1/(x + 1) - 1/(x*(x + 1)))]
++
++    assert dup_mul_ground(f, EX(x*(x + 1)), EX) == dup_normal([], EX)
++
+ 
+ def test_dmp_mul_ground():
+     assert dmp_mul_ground(f_0, ZZ(2), 2, ZZ) == [
+@@ -195,6 +200,10 @@ def test_dmp_mul_ground():
+              QQ(1, 14)], [QQ(1, 14)]]
+     ]
+ 
++    f = [[EX(1/x - 1/(x + 1) - 1/(x*(x + 1)))]]
++
++    assert dmp_mul_ground(f, EX(x*(x + 1)), 1, EX) == [[]]
++
+ 
+ def test_dup_quo_ground():
+     raises(ZeroDivisionError, lambda: dup_quo_ground(dup_normal([1, 2,
+diff --git a/sympy/polys/tests/test_polytools.py b/sympy/polys/tests/test_polytools.py
+index c774fc41e2..fb1cafbe6b 100644
+--- a/sympy/polys/tests/test_polytools.py
++++ b/sympy/polys/tests/test_polytools.py
+@@ -1445,6 +1445,18 @@ def test_Poly_clear_denoms():
+         x + 3*sqrt(2), x, domain='EX') and poly.get_domain() == EX
+ 
+ 
++def test_Poly_clear_denoms_zero_in_EX():
++    coeff, poly = Poly(
++        1/x - 1/(x + 1) - 1/(x*(x + 1)), y, domain='EX').clear_denoms()
++    zero = Poly(0, y, domain='EX')
++
++    assert coeff != 0
++    assert poly.rep == zero.rep
++    assert poly.is_zero is True
++    assert poly.terms_gcd() == ((0,), zero)
++    assert poly.primitive() == (0, zero)
++
++
+ def test_Poly_rat_clear_denoms():
+     f = Poly(x**2/y + 1, x)
+     g = Poly(x**3 + y, x)

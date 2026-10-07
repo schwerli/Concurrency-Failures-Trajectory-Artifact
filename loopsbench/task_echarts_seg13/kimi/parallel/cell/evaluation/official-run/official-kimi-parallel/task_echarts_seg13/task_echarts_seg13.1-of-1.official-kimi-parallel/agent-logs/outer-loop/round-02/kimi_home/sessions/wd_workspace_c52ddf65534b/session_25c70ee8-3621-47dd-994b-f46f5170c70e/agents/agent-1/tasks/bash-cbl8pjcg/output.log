@@ -1,0 +1,140 @@
+From 18b5db25e01fd40539fab81c9a67d8278909e7ff Mon Sep 17 00:00:00 2001
+From: 100pah <sushuang0322@gmail.com>
+Date: Tue, 22 Jul 2025 17:03:14 +0800
+Subject: [PATCH] fix(scale): Fix that extreme small numbers can not be
+ displayed in Cartesian due to the inappropriate rounding precision.  Close
+ #16266
+
+---
+ src/scale/Interval.ts                          | 16 ++++++++++++----
+ src/scale/Log.ts                               |  3 ++-
+ src/scale/Time.ts                              |  1 +
+ src/util/number.ts                             |  5 +++--
+ test/runTest/actions/__meta__.json             |  1 +
+ test/runTest/actions/scale-extreme-number.json |  1 +
+ 6 files changed, 20 insertions(+), 7 deletions(-)
+ create mode 100644 test/runTest/actions/scale-extreme-number.json
+
+diff --git a/src/scale/Interval.ts b/src/scale/Interval.ts
+index ebc6ec73ae..917aa3f531 100644
+--- a/src/scale/Interval.ts
++++ b/src/scale/Interval.ts
+@@ -35,7 +35,7 @@ class IntervalScale<SETTING extends ScaleSettingDefault = ScaleSettingDefault> e
+     // Step is calculated in adjustExtent.
+     protected _interval: number = 0;
+     protected _niceExtent: [number, number];
+-    private _intervalPrecision: number = 2;
++    protected _intervalPrecision: number = 2;
+ 
+ 
+     parse(val: ScaleDataValue): number {
+@@ -213,9 +213,10 @@ class IntervalScale<SETTING extends ScaleSettingDefault = ScaleSettingDefault> e
+             const minorTicksGroup = [];
+             const interval = nextTick.value - prevTick.value;
+             const minorInterval = interval / splitNumber;
++            const minorIntervalPrecision = helper.getIntervalPrecision(minorInterval);
+ 
+             while (count < splitNumber - 1) {
+-                const minorTick = roundNumber(prevTick.value + (count + 1) * minorInterval);
++                const minorTick = roundNumber(prevTick.value + (count + 1) * minorInterval, minorIntervalPrecision);
+ 
+                 // For the first and last interval. The count may be less than splitNumber.
+                 if (minorTick > extent[0] && minorTick < extent[1]) {
+@@ -276,6 +277,12 @@ class IntervalScale<SETTING extends ScaleSettingDefault = ScaleSettingDefault> e
+     }
+ 
+     /**
++     * FIXME: refactor - disallow override, use composition instead.
++     *
++     * The override of `calcNiceTicks` should ensure these members are provided:
++     *  this._intervalPrecision
++     *  this._interval
++     *
+      * @param splitNumber By default `5`.
+      */
+     calcNiceTicks(splitNumber?: number, minInterval?: number, maxInterval?: number): void {
+@@ -345,12 +352,13 @@ class IntervalScale<SETTING extends ScaleSettingDefault = ScaleSettingDefault> e
+ 
+         this.calcNiceTicks(opt.splitNumber, opt.minInterval, opt.maxInterval);
+         const interval = this._interval;
++        const intervalPrecition = this._intervalPrecision;
+ 
+         if (!opt.fixMin) {
+-            extent[0] = roundNumber(Math.floor(extent[0] / interval) * interval);
++            extent[0] = roundNumber(Math.floor(extent[0] / interval) * interval, intervalPrecition);
+         }
+         if (!opt.fixMax) {
+-            extent[1] = roundNumber(Math.ceil(extent[1] / interval) * interval);
++            extent[1] = roundNumber(Math.ceil(extent[1] / interval) * interval, intervalPrecition);
+         }
+         this._innerSetExtent(extent[0], extent[1]);
+     }
+diff --git a/src/scale/Log.ts b/src/scale/Log.ts
+index 63665bbe0f..bdd799056c 100644
+--- a/src/scale/Log.ts
++++ b/src/scale/Log.ts
+@@ -27,7 +27,7 @@ import {
+     DimensionLoose, DimensionName, ParsedAxisBreakList, AxisBreakOption,
+     ScaleTick
+ } from '../util/types';
+-import { logTransform } from './helper';
++import { getIntervalPrecision, logTransform } from './helper';
+ import SeriesData from '../data/SeriesData';
+ import { getScaleBreakHelper } from './break';
+ 
+@@ -165,6 +165,7 @@ class LogScale extends IntervalScale {
+         ] as [number, number];
+ 
+         this._interval = interval;
++        this._intervalPrecision = getIntervalPrecision(interval);
+         this._niceExtent = niceExtent;
+     }
+ 
+diff --git a/src/scale/Time.ts b/src/scale/Time.ts
+index 85768cacf2..07f589867e 100644
+--- a/src/scale/Time.ts
++++ b/src/scale/Time.ts
+@@ -297,6 +297,7 @@ class TimeScale extends IntervalScale<TimeScaleSetting> {
+ 
+         // Interval that can be used to calculate ticks
+         this._interval = scaleIntervals[idx][1];
++        this._intervalPrecision = scaleHelper.getIntervalPrecision(this._interval);
+         // Min level used when picking ticks from top down.
+         // We check one more level to avoid the ticks are to sparse in some case.
+         this._minLevelUnit = scaleIntervals[Math.max(idx - 1, 0)][0];
+diff --git a/src/util/number.ts b/src/util/number.ts
+index b39e85e1c1..f156e6d3de 100644
+--- a/src/util/number.ts
++++ b/src/util/number.ts
+@@ -157,8 +157,9 @@ export function round(x: number | string, precision: number, returnStr: false):
+ export function round(x: number | string, precision: number, returnStr: true): string;
+ export function round(x: number | string, precision?: number, returnStr?: boolean): string | number {
+     if (precision == null) {
+-        const expStr = (x + '').split('e')[1];
+-        precision = expStr ? -expStr + 1 : 10;
++        // FIXME: the default precision should not be provided, since there is no universally adaptable
++        //  precision. The caller need to input a precision according to the scenarios.
++        precision = 10;
+     }
+     // Avoid range error
+     precision = Math.min(Math.max(0, precision), ROUND_SUPPORTED_PRECISION_MAX);
+diff --git a/test/runTest/actions/__meta__.json b/test/runTest/actions/__meta__.json
+index 586bc8d009..aed89b72d5 100644
+--- a/test/runTest/actions/__meta__.json
++++ b/test/runTest/actions/__meta__.json
+@@ -189,6 +189,7 @@
+   "sankey-emphasis-lineStyle": 1,
+   "sankey-jump": 1,
+   "sankey-level": 1,
++  "scale-extreme-number": 2,
+   "scatter-random-stream-fix-axis": 1,
+   "scatter-single-axis": 3,
+   "scatterMatrix": 3,
+diff --git a/test/runTest/actions/scale-extreme-number.json b/test/runTest/actions/scale-extreme-number.json
+new file mode 100644
+index 0000000000..a9492b341e
+--- /dev/null
++++ b/test/runTest/actions/scale-extreme-number.json
+@@ -0,0 +1 @@
++[{"name":"Action 1","ops":[{"type":"mousemove","time":29,"x":328,"y":84},{"type":"mousemove","time":229,"x":235,"y":95},{"type":"mousemove","time":429,"x":180,"y":80},{"type":"mousemove","time":629,"x":141,"y":78},{"type":"mousemove","time":836,"x":113,"y":83},{"type":"mousemove","time":1053,"x":113,"y":83},{"type":"valuechange","selector":"#main0>div.test-chart-block-left>div.test-inputs.test-buttons.test-inputs-style-normal>span.test-inputs-select>select.test-inputs-select-select","value":"1","time":1995,"target":"select"},{"time":1996,"delay":400,"type":"screenshot-auto"},{"type":"mousemove","time":2029,"x":109,"y":79},{"type":"mousemove","time":2229,"x":110,"y":75},{"type":"valuechange","selector":"#main0>div.test-chart-block-left>div.test-inputs.test-buttons.test-inputs-style-normal>span.test-inputs-select>select.test-inputs-select-select","value":"2","time":3695,"target":"select"},{"time":3696,"delay":400,"type":"screenshot-auto"},{"type":"mousemove","time":3729,"x":111,"y":90},{"type":"mousemove","time":3929,"x":115,"y":79},{"type":"mousemove","time":4137,"x":115,"y":79},{"type":"valuechange","selector":"#main0>div.test-chart-block-left>div.test-inputs.test-buttons.test-inputs-style-normal>span.test-inputs-select>select.test-inputs-select-select","value":"0","time":5179,"target":"select"},{"time":5180,"delay":400,"type":"screenshot-auto"},{"type":"mousemove","time":5212,"x":139,"y":47},{"type":"mousemove","time":5412,"x":398,"y":157},{"type":"mousemove","time":5613,"x":418,"y":123},{"type":"mousedown","time":5695,"x":419,"y":123},{"type":"mousemove","time":5821,"x":419,"y":123},{"type":"mouseup","time":5828,"x":419,"y":123},{"time":5829,"delay":400,"type":"screenshot-auto"}],"scrollY":0,"scrollX":0,"timestamp":1753174907387},{"name":"Action 2","ops":[{"type":"mousemove","time":555,"x":362,"y":233},{"type":"mousemove","time":755,"x":332,"y":316},{"type":"mousemove","time":955,"x":317,"y":317},{"type":"mousemove","time":1155,"x":186,"y":354},{"type":"mousemove","time":1362,"x":185,"y":355},{"type":"mousemove","time":1921,"x":185,"y":355},{"type":"mousemove","time":2122,"x":185,"y":383},{"type":"mousemove","time":2327,"x":184,"y":383},{"type":"mousemove","time":2538,"x":321,"y":340},{"type":"mousemove","time":2744,"x":342,"y":340},{"type":"mousemove","time":2871,"x":342,"y":340},{"type":"mousemove","time":3071,"x":250,"y":360},{"type":"mousemove","time":3271,"x":190,"y":380},{"type":"mousemove","time":3482,"x":190,"y":380},{"type":"mousemove","time":3904,"x":195,"y":377},{"type":"mousemove","time":4113,"x":353,"y":337}],"scrollY":356,"scrollX":0,"timestamp":1753174920243}]
+\ No newline at end of file

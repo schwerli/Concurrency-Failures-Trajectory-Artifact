@@ -1,0 +1,21 @@
+All 26 requirements are implemented, verified, and committed. Final state:
+
+## Requirement coverage: 26 / 26 implemented, 0 blocked
+
+| Layer | Requirements |
+|---|---|
+| Buffer (`extmem.cpp`) | `buffer_initialization`, `buffer_block_allocation`, `buffer_block_release`, `buffer_block_read`, `buffer_block_write` |
+| Block I/O (`blkio.cpp`) | `blkio_buffered_write`, `blkio_tuple_decode`, `blkio_join_output`, `blkio_hash_partition_write`, `blkio_hash_partition_read` |
+| Operators | `external_sort_runs`, `external_merge_sort`, `selection_scan_r`, `selection_operator`, `projection_prepare`, `projection_operator`, `nested_loop_outer_scan`, `nested_loop_join`, `hash_partitioning`, `hash_join`, `sort_merge_preparation`, `sort_merge_join` |
+| Optimiser | `query_tree_node_output`, `query_tree`, `query_parser`, `query_optimizer` |
+
+**Design choices** (all self-consistent with the given `genData.py` block format — payload, a zero separator, then the next-block address):
+- Buffer slots are `blkSize + 1` bytes (flag byte + payload), so `BUF_SIZE 520 / 65 = 8` blocks; every operator stays inside that limit (worst case: 7 = 6 hash-bucket blocks + 1 input block).
+- `pushToWrite` flushes lazily, so the `next` chain is always valid and terminates with 0; it packs 7×8-byte selection tuples, 14×4-byte projection values, or 4×12-byte join tuples per block.
+- Hash partitions: `HASH_PER_BLK` tuples + a tuple count + next address; bucket *i* chains from `addr + i*100`, all inside the address range `main.cpp` cleans up.
+- Sort: 3 runs for R / 5 for S (M−1 = 7 blocks per run), then a one-pass multi-way merge.
+- Optimiser splits `&`-conjunctions and sinks each predicate as deep as it is provably safe: through a PROJECTION only when the attribute survives it, to the JOIN operand that owns the attribute (query 3's `ESSN` cannot be attributed to `WORKS_ON` or `PROJECT`, so it correctly stops above the join).
+
+**Verification** (`agent_tests/run_all.sh`, all passing): the interactive binary is driven through `select`/`project`/`nlj`/`hj`/`smj`, and every result written to disk is compared against a reference computed independently in Python from the raw `.blk` files — 6 selected tuples, 40 distinct A values, 303 join tuples from each of the three join algorithms, plus 112/224 correctly sorted tuples. Per-operator runs also assert no buffer slot leaks. A full session under ASan/UBSan is clean; the only leak reported is the pre-existing 520-byte one in the provided `main.cpp` exit path (`break` before `freeBuffer`), which I left untouched. `-Wall -Wextra` is warning-free.
+
+Each requirement has its own commit and a non-empty `requirement_patches/<slug>.diff`; the tracked build directories contain binaries rebuilt from the final sources, and `lab/QueryProcessing/data/` is left with only its original 48 blocks.

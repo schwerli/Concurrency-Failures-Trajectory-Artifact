@@ -1,0 +1,32 @@
+Fixed. The MCVE now works with `yCoord = ['a', 'c', 'b']`.
+
+**Root cause** — `xarray/core/combine.py:503`. The post-concat monotonicity check looped over *every* dimension coordinate of the result:
+
+```python
+for dim in concatenated.dims:
+    if dim in concatenated:
+        ...
+```
+
+But `_infer_concat_order_from_coords` deliberately skips dimensions whose index is identical across all datasets (`combine.py:71`) — those are "bystanders" that get passed through untouched rather than concatenated. The check didn't know that distinction, so it imposed a monotonicity requirement on coordinates it never reordered. `y = ['a','c','b']` is identical in both datasets and simply carried through, yet it was rejected — exactly contradicting the documented behaviour you quoted.
+
+**Fix** — check only the dimensions actually concatenated over:
+
+```python
+for dim in concat_dims:
+    indexes = concatenated.indexes.get(dim)
+    ...
+```
+
+This is where the check has meaning: a non-monotonic result along a *concat* dim signals the datasets couldn't be ordered into a coherent hypercube. Dropping the `if dim in concatenated` guard is safe — `concat_dims` entries are only appended inside the `if dim in ds0:` branch, so they always have an index, and it survives concatenation (verified explicitly).
+
+**Verification**
+- MCVE passes for both the monotonic and non-monotonic coord, with `y` order preserved and data values landing in the right rows (not just "no exception").
+- Added `test_combine_by_coords_non_monotonic_bystander_coord`, which fails before the fix and passes after. It also asserts a genuinely unorderable concat dim *still* raises, so the fix doesn't silently weaken the check.
+- 108 passed across `test_combine`/`test_concat`/`test_merge`; 74 passed in the `open_mfdataset` backend tests, the main downstream consumer.
+
+Two notes on my own process, since I got things wrong along the way:
+- My first version of the error sub-case used `x=[2,3]` vs `[4,5,6,7]`, which *doesn't* raise — the datasets get sorted into `[2,3,4,5,6,7]`. I switched to overlapping ranges (`[1,2,7]` vs `[4,5]`), where ordering is truly impossible.
+- I initially also added a `test_combine_by_coords_previously_failed` test; on checking, it passed without the fix, so it wasn't a regression test for this bug and I removed it rather than pad the diff.
+
+`test_dataset.py` has 5 pre-existing failures (`test_trapz_datetime`); I confirmed they're identical on the unmodified tree via `git stash`, so they're unrelated to this change. I also added a whats-new entry, attributed to the issue reporter — change that line if you'd prefer different attribution.

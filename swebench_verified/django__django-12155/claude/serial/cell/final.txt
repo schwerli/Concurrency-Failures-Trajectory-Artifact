@@ -1,0 +1,12 @@
+Fixed in `django/contrib/admindocs/utils.py:37`.
+
+**The change:** compute the common indent from `lines[1:]` instead of all lines. The first line of a docstring never carries indentation (it starts right after the opening quotes), so including it forced `indent = 0` and left the remaining lines with their source indentation intact. `parse_rst()` interpolates that body directly beneath `.. default-role:: cmsreference`, where an indented block is read as directive content — hence *"Error in 'default-role' directive: no content permitted."*
+
+I added `default=0` to the `min()`: with the first line excluded, a single-line docstring (`"""Single line."""`) leaves an empty generator, which would otherwise raise `ValueError`. For multi-line docstrings the default is never used, so behavior is unchanged there.
+
+**What I verified:**
+- `trim_docstring` over first-line-not-empty, single-line, classic leading-blank-line, and mixed docstrings, plus `''`/`None`/whitespace-only — all correct; nested indentation (`    deeper`) is preserved relative to the body.
+- Printed the actual reST source handed to docutils, before vs. after. Before: `    Display an individual thing.` sits indented under the directive (the failure). After: it's a sibling block at column 0.
+- `admin_docs` suite: 58 tests, OK.
+
+**Caveats, stated plainly:** docutils is not installed in this environment, so all 50 admin_docs tests that need it — including the regression test I added at `tests/admin_docs/test_utils.py:110` — **skip rather than run**. I confirmed the mechanism at the reST-source level, not through an actual docutils render. This env also lacks `asgiref`, `pytz`, and `sqlparse`; I used throwaway stubs in `/tmp/stub` (since deleted) purely to make the test runner importable — nothing under `/testbed` was touched beyond the diff above.

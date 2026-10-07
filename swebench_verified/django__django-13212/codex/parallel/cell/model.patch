@@ -1,0 +1,299 @@
+diff --git a/django/core/validators.py b/django/core/validators.py
+index 84b4f31ec7..3a71e87c84 100644
+--- a/django/core/validators.py
++++ b/django/core/validators.py
+@@ -16,6 +16,10 @@ from django.utils.translation import gettext_lazy as _, ngettext_lazy
+ EMPTY_VALUES = (None, '', [], (), {})
+ 
+ 
++def _error_params(value, **kwargs):
++    return {'value': value, **kwargs}
++
++
+ @deconstructible
+ class RegexValidator:
+     regex = ''
+@@ -40,6 +44,9 @@ class RegexValidator:
+ 
+         self.regex = _lazy_re_compile(self.regex, self.flags)
+ 
++    def _raise_validation_error(self, value):
++        raise ValidationError(self.message, code=self.code, params=_error_params(value))
++
+     def __call__(self, value):
+         """
+         Validate that the input contains (or does *not* contain, if
+@@ -48,7 +55,7 @@ class RegexValidator:
+         regex_matches = self.regex.search(str(value))
+         invalid_input = regex_matches if self.inverse_match else not regex_matches
+         if invalid_input:
+-            raise ValidationError(self.message, code=self.code)
++            self._raise_validation_error(value)
+ 
+     def __eq__(self, other):
+         return (
+@@ -100,11 +107,11 @@ class URLValidator(RegexValidator):
+ 
+     def __call__(self, value):
+         if not isinstance(value, str):
+-            raise ValidationError(self.message, code=self.code)
++            self._raise_validation_error(value)
+         # Check if the scheme is valid.
+         scheme = value.split('://')[0].lower()
+         if scheme not in self.schemes:
+-            raise ValidationError(self.message, code=self.code)
++            self._raise_validation_error(value)
+ 
+         # Then check full URL
+         try:
+@@ -115,13 +122,16 @@ class URLValidator(RegexValidator):
+                 try:
+                     scheme, netloc, path, query, fragment = urlsplit(value)
+                 except ValueError:  # for example, "Invalid IPv6 URL"
+-                    raise ValidationError(self.message, code=self.code)
++                    self._raise_validation_error(value)
+                 try:
+                     netloc = punycode(netloc)  # IDN -> ACE
+                 except UnicodeError:  # invalid domain part
+                     raise e
+                 url = urlunsplit((scheme, netloc, path, query, fragment))
+-                super().__call__(url)
++                try:
++                    super().__call__(url)
++                except ValidationError:
++                    self._raise_validation_error(value)
+             else:
+                 raise
+         else:
+@@ -132,14 +142,14 @@ class URLValidator(RegexValidator):
+                 try:
+                     validate_ipv6_address(potential_ip)
+                 except ValidationError:
+-                    raise ValidationError(self.message, code=self.code)
++                    self._raise_validation_error(value)
+ 
+         # The maximum length of a full host name is 253 characters per RFC 1034
+         # section 3.1. It's defined to be 255 bytes or less, but this includes
+         # one byte for the length of the name and one byte for the trailing dot
+         # that's used to indicate absolute names in DNS.
+         if len(urlsplit(value).netloc) > 253:
+-            raise ValidationError(self.message, code=self.code)
++            self._raise_validation_error(value)
+ 
+ 
+ integer_validator = RegexValidator(
+@@ -208,12 +218,12 @@ class EmailValidator:
+ 
+     def __call__(self, value):
+         if not value or '@' not in value:
+-            raise ValidationError(self.message, code=self.code)
++            raise ValidationError(self.message, code=self.code, params=_error_params(value))
+ 
+         user_part, domain_part = value.rsplit('@', 1)
+ 
+         if not self.user_regex.match(user_part):
+-            raise ValidationError(self.message, code=self.code)
++            raise ValidationError(self.message, code=self.code, params=_error_params(value))
+ 
+         if (domain_part not in self.domain_allowlist and
+                 not self.validate_domain_part(domain_part)):
+@@ -225,7 +235,7 @@ class EmailValidator:
+             else:
+                 if self.validate_domain_part(domain_part):
+                     return
+-            raise ValidationError(self.message, code=self.code)
++            raise ValidationError(self.message, code=self.code, params=_error_params(value))
+ 
+     def validate_domain_part(self, domain_part):
+         if self.domain_regex.match(domain_part):
+@@ -272,12 +282,20 @@ def validate_ipv4_address(value):
+     try:
+         ipaddress.IPv4Address(value)
+     except ValueError:
+-        raise ValidationError(_('Enter a valid IPv4 address.'), code='invalid')
++        raise ValidationError(
++            _('Enter a valid IPv4 address.'),
++            code='invalid',
++            params=_error_params(value),
++        )
+ 
+ 
+ def validate_ipv6_address(value):
+     if not is_valid_ipv6_address(value):
+-        raise ValidationError(_('Enter a valid IPv6 address.'), code='invalid')
++        raise ValidationError(
++            _('Enter a valid IPv6 address.'),
++            code='invalid',
++            params=_error_params(value),
++        )
+ 
+ 
+ def validate_ipv46_address(value):
+@@ -287,7 +305,11 @@ def validate_ipv46_address(value):
+         try:
+             validate_ipv6_address(value)
+         except ValidationError:
+-            raise ValidationError(_('Enter a valid IPv4 or IPv6 address.'), code='invalid')
++            raise ValidationError(
++                _('Enter a valid IPv4 or IPv6 address.'),
++                code='invalid',
++                params=_error_params(value),
++            )
+ 
+ 
+ ip_address_validator_map = {
+@@ -438,7 +460,7 @@ class DecimalValidator:
+     def __call__(self, value):
+         digit_tuple, exponent = value.as_tuple()[1:]
+         if exponent in {'F', 'n', 'N'}:
+-            raise ValidationError(self.messages['invalid'])
++            raise ValidationError(self.messages['invalid'], params=_error_params(value))
+         if exponent >= 0:
+             # A positive exponent adds that many trailing zeros.
+             digits = len(digit_tuple) + exponent
+@@ -460,20 +482,20 @@ class DecimalValidator:
+             raise ValidationError(
+                 self.messages['max_digits'],
+                 code='max_digits',
+-                params={'max': self.max_digits},
++                params=_error_params(value, max=self.max_digits),
+             )
+         if self.decimal_places is not None and decimals > self.decimal_places:
+             raise ValidationError(
+                 self.messages['max_decimal_places'],
+                 code='max_decimal_places',
+-                params={'max': self.decimal_places},
++                params=_error_params(value, max=self.decimal_places),
+             )
+         if (self.max_digits is not None and self.decimal_places is not None and
+                 whole_digits > (self.max_digits - self.decimal_places)):
+             raise ValidationError(
+                 self.messages['max_whole_digits'],
+                 code='max_whole_digits',
+-                params={'max': (self.max_digits - self.decimal_places)},
++                params=_error_params(value, max=(self.max_digits - self.decimal_places)),
+             )
+ 
+     def __eq__(self, other):
+@@ -507,10 +529,11 @@ class FileExtensionValidator:
+             raise ValidationError(
+                 self.message,
+                 code=self.code,
+-                params={
+-                    'extension': extension,
+-                    'allowed_extensions': ', '.join(self.allowed_extensions)
+-                }
++                params=_error_params(
++                    value,
++                    extension=extension,
++                    allowed_extensions=', '.join(self.allowed_extensions),
++                ),
+             )
+ 
+     def __eq__(self, other):
+@@ -550,7 +573,7 @@ class ProhibitNullCharactersValidator:
+ 
+     def __call__(self, value):
+         if '\x00' in str(value):
+-            raise ValidationError(self.message, code=self.code)
++            raise ValidationError(self.message, code=self.code, params=_error_params(value))
+ 
+     def __eq__(self, other):
+         return (
+diff --git a/docs/ref/validators.txt b/docs/ref/validators.txt
+index 50761e5a42..eedde3d3f6 100644
+--- a/docs/ref/validators.txt
++++ b/docs/ref/validators.txt
+@@ -67,7 +67,10 @@ Built-in validators
+ The :mod:`django.core.validators` module contains a collection of callable
+ validators for use with model and form fields. They're used internally but
+ are available for use with your own fields, too. They can be used in addition
+-to, or in lieu of custom ``field.clean()`` methods.
++to, or in lieu of custom ``field.clean()`` methods. All of these validators
++pass the provided value to :exc:`~django.core.exceptions.ValidationError` in
++the ``params`` dictionary as ``value``, so you can use ``%(value)s`` in custom
++messages.
+ 
+ ``RegexValidator``
+ ------------------
+diff --git a/docs/releases/3.2.txt b/docs/releases/3.2.txt
+index 5e75f497f4..ad7264af2c 100644
+--- a/docs/releases/3.2.txt
++++ b/docs/releases/3.2.txt
+@@ -327,7 +327,10 @@ Utilities
+ Validators
+ ~~~~~~~~~~
+ 
+-* ...
++* Built-in validators in :mod:`django.core.validators` now include the
++  provided value in the ``params`` of raised
++  :class:`~django.core.exceptions.ValidationError`\s, allowing custom error
++  messages to use a ``%(value)s`` placeholder.
+ 
+ .. _backwards-incompatible-3.2:
+ 
+diff --git a/tests/validators/tests.py b/tests/validators/tests.py
+index d6d013c026..536b58edba 100644
+--- a/tests/validators/tests.py
++++ b/tests/validators/tests.py
+@@ -354,6 +354,60 @@ class TestValidators(SimpleTestCase):
+         with self.assertRaisesMessage(ValidationError, '"djangoproject.com" has more than 16 characters.'):
+             v('djangoproject.com')
+ 
++    def test_email_validator_custom_message(self):
++        v = EmailValidator(message='"%(value)s" is not a valid email address.')
++        with self.assertRaisesMessage(ValidationError, '"invalid" is not a valid email address.'):
++            v('invalid')
++
++    def test_validators_include_value_in_params(self):
++        file_value = ContentFile('contents', name='file.jpg')
++        long_url = (
++            'http://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.'
++            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaa.'
++            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.'
++            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.'
++            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.'
++            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.'
++            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.'
++            'aaaaaaaaaaaaaaaaaaaaaaaaa'
++        )
++        test_cases = [
++            (validate_integer, 'a', {'value': 'a'}),
++            (validate_email, 'invalid', {'value': 'invalid'}),
++            (URLValidator(), long_url, {'value': long_url}),
++            (validate_ipv4_address, '256.1.1.1', {'value': '256.1.1.1'}),
++            (validate_ipv6_address, '1:2', {'value': '1:2'}),
++            (validate_ipv46_address, 'invalid', {'value': 'invalid'}),
++            (
++                DecimalValidator(max_digits=2, decimal_places=0),
++                Decimal('100'),
++                {'max': 2, 'value': Decimal('100')},
++            ),
++            (
++                FileExtensionValidator(['txt']),
++                file_value,
++                {'extension': 'jpg', 'allowed_extensions': 'txt', 'value': file_value},
++            ),
++            (ProhibitNullCharactersValidator(), '\x00something', {'value': '\x00something'}),
++        ]
++        for validator, value, expected_params in test_cases:
++            name = (
++                validator.__name__
++                if isinstance(validator, types.FunctionType)
++                else validator.__class__.__name__
++            )
++            with self.subTest(name, value=value):
++                with self.assertRaises(ValidationError) as cm:
++                    validator(value)
++                self.assertEqual(cm.exception.params, expected_params)
++
++    def test_decimal_validator_invalid_params_include_value(self):
++        value = Decimal('NaN')
++        with self.assertRaises(ValidationError) as cm:
++            DecimalValidator(max_digits=10, decimal_places=2)(value)
++        self.assertEqual(set(cm.exception.params), {'value'})
++        self.assertIs(cm.exception.params['value'], value)
++
+ 
+ class TestValidatorEquality(TestCase):
+     """

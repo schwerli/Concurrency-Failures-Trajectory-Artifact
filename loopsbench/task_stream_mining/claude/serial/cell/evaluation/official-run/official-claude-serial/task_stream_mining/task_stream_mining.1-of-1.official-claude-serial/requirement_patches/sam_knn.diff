@@ -1,0 +1,956 @@
+diff --git a/agent_tests/test_sam_knn.py b/agent_tests/test_sam_knn.py
+new file mode 100644
+index 0000000..f254bd7
+--- /dev/null
++++ b/agent_tests/test_sam_knn.py
+@@ -0,0 +1,237 @@
++"""Tests for the SAM-KNN classifier (STM / LTM self adjusting memory)."""
++
++import math
++import os
++import random
++import sys
++import unittest
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from stream.experiments.sam_exp import AbruptDriftStream, SAMKNNExperiment
++from stream.sam_knn import (LongTermMemory, SAMKNN, SAMModel, ShortTermMemory,
++                            euclidean_distance, knn_search, knn_vote)
++
++
++class TestDistances(unittest.TestCase):
++
++    def test_euclidean(self):
++        self.assertAlmostEqual(euclidean_distance([0.0, 0.0], [3.0, 4.0]), 5.0)
++        self.assertAlmostEqual(euclidean_distance([1.0], [1.0]), 0.0)
++
++    def test_weighted_euclidean(self):
++        self.assertAlmostEqual(euclidean_distance([0.0, 0.0], [3.0, 4.0], [1.0, 0.0]), 3.0)
++        self.assertAlmostEqual(euclidean_distance([0.0, 0.0], [1.0, 1.0], [4.0, 0.0]), 2.0)
++
++    def test_knn_search_orders_by_distance(self):
++        features = [[0.0], [10.0], [1.0], [5.0]]
++        labels = [0, 1, 0, 1]
++        neighbours = knn_search(features, labels, [0.5], 3)
++        self.assertEqual([index for _distance, index in neighbours], [0, 2, 3])
++        self.assertAlmostEqual(neighbours[0][0], 0.5)
++
++    def test_knn_search_can_exclude_an_index(self):
++        features = [[0.0], [1.0], [2.0]]
++        labels = [0, 1, 2]
++        neighbours = knn_search(features, labels, [0.0], 1, exclude_index=0)
++        self.assertEqual(neighbours[0][1], 1)
++
++    def test_knn_vote_majority_and_ties(self):
++        features = [[0.0], [0.1], [5.0], [5.1]]
++        labels = [0, 0, 1, 1]
++        self.assertEqual(knn_vote(features, labels, [0.05], 3), 0)
++        self.assertEqual(knn_vote(features, labels, [5.05], 3), 1)
++        # 2 vs 2 tie: the class with the closest neighbour wins
++        self.assertEqual(knn_vote(features, labels, [0.2], 4), 0)
++        self.assertIsNone(knn_vote([], [], [0.0], 3))
++
++
++class TestShortTermMemory(unittest.TestCase):
++
++    def test_fifo_eviction(self):
++        memory = ShortTermMemory(max_size=3)
++        self.assertIsNone(memory.add([0.0], 0))
++        memory.add([1.0], 1)
++        memory.add([2.0], 0)
++        self.assertEqual(memory.get_size(), 3)
++        evicted = memory.add([3.0], 1)
++        self.assertEqual(evicted, ([0.0], 0))
++        self.assertEqual(memory.get_size(), 3)
++        features, labels = memory.get_window()
++        self.assertEqual(features, [[1.0], [2.0], [3.0]])
++        self.assertEqual(labels, [1, 0, 1])
++
++    def test_knn_predict(self):
++        memory = ShortTermMemory(max_size=10)
++        for value in (0.0, 0.1, 0.2):
++            memory.add([value], 0)
++        for value in (9.0, 9.1, 9.2):
++            memory.add([value], 1)
++        self.assertEqual(memory.knn_predict([0.15], 3), 0)
++        self.assertEqual(memory.knn_predict([9.15], 3), 1)
++        self.assertIsNone(ShortTermMemory().knn_predict([0.0], 3))
++
++    def test_stores_copies(self):
++        memory = ShortTermMemory(max_size=2)
++        features = [1.0, 2.0]
++        memory.add(features, 0)
++        features[0] = 99.0
++        self.assertEqual(memory.get_window()[0][0], [1.0, 2.0])
++
++
++class TestLongTermMemory(unittest.TestCase):
++
++    def test_add_and_predict(self):
++        memory = LongTermMemory(max_size=100)
++        for value in (0.0, 0.1, 0.2):
++            memory.add([value], 0)
++        for value in (5.0, 5.1, 5.2):
++            memory.add([value], 1)
++        self.assertEqual(memory.get_size(), 6)
++        self.assertEqual(memory.knn_predict([5.05], 3), 1)
++
++    def test_clean_removes_contradicted_instances(self):
++        memory = LongTermMemory(max_size=100)
++        for value in (0.0, 0.05, 0.1):
++            memory.add([value], 0)      # consistent with the STM below
++        for value in (0.2, 0.25):
++            memory.add([value], 1)      # contradicted: this region is class 0
++        stm_features = [[v] for v in (0.0, 0.02, 0.04, 0.2, 0.22, 0.24)]
++        stm_labels = [0, 0, 0, 0, 0, 0]
++        removed = memory.clean(stm_features, stm_labels, k=3)
++        self.assertEqual(removed, 2)
++        self.assertEqual(memory.get_size(), 3)
++        self.assertEqual(set(memory.labels), {0})
++        self.assertEqual(memory.num_cleaned, 2)
++
++    def test_clean_is_a_noop_without_stm(self):
++        memory = LongTermMemory()
++        memory.add([0.0], 0)
++        self.assertEqual(memory.clean([], [], k=3), 0)
++        self.assertEqual(memory.get_size(), 1)
++
++    def test_compress_creates_prototypes(self):
++        memory = LongTermMemory(max_size=1000, min_cluster_size=2)
++        rng = random.Random(0)
++        for _ in range(30):
++            memory.add([rng.gauss(0.0, 0.1), rng.gauss(0.0, 0.1)], 0)
++        for _ in range(30):
++            memory.add([rng.gauss(5.0, 0.1), rng.gauss(5.0, 0.1)], 1)
++        size_before = memory.get_size()
++        self.assertEqual(memory.num_compressions, 0)
++        removed = memory.compress(target_size=20)
++        self.assertGreater(removed, 0)
++        self.assertLess(memory.get_size(), size_before)
++        self.assertEqual(set(memory.labels), {0, 1})
++        self.assertEqual(memory.num_compressions, 1)
++        # the prototypes still separate the two concepts
++        self.assertEqual(memory.knn_predict([0.0, 0.0], 1), 0)
++        self.assertEqual(memory.knn_predict([5.0, 5.0], 1), 1)
++
++    def test_capacity_is_enforced(self):
++        memory = LongTermMemory(max_size=20, min_cluster_size=2)
++        rng = random.Random(1)
++        for i in range(60):
++            memory.add([rng.random(), rng.random()], i % 2)
++        self.assertLessEqual(memory.get_size(), 20)
++
++
++class TestSAMModel(unittest.TestCase):
++
++    def test_evicted_instances_move_to_ltm(self):
++        model = SAMModel(k=3, stm_max_size=10, ltm_clean_frequency=10 ** 9)
++        for i in range(25):
++            model.partial_fit([i / 25.0], i % 2)
++        sizes = model.get_memory_sizes()
++        self.assertEqual(sizes["stm"], 10)
++        self.assertEqual(sizes["ltm"], 15)
++        self.assertEqual(sizes["total"], 25)
++        self.assertIs(SAMKNN, SAMModel)
++
++    def test_predict_uses_stm_while_it_is_small(self):
++        model = SAMModel(k=1, stm_max_size=5, min_stm_size=50,
++                         ltm_clean_frequency=10 ** 9)
++        for i in range(20):
++            model.partial_fit([float(i)], 0 if i < 10 else 1)
++        details = model.predict_detailed([19.0])
++        self.assertEqual(details["memory"], "STM")
++        self.assertEqual(details["prediction"], 1)
++
++    def test_evaluate_memories_returns_accuracies(self):
++        model = SAMModel(k=3, stm_max_size=50, validation_size=10,
++                         ltm_clean_frequency=10 ** 9)
++        rng = random.Random(2)
++        for _ in range(200):
++            label = rng.randint(0, 1)
++            model.partial_fit([rng.gauss(label * 5.0, 0.5)], label)
++        stm_accuracy, ltm_accuracy = model._evaluate_memories([0.0], 3)
++        self.assertGreaterEqual(stm_accuracy, 0.0)
++        self.assertLessEqual(stm_accuracy, 1.0)
++        self.assertGreaterEqual(ltm_accuracy, 0.0)
++        self.assertLessEqual(ltm_accuracy, 1.0)
++        self.assertGreater(stm_accuracy, 0.8)
++
++    def test_ties_prefer_the_stm(self):
++        model = SAMModel(k=1, stm_max_size=10, min_stm_size=1,
++                         ltm_clean_frequency=10 ** 9)
++        for i in range(20):
++            model.partial_fit([float(i)], 0)
++        model._memory_accuracies = (0.5, 0.5)
++        model._weights_age = model.instances_seen
++        self.assertEqual(model.predict_detailed([5.0])["memory"], "STM")
++
++    def test_accepts_instance_objects(self):
++        from streams import Instance
++        model = SAMModel(k=1, stm_max_size=10)
++        model.partial_fit(Instance([0.0], 1))
++        self.assertEqual(model.predict(Instance([0.0], 1)), 1)
++        model.train(Instance([1.0], 0))
++        self.assertEqual(model.get_memory_sizes()["stm"], 2)
++
++    def test_learns_a_separable_stream(self):
++        model = SAMModel(k=5, stm_max_size=200, ltm_clean_frequency=100)
++        rng = random.Random(4)
++        correct = 0
++        for i in range(1000):
++            label = rng.randint(0, 1)
++            features = [rng.gauss(label * 3.0, 1.0) for _ in range(3)]
++            correct += int(model.predict(features) == label)
++            model.partial_fit(features, label)
++        self.assertGreater(correct / 1000.0, 0.85)
++
++
++class TestSAMExperiment(unittest.TestCase):
++
++    def test_drift_stream_swaps_class_means(self):
++        stream = AbruptDriftStream(seed=1, num_attributes=4, drift_point=100)
++        before = [stream.next_instance() for _ in range(100)]
++        after = [stream.next_instance() for _ in range(100)]
++        mean_before = sum(sum(i.features) / 4 for i in before if i.label == 1) / \
++            max(1, sum(1 for i in before if i.label == 1))
++        mean_after = sum(sum(i.features) / 4 for i in after if i.label == 1) / \
++            max(1, sum(1 for i in after if i.label == 1))
++        self.assertGreater(mean_before, 0.5)
++        self.assertLess(mean_after, 0.5)
++
++    def test_small_experiment_run(self):
++        experiment = SAMKNNExperiment(k=5, stm_size=200, num_instances=1500,
++                                      drift_point=750, tail_size=300)
++        results = experiment.run_all()
++        for key in ("SAM_ACCURACY_STABLE", "SAM_ACCURACY_DRIFT", "SAM_STM_SIZE",
++                    "SAM_LTM_SIZE", "SAM_MEMORY_DECISIONS"):
++            self.assertIn(key, results)
++        self.assertGreater(results["SAM_ACCURACY_STABLE"], 0.5)
++        self.assertGreaterEqual(results["SAM_MEMORY_DECISIONS"], 0.0)
++        self.assertLessEqual(results["SAM_MEMORY_DECISIONS"], 1.0)
++        self.assertGreater(results["SAM_STM_SIZE"], 0.0)
++
++    def test_memory_comparison_reports_three_policies(self):
++        experiment = SAMKNNExperiment(k=5, stm_size=200, num_instances=1500,
++                                      drift_point=750, tail_size=300)
++        comparison = experiment.compare_memories()
++        self.assertEqual(set(comparison),
++                         {"stm_only_accuracy", "ltm_only_accuracy", "sam_accuracy"})
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/run.sh b/run.sh
+index 1088d72..e66600b 100755
+--- a/run.sh
++++ b/run.sh
+@@ -17,3 +17,6 @@ $PYTHON -m stream.experiments.adwin_exp
+ 
+ # --- MOA (OzaBagging ensemble + interleaved test-then-train) ---------------
+ $PYTHON moa_framework.py
++
++# --- SAM-KNN (self adjusting memory kNN) -----------------------------------
++$PYTHON -m stream.experiments.sam_exp
+diff --git a/stream/experiments/sam_exp.py b/stream/experiments/sam_exp.py
+new file mode 100644
+index 0000000..dd316d4
+--- /dev/null
++++ b/stream/experiments/sam_exp.py
+@@ -0,0 +1,190 @@
++"""Experiments for the SAM-KNN classifier.
++
++Two prequential runs produce the five reported metrics:
++
++* a *stable* run on ``RandomTreeGenerator`` (accuracy, STM size, LTM size),
++* a *drifting* run on a Gaussian stream whose class means swap at sample 5000
++  (post drift accuracy and the share of predictions taken from the STM).
++
++The drifting run also compares the three possible memory policies - STM only,
++LTM only and the combined self adjusting memory - which is what motivates the
++architecture in the first place.
++"""
++
++import os
++import random
++import sys
++from typing import Dict, List, Optional
++
++if __package__ in (None, ""):  # allow "python3 stream/experiments/sam_exp.py"
++    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
++        os.path.abspath(__file__)))))
++
++from stream.sam_knn import SAMModel
++from streams import Instance, RandomTreeGenerator, StreamGenerator
++
++
++class AbruptDriftStream(StreamGenerator):
++    """Gaussian classes whose means swap at ``drift_point`` (abrupt drift).
++
++    Before the drift class ``c`` is drawn from ``N(c * separation, sigma)`` in
++    every dimension; afterwards the two class means are exchanged, so every
++    piece of knowledge about the old concept becomes actively misleading.
++    """
++
++    def __init__(self, seed: int = 42, num_attributes: int = 10,
++                 num_classes: int = 2, drift_point: int = 5000,
++                 separation: float = 1.0, sigma: float = 1.0):
++        super().__init__(seed)
++        self.num_attributes = num_attributes
++        self.num_classes = num_classes
++        self.drift_point = drift_point
++        self.separation = separation
++        self.sigma = sigma
++
++    def _mean_for(self, label: int) -> float:
++        if self.instances_generated < self.drift_point:
++            concept_label = label
++        else:  # the class means are swapped after the drift
++            concept_label = (self.num_classes - 1) - label
++        return concept_label * self.separation
++
++    def next_instance(self) -> Instance:
++        label = self.rng.randint(0, self.num_classes - 1)
++        mean = self._mean_for(label)
++        features = [self.rng.gauss(mean, self.sigma)
++                    for _ in range(self.num_attributes)]
++        self.instances_generated += 1
++        return Instance(features, label)
++
++
++class SAMKNNExperiment:
++    """Runs the SAM-KNN experiments on stable and drifting streams."""
++
++    def __init__(self, k: int = 5, stm_size: int = 1000,
++                 num_instances: int = 10000, seed: int = 42,
++                 drift_point: int = 5000, tail_size: int = 2000):
++        self.k = k
++        self.stm_size = stm_size
++        self.num_instances = num_instances
++        self.seed = seed
++        self.drift_point = drift_point
++        self.tail_size = tail_size
++        self.results: Dict[str, float] = {}
++
++    # -- helpers -----------------------------------------------------------
++    def _new_model(self) -> SAMModel:
++        return SAMModel(k=self.k, stm_max_size=self.stm_size,
++                        ltm_max_size=10000, min_stm_size=50,
++                        ltm_clean_frequency=500)
++
++    def _run_stream(self, stream: StreamGenerator, num_instances: int,
++                    model: Optional[SAMModel] = None) -> Dict[str, object]:
++        """Interleaved test-then-train pass recording per-memory behaviour."""
++        model = model or self._new_model()
++        correct = 0
++        stm_only_correct = 0
++        ltm_only_correct = 0
++        stm_only_seen = 0
++        ltm_only_seen = 0
++        stm_sizes: List[int] = []
++        ltm_sizes: List[int] = []
++        recent: List[int] = []
++        accuracy_curve: List[Dict[str, float]] = []
++
++        for index in range(num_instances):
++            instance = stream.next_instance()
++            details = model.predict_detailed(instance.features)
++            hit = int(details["prediction"] == instance.label)
++            correct += hit
++            recent.append(hit)
++            if len(recent) > self.tail_size:
++                recent.pop(0)
++            if details["stm_prediction"] is not None:
++                stm_only_seen += 1
++                stm_only_correct += int(details["stm_prediction"] == instance.label)
++            if details["ltm_prediction"] is not None:
++                ltm_only_seen += 1
++                ltm_only_correct += int(details["ltm_prediction"] == instance.label)
++
++            model.partial_fit(instance.features, instance.label)
++            stm_sizes.append(model.stm.get_size())
++            ltm_sizes.append(model.ltm.get_size())
++            if (index + 1) % 1000 == 0:
++                accuracy_curve.append({
++                    "instances": index + 1,
++                    "accuracy": correct / float(index + 1),
++                    "recent_accuracy": sum(recent) / float(len(recent)),
++                })
++
++        decisions = model.get_memory_decisions()
++        return {
++            "model": model,
++            "accuracy": correct / float(num_instances),
++            "tail_accuracy": sum(recent) / float(len(recent)) if recent else 0.0,
++            "stm_only_accuracy": (stm_only_correct / stm_only_seen) if stm_only_seen else 0.0,
++            "ltm_only_accuracy": (ltm_only_correct / ltm_only_seen) if ltm_only_seen else 0.0,
++            "mean_stm_size": sum(stm_sizes) / float(len(stm_sizes)),
++            "mean_ltm_size": sum(ltm_sizes) / float(len(ltm_sizes)),
++            "final_stm_size": stm_sizes[-1] if stm_sizes else 0,
++            "final_ltm_size": ltm_sizes[-1] if ltm_sizes else 0,
++            "stm_fraction": decisions["stm_fraction"],
++            "curve": accuracy_curve,
++        }
++
++    # -- experiments 1, 3 and 4 -------------------------------------------
++    def run_stable(self) -> Dict[str, object]:
++        """Prequential accuracy and memory sizes on a stationary stream."""
++        stream = RandomTreeGenerator(seed=self.seed, num_attributes=10,
++                                     num_classes=2, max_depth=5)
++        stats = self._run_stream(stream, self.num_instances)
++        self.results["SAM_ACCURACY_STABLE"] = stats["accuracy"]
++        self.results["SAM_STM_SIZE"] = stats["mean_stm_size"]
++        self.results["SAM_LTM_SIZE"] = stats["final_ltm_size"]
++        self.results["_stable"] = stats
++        return stats
++
++    # -- experiments 2 and 5 ----------------------------------------------
++    def run_drift(self) -> Dict[str, object]:
++        """Accuracy after an abrupt drift and the STM/LTM decision split."""
++        stream = AbruptDriftStream(seed=self.seed, num_attributes=10,
++                                   num_classes=2, drift_point=self.drift_point)
++        stats = self._run_stream(stream, self.num_instances)
++        self.results["SAM_ACCURACY_DRIFT"] = stats["tail_accuracy"]
++        self.results["SAM_MEMORY_DECISIONS"] = stats["stm_fraction"]
++        self.results["_drift"] = stats
++        return stats
++
++    def compare_memories(self) -> Dict[str, float]:
++        """STM only vs LTM only vs the combined self adjusting memory."""
++        stats = self.results.get("_drift") or self.run_drift()
++        comparison = {
++            "stm_only_accuracy": stats["stm_only_accuracy"],
++            "ltm_only_accuracy": stats["ltm_only_accuracy"],
++            "sam_accuracy": stats["accuracy"],
++        }
++        self.results.update(comparison)
++        return comparison
++
++    # -- driver ------------------------------------------------------------
++    def run_all(self) -> Dict[str, float]:
++        self.run_stable()
++        self.run_drift()
++        self.compare_memories()
++        return self.results
++
++    def report(self):
++        results = self.run_all()
++        print(f"SAM_ACCURACY_STABLE: {results['SAM_ACCURACY_STABLE']:.4f}")
++        print(f"SAM_ACCURACY_DRIFT: {results['SAM_ACCURACY_DRIFT']:.4f}")
++        print(f"SAM_STM_SIZE: {results['SAM_STM_SIZE']:.2f}")
++        print(f"SAM_LTM_SIZE: {int(results['SAM_LTM_SIZE'])}")
++        print(f"SAM_MEMORY_DECISIONS: {results['SAM_MEMORY_DECISIONS']:.4f}")
++
++
++def main():
++    SAMKNNExperiment().report()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/stream/sam_knn.py b/stream/sam_knn.py
+new file mode 100644
+index 0000000..85e6cc2
+--- /dev/null
++++ b/stream/sam_knn.py
+@@ -0,0 +1,500 @@
++"""SAM-KNN: k nearest neighbours with a Self Adjusting Memory.
++
++Reference: Losing, Hammer & Wersing, "KNN Classifier with Self Adjusting Memory
++for Heterogeneous Concept Drift", ICDM 2016.
++
++The model keeps two memories:
++
++* the **Short Term Memory** (STM) - a sliding window of the most recent
++  instances, which follows the current concept and forgets quickly,
++* the **Long Term Memory** (LTM) - instances evicted from the STM that do not
++  contradict the current concept, compressed into prototypes when it overflows.
++
++Both memories answer with a kNN vote.  For every query the memory with the
++higher local accuracy decides, so the model can switch between "react fast"
++(STM) and "remember old knowledge" (LTM) behaviour, which is what makes it
++robust against heterogeneous drift.
++"""
++
++import heapq
++import math
++from itertools import repeat
++from typing import Dict, List, Optional, Sequence, Tuple
++
++Features = Sequence[float]
++
++
++# ----------------------------------------------------------------------
++# distance helpers
++# ----------------------------------------------------------------------
++def euclidean_distance(a: Features, b: Features,
++                       weights: Optional[Sequence[float]] = None) -> float:
++    """Euclidean distance ``sqrt(sum((a - b)^2))`` with optional weighting."""
++    if weights is None:
++        return math.dist(a, b)
++    return math.sqrt(sum(w * (x - y) * (x - y) for w, x, y in zip(weights, a, b)))
++
++
++def knn_search(features: List[Features], labels: List[int], query: Features,
++               k: int, weights: Optional[Sequence[float]] = None,
++               exclude_index: Optional[int] = None) -> List[Tuple[float, int]]:
++    """Return the ``k`` closest ``(distance, index)`` pairs, nearest first."""
++    if not features or k <= 0:
++        return []
++    if weights is None:
++        # math.dist over a C level map is the hot loop of the whole model
++        distances = list(map(math.dist, features, repeat(query)))
++    else:
++        distances = [euclidean_distance(stored, query, weights) for stored in features]
++    if exclude_index is not None and 0 <= exclude_index < len(distances):
++        distances[exclude_index] = float('inf')
++    if k >= len(distances):
++        return sorted(zip(distances, range(len(distances))))
++    nearest = heapq.nsmallest(k, range(len(distances)), key=distances.__getitem__)
++    return [(distances[i], i) for i in nearest]
++
++
++def knn_vote(features: List[Features], labels: List[int], query: Features, k: int,
++             weights: Optional[Sequence[float]] = None,
++             exclude_index: Optional[int] = None) -> Optional[int]:
++    """Majority label of the ``k`` nearest neighbours (``None`` if empty).
++
++    Ties between classes are broken by the smaller neighbour distance and then
++    by the smaller class label, which keeps predictions deterministic.
++    """
++    neighbours = knn_search(features, labels, query, k, weights, exclude_index)
++    if not neighbours:
++        return None
++    votes: Dict[int, int] = {}
++    closest: Dict[int, float] = {}
++    for distance, index in neighbours:
++        if distance == float('inf'):
++            continue
++        label = labels[index]
++        votes[label] = votes.get(label, 0) + 1
++        if label not in closest or distance < closest[label]:
++            closest[label] = distance
++    if not votes:
++        return None
++    return min(votes, key=lambda label: (-votes[label], closest[label], label))
++
++
++# ----------------------------------------------------------------------
++# memories
++# ----------------------------------------------------------------------
++class ShortTermMemory:
++    """FIFO sliding window of the most recent instances."""
++
++    def __init__(self, max_size: int = 5000,
++                 feature_weights: Optional[Sequence[float]] = None):
++        self.max_size = max_size
++        self.feature_weights = feature_weights
++        self.features: List[List[float]] = []
++        self.labels: List[int] = []
++
++    def add(self, features: Features, label: int
++            ) -> Optional[Tuple[List[float], int]]:
++        """Append an instance; return the evicted one when the window is full."""
++        evicted = None
++        self.features.append(list(features))
++        self.labels.append(int(label))
++        if len(self.features) > self.max_size:
++            evicted = (self.features.pop(0), self.labels.pop(0))
++        return evicted
++
++    def knn_predict(self, query: Features, k: int = 5,
++                    exclude_index: Optional[int] = None) -> Optional[int]:
++        return knn_vote(self.features, self.labels, query, k,
++                        self.feature_weights, exclude_index)
++
++    def get_size(self) -> int:
++        return len(self.features)
++
++    def get_window(self) -> Tuple[List[List[float]], List[int]]:
++        """The stored ``(features, labels)`` in arrival order."""
++        return self.features, self.labels
++
++    def clear(self):
++        self.features = []
++        self.labels = []
++
++    def __len__(self) -> int:
++        return len(self.features)
++
++    def __repr__(self) -> str:
++        return f"ShortTermMemory(size={len(self.features)}/{self.max_size})"
++
++
++class LongTermMemory:
++    """Compressed store of knowledge that is still consistent with the stream."""
++
++    def __init__(self, max_size: int = 10000, min_cluster_size: int = 10,
++                 feature_weights: Optional[Sequence[float]] = None,
++                 max_kmeans_iterations: int = 5,
++                 distance_budget: int = 2_000_000):
++        self.max_size = max_size
++        self.min_cluster_size = max(1, min_cluster_size)
++        self.feature_weights = feature_weights
++        self.max_kmeans_iterations = max_kmeans_iterations
++        #: soft cap on the number of distance evaluations spent per compression
++        self.distance_budget = distance_budget
++        self.features: List[List[float]] = []
++        self.labels: List[int] = []
++        self.num_cleaned = 0
++        self.num_compressions = 0
++
++    # -- basic operations --------------------------------------------------
++    def add(self, features: Features, label: int):
++        self.features.append(list(features))
++        self.labels.append(int(label))
++        if len(self.features) > self.max_size:
++            self.compress()
++            # compression may not be able to free anything (e.g. tiny classes)
++            while len(self.features) > self.max_size:
++                self.features.pop(0)
++                self.labels.pop(0)
++
++    def knn_predict(self, query: Features, k: int = 5) -> Optional[int]:
++        return knn_vote(self.features, self.labels, query, k, self.feature_weights)
++
++    def get_size(self) -> int:
++        return len(self.features)
++
++    def clear(self):
++        self.features = []
++        self.labels = []
++
++    def __len__(self) -> int:
++        return len(self.features)
++
++    def __repr__(self) -> str:
++        return f"LongTermMemory(size={len(self.features)}/{self.max_size})"
++
++    # -- cleaning ----------------------------------------------------------
++    def clean(self, stm_features: List[Features], stm_labels: List[int],
++              k: int = 5) -> int:
++        """Drop instances that the current concept (the STM) contradicts.
++
++        An instance is contradicted when the kNN prediction obtained from the
++        STM disagrees with the label stored in the LTM.  Returns the number of
++        removed instances.
++        """
++        if not self.features or not stm_features:
++            return 0
++        kept_features: List[List[float]] = []
++        kept_labels: List[int] = []
++        for stored, label in zip(self.features, self.labels):
++            prediction = knn_vote(stm_features, stm_labels, stored, k,
++                                  self.feature_weights)
++            if prediction is None or prediction == label:
++                kept_features.append(stored)
++                kept_labels.append(label)
++        removed = len(self.features) - len(kept_features)
++        self.features = kept_features
++        self.labels = kept_labels
++        self.num_cleaned += removed
++        return removed
++
++    # -- compression -------------------------------------------------------
++    def compress(self, target_size: Optional[int] = None) -> int:
++        """Replace groups of instances of one class by their centroid.
++
++        Clustering is done per class with k-means, using roughly
++        ``min_cluster_size`` instances per cluster.  Returns the number of
++        instances removed by the compression.
++        """
++        if not self.features:
++            return 0
++        size_before = len(self.features)
++        if target_size is None:
++            target_size = max(1, self.max_size // 2)
++        if size_before <= target_size:
++            return 0
++
++        by_class: Dict[int, List[int]] = {}
++        for index, label in enumerate(self.labels):
++            by_class.setdefault(label, []).append(index)
++
++        new_features: List[List[float]] = []
++        new_labels: List[int] = []
++        for label, indices in sorted(by_class.items()):
++            members = [self.features[i] for i in indices]
++            if len(members) <= self.min_cluster_size:
++                new_features.extend(members)
++                new_labels.extend([label] * len(members))
++                continue
++            share = max(1, int(round(target_size * len(members) / float(size_before))))
++            num_clusters = min(len(members),
++                               max(1, min(share, len(members) // self.min_cluster_size)))
++            centroids = self._kmeans(members, num_clusters)
++            new_features.extend(centroids)
++            new_labels.extend([label] * len(centroids))
++
++        self.features = new_features
++        self.labels = new_labels
++        self.num_compressions += 1
++        return size_before - len(self.features)
++
++    def _kmeans(self, points: List[List[float]], num_clusters: int) -> List[List[float]]:
++        """Deterministic Lloyd's algorithm; returns the cluster centroids."""
++        num_points = len(points)
++        if num_clusters >= num_points:
++            return [list(p) for p in points]
++        if num_clusters <= 1:
++            return [self._centroid(points)]
++        # evenly spaced seeds keep the initialisation deterministic
++        step = num_points / float(num_clusters)
++        centroids = [list(points[min(num_points - 1, int(i * step))])
++                     for i in range(num_clusters)]
++        pairs_per_iteration = max(1, num_points * num_clusters)
++        iterations = max(1, min(self.max_kmeans_iterations,
++                                self.distance_budget // pairs_per_iteration))
++        distance = math.dist
++        assignment = [0] * num_points
++        for _ in range(iterations):
++            changed = False
++            for i, point in enumerate(points):
++                best, best_distance = 0, float('inf')
++                for c, centroid in enumerate(centroids):
++                    d = distance(point, centroid)
++                    if d < best_distance:
++                        best, best_distance = c, d
++                if assignment[i] != best:
++                    assignment[i] = best
++                    changed = True
++            groups: Dict[int, List[List[float]]] = {}
++            for i, cluster in enumerate(assignment):
++                groups.setdefault(cluster, []).append(points[i])
++            centroids = [self._centroid(groups[c]) for c in sorted(groups)]
++            if not changed:
++                break
++        return centroids
++
++    @staticmethod
++    def _centroid(points: List[List[float]]) -> List[float]:
++        count = float(len(points))
++        dimensions = len(points[0])
++        centroid = [0.0] * dimensions
++        for point in points:
++            for d in range(dimensions):
++                centroid[d] += point[d]
++        return [value / count for value in centroid]
++
++
++# ----------------------------------------------------------------------
++# the classifier
++# ----------------------------------------------------------------------
++class SAMModel:
++    """kNN classifier with a self adjusting memory (STM + LTM).
++
++    Args:
++        k: number of neighbours.
++        stm_max_size: capacity of the short term memory.
++        ltm_max_size: capacity of the long term memory.
++        min_stm_size: STM instances required before the LTM may take over.
++        ltm_clean_frequency: instances between two LTM cleaning passes.
++        validation_size: number of recent STM instances used to estimate the
++            local accuracy of each memory.
++        evaluation_frequency: instances between two memory evaluations; the
++            weights are reused in between (the memories change slowly, and a
++            full evaluation costs ``validation_size * (|STM| + |LTM|)``
++            distance computations).
++        local_evaluation: when True the validation window is formed by the STM
++            instances closest to the query instead of the most recent ones.
++    """
++
++    def __init__(self, k: int = 5, stm_max_size: int = 5000,
++                 ltm_max_size: int = 10000, min_stm_size: int = 50,
++                 ltm_clean_frequency: int = 500, validation_size: int = 20,
++                 evaluation_frequency: int = 100, min_cluster_size: int = 10,
++                 feature_weights: Optional[Sequence[float]] = None,
++                 local_evaluation: bool = False):
++        self.k = k
++        self.min_stm_size = min_stm_size
++        self.ltm_clean_frequency = max(1, ltm_clean_frequency)
++        self.validation_size = max(1, validation_size)
++        self.evaluation_frequency = max(1, evaluation_frequency)
++        self.local_evaluation = local_evaluation
++        self.feature_weights = feature_weights
++        self.stm = ShortTermMemory(max_size=stm_max_size,
++                                   feature_weights=feature_weights)
++        self.ltm = LongTermMemory(max_size=ltm_max_size,
++                                  min_cluster_size=min_cluster_size,
++                                  feature_weights=feature_weights)
++        self.instances_seen = 0
++        self.stm_decisions = 0
++        self.ltm_decisions = 0
++        self._weights_age = -1
++        self._memory_accuracies: Tuple[float, float] = (1.0, 0.0)
++        self.last_prediction_details: Dict[str, object] = {}
++
++    # -- helpers -----------------------------------------------------------
++    @staticmethod
++    def _as_features(instance) -> Features:
++        """Accept both raw feature lists and :class:`streams.Instance`."""
++        return getattr(instance, "features", instance)
++
++    # -- learning ----------------------------------------------------------
++    def partial_fit(self, features, label: Optional[int] = None):
++        """Add one labelled instance to the memories."""
++        if label is None:
++            label = getattr(features, "label", None)
++            if label is None:
++                raise ValueError("a label is required")
++        features = self._as_features(features)
++        self.instances_seen += 1
++
++        evicted = self.stm.add(features, label)
++        if evicted is not None:
++            # instances leaving the STM are preserved as long term knowledge
++            self.ltm.add(evicted[0], evicted[1])
++
++        if self.instances_seen % self.ltm_clean_frequency == 0 and self.ltm.get_size():
++            stm_features, stm_labels = self.stm.get_window()
++            self.ltm.clean(stm_features, stm_labels, self.k)
++            if self.ltm.get_size() > self.ltm.max_size:
++                self.ltm.compress()
++            # the LTM changed substantially, so re-weight the memories
++            self._weights_age = -1
++
++    def train(self, instance, weight: float = 1.0):
++        """Adapter so the model can be used by the prequential evaluators."""
++        self.partial_fit(instance)
++
++    def fit(self, features_list, labels):
++        for features, label in zip(features_list, labels):
++            self.partial_fit(features, label)
++        return self
++
++    # -- memory evaluation -------------------------------------------------
++    def _validation_window(self, query: Optional[Features]
++                           ) -> List[Tuple[int, List[float], int]]:
++        """``(stm_index, features, label)`` of the validation instances."""
++        features, labels = self.stm.get_window()
++        size = len(features)
++        if size == 0:
++            return []
++        count = min(self.validation_size, size)
++        if self.local_evaluation and query is not None:
++            neighbours = knn_search(features, labels, query, count,
++                                    self.feature_weights)
++            return [(index, features[index], labels[index])
++                    for _distance, index in neighbours]
++        start = size - count
++        return [(index, features[index], labels[index])
++                for index in range(start, size)]
++
++    def _evaluate_memories(self, query: Optional[Features] = None,
++                           k: Optional[int] = None) -> Tuple[float, float]:
++        """Local accuracy of the STM-kNN and of the LTM-kNN.
++
++        Both memories are asked to label the instances of the validation window
++        (the most recent STM instances, or the ones closest to ``query`` when
++        ``local_evaluation`` is on).  The STM is evaluated leave-one-out so that
++        an instance cannot predict itself.
++        """
++        k = k or self.k
++        window = self._validation_window(query)
++        if not window:
++            return (1.0, 0.0)
++        stm_features, stm_labels = self.stm.get_window()
++        stm_correct = 0
++        ltm_correct = 0
++        ltm_available = self.ltm.get_size() > 0
++        for index, features, label in window:
++            if self.stm.get_size() > 1:
++                prediction = knn_vote(stm_features, stm_labels, features, k,
++                                      self.feature_weights, exclude_index=index)
++                stm_correct += int(prediction == label)
++            if ltm_available:
++                ltm_correct += int(self.ltm.knn_predict(features, k) == label)
++        size = float(len(window))
++        stm_accuracy = stm_correct / size
++        ltm_accuracy = (ltm_correct / size) if ltm_available else 0.0
++        return (stm_accuracy, ltm_accuracy)
++
++    def _memory_accuracies_for(self, query: Features) -> Tuple[float, float]:
++        """Cached wrapper around :meth:`_evaluate_memories`."""
++        stale = (self._weights_age < 0
++                 or self.instances_seen - self._weights_age >= self.evaluation_frequency)
++        if stale or self.local_evaluation:
++            self._memory_accuracies = self._evaluate_memories(query, self.k)
++            self._weights_age = self.instances_seen
++        return self._memory_accuracies
++
++    # -- prediction --------------------------------------------------------
++    def predict_detailed(self, features) -> Dict[str, object]:
++        """Predict and expose which memory was used and why."""
++        features = self._as_features(features)
++        stm_prediction = self.stm.knn_predict(features, self.k)
++        ltm_prediction = (self.ltm.knn_predict(features, self.k)
++                          if self.ltm.get_size() else None)
++        stm_accuracy, ltm_accuracy = self._memory_accuracies_for(features)
++
++        use_stm = True
++        if stm_prediction is None:
++            use_stm = False
++        elif self.stm.get_size() < self.min_stm_size:
++            use_stm = True  # too little evidence to trust the long term memory
++        elif ltm_prediction is not None and ltm_accuracy > stm_accuracy:
++            use_stm = False
++
++        if use_stm and stm_prediction is not None:
++            prediction, memory = stm_prediction, "STM"
++            self.stm_decisions += 1
++        elif ltm_prediction is not None:
++            prediction, memory = ltm_prediction, "LTM"
++            self.ltm_decisions += 1
++        else:
++            prediction, memory = (stm_prediction if stm_prediction is not None else 0), "STM"
++            self.stm_decisions += 1
++
++        self.last_prediction_details = {
++            "prediction": prediction,
++            "memory": memory,
++            "stm_prediction": stm_prediction,
++            "ltm_prediction": ltm_prediction,
++            "stm_accuracy": stm_accuracy,
++            "ltm_accuracy": ltm_accuracy,
++        }
++        return self.last_prediction_details
++
++    def predict(self, features) -> int:
++        """Class prediction of the memory with the higher local accuracy."""
++        return int(self.predict_detailed(features)["prediction"])
++
++    def get_votes(self, instance) -> Dict[int, float]:
++        return {self.predict(instance): 1.0}
++
++    # -- statistics --------------------------------------------------------
++    def get_memory_sizes(self) -> Dict[str, int]:
++        return {
++            "stm": self.stm.get_size(),
++            "ltm": self.ltm.get_size(),
++            "total": self.stm.get_size() + self.ltm.get_size(),
++        }
++
++    def get_memory_decisions(self) -> Dict[str, float]:
++        total = self.stm_decisions + self.ltm_decisions
++        return {
++            "stm_decisions": self.stm_decisions,
++            "ltm_decisions": self.ltm_decisions,
++            "stm_fraction": (self.stm_decisions / total) if total else 0.0,
++        }
++
++    def reset(self):
++        self.stm.clear()
++        self.ltm.clear()
++        self.instances_seen = 0
++        self.stm_decisions = 0
++        self.ltm_decisions = 0
++        self._weights_age = -1
++        self._memory_accuracies = (1.0, 0.0)
++
++    def __repr__(self) -> str:
++        sizes = self.get_memory_sizes()
++        return f"SAMModel(k={self.k}, stm={sizes['stm']}, ltm={sizes['ltm']})"
++
++
++# convenience alias mirroring the paper's name
++SAMKNN = SAMModel

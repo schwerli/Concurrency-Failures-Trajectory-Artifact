@@ -1,0 +1,37 @@
+Migration complete and verified. Here's the structure delivered in `/output`:
+
+```
+/output
+├── test13.mjs                  ← entry point
+└── lib
+    ├── pyaes/                  ← port of the pyaes package
+    │   ├── tables.mjs          S-box + GF(2^8) arithmetic, derived tables
+    │   ├── aes.mjs             block cipher core (key expansion, encrypt/decrypt)
+    │   ├── modes.mjs           AESModeOfOperationECB
+    │   └── index.mjs           package facade (`import * as pyaes`)
+    └── python/                 ← Python runtime semantics
+        ├── bytes.mjs           str.encode() + repr(bytes)
+        ├── argparse.mjs        ArgumentParser subset
+        ├── errors.mjs          ValueError + traceback rendering
+        └── linecache.mjs       source lookup for tracebacks
+```
+
+## Verification
+
+**608 differential cases against the executable, 0 mismatches** — comparing stdout, stderr, and exit code. Plus the AES core passes FIPS-197 known-answer vectors for 128/192/256-bit keys.
+
+Coverage: the 4 documented cases, ~250 random keys/data across all three key sizes, quote/backslash/control-char payloads, invalid key sizes (0–64 bytes), non-16-byte data, UTF-8 multibyte, and ~60 argparse forms (`--key=v`, prefix abbreviation, duplicates, `--help`, missing values, unrecognized args, `--` separator).
+
+## Three behaviors worth flagging
+
+**1. `repr(bytes)` switches quote style.** Ciphertext is random bytes, so a `0x27` byte makes Python emit `b"...'..."` instead of `b'...'`. A naive port hardcoding single quotes fails on roughly 6% of random inputs. The rule: double quotes only when the data contains `'` and no `"`.
+
+**2. Traceback source lines depend on the working directory.** The frozen binary records bare paths like `"test13.py"`, which CPython resolves through `linecache` **relative to the CWD**. Run from `/workspace/dataset`, tracebacks include source and caret lines; run from anywhere else, only the `File "...", line N` headers appear. I confirmed the mechanism by planting a decoy `test13.py` — the binary printed *the decoy's* line 11 with carets clipped to it. `lib/python/linecache.mjs` reproduces this, including CPython's byte-offset→character-offset anchor math, so all three CWD scenarios match byte-for-byte.
+
+**3. `--` stays in the error message.** argparse only strips the separator when an action consumes it; this parser declares no positionals, so `-- extra` reports `unrecognized arguments: -- extra`, keeping the `--`.
+
+## One unavoidable difference
+
+The PyInstaller footer `[PYI-4166:ERROR] Failed to execute script...` embeds the process ID, so it can't be reproduced byte-exactly by any port. I emit the same line using `process.pid` — the faithful analog. This affects only stderr on invalid input; **stdout and exit codes match exactly in every case**. My test harness normalized that PID before comparing.
+
+I used `node:fs` (a permitted built-in) for the linecache emulation. No npm packages, no bare-specifier imports, no `node:crypto`, no `require`/`module.exports`.

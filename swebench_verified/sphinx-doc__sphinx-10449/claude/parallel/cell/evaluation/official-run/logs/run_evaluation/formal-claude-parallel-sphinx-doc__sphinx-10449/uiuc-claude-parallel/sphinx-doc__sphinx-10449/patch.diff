@@ -1,0 +1,209 @@
+diff --git a/CHANGES b/CHANGES
+index bc32362ae..c08d3fd3c 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -16,6 +16,9 @@ Features added
+ Bugs fixed
+ ----------
+ 
++* #9575: autodoc: The annotation of return value should not be shown when
++  ``autodoc_typehints="description"``
++
+ Testing
+ --------
+ 
+diff --git a/mx/run.py b/mx/run.py
+new file mode 100644
+index 000000000..599590886
+--- /dev/null
++++ b/mx/run.py
+@@ -0,0 +1,61 @@
++import os, shutil, sys, itertools
++sys.path.insert(0, '/testbed')
++sys.path.insert(0, '/workspace/mx/src')
++from sphinx.cmd.build import build_main
++
++BASE = '/workspace/mx'
++INDEX = """
++.. autoclass:: mymod.Plain
++
++.. autoclass:: mymod.DocInit
++
++.. autoexception:: mymod.MyError
++
++.. autoexception:: mymod.DocInitError
++
++.. autoclass:: mymod.ExplicitRtype
++
++.. autoclass:: mymod.ExplicitReturns
++
++.. autoclass:: mymod.NewAnnotation
++
++.. autoclass:: mymod.WithMethod
++   :members:
++
++.. autoclass:: mymod.DocInit
++   :noindex:
++   :special-members: __init__
++
++.. autofunction:: mymod.func
++"""
++
++CONF = """
++import sys
++sys.path.insert(0, '/workspace/mx/src')
++extensions = ['sphinx.ext.autodoc']
++autodoc_typehints = %r
++autodoc_typehints_description_target = %r
++autoclass_content = %r
++"""
++
++results = {}
++for th, tgt, acc in itertools.product(
++        ['description', 'both', 'signature', 'none'],
++        ['all', 'documented', 'documented_params'],
++        ['class', 'both']):
++    src = os.path.join(BASE, 'src_%s_%s_%s' % (th, tgt, acc))
++    out = os.path.join(BASE, 'out_%s_%s_%s' % (th, tgt, acc))
++    shutil.rmtree(src, ignore_errors=True); shutil.rmtree(out, ignore_errors=True)
++    os.makedirs(src)
++    with open(os.path.join(src, 'conf.py'), 'w') as f:
++        f.write(CONF % (th, tgt, acc))
++    with open(os.path.join(src, 'index.rst'), 'w') as f:
++        f.write(INDEX)
++    rc = build_main(['-b', 'text', '-q', '-E', src, out])
++    txt = open(os.path.join(out, 'index.txt')).read()
++    results[(th, tgt, acc)] = (rc, txt)
++
++import pickle
++with open('/workspace/mx/results.pkl', 'wb') as f:
++    pickle.dump(results, f)
++print("done", len(results))
+diff --git a/mx/src/mymod.py b/mx/src/mymod.py
+new file mode 100644
+index 000000000..e9887dd55
+--- /dev/null
++++ b/mx/src/mymod.py
+@@ -0,0 +1,75 @@
++class Plain:
++    """Plain class docstring."""
++    def __init__(self, x: int) -> None:
++        pass
++
++
++class DocInit:
++    """DocInit docstring."""
++    def __init__(self, x: int) -> None:
++        """Init docstring.
++
++        :param x: Some integer
++        """
++
++
++class MyError(Exception):
++    """MyError docstring."""
++    def __init__(self, x: int) -> None:
++        pass
++
++
++class DocInitError(Exception):
++    """DocInitError docstring.
++
++    :param x: Some integer
++    """
++    def __init__(self, x: int) -> None:
++        pass
++
++
++class ExplicitRtype:
++    """ExplicitRtype docstring.
++
++    :param x: Some integer
++    :rtype: int
++    """
++    def __init__(self, x: int) -> None:
++        pass
++
++
++class ExplicitReturns:
++    """ExplicitReturns docstring.
++
++    :returns: a thing
++    """
++    def __init__(self, x: int) -> None:
++        pass
++
++
++class NewAnnotation:
++    """NewAnnotation docstring."""
++    def __new__(cls, i: int) -> 'NewAnnotation':
++        pass
++
++
++class BothContent:
++    """Class docstring."""
++    def __init__(self, x: int) -> None:
++        """Init docstring.
++
++        :param x: Some integer
++        """
++
++
++def func(a: int) -> None:
++    """func docstring."""
++
++
++class WithMethod:
++    """WithMethod docstring."""
++    def __init__(self, x: int) -> None:
++        pass
++
++    def meth(self, y: int) -> None:
++        """meth docstring."""
+diff --git a/tests/test_ext_autodoc_configs.py b/tests/test_ext_autodoc_configs.py
+index fdb82b1b9..3457cf710 100644
+--- a/tests/test_ext_autodoc_configs.py
++++ b/tests/test_ext_autodoc_configs.py
+@@ -1041,9 +1041,6 @@ def test_autodoc_typehints_description_with_documented_init(app):
+             '   Parameters:\n'
+             '      **x** (*int*) --\n'
+             '\n'
+-            '   Return type:\n'
+-            '      None\n'
+-            '\n'
+             '   __init__(x)\n'
+             '\n'
+             '      Init docstring.\n'
+@@ -1104,6 +1101,32 @@ def test_autodoc_typehints_description_with_documented_init_no_undoc_doc_rtype(a
+             '         **x** (*int*) -- Some integer\n' == context)
+ 
+ 
++@pytest.mark.sphinx('text', testroot='ext-autodoc',
++                    confoverrides={'autodoc_typehints': "description"})
++def test_autodoc_typehints_description_no_rtype_for_class(app):
++    # a class has no return value; the annotation of its __init__() must not
++    # be shown as the return type of the class itself.  Methods still get one.
++    (app.srcdir / 'index.rst').write_text(
++        '.. autoclass:: target.typehints._ClassWithDocumentedInit\n'
++        '\n'
++        '.. automethod:: target.typehints.Math.nothing\n',
++        encoding='utf8'
++    )
++    app.build()
++    context = (app.outdir / 'index.txt').read_text(encoding='utf8')
++    assert ('class target.typehints._ClassWithDocumentedInit(x)\n'
++            '\n'
++            '   Class docstring.\n'
++            '\n'
++            '   Parameters:\n'
++            '      **x** (*int*) --\n'
++            '\n'
++            'Math.nothing()\n'
++            '\n'
++            '   Return type:\n'
++            '      None\n' == context)
++
++
+ @pytest.mark.sphinx('text', testroot='ext-autodoc',
+                     confoverrides={'autodoc_typehints': "description"})
+ def test_autodoc_typehints_description_for_invalid_node(app):

@@ -1,0 +1,264 @@
+diff --git a/sphinx/domains/std.py b/sphinx/domains/std.py
+index d820cfe5c..0f41831fc 100644
+--- a/sphinx/domains/std.py
++++ b/sphinx/domains/std.py
+@@ -305,7 +305,7 @@ def make_glossary_term(env: "BuildEnvironment", textnodes: Iterable[Node], index
+         term['ids'].append(node_id)
+ 
+     std = cast(StandardDomain, env.get_domain('std'))
+-    std.note_object('term', termtext.lower(), node_id, location=term)
++    std.note_object('term', termtext, node_id, location=term)
+ 
+     # add an index entry too
+     indexnode = addnodes.index()
+@@ -565,7 +565,7 @@ class StandardDomain(Domain):
+         # links to tokens in grammar productions
+         'token':   TokenXRefRole(),
+         # links to terms in glossary
+-        'term':    XRefRole(lowercase=True, innernodeclass=nodes.inline,
++        'term':    XRefRole(innernodeclass=nodes.inline,
+                             warn_dangling=True),
+         # links to headings or arbitrary labels
+         'ref':     XRefRole(lowercase=True, innernodeclass=nodes.inline,
+@@ -928,7 +928,12 @@ class StandardDomain(Domain):
+                           node: pending_xref, contnode: Element) -> Element:
+         objtypes = self.objtypes_for_role(typ) or []
+         for objtype in objtypes:
+-            if (objtype, target) in self.objects:
++            if objtype == 'term':
++                obj = self._find_term(target)
++                if obj:
++                    docname, labelid = obj
++                    break
++            elif (objtype, target) in self.objects:
+                 docname, labelid = self.objects[objtype, target]
+                 break
+         else:
+@@ -938,6 +943,21 @@ class StandardDomain(Domain):
+         return make_refnode(builder, fromdocname, docname,
+                             labelid, contnode)
+ 
++    def _find_term(self, target: str) -> Optional[Tuple[str, str]]:
++        if ('term', target) in self.objects:
++            return self.objects['term', target]
++
++        obj = None  # type: Optional[Tuple[str, str]]
++        ltarget = target.lower()
++        for (objtype, objname), info in self.objects.items():
++            if objtype != 'term' or objname.lower() != ltarget:
++                continue
++            if obj:
++                return None
++            obj = info
++
++        return obj
++
+     def resolve_any_xref(self, env: "BuildEnvironment", fromdocname: str,
+                          builder: "Builder", target: str, node: pending_xref,
+                          contnode: Element) -> List[Tuple[str, Element]]:
+@@ -951,17 +971,26 @@ class StandardDomain(Domain):
+                 results.append(('std:' + role, res))
+         # all others
+         for objtype in self.object_types:
+-            key = (objtype, target)
+             if objtype == 'term':
+-                key = (objtype, ltarget)
+-            if key in self.objects:
+-                docname, labelid = self.objects[key]
++                obj = self._find_term(target)
++            elif (objtype, target) in self.objects:
++                obj = self.objects[objtype, target]
++            else:
++                obj = None
++
++            if obj:
++                docname, labelid = obj
+                 results.append(('std:' + self.role_for_objtype(objtype),
+                                 make_refnode(builder, fromdocname, docname,
+                                              labelid, contnode)))
+         return results
+ 
+     def get_objects(self) -> Iterator[Tuple[str, str, str, str, str, int]]:
++        term_case_counts = {}  # type: Dict[str, int]
++        for (objtype, name), _info in self.objects.items():
++            if objtype == 'term':
++                term_case_counts[name.lower()] = term_case_counts.get(name.lower(), 0) + 1
++
+         # handle the special 'doc' reference here
+         for doc in self.env.all_docs:
+             yield (doc, clean_astext(self.env.titles[doc]), 'doc', doc, '', -1)
+@@ -971,9 +1000,15 @@ class StandardDomain(Domain):
+                 yield (fullname, fullname, 'cmdoption', info[0], info[1], 1)
+             else:
+                 yield (option, option, 'cmdoption', info[0], info[1], 1)
+-        for (type, name), info in self.objects.items():
+-            yield (name, name, type, info[0], info[1],
+-                   self.object_types[type].attrs['searchprio'])
++        for (objtype, name), info in self.objects.items():
++            if objtype == 'term' and term_case_counts[name.lower()] == 1:
++                # Keep the historic lowercase inventory key when it is unique.
++                fullname = name.lower()
++            else:
++                fullname = name
++
++            yield (fullname, name, objtype, info[0], info[1],
++                   self.object_types[objtype].attrs['searchprio'])
+         for name, (docname, labelid, sectionname) in self.labels.items():
+             yield (name, sectionname, 'label', docname, labelid, -1)
+         # add anonymous-only labels as well
+diff --git a/sphinx/ext/intersphinx.py b/sphinx/ext/intersphinx.py
+index 02f605bac..2de7b38fc 100644
+--- a/sphinx/ext/intersphinx.py
++++ b/sphinx/ext/intersphinx.py
+@@ -50,6 +50,27 @@ from sphinx.util.typing import Inventory
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _get_intersphinx_object(inventory: Inventory, objtype: str, target: str) -> Any:
++    objects = inventory.get(objtype)
++    if not objects:
++        return None
++    elif target in objects:
++        return objects[target]
++    elif objtype != 'std:term':
++        return None
++
++    obj = None
++    ltarget = target.lower()
++    for name, info in objects.items():
++        if name.lower() != ltarget:
++            continue
++        if obj:
++            return None
++        obj = info
++
++    return obj
++
++
+ class InventoryAdapter:
+     """Inventory adapter for environment"""
+ 
+@@ -304,9 +325,10 @@ def missing_reference(app: Sphinx, env: BuildEnvironment, node: Element, contnod
+                     to_try.append((inventories.named_inventory[setname], full_qualified_name))
+     for inventory, target in to_try:
+         for objtype in objtypes:
+-            if objtype not in inventory or target not in inventory[objtype]:
++            obj = _get_intersphinx_object(inventory, objtype, target)
++            if obj is None:
+                 continue
+-            proj, version, uri, dispname = inventory[objtype][target]
++            proj, version, uri, dispname = obj
+             if '://' not in uri and node.get('refdoc'):
+                 # get correct path in case of subdirectories
+                 uri = path.join(relative_path(node['refdoc'], '.'), uri)
+diff --git a/tests/test_domain_std.py b/tests/test_domain_std.py
+index aa1d29eb1..80da7dabc 100644
+--- a/tests/test_domain_std.py
++++ b/tests/test_domain_std.py
+@@ -280,6 +280,54 @@ def test_glossary_conflicted_labels(app):
+     assert ("foo", "foo", "term", "index", "term-0", -1) in objects
+ 
+ 
++def test_glossary_term_case_insensitive_fallback(app):
++    text = (".. glossary::\n"
++            "\n"
++            "   MySQL\n"
++            "       Database server\n"
++            "\n"
++            ":term:`mysql`\n")
++    doctree = restructuredtext.parse(app, text, "case5")
++    refnode = list(doctree.traverse(pending_xref))[0]
++    domain = app.env.get_domain('std')
++
++    ref = domain.resolve_xref(app.env, 'case5', None, 'term',
++                              refnode['reftarget'], refnode, refnode[0].deepcopy())
++    assert ref['refid'] == 'term-MySQL'
++
++
++def test_glossary_term_case_sensitive(app, warning):
++    text = (".. glossary::\n"
++            "\n"
++            "   MySQL\n"
++            "       Database server\n"
++            "\n"
++            "   mysql\n"
++            "       Command line client\n"
++            "\n"
++            "See :term:`MySQL`, :term:`mysql`, and :term:`MYSQL`.\n")
++    doctree = restructuredtext.parse(app, text, "case6")
++    refnodes = list(doctree.traverse(pending_xref))
++    domain = app.env.get_domain("std")
++
++    assert "duplicate term description" not in warning.getvalue()
++    assert ('term', 'MySQL') in domain.objects
++    assert ('term', 'mysql') in domain.objects
++    assert [node['reftarget'] for node in refnodes] == ['MySQL', 'mysql', 'MYSQL']
++
++    ref = domain.resolve_xref(app.env, 'case6', None, 'term',
++                              refnodes[0]['reftarget'], refnodes[0], refnodes[0][0].deepcopy())
++    assert ref['refid'] == 'term-MySQL'
++
++    ref = domain.resolve_xref(app.env, 'case6', None, 'term',
++                              refnodes[1]['reftarget'], refnodes[1], refnodes[1][0].deepcopy())
++    assert ref['refid'] == 'term-mysql'
++
++    ref = domain.resolve_xref(app.env, 'case6', None, 'term',
++                              refnodes[2]['reftarget'], refnodes[2], refnodes[2][0].deepcopy())
++    assert ref is None
++
++
+ def test_cmdoption(app):
+     text = (".. program:: ls\n"
+             "\n"
+diff --git a/tests/test_ext_intersphinx.py b/tests/test_ext_intersphinx.py
+index 53faa7a37..5c41e6b60 100644
+--- a/tests/test_ext_intersphinx.py
++++ b/tests/test_ext_intersphinx.py
+@@ -10,6 +10,7 @@
+ 
+ import os
+ import unittest
++import zlib
+ from io import BytesIO
+ from unittest import mock
+ 
+@@ -25,6 +26,15 @@ from sphinx.ext.intersphinx import (
+ )
+ from sphinx.ext.intersphinx import setup as intersphinx_setup
+ 
++inventory_v2_mixed_case_term = '''\
++# Sphinx inventory version 2
++# Project: foo
++# Version: 2.0
++# The remainder of this file is compressed with zlib.
++'''.encode() + zlib.compress('''\
++MySQL std:term -1 glossary.html#term-MySQL -
++'''.encode())
++
+ 
+ def fake_node(domain, type, target, content, **attrs):
+     contnode = nodes.emphasis(content, content)
+@@ -228,6 +238,23 @@ def test_missing_reference_stddomain(tempdir, app, status, warning):
+     assert rn.astext() == '-l'
+ 
+ 
++def test_missing_reference_stddomain_term_case_insensitive(tempdir, app, status, warning):
++    inv_file = tempdir / 'inventory'
++    inv_file.write_bytes(inventory_v2_mixed_case_term)
++    app.config.intersphinx_mapping = {
++        'cmd': ('https://docs.python.org/', inv_file),
++    }
++    app.config.intersphinx_cache_limit = 0
++
++    normalize_intersphinx_mapping(app, app.config)
++    load_mappings(app)
++
++    node, contnode = fake_node('std', 'term', 'mysql', 'mysql')
++    rn = missing_reference(app, app.env, node, contnode)
++    assert rn['refuri'] == 'https://docs.python.org/glossary.html#term-MySQL'
++    assert rn.astext() == 'mysql'
++
++
+ @pytest.mark.sphinx('html', testroot='ext-intersphinx-cppdomain')
+ def test_missing_reference_cppdomain(tempdir, app, status, warning):
+     inv_file = tempdir / 'inventory'

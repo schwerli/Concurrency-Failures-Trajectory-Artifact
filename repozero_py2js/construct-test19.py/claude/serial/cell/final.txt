@@ -1,0 +1,37 @@
+Migration complete and verified against the executable.
+
+## Files in `/output`
+
+```
+test19.mjs                      entry point
+lib/python/bytes.mjs            UTF-8 encoding + bytes repr()
+lib/python/str.mjs              code-point len(), strip(), str repr()
+lib/python/int.mjs              int() parsing semantics (BigInt)
+lib/argparse/formatter.mjs      usage/help layout + wrapping
+lib/argparse/parser.mjs         ArgumentParser
+lib/argparse/index.mjs          barrel
+lib/construct/errors.mjs        FormatFieldError / StreamError + frames
+lib/construct/formatfield.mjs   Int8ul / Int16ul / Int32ul / Int64ul
+lib/construct/bytesfield.mjs    Bytes(n)
+lib/construct/index.mjs         barrel
+lib/pytraceback.mjs             CPython traceback rendering
+```
+
+## Behaviours found by probing the binary, not from the source
+
+- **`len(str)` vs `len(str.encode())`** — `Bytes(len(args.d))` uses code points, so `--d 'héllo'` fails with `expected 5, found 6`. Uses `[...s].length`, not `.length` (matters for emoji).
+- **bytes repr quoting** — prefers `'`, switches to `"` when the data holds `'` but no `"`, escapes `\'` when both appear.
+- **`int()` accepts** `1_0`, `' 42 '`, `+7`; rejects `0x10`, `3.0`, `1__0`. Parsed as BigInt so `999999999999999999999` survives argparse and fails at `Int8ul` with the value printed in full.
+- **`--` with no positionals** lands in extras → `unrecognized arguments: --`.
+- **Traceback source lines come from `linecache`** — the frozen binary prints the quoted line and carets only when `test19.py` is readable relative to the *current directory*. Reproduced by actually reading the file; verified in both directory states.
+
+## Two bugs caught by differential testing
+
+1. Help showed `-h` instead of `-h, --help` — usage uses only the first option string, the help column joins all of them.
+2. Usage wrapping grouped `--e E` as one unit. argparse re-splits the formatted usage with a regex at whitespace, so at `COLUMNS=60` Python breaks *between* `--e` and `E`. Also fixed the narrow-terminal `max_help_position = min(24, max(width-20, 4))` shrink.
+
+## Verification
+
+56 hand-picked cases (samples, boundaries, quoting, all 8 failure sites, multibyte, 30 argparse cases) plus 135 fuzz cases, each run from both `/workspace` and `/workspace/dataset`, comparing stdout, stderr and exit code — **all match**. Help and usage compared byte-exactly at `COLUMNS` 8→1000 with the prog name forced to `test19_executable`: zero mismatches.
+
+Two intentional differences, both stderr-only: the prog name in usage follows `argv[1]` (`test19.mjs`), as argparse does; and the `[PYI-<pid>:ERROR]` footer carries this process's pid, which varies between runs of the original binary too. The harnesses are at `/workspace/difftest.sh`, `/workspace/fuzz.sh`, `/workspace/difftest_lib.sh` if you want to re-run them.

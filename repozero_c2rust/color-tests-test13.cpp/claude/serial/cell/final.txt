@@ -1,0 +1,43 @@
+Done. The Rust port is complete and verified byte-for-byte against the C++ binary.
+
+## Reverse-engineered behavior
+
+Working black-box from the binary (the library header wasn't in the dataset), I pinned down three non-obvious things:
+
+**1. `hueDifference` is not a true circular distance.** It's a plain absolute difference with a single fold:
+```
+d = |h1 - h2|;  if (d > 180) d = 360 - d;
+```
+Hues are *not* wrapped into `0..360` first, so out-of-turn inputs fall through to **negative** results: `0` vs `720` → `-360`, `370` vs `0` → `-10`, `0` vs `361` → `-1`. I reproduced this quirk rather than "fixing" it.
+
+**2. Arithmetic is `f32`, not `f64`.** The tell: `hue1=0.001, hue2=360` prints `0.00100708`, which is exactly `33 × 2⁻¹⁵` — the f32 rounding of `360 - 0.001f` amplified by cancellation in the fold. A double-precision path would print `0.001`.
+
+**3. `%g` rounds half-to-even.** `1.015625` → `1.01562` (kept digit even, stays) while `1.046875` → `1.04688`. Rust's `{:.5e}` uses the same rule over the exact binary value, so I build the 6 significant digits from it rather than hand-rolling decimal conversion.
+
+## Structure
+
+```
+/output/Cargo.toml            [[bin]] path = "test13.rs"
+/output/test13.rs             entry point (package root)
+/output/src/color/hsl.rs      HSL — stores components verbatim, no clamping
+/output/src/color/converter.rs ColorConverter::hue_difference
+/output/src/cxx/stof.rs       std::stof / strtof semantics
+/output/src/cxx/ostream.rs    std::cout default float formatting (%g, prec 6)
+/output/test13                executable
+```
+
+`test13.rs` pulls in the modules via `#[path]`, and the re-exports are written edition-agnostically, so **both** `cargo build --release` and a bare `rustc test13.rs` work — the latter defaults to edition 2015, which was the one real snag. Zero dependencies, zero warnings.
+
+The two `cxx` shims carry most of the fidelity work: `stof` handles leading whitespace, partial parses (`"1.5abc"` → `1.5`), hex floats (`0x1.8p1` → `3`, and a bare `0x` converting as just `0`), `inf`/`nan` spellings, and glibc's `ERANGE` rule where **any** subnormal counts as underflow — which is why `stof("1e-38")` throws even though `1e-38` is a representable float. Error paths reproduce the `terminate called after throwing…` report on stderr and the `SIGABRT` status (134).
+
+## Verification
+
+Differential testing against `test13_executable`, comparing stdout, stderr, and exit status:
+
+| Suite | Result |
+|---|---|
+| Documented examples, argc variants, wrap/sign quirks, format boundaries, stof grammar & error paths | **436/436** |
+| Randomized fuzz across 14 magnitude bands + near-360 max-cancellation cases | **2400/2400** |
+| Hex-float literals, 17-significant-digit decimals, `%g` form-switch boundaries | **1800/1800** |
+
+One thing worth flagging: `l2` is parsed but never affects output, since `hueDifference` reads only the hue — I confirmed empirically that varying `s`/`l` (including out-of-range values like `5` and `-3`) never changes the result. I kept the parse anyway, because it's observable: a malformed 6th argument must still abort.

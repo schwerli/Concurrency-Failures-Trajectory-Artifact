@@ -1,0 +1,33 @@
+Everything is complete and verified. Final state:
+
+## Summary
+
+**Requirement coverage: 27 reviewed / 27 implemented / 0 blocked** — one commit + one non-empty patch in `requirement_patches/` per requirement slug.
+
+### `LexicalAnalyzer/LexicalAnalysis.cpp` (12 requirements)
+| Slug | What landed |
+|---|---|
+| `lex_preprocess_io` | open source, slurp via `rdbuf()` into a buffer, emit output file |
+| `lex_comment_stripping` | `//` (newline kept) and cross-line `/* */` removal, unterminated-comment safe |
+| `lex_whitespace_normalization` | drop `\n\r\t`, collapse space runs |
+| `lex_preprocessing` | char-stream display, progress banners, write `afterPreProcess.txt` |
+| `lex_identifier_rules` / `lex_number_rules` | `IsIdentifier`, `IsNum` |
+| `lex_classification` | `wtMatch` word→code table (1–15), then 16/17, then illegal |
+| `lex_token_scan_loop` | delimiter/word-span scanner with `<<` lookahead, `wtPair` in encounter order |
+| `lex_token_table_print` | `setw(8/12/12)` table, illegal tokens diverted to `errorSeq` |
+| `lex_error_locator` | `findError` → `第<行>行第<列>列` (1-based row, raw `find` column) |
+| `lex_token_error_report` | dedup by spelling + index list + positions |
+| `lex_tokenizer` | write table + report to `processed.txt`, success banner |
+
+The generated `afterPreProcess.txt` is **byte-identical** to the committed reference, and all 36 token rows plus the whole illegal-token block of `processed.txt` match it byte-for-byte. The single divergence is the Chinese header line's `setw` padding: the committed reference was compiled on Windows (GBK, 2 bytes/char) while the UTF-8 source on g++ gives 3 bytes/char — unavoidable, and I kept the reference's column widths.
+
+### `Parser/SyntacticParser.cpp` (15 requirements)
+`load_file`, `operator<<(rule)` (`L::=r1|r2`), `split_into_rules` (`::=`/`|`, merges duplicate left parts, `@` excluded from terminals), `check_rules`/`check_set`, `operator<<(F_set)` (`First(X)={a,b}`), `findFirst` (terminals, non-terminal expansion, ε propagation, recursion-guarded), `checkFirst`, `findFollow` (suffix FIRST, parent recursion, always `#`), `checkFollow`, `LL_1` (col = terminals + `#`, rows in rule order so `row[0]` is the start symbol, blank cells, FIRST/FOLLOW filling), table grid printer, `print_state`, and the stack-driven parse loop.
+
+Verified against both readme test cases: `E::=a|b|(T) T::=EG G::=,EG|@` accepts `(a,a)` / rejects `(a,)`; `E::=aH H::=aMd|d M::=Ab|@ A::=aM|e` accepts `aaabd` / rejects `aa`, `abd`. FIRST/FOLLOW/table were unit-checked on all three shipped grammars.
+
+### Verification
+- `agent_tests/run_tests.sh`: **36/36 pass** (builds, byte-compare of preprocessing, reference token rows in `agent_tests/expected/token_rows.txt`, error report, parser sets/table/trace/verdicts on two grammars).
+- Both files compile warning-free under `-Wall -Wextra` with `-std=c++98/11/14/17/20`.
+- Edge cases exercised: empty source, unterminated comment, empty stdin, unknown input symbols, left-recursive grammar (bounded parse loop — added as a follow-up hardening commit).
+- All shipped data/reference files (`testCpp.txt`, `processed.txt`, `afterPreProcess.txt`, `test1-3.txt`) are unmodified in git; runs were done in scratch dirs.

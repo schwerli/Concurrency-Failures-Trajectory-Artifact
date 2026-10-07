@@ -1,0 +1,24 @@
+Fixed.
+
+**Root cause** (`django/db/models/fields/files.py:298`): `__init__` evaluates a callable `storage` and rebinds `self.storage` to the result, stashing the original in `self._storage_callable`. `deconstruct()` then gated on the *evaluated* value:
+
+```python
+if self.storage is not default_storage:
+    kwargs["storage"] = getattr(self, "_storage_callable", self.storage)
+```
+
+So a callable returning `default_storage` made the guard false and the kwarg was dropped entirely — the callable reference was lost even though it was the thing that needed serializing.
+
+**Fix** — resolve the callable first, then test *that* against `default_storage`:
+
+```python
+storage = getattr(self, "_storage_callable", self.storage)
+if storage is not default_storage:
+    kwargs["storage"] = storage
+```
+
+A callable is never `default_storage` itself, so it's always emitted regardless of what it returns; plain `storage=default_storage` is still omitted as before.
+
+**Tests**: added `callable_default_storage` plus a `storage_callable_default` field to `tests/file_storage/models.py`, and `test_deconstruction_storage_callable_default` asserting the kwarg is the callable. Verified it fails without the fix (`KeyError: 'storage'`) and passes with it.
+
+Full run of `file_storage`, `file_uploads`, `model_fields.test_filefield`, `model_fields.test_imagefield`, `migrations.test_writer`: 332 tests, one failure — `file_uploads.tests.DirectoryCreationTests.test_readonly_root`. That one is pre-existing and environmental, not related to this change: it chmods a directory to `0o500` and expects `PermissionError`, but the suite is running as root, which bypasses the permission bits.

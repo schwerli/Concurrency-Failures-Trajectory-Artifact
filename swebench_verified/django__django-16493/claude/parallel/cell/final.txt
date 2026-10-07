@@ -1,0 +1,30 @@
+Fixed.
+
+## The bug
+
+`FileField.__init__` evaluates a callable `storage` immediately, keeping the original in `self._storage_callable`. But `deconstruct()` gated on the *evaluated* value:
+
+```python
+if self.storage is not default_storage:              # evaluated — wrong thing to test
+    kwargs["storage"] = getattr(self, "_storage_callable", self.storage)
+```
+
+So a callable returning `default_storage` failed the guard and the kwarg was dropped entirely — even though `_storage_callable` was sitting right there. The fix resolves the callable-or-instance *first*, then tests that:
+
+```python
+storage = getattr(self, "_storage_callable", self.storage)
+if storage is not default_storage:
+    kwargs["storage"] = storage
+```
+
+A callable is never identical to `default_storage`, so any callable is now always preserved. The non-callable path is unchanged (`getattr` falls back to `self.storage`), so `storage=default_storage` passed directly is still correctly omitted.
+
+## Verification
+
+- **New regression test** `test_deconstruction_storage_callable_default` fails with `KeyError: 'storage'` on the unpatched source, passes with the fix (I confirmed both directions by stashing only `files.py`).
+- **End-to-end**, reproducing the report's scenario: `makemigrations` now emits `storage=myapp.models.get_storage` for the callable returning `default_storage`, and three consecutive `--check` runs report "No changes detected" — the flapping migration is gone. A plain `FileField()` still correctly omits the kwarg.
+- **Regression sweep**: 1996 tests across `file_storage`, `model_fields`, `field_deconstruction`, `migrations`, `invalid_models_tests`, `model_forms`, `staticfiles_tests` → all pass.
+
+One caveat worth stating plainly: `file_uploads.tests.DirectoryCreationTests.test_readonly_root` fails in this environment, but it fails identically on the unpatched tree — the suite runs as root, so a read-only directory doesn't raise `PermissionError`. Unrelated to this change.
+
+I did not add a `docs/releases/` entry; say the word if you want one for the target backport branches.

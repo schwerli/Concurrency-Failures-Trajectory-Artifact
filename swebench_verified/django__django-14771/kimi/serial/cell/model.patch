@@ -1,0 +1,41 @@
+diff --git a/django/utils/autoreload.py b/django/utils/autoreload.py
+index cc65c043ab..9b6e638db4 100644
+--- a/django/utils/autoreload.py
++++ b/django/utils/autoreload.py
+@@ -220,6 +220,13 @@ def get_child_arguments():
+     py_script = Path(sys.argv[0])
+ 
+     args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions]
++    # Pass -X options, e.g. -Xutf8, so that they're also applied to
++    # the reloader run with StatReloader.
++    if sys.implementation.name == 'cpython':
++        args.extend(
++            '-X%s=%s' % (key, value) if isinstance(value, str) else
++            '-X%s' % key for key, value in sys._xoptions.items()
++        )
+     # __spec__ is set when the server was started with the `-m` option,
+     # see https://docs.python.org/3/reference/import.html#main-spec
+     # __spec__ may not exist, e.g. when running in a Conda env.
+diff --git a/tests/utils_tests/test_autoreload.py b/tests/utils_tests/test_autoreload.py
+index 7c28a9d4d0..1838c2a842 100644
+--- a/tests/utils_tests/test_autoreload.py
++++ b/tests/utils_tests/test_autoreload.py
+@@ -203,6 +203,18 @@ class TestChildArguments(SimpleTestCase):
+             [sys.executable, '-Werror', __file__, 'runserver']
+         )
+ 
++    @mock.patch('__main__.__spec__', None)
++    @mock.patch('sys.argv', [__file__, 'runserver'])
++    @mock.patch('sys.warnoptions', [])
++    def test_xoptions(self):
++        with mock.patch.dict(sys._xoptions, clear=True):
++            sys._xoptions['utf8'] = True
++            sys._xoptions['a'] = 'b'
++            self.assertEqual(
++                autoreload.get_child_arguments(),
++                [sys.executable, '-Xutf8', '-Xa=b', __file__, 'runserver'],
++            )
++
+     @mock.patch('__main__.__spec__', None)
+     @mock.patch('sys.warnoptions', [])
+     def test_exe_fallback(self):

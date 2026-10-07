@@ -1,0 +1,25 @@
+Done. The fix makes pyreverse read PEP 484 annotations when determining attribute types.
+
+**Changes** (`pylint/pyreverse/`):
+
+- `utils.py:220-275` — three new helpers:
+  - `get_annotation_label()` — renders a `Name` annotation as its name and a `Subscript` (e.g. `List[int]`) via `as_string()`.
+  - `get_annotation()` — finds the annotation for an `AssignName`/`AssignAttr`: from the `AnnAssign` parent (`self.x: int = ...`, `a: str = ...`), or, for `self.x = x` in `__init__`, from the matching parameter's annotation. If the inferred default is `None`, the label becomes `Optional[<type>]` (not double-wrapped if already `Optional[...]`).
+  - `infer_node()` — returns the annotation when there is one, otherwise falls back to `node.infer()` as before.
+- `inspector.py:220,232` — `visit_assignname` and `handle_assignattr_type` now go through `utils.infer_node` instead of `node.infer()` directly.
+- `diagrams.py:125` — `class_names` accepts `Name`/`Subscript` nodes so annotation types reach the label.
+
+**Verified** — the issue's exact example went from `a : NoneType` to `a : Optional[str]`, and a wider sample renders as expected:
+
+```
+a : Optional[str]   (a: str = None)        e : Dict[str, int]  (Dict[str, int] = {})
+b : int             (b: int = 3)           f : Optional[Sub]   (f: Sub = None)
+c : Optional[str]   (Optional[str] = None) cls_attr : int      (class-level annotation)
+d : Optional[List[int]]                    made : Sub          (self.made: Sub = Sub())
+```
+
+Unannotated attributes keep their old inferred types and association arrows. I also ran pyreverse over the whole `pylint` package (no crashes; real hints like `Pattern[str]`, `List[Message]` now show), and checked the VCG writer output.
+
+**Tests** — added parametrized `get_annotation` tests for `AnnAssign` and `AssignAttr` plus `infer_node` fallback tests to `tests/unittest_pyreverse_writer.py`. All pyreverse tests pass (37), `test_pylint_runners.py` passes, isort clean, and pylint rates the changed files 10.00/10. ChangeLog and `doc/whatsnew/2.9.rst` entries added.
+
+One behavior note worth flagging: when an attribute is annotated with a class that's also in the diagram, the type now appears in the class label but the "association" arrow for that attribute is no longer drawn (the inferred value is the annotation node rather than the `ClassDef`). Rendering has-a edges from type hints is a separable follow-up if you want both.

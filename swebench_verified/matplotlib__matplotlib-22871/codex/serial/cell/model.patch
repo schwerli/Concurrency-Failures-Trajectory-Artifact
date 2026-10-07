@@ -1,0 +1,66 @@
+diff --git a/lib/matplotlib/dates.py b/lib/matplotlib/dates.py
+index 4d8ddf3ee5..098cb0270c 100644
+--- a/lib/matplotlib/dates.py
++++ b/lib/matplotlib/dates.py
+@@ -791,14 +791,21 @@ class ConciseDateFormatter(ticker.Formatter):
+         # or lower right of the axis.
+         offsetfmts = self.offset_formats
+         show_offset = self.show_offset
++        zerovals = [0, 1, 1, 0, 0, 0, 0]
+ 
+         # determine the level we will label at:
+         # mostly 0: years,  1: months,  2: days,
+         # 3: hours, 4: minutes, 5: seconds, 6: microseconds
+         for level in range(5, -1, -1):
+             if len(np.unique(tickdate[:, level])) > 1:
+-                if level < 2:
++                if level == 0:
+                     show_offset = False
++                elif level == 1:
++                    # January is the zero-format month tick that normally
++                    # carries the year.  If it is absent, keep the year in the
++                    # offset so the axis still shows it somewhere.
++                    show_offset = show_offset and not np.any(
++                        tickdate[:, level] == zerovals[level])
+                 break
+             elif level == 0:
+                 # all tickdate are the same, so only micros might be different
+@@ -807,7 +814,6 @@ class ConciseDateFormatter(ticker.Formatter):
+ 
+         # level is the basic level we will label at.
+         # now loop through and decide the actual ticklabels
+-        zerovals = [0, 1, 1, 0, 0, 0, 0]
+         labels = [''] * len(tickdate)
+         for nn in range(len(tickdate)):
+             if level < 5:
+diff --git a/lib/matplotlib/tests/test_dates.py b/lib/matplotlib/tests/test_dates.py
+index a78c39c560..9311a69c22 100644
+--- a/lib/matplotlib/tests/test_dates.py
++++ b/lib/matplotlib/tests/test_dates.py
+@@ -613,6 +613,26 @@ def test_concise_formatter_show_offset(t_delta, expected):
+     assert formatter.get_offset() == expected
+ 
+ 
++def test_concise_formatter_show_offset_without_january():
++    d1 = datetime.datetime(2021, 2, 15)
++    d2 = d1 + datetime.timedelta(days=198)
++
++    fig, ax = plt.subplots()
++    locator = mdates.AutoDateLocator()
++    formatter = mdates.ConciseDateFormatter(locator)
++    ax.xaxis.set_major_locator(locator)
++    ax.xaxis.set_major_formatter(formatter)
++
++    ax.plot([d1, d2], [0, 0])
++    ax.set_xlim(d1, d2)
++    fig.draw_without_rendering()
++
++    ticks = mdates.num2date(ax.get_xticks())
++    assert {tick.year for tick in ticks} == {2021}
++    assert all(tick.month != 1 for tick in ticks)
++    assert formatter.get_offset() == '2021'
++
++
+ def test_offset_changes():
+     fig, ax = plt.subplots()
+ 

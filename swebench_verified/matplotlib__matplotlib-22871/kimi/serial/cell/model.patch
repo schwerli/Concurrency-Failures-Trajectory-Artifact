@@ -1,0 +1,50 @@
+diff --git a/lib/matplotlib/dates.py b/lib/matplotlib/dates.py
+index 4d8ddf3ee5..e4d62d910f 100644
+--- a/lib/matplotlib/dates.py
++++ b/lib/matplotlib/dates.py
+@@ -797,7 +797,12 @@ class ConciseDateFormatter(ticker.Formatter):
+         # 3: hours, 4: minutes, 5: seconds, 6: microseconds
+         for level in range(5, -1, -1):
+             if len(np.unique(tickdate[:, level])) > 1:
+-                if level < 2:
++                if level < 2 and any(tickdate[:, 1] == 1):
++                    # ticks at the year or month level: the year is already
++                    # part of the tick labels (yearly ticks, or January
++                    # ticks labelled via zero_formats), so the offset would
++                    # be redundant.  If no tick falls in January, the year
++                    # is not shown anywhere, so keep the offset.
+                     show_offset = False
+                 break
+             elif level == 0:
+diff --git a/lib/matplotlib/tests/test_dates.py b/lib/matplotlib/tests/test_dates.py
+index a78c39c560..f1a80bcb6d 100644
+--- a/lib/matplotlib/tests/test_dates.py
++++ b/lib/matplotlib/tests/test_dates.py
+@@ -613,6 +613,27 @@ def test_concise_formatter_show_offset(t_delta, expected):
+     assert formatter.get_offset() == expected
+ 
+ 
++@pytest.mark.parametrize('t_delta, expected', [
++    (datetime.timedelta(days=180), '1997'),
++    (datetime.timedelta(days=330), '1997'),
++])
++def test_concise_formatter_show_offset_year_not_shown(t_delta, expected):
++    # Less than a year of data with no January tick: the year is not part
++    # of any tick label, so it must appear in the offset.
++    d1 = datetime.datetime(1997, 2, 1)
++    d2 = d1 + t_delta
++
++    fig, ax = plt.subplots()
++    locator = mdates.AutoDateLocator()
++    formatter = mdates.ConciseDateFormatter(locator)
++    ax.xaxis.set_major_locator(locator)
++    ax.xaxis.set_major_formatter(formatter)
++
++    ax.plot([d1, d2], [0, 0])
++    fig.canvas.draw()
++    assert formatter.get_offset() == expected
++
++
+ def test_offset_changes():
+     fig, ax = plt.subplots()
+ 

@@ -1,0 +1,886 @@
+diff --git a/audit/conf.py b/audit/conf.py
+new file mode 100644
+index 0000000000..0f3da813cd
+--- /dev/null
++++ b/audit/conf.py
+@@ -0,0 +1,13 @@
++import django
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_TZ=False,
++        USE_I18N=True,
++        USE_L10N=True,
++        SECRET_KEY="x",
++        INSTALLED_APPS=["django.contrib.contenttypes", "django.contrib.auth"],
++        DATABASES={},
++    )
++django.setup()
+diff --git a/audit/t1.py b/audit/t1.py
+new file mode 100644
+index 0000000000..1fed40359d
+--- /dev/null
++++ b/audit/t1.py
+@@ -0,0 +1,35 @@
++import conf, traceback
++from decimal import Decimal
++from django import forms
++
++def probe(label, fn):
++    try:
++        r = fn()
++        print(f"OK   {label}: {r!r}")
++    except forms.ValidationError as e:
++        print(f"VE   {label}: {e.messages}")
++    except Exception as e:
++        print(f"BOOM {label}: {type(e).__name__}: {e}")
++
++# 1. IntegerField step_size + huge int
++probe("IntegerField(step_size=3).clean('9'*400)",
++      lambda: forms.IntegerField(step_size=3).clean("9"*400))
++probe("IntegerField(step_size=3).clean('12')",
++      lambda: forms.IntegerField(step_size=3).clean("12"))
++# 2. DecimalField step_size with huge exponent
++probe("DecimalField(step_size=3).clean('1e400')",
++      lambda: forms.DecimalField(step_size=3).clean("1e400"))
++probe("DecimalField().clean('1e400')",
++      lambda: forms.DecimalField().clean("1e400"))
++probe("DecimalField(max_digits=10,decimal_places=2).clean('1e999999999')",
++      lambda: forms.DecimalField(max_digits=10, decimal_places=2).clean("1e999999999"))
++probe("DecimalField().clean('1e999999999999999999999')",
++      lambda: forms.DecimalField().clean("1e999999999999999999999"))
++# 3. FloatField step_size
++probe("FloatField(step_size=3).clean('1e308')",
++      lambda: forms.FloatField(step_size=3).clean("1e308"))
++probe("FloatField(step_size=3).clean('1e400')",
++      lambda: forms.FloatField(step_size=3).clean("1e400"))
++# max/min value validators with huge ints
++probe("IntegerField(max_value=10).clean('9'*400)",
++      lambda: forms.IntegerField(max_value=10).clean("9"*400))
+diff --git a/audit/t2.py b/audit/t2.py
+new file mode 100644
+index 0000000000..52a9c47b46
+--- /dev/null
++++ b/audit/t2.py
+@@ -0,0 +1,19 @@
++import conf, traceback, json
++from django import forms
++
++def probe(label, fn):
++    try:
++        r = fn()
++        print(f"OK   {label}: {str(r)[:60]!r}")
++    except forms.ValidationError as e:
++        print(f"VE   {label}: {e.messages}")
++    except Exception as e:
++        print(f"BOOM {label}: {type(e).__name__}: {str(e)[:120]}")
++
++deep = "[" * 100000 + "]" * 100000
++deep2 = "[" * 100000  # unterminated deep
++probe("JSONField.to_python(deep nested)", lambda: forms.JSONField().clean(deep))
++probe("JSONField.to_python(deep unterminated)", lambda: forms.JSONField().clean(deep2))
++probe("JSONField.bound_data(deep)", lambda: forms.JSONField().bound_data(deep, None))
++probe("JSONField.has_changed(None, deep)", lambda: forms.JSONField().has_changed(None, deep))
++probe('JSONField deep dict', lambda: forms.JSONField().clean('{"a":' * 50000 + "1" + "}" * 50000))
+diff --git a/audit/t3.py b/audit/t3.py
+new file mode 100644
+index 0000000000..5d8844059f
+--- /dev/null
++++ b/audit/t3.py
+@@ -0,0 +1,30 @@
++import conf, datetime
++from django import forms
++
++def probe(label, fn):
++    try:
++        r = fn()
++        print(f"OK   {label}: {str(r)[:70]!r}")
++    except forms.ValidationError as e:
++        print(f"VE   {label}: {e.messages}")
++    except Exception as e:
++        print(f"BOOM {label}: {type(e).__name__}: {str(e)[:140]}")
++
++for v in ["99999999999999999999-01-01", "9999999-1-1", "1-1-99999999999", "0001-01-01",
++          "999999999999/1/1", "1/1/99999999999999999999999"]:
++    probe(f"DateField.clean({v!r})", lambda v=v: forms.DateField().clean(v))
++for v in ["99999999999999:00", "1:99999999999999999999", "00:00:99999999999999999999"]:
++    probe(f"TimeField.clean({v!r})", lambda v=v: forms.TimeField().clean(v))
++for v in ["9999999999-01-01 00:00", "0001-01-01T00:00+99:99",
++          "0001-01-01T00:00:00.99999999999999999999",
++          "0001-01-01T00:00-2359", "9999-12-31T23:59:59.999999+23:59"]:
++    probe(f"DateTimeField.clean({v!r})", lambda v=v: forms.DateTimeField().clean(v))
++for v in ["999999999999999999 00:00:00", "P999999999999999999999D", "1e1000 00:00",
++          "999999999999999999999999:00"]:
++    probe(f"DurationField.clean({v!r})", lambda v=v: forms.DurationField().clean(v))
++probe("UUIDField.clean(garbage)", lambda: forms.UUIDField().clean("x" * 40))
++probe("UUIDField.clean(int-ish)", lambda: forms.UUIDField().clean("1" * 40))
++for v in ["http://[", "http://]", "////]@N.AN", "http://", "//[0:0::0:0:]", "http://%"]:
++    probe(f"URLField.clean({v!r})", lambda v=v: forms.URLField().clean(v))
++for v in ["::ffff:1.2.3.4.5", "1:2", ":::", "%" * 20 + ":"]:
++    probe(f"GenericIPAddressField.clean({v!r})", lambda v=v: forms.GenericIPAddressField().clean(v))
+diff --git a/audit/t4.py b/audit/t4.py
+new file mode 100644
+index 0000000000..333d78d735
+--- /dev/null
++++ b/audit/t4.py
+@@ -0,0 +1,56 @@
++import conf
++from decimal import Decimal
++from django import forms
++
++
++class IntForm(forms.Form):
++    n = forms.IntegerField(step_size=3)
++
++
++class IntFormBounded(forms.Form):
++    n = forms.IntegerField(step_size=3, max_value=100, min_value=0)
++
++
++class DecForm(forms.Form):
++    d = forms.DecimalField(step_size=Decimal("0.01"))
++
++
++class DecFormBounded(forms.Form):
++    d = forms.DecimalField(step_size=Decimal("0.01"), max_digits=10, decimal_places=2)
++
++
++class JForm(forms.Form):
++    j = forms.JSONField()
++
++
++def probe(label, fn):
++    try:
++        print(f"OK   {label}: {str(fn())[:80]!r}")
++    except Exception as e:
++        print(f"BOOM {label}: {type(e).__name__}: {str(e)[:130]}")
++
++
++probe("IntForm(step_size).is_valid() huge int", lambda: IntForm(data={"n": "9" * 400}).is_valid())
++probe("IntFormBounded.is_valid() huge int", lambda: IntFormBounded(data={"n": "9" * 400}).is_valid())
++probe("DecForm.is_valid() 1e400", lambda: DecForm(data={"d": "1e400"}).is_valid())
++probe("DecFormBounded.is_valid() 1e400", lambda: DecFormBounded(data={"d": "1e400"}).is_valid())
++probe("DecForm.is_valid() -1e400", lambda: DecForm(data={"d": "-1e400"}).is_valid())
++probe("DecForm.is_valid() 1e-400", lambda: DecForm(data={"d": "1e-400"}).is_valid())
++
++deep = "[" * 100000 + "]" * 100000
++probe("JForm.is_valid() deep json", lambda: JForm(data={"j": deep}).is_valid())
++
++
++def render_after_invalid():
++    f = JForm(data={"j": deep})
++    try:
++        f.is_valid()
++    except RecursionError as e:
++        return "is_valid crashed: " + type(e).__name__
++    return str(f)
++
++
++probe("JForm render", render_after_invalid)
++
++# model form path for JSONField
++probe("modelform-ish JSONField(required=False) empty ok", lambda: forms.JSONField(required=False).clean(""))
+diff --git a/audit/t5.py b/audit/t5.py
+new file mode 100644
+index 0000000000..a9733c55e6
+--- /dev/null
++++ b/audit/t5.py
+@@ -0,0 +1,39 @@
++import conf, traceback, sys
++from decimal import Decimal
++from django import forms
++
++
++def tb(label, fn):
++    print("=" * 20, label)
++    try:
++        fn()
++        print("no exception")
++    except Exception:
++        traceback.print_exc()
++
++
++tb("IntegerField step_size huge", lambda: forms.IntegerField(step_size=3).clean("9" * 400))
++tb("DecimalField step_size 1e400", lambda: forms.DecimalField(step_size=Decimal("0.01")).clean("1e400"))
++deep = "[" * 100000 + "]" * 100000
++tb("JSONField deep", lambda: forms.JSONField().clean(deep))
++
++
++class JForm(forms.Form):
++    j = forms.JSONField()
++
++
++tb("JSONField render bound form without is_valid", lambda: str(JForm(data={"j": deep})))
++
++# minimal nesting depth that triggers RecursionError
++print("recursionlimit", sys.getrecursionlimit())
++lo, hi = 1, 100000
++while lo < hi:
++    mid = (lo + hi) // 2
++    try:
++        forms.JSONField().clean("[" * mid + "]" * mid)
++        lo = mid + 1
++    except RecursionError:
++        hi = mid
++    except Exception:
++        lo = mid + 1
++print("min nesting depth to crash:", lo, " payload bytes:", 2 * lo)
+diff --git a/audit/t6.py b/audit/t6.py
+new file mode 100644
+index 0000000000..f8be334a16
+--- /dev/null
++++ b/audit/t6.py
+@@ -0,0 +1,64 @@
++import conf, json, sys
++from django import forms
++from django.core.files.uploadedfile import SimpleUploadedFile
++
++
++def probe(label, fn):
++    try:
++        print(f"OK   {label}: {str(fn())[:80]!r}")
++    except forms.ValidationError as e:
++        print(f"VE   {label}: {e.messages}")
++    except Exception as e:
++        print(f"BOOM {label}: {type(e).__name__}: {str(e)[:130]}")
++
++
++# FileField with name=None
++class NoNameFile(SimpleUploadedFile):
++    pass
++
++
++f = SimpleUploadedFile("x", b"abc")
++f.name = None
++probe("FileField(max_length=5).clean(name=None)", lambda: forms.FileField(max_length=5).clean(f))
++probe("FileField().clean(name=None)", lambda: forms.FileField().clean(f))
++
++# json dumps vs loads recursion window (render path)
++lo, hi = 1, 2000
++best = None
++for depth in range(900, 999):
++    payload = "[" * depth + "]" * depth
++    try:
++        parsed = json.loads(payload)
++    except RecursionError:
++        continue
++    try:
++        json.dumps(parsed)
++    except RecursionError:
++        best = depth
++        break
++print("loads-ok / dumps-RecursionError depth:", best)
++
++# render bound form where loads succeeds but prepare_value dumps may fail
++for depth in (900, 950, 980, 990, 993):
++    payload = "[" * depth + "]" * depth
++
++    class JF(forms.Form):
++        j = forms.JSONField()
++
++    probe(f"render bound JSONField depth={depth}", lambda p=payload: str(JF(data={"j": p}))[:1])
++
++# MultiValueField.has_changed with data=None
++probe("SplitDateTimeField.has_changed(None, None)",
++      lambda: forms.SplitDateTimeField().has_changed(None, None))
++probe("SplitDateTimeField.clean(str)", lambda: forms.SplitDateTimeField().clean("abc"))
++probe("MultipleChoiceField.has_changed(None, 'abc')",
++      lambda: forms.MultipleChoiceField(choices=[("a", "a")]).has_changed(None, "abc"))
++
++# BaseTemporalField with list input
++probe("DateField.clean(['a'])", lambda: forms.DateField().clean(["a"]))
++probe("DateField.clean(123)", lambda: forms.DateField().clean(123))
++probe("TimeField.clean(123)", lambda: forms.TimeField().clean(123))
++probe("DateTimeField.clean(123)", lambda: forms.DateTimeField().clean(123))
++probe("GenericIPAddressField.clean(123)", lambda: forms.GenericIPAddressField().clean(123))
++probe("UUIDField.clean(123)", lambda: forms.UUIDField().clean(123))
++probe("DurationField.clean(['a'])", lambda: forms.DurationField().clean(["a"]))
+diff --git a/audit/t7.py b/audit/t7.py
+new file mode 100644
+index 0000000000..df0064abb2
+--- /dev/null
++++ b/audit/t7.py
+@@ -0,0 +1,39 @@
++import conf
++from django import forms
++from django.http import QueryDict
++
++
++class F(forms.Form):
++    d = forms.DateField()
++    ip = forms.GenericIPAddressField()
++
++
++qd = QueryDict("d=1&d=2&ip=1&ip=2")
++print("QueryDict.get types:", type(qd.get("d")), type(qd.get("ip")))
++f = F(data=qd)
++print("is_valid:", f.is_valid(), f.errors)
++
++# dict fed directly (JSON body pattern)
++try:
++    f2 = F(data={"d": ["2020-01-01"], "ip": "1.2.3.4"})
++    print("list-valued dict:", f2.is_valid(), f2.errors)
++except Exception as e:
++    print("BOOM list-valued dict:", type(e).__name__, e)
++
++try:
++    f3 = F(data={"d": 20200101, "ip": 12345})
++    print("int-valued dict:", f3.is_valid(), f3.errors)
++except Exception as e:
++    print("BOOM int-valued dict:", type(e).__name__, e)
++
++
++# SelectMultiple widget on a DateField -> getlist
++class F4(forms.Form):
++    d = forms.DateField(widget=forms.SelectMultiple(choices=[]))
++
++
++try:
++    f4 = F4(data=QueryDict("d=2020-01-01&d=2020-01-02"))
++    print("SelectMultiple DateField:", f4.is_valid(), f4.errors)
++except Exception as e:
++    print("BOOM SelectMultiple DateField:", type(e).__name__, e)
+diff --git a/django/forms/widgets.py b/django/forms/widgets.py
+index 842b73e95c..3d6091c250 100644
+--- a/django/forms/widgets.py
++++ b/django/forms/widgets.py
+@@ -1161,6 +1161,8 @@ class SelectDateWidget(Widget):
+                 # Return pseudo-ISO dates with zeros for any unselected values,
+                 # e.g. '2017-0-23'.
+                 return "%s-%s-%s" % (y or 0, m or 0, d or 0)
++            except OverflowError:
++                return "0-0-0"
+             return date_value.strftime(input_format)
+         return data.get(name)
+ 
+diff --git a/fuzz1.py b/fuzz1.py
+new file mode 100644
+index 0000000000..f5ae616c41
+--- /dev/null
++++ b/fuzz1.py
+@@ -0,0 +1,60 @@
++import os, django, traceback
++os.environ.setdefault("DJANGO_SETTINGS_MODULE", "s")
++import sys
++sys.path.insert(0, "/workspace")
++with open("/workspace/s.py","w") as f:
++    f.write("SECRET_KEY='x'\nUSE_TZ=True\nINSTALLED_APPS=['django.contrib.contenttypes','django.contrib.auth']\nDATABASES={'default':{'ENGINE':'django.db.backends.sqlite3','NAME':':memory:'}}\nUSE_I18N=True\n")
++django.setup()
++
++from django import forms
++from django.core.exceptions import ValidationError
++from django.http import QueryDict
++
++HOSTILE = [
++    "9"*20, "-"+"9"*20, "9"*4400, "1e400", "99999", "10000", "0", "-1",
++    "\x00", "1_0", " 12 ", "١٢٣٤", "inf", "nan", "1e309",
++]
++
++FIELDS = {}
++for nm in dir(forms):
++    obj = getattr(forms, nm)
++    if isinstance(obj, type) and issubclass(obj, forms.Field) and obj is not forms.Field:
++        FIELDS[nm]=obj
++
++def build(fcls):
++    try:
++        return fcls(required=False)
++    except Exception:
++        return None
++
++bad = []
++for nm, fcls in sorted(FIELDS.items()):
++    f = build(fcls)
++    if f is None: continue
++    for h in HOSTILE:
++        # build a querydict covering plain name + multiwidget subnames + selectdate subnames
++        qd = QueryDict(mutable=True)
++        for key in ["f", "f_0", "f_1", "f_2", "f_year", "f_month", "f_day"]:
++            qd[key] = h
++        class F(forms.Form):
++            pass
++        F.base_fields = {"f": f}
++        form = F(qd)
++        try:
++            form.is_valid()
++            form.errors
++        except ValidationError:
++            pass
++        except Exception as e:
++            bad.append((nm, "is_valid", h[:30], type(e).__name__, str(e)[:80], traceback.format_exc()))
++            continue
++        try:
++            str(form)
++        except Exception as e:
++            bad.append((nm, "render", h[:30], type(e).__name__, str(e)[:80], traceback.format_exc()))
++
++for b in bad:
++    print("="*70)
++    print(b[0], b[1], repr(b[2]), b[3], b[4])
++    print(b[5][-1500:])
++print("total bad:", len(bad))
+diff --git a/fuzz2.py b/fuzz2.py
+new file mode 100644
+index 0000000000..15aae1aafe
+--- /dev/null
++++ b/fuzz2.py
+@@ -0,0 +1,48 @@
++import os, sys, django, traceback, itertools
++sys.path.insert(0, "/workspace")
++os.environ.setdefault("DJANGO_SETTINGS_MODULE", "s")
++django.setup()
++from django import forms
++from django.core.exceptions import ValidationError
++from django.http import QueryDict
++
++HOSTILE = [
++    "9"*20, "-"+"9"*20, "9"*4400, "1e400", "99999", "10000", "0",
++    "9"*20+" 00:00:00", "P"+"9"*20+"D", "1e400 00:00:00",
++    "999999999999999999999 days", "9"*400+":00:00",
++    "00:00:"+"9"*20, "0:0:0."+"9"*20,
++    "1"+"0"*400, "["+"9"*4400+"]", '{"a": '+"9"*4400+'}',
++    "9"*4400+".0", "1E1000", "0x10",
++    "12:00:00.999999999999999999999",
++    "9999-99-99", "0-0-0", "10000-1-1", "0001-01-01",
++]
++FIELDS = {}
++for nm in dir(forms):
++    obj = getattr(forms, nm)
++    if isinstance(obj, type) and issubclass(obj, forms.Field) and obj is not forms.Field:
++        FIELDS[nm]=obj
++
++bad=[]
++for nm, fcls in sorted(FIELDS.items()):
++    try: f = fcls(required=False)
++    except Exception: continue
++    for h in HOSTILE:
++        qd = QueryDict(mutable=True)
++        for key in ["f","f_0","f_1","f_2","f_year","f_month","f_day"]:
++            qd[key]=h
++        class F(forms.Form): pass
++        F.base_fields={"f":f}
++        form=F(qd)
++        for stage, fn in (("is_valid", lambda: form.is_valid()), ("render", lambda: str(form))):
++            try: fn()
++            except ValidationError: pass
++            except Exception as e:
++                bad.append((nm,stage,h,type(e).__name__,str(e)[:100],traceback.format_exc()))
++                break
++seen=set()
++for b in bad:
++    k=(b[0],b[1],b[3])
++    print("#"*70); print(b[0],b[1],repr(b[2][:40]),b[3],b[4])
++    if k not in seen:
++        seen.add(k); print(b[5][-900:])
++print("total:",len(bad))
+diff --git a/fuzz3.py b/fuzz3.py
+new file mode 100644
+index 0000000000..0aeea2f87c
+--- /dev/null
++++ b/fuzz3.py
+@@ -0,0 +1,70 @@
++import os, sys, django, traceback, inspect
++sys.path.insert(0,"/workspace"); os.environ.setdefault("DJANGO_SETTINGS_MODULE","s")
++django.setup()
++from django import forms
++from django.forms import widgets as W
++from django.http import QueryDict
++from django.core.exceptions import ValidationError
++
++HOSTILE = ["9"*20,"-"+"9"*20,"9"*4400,"10000","0","99999","0-0-0","10000-1-1",
++           "9"*20+"-1-1","1-1-1","0001-1-1","","\x00","1e400","٩"*20]
++
++widget_classes=[]
++for nm in dir(W):
++    o=getattr(W,nm)
++    if isinstance(o,type) and issubclass(o,W.Widget):
++        widget_classes.append((("forms.widgets."+nm),o))
++try:
++    from django.contrib.admin import widgets as AW
++    for nm in dir(AW):
++        o=getattr(AW,nm)
++        if isinstance(o,type) and issubclass(o,W.Widget):
++            widget_classes.append((("admin.widgets."+nm),o))
++except Exception as e:
++    print("admin import fail",e)
++try:
++    from django.contrib.postgres.forms import array as PA, ranges as PR
++    for mod,pfx in ((PA,"pg.array."),(PR,"pg.ranges.")):
++        for nm in dir(mod):
++            o=getattr(mod,nm)
++            if isinstance(o,type) and issubclass(o,W.Widget):
++                widget_classes.append((pfx+nm,o))
++except Exception as e:
++    print("pg import fail",type(e).__name__,e)
++
++def mk(cls):
++    tries=[(),(None,),]
++    if cls in (W.MultiWidget,):
++        tries=[((W.TextInput(),W.TextInput()),)]
++    if 'SplitArrayWidget' in cls.__name__:
++        tries=[(W.TextInput(),3)]
++    if 'RangeWidget' in cls.__name__ and cls.__name__=='RangeWidget':
++        tries=[(W.TextInput,)]
++    for a in tries:
++        try: return cls(*a)
++        except Exception: continue
++    return None
++
++bad=[]
++for nm,cls in widget_classes:
++    w=mk(cls)
++    if w is None: continue
++    for h in HOSTILE:
++        qd=QueryDict(mutable=True)
++        for k in ["f","f_0","f_1","f_2","f_year","f_month","f_day","f-clear"]:
++            qd[k]=h
++        try:
++            v=w.value_from_datadict(qd,{},"f")
++        except Exception as e:
++            bad.append((nm,"vfd",h,type(e).__name__,str(e)[:90],traceback.format_exc())); continue
++        for stage,val in (("render_raw",h),("render_vfd",v)):
++            try:
++                w.render("f",val)
++            except Exception as e:
++                bad.append((nm,stage,h,type(e).__name__,str(e)[:90],traceback.format_exc()))
++seen=set()
++for b in bad:
++    print("#"*70); print(b[0],b[1],repr(b[2][:30]),b[3],b[4])
++    k=(b[0],b[1],b[3])
++    if k not in seen: seen.add(k); print(b[5][-800:])
++print("total",len(bad))
+diff --git a/fuzz4.py b/fuzz4.py
+new file mode 100644
+index 0000000000..3e41acea5b
+--- /dev/null
++++ b/fuzz4.py
+@@ -0,0 +1,77 @@
++import os, sys, django, traceback
++sys.path.insert(0,"/workspace"); os.environ["DJANGO_SETTINGS_MODULE"]="s2"
++django.setup()
++from django import forms
++from django.forms import widgets as W
++from django.contrib.admin import widgets as AW
++from django.http import QueryDict
++from django.core.exceptions import ValidationError
++
++INTERESTING=(OverflowError,TypeError,OSError,UnicodeDecodeError,ValueError,RecursionError,MemoryError,ArithmeticError,LookupError,AttributeError)
++
++HOSTILE=["9"*20,"-"+"9"*20,"9"*4400,"10000","0","99999","1","0-0-0","10000-1-1",
++  "9"*20+"-1-1","1-1-1","0001-01-01","","\x00","1e400","٩"*20,"9999-12-31",
++  "9"*20+" 00:00:00","P"+"9"*20+"D","0:0:"+"9"*20,"1e400 00:00:00",
++  "9999-12-31 23:59:59.999999","+"+"9"*20,"1_0"," 12 ","0x1f","１２３４"]
++
++COMBOS=[
++  ("DateField+SelectDateWidget", lambda: forms.DateField(required=False, widget=W.SelectDateWidget())),
++  ("DateField+SelectDateWidget(req)", lambda: forms.DateField(widget=W.SelectDateWidget())),
++  ("DateTimeField+SelectDateWidget", lambda: forms.DateTimeField(required=False, widget=W.SelectDateWidget())),
++  ("SplitDateTimeField", lambda: forms.SplitDateTimeField(required=False)),
++  ("SplitDateTimeField+hidden", lambda: forms.SplitDateTimeField(required=False, widget=W.SplitHiddenDateTimeWidget())),
++  ("DateField", lambda: forms.DateField(required=False)),
++  ("DateTimeField", lambda: forms.DateTimeField(required=False)),
++  ("TimeField", lambda: forms.TimeField(required=False)),
++  ("DurationField", lambda: forms.DurationField(required=False)),
++  ("IntegerField", lambda: forms.IntegerField(required=False)),
++  ("FloatField", lambda: forms.FloatField(required=False)),
++  ("DecimalField", lambda: forms.DecimalField(required=False)),
++  ("JSONField", lambda: forms.JSONField(required=False)),
++  ("CharField+Textarea", lambda: forms.CharField(required=False, widget=W.Textarea)),
++  ("BooleanField", lambda: forms.BooleanField(required=False)),
++  ("NullBooleanField", lambda: forms.NullBooleanField(required=False)),
++  ("ChoiceField+Radio", lambda: forms.ChoiceField(required=False, choices=[("a","a")], widget=W.RadioSelect)),
++  ("MultipleChoiceField+CBSM", lambda: forms.MultipleChoiceField(required=False, choices=[("a","a")], widget=W.CheckboxSelectMultiple)),
++  ("TypedChoiceField-int", lambda: forms.TypedChoiceField(required=False, coerce=int, choices=[("1","1")])),
++  ("TypedMultipleChoiceField-int", lambda: forms.TypedMultipleChoiceField(required=False, coerce=int, choices=[("1","1")])),
++  ("FilePathField", None),
++  ("AdminDate", lambda: forms.DateField(required=False, widget=AW.AdminDateWidget())),
++  ("AdminSplitDateTime", lambda: forms.SplitDateTimeField(required=False, widget=AW.AdminSplitDateTime())),
++  ("AdminURL", lambda: forms.URLField(required=False, widget=AW.AdminURLFieldWidget())),
++  ("AdminUUID", lambda: forms.UUIDField(required=False, widget=AW.AdminUUIDInputWidget())),
++  ("UUIDField", lambda: forms.UUIDField(required=False)),
++  ("GenericIPAddressField", lambda: forms.GenericIPAddressField(required=False)),
++  ("SlugField", lambda: forms.SlugField(required=False)),
++  ("EmailField", lambda: forms.EmailField(required=False)),
++  ("URLField", lambda: forms.URLField(required=False)),
++  ("ImageField", lambda: forms.ImageField(required=False)),
++  ("FileField", lambda: forms.FileField(required=False)),
++]
++bad=[]
++for label, mk in COMBOS:
++    if mk is None: continue
++    for h in HOSTILE:
++        try: f=mk()
++        except Exception: continue
++        qd=QueryDict(mutable=True)
++        for k in ["f","f_0","f_1","f_2","f_year","f_month","f_day","f-clear"]:
++            qd[k]=h
++        class F(forms.Form): pass
++        F.base_fields={"f":f}
++        form=F(qd)
++        try:
++            form.is_valid()
++        except ValidationError: pass
++        except INTERESTING as e:
++            bad.append((label,"is_valid",h,type(e).__name__,str(e)[:110],traceback.format_exc())); continue
++        try:
++            str(form)
++        except INTERESTING as e:
++            bad.append((label,"render",h,type(e).__name__,str(e)[:110],traceback.format_exc()))
++seen=set()
++for b in bad:
++    print("#"*70); print(b[0],"|",b[1],"|",repr(b[2][:32]),"|",b[3],"|",b[4])
++    k=(b[0],b[1],b[3])
++    if k not in seen: seen.add(k); print(b[5][-1100:])
++print("total",len(bad))
+diff --git a/fuzz5.py b/fuzz5.py
+new file mode 100644
+index 0000000000..188722fa37
+--- /dev/null
++++ b/fuzz5.py
+@@ -0,0 +1,33 @@
++import os, sys, django, itertools, traceback
++sys.path.insert(0,"/workspace"); os.environ["DJANGO_SETTINGS_MODULE"]="s2"
++django.setup()
++from django import forms
++from django.forms import widgets as W
++from django.http import QueryDict
++from django.core.exceptions import ValidationError
++from django.utils import translation
++
++VALS=["", "0", "1", "12", "31", "10000", "9999", "9"*20, "-"+"9"*20, "9"*4400,
++      "1e5", "\x00", " 2 ", "٩٩٩", "+1", "1_0", "0x1", "None", "9"*310, "2147483648",
++      "-1", "1.5", "١٢٣٤"]
++bad=[]
++langs=["en","de","ja","fr"]
++for lang in langs:
++  translation.activate(lang)
++  for y,m,d in itertools.product(VALS,repeat=3):
++    qd=QueryDict(mutable=True); qd["f_year"]=y; qd["f_month"]=m; qd["f_day"]=d
++    class F(forms.Form): pass
++    F.base_fields={"f":forms.DateField(required=False,widget=W.SelectDateWidget())}
++    form=F(qd)
++    try:
++        form.is_valid(); s=str(form)
++    except ValidationError: pass
++    except Exception as e:
++        bad.append((lang,y,m,d,type(e).__name__,str(e)[:100],traceback.format_exc()))
++translation.deactivate()
++seen=set()
++for b in bad[:40]:
++    print("#"*60); print(b[:6])
++    k=(b[0],b[4])
++    if k not in seen: seen.add(k); print(b[6][-900:])
++print("total",len(bad))
+diff --git a/repro_refute.py b/repro_refute.py
+new file mode 100644
+index 0000000000..84c9e7ae66
+--- /dev/null
++++ b/repro_refute.py
+@@ -0,0 +1,140 @@
++import django
++from django.conf import settings
++
++settings.configure(
++    DEBUG=True,
++    USE_I18N=False,
++    USE_TZ=False,
++    DATABASES={},
++    INSTALLED_APPS=["django.contrib.contenttypes", "django.contrib.auth"],
++)
++django.setup()
++
++from decimal import Decimal
++
++from django import forms
++from django.forms.widgets import SelectDateWidget
++from django.http import QueryDict
++
++w = SelectDateWidget()
++
++
++class F(forms.Form):
++    field = forms.DateField(widget=SelectDateWidget())
++
++
++def probe(y, m, d, label=""):
++    data = {"field_year": y, "field_month": m, "field_day": d}
++    # 1) raw widget call
++    try:
++        raw = repr(w.value_from_datadict(data, {}, "field"))
++        raw_exc = None
++    except BaseException as e:
++        raw = None
++        raw_exc = "%s: %s" % (type(e).__name__, e)
++    # 2) full form path
++    try:
++        f = F(data=data)
++        valid = f.is_valid()
++        out = repr(f.cleaned_data.get("field")) if valid else repr(dict(f.errors))
++        form_exc = None
++    except BaseException as e:
++        valid = None
++        out = None
++        form_exc = "%s: %s" % (type(e).__name__, e)
++    print(
++        "%-26s vfd=%-16s vfd_exc=%-30s valid=%-5s -> %-28s form_exc=%s"
++        % (label or repr((y, m, d)), raw, raw_exc, valid, out, form_exc)
++    )
++    return raw_exc, form_exc
++
++
++print("=== claimed 'surprising accepted' values ===")
++cases = [
++    ("٢٠٠٠", "1", "1", "arabic-indic year"),
++    ("२०००", "1", "1", "devanagari year"),
++    ("２０００", "1", "1", "fullwidth year"),
++    (" 2000 ", "1", "1", "spaces"),
++    ("\t2000\n", "1", "1", "tab/newline"),
++    ("\xa02000\xa0", "1", "1", "nbsp"),
++    ("+2000", "+1", "+1", "plus signs"),
++    ("2_000", "1", "1", "underscore literal"),
++    ("1", "1", "1", "year 1"),
++    ("9", "12", "31", "year 9"),
++    ("99", "6", "15", "year 99"),
++    ("999", "1", "1", "year 999"),
++    (b"2000", "1", "1", "bytes year"),
++    (2000.9, 1, 1, "float truncation"),
++    (Decimal("2000"), 1, 1, "Decimal"),
++    (True, True, True, "bool True"),
++]
++exc_seen = []
++for y, m, d, label in cases:
++    a, b = probe(y, m, d, label)
++    if a or b:
++        exc_seen.append((label, a, b))
++
++print()
++print("=== claimed 'correctly rejected' values ===")
++rej = [
++    ("1e5", "1", "1", "1e5"),
++    ("0x10", "1", "1", "0x10"),
++    ("0b11", "1", "1", "0b11"),
++    ("0o17", "1", "1", "0o17"),
++    ("2,000", "1", "1", "comma"),
++    ("2000.5", "1", "1", "float str"),
++    ("inf", "1", "1", "inf"),
++    ("nan", "1", "1", "nan"),
++    ("abcd", "1", "1", "abcd"),
++    ("20\x0000", "1", "1", "NUL"),
++    ("\U0001f600", "1", "1", "emoji"),
++    ("²000", "1", "1", "superscript 2"),
++    ("Ⅰ", "1", "1", "roman numeral"),
++    ("①", "1", "1", "circled 1"),
++    ("0", "1", "1", "year 0"),
++    ("10000", "1", "1", "year 10000"),
++    ("-2000", "1", "1", "negative year"),
++    ("2000", "0", "1", "month 0"),
++    ("2000", "13", "1", "month 13"),
++    ("2000", "-1", "1", "month -1"),
++    ("2000", "1", "0", "day 0"),
++    ("2000", "1", "32", "day 32"),
++    ("2000", "1", "-1", "day -1"),
++    ("2001", "2", "29", "Feb 29 non-leap"),
++    ("9" * 4400, "1", "1", "4400-digit year"),
++]
++for y, m, d, label in rej:
++    a, b = probe(y, m, d, label)
++    if a or b:
++        exc_seen.append((label, a, b))
++
++print()
++print("=== huge year (the OverflowError case the fix targets) ===")
++for n in (5000, 100000, 10**6):
++    a, b = probe("9" * 10, "9" * n, "1", "month %d digits" % n)
++    if a or b:
++        exc_seen.append(("month %d digits" % n, a, b))
++a, b = probe("1" * 40000, "1", "1", "year 40000 digits")
++if a or b:
++    exc_seen.append(("year 40000 digits", a, b))
++
++print()
++print("=== real QueryDict path ===")
++qd = QueryDict("field_year=%D9%A2%D9%A0%D9%A0%D9%A0&field_month=1&field_day=1")
++print("vfd:", repr(w.value_from_datadict(qd, {}, "field")))
++f = F(data=qd)
++print("is_valid:", f.is_valid(), "cleaned:", repr(f.cleaned_data.get("field")))
++print("exact claim vfd == '2000-01-01':",
++      w.value_from_datadict({"field_year": "٢٠٠٠",
++                             "field_month": "1", "field_day": "1"}, {}, "field") == "2000-01-01")
++
++print()
++print("=== rendered options for default widget (does UI offer 0001?) ===")
++import datetime
++this_year = datetime.date.today().year
++print("years attr:", list(w.years))
++html = F().as_p()
++print("'>1<' option present:", 'value="1"' in html.split("field_month")[0])
++
++print()
++print("EXCEPTIONS ESCAPING ANYWHERE:", exc_seen if exc_seen else "NONE")
+diff --git a/s.py b/s.py
+new file mode 100644
+index 0000000000..ab5657255b
+--- /dev/null
++++ b/s.py
+@@ -0,0 +1,5 @@
++SECRET_KEY='x'
++USE_TZ=True
++INSTALLED_APPS=['django.contrib.contenttypes','django.contrib.auth']
++DATABASES={'default':{'ENGINE':'django.db.backends.sqlite3','NAME':':memory:'}}
++USE_I18N=True
+diff --git a/s2.py b/s2.py
+new file mode 100644
+index 0000000000..134eda4333
+--- /dev/null
++++ b/s2.py
+@@ -0,0 +1,7 @@
++SECRET_KEY='x'
++USE_TZ=True
++USE_I18N=True
++INSTALLED_APPS=['django.contrib.contenttypes','django.contrib.auth','django.contrib.admin','django.contrib.messages','django.contrib.sessions','django.contrib.staticfiles']
++DATABASES={'default':{'ENGINE':'django.db.backends.sqlite3','NAME':':memory:'}}
++STATIC_URL='/static/'
++TEMPLATES=[{'BACKEND':'django.template.backends.django.DjangoTemplates','APP_DIRS':True,'OPTIONS':{'context_processors':[]}}]
+diff --git a/tests/forms_tests/widget_tests/test_selectdatewidget.py b/tests/forms_tests/widget_tests/test_selectdatewidget.py
+index cfcd037987..b1aac06d45 100644
+--- a/tests/forms_tests/widget_tests/test_selectdatewidget.py
++++ b/tests/forms_tests/widget_tests/test_selectdatewidget.py
+@@ -621,6 +621,37 @@ class SelectDateWidgetTest(WidgetTest):
+                     self.widget.value_from_datadict(data, {}, "field"), expected
+                 )
+ 
++    def test_value_from_datadict_overflow(self):
++        # Values that overflow the C long used by datetime.date() don't crash,
++        # they're treated as an invalid date (#34495).
++        tests = [
++            ("1234567821345678", "1", "1"),
++            ("-1234567821345678", "1", "1"),
++            ("2000", "1234567821345678", "1"),
++            ("2000", "1", "1234567821345678"),
++        ]
++        for values in tests:
++            with self.subTest(values=values):
++                data = {
++                    "field_%s" % field_name: value
++                    for field_name, value in zip(("year", "month", "day"), values)
++                }
++                self.assertEqual(
++                    self.widget.value_from_datadict(data, {}, "field"), "0-0-0"
++                )
++
++    def test_form_with_overflow_year(self):
++        # A year that overflows the C long used by datetime.date() makes the
++        # form invalid instead of crashing with an OverflowError (#34495).
++        class TestForm(Form):
++            field = DateField(widget=self.widget)
++
++        form = TestForm(
++            {"field_year": "1234567821345678", "field_month": "1", "field_day": "1"}
++        )
++        self.assertIs(form.is_valid(), False)
++        self.assertEqual(form.errors, {"field": ["Enter a valid date."]})
++
+     def test_value_omitted_from_data(self):
+         self.assertIs(self.widget.value_omitted_from_data({}, {}, "field"), True)
+         self.assertIs(

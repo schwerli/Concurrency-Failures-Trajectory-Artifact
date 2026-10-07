@@ -1,0 +1,48 @@
+diff --git a/sklearn/feature_extraction/tests/test_text.py b/sklearn/feature_extraction/tests/test_text.py
+index 7b7697ff4..bb801ea3b 100644
+--- a/sklearn/feature_extraction/tests/test_text.py
++++ b/sklearn/feature_extraction/tests/test_text.py
+@@ -1,6 +1,7 @@
+ # -*- coding: utf-8 -*-
+ from collections.abc import Mapping
+ import re
++import unicodedata
+ import warnings
+ 
+ import pytest
+@@ -97,6 +98,11 @@ def test_strip_accents():
+     expected = 'this is a test'
+     assert strip_accents_unicode(a) == expected
+ 
++    # strip accents from strings that are already decomposed in NFKD form
++    a = unicodedata.normalize('NFKD', 'ñ')
++    expected = 'n'
++    assert strip_accents_unicode(a) == expected
++
+ 
+ def test_to_ascii():
+     # check some classical latin accentuated symbols
+@@ -156,6 +162,10 @@ def test_word_analyzer_unigrams(Vectorizer):
+                 "c'etait", 'pas', 'tres', 'bon.']
+     assert wa(text) == expected
+ 
++    wa = Vectorizer(strip_accents='unicode').build_analyzer()
++    text = unicodedata.normalize('NFKD', 'café')
++    assert wa(text) == ['cafe']
++
+ 
+ def test_word_analyzer_unigrams_and_bigrams():
+     wa = CountVectorizer(analyzer="word", strip_accents='unicode',
+diff --git a/sklearn/feature_extraction/text.py b/sklearn/feature_extraction/text.py
+index bb5a9d646..b6708faae 100644
+--- a/sklearn/feature_extraction/text.py
++++ b/sklearn/feature_extraction/text.py
+@@ -130,7 +130,7 @@ def strip_accents_unicode(s):
+         ASCII equivalent.
+     """
+     normalized = unicodedata.normalize('NFKD', s)
+-    if normalized == s:
++    if normalized == s and not any(unicodedata.combining(c) for c in s):
+         return s
+     else:
+         return ''.join([c for c in normalized if not unicodedata.combining(c)])

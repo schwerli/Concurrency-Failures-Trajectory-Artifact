@@ -1,0 +1,15 @@
+Fixed in `django/db/models/base.py:1705`.
+
+**Root cause:** `_check_ordering` traverses related lookups with `_cls._meta.get_field(part)`. `pk` is an alias, not a real field, so `get_field('pk')` raises `FieldDoesNotExist` — and since `fld` is by then the FK (not `None`) with no `pk` transform, the check falls through to `models.E015`. The non-related branch of the same method already special-cased `pk` (`fields = {f for f in fields if f != 'pk'}`); the related-field traversal added in 440505cb2c didn't.
+
+**The fix**, two coupled parts:
+
+1. Resolve `pk` to `_cls._meta.pk` during traversal instead of going through `get_field`.
+2. Reset `_cls = None` when a part isn't a relation.
+
+Part 2 isn't cosmetic — without it, part 1 introduces a false negative. `_cls` was only ever advanced, never invalidated, so after a non-relation part it still pointed at the *previous* model. `name__pk` on a `CharField` would then resolve `pk` against that stale model and silently validate. Setting `_cls = None` makes the next `_cls._meta` raise `AttributeError`, which the existing `except` handles — falling back to the transform check, so registered lookups like `parent__name__lower` still pass. It also fixes a pre-existing miss of the same shape: `parent__field1__field2` was accepted before and is now correctly flagged.
+
+**Verification:**
+- Confirmed the failure first: `ordering = ('parent__pk',)` raised E015 before the change, clean after.
+- Added two regression tests to `tests/invalid_models_tests/test_models.py` (`test_ordering_pointing_to_related_model_pk`, `test_ordering_pointing_multiple_times_to_model_fields`), plus two scratch tests I used to pin the false-negative and transform behavior — those confirmed `name__pk` is rejected and `parent__name__lower` accepted.
+- `invalid_models_tests`: 194 passed. `model_options ordering queries model_inheritance check_framework model_meta admin_checks`: 686 passed. No regressions.

@@ -1,0 +1,31 @@
+Done. Everything builds clean with zero dependencies.
+
+## What I built
+
+`/output` is a Cargo project with the library split into modules under `/output/clipper2/`:
+
+| File | Contents |
+|---|---|
+| `clipper2/core.rs` | `Point64`/`Path64`/`Paths64`/`Rect64`, `area`, `translate_paths`, winding helpers |
+| `clipper2/engine.rs` | The boolean clipping engine (`Clipper64`, `FillRule`, `ClipType`) |
+| `clipper2/clipper.rs` | `union` / `intersect` / `difference` / `xor` / `boolean_op` |
+| `clipper2/ostream.rs` | `std::cout`-compatible `double` formatting |
+| `test6.rs` | Entry point, mirroring the C++ line for line |
+
+Rather than a Vatti sweep-line, the engine builds a **planar arrangement**: it cuts every input edge at all intersections, classifies each resulting edge by evaluating subject/clip winding numbers immediately to its left and right, keeps only edges where the boolean result flips, orients them interior-on-the-left, then chains them into rings by always taking the sharpest clockwise turn. Outer rings come out CCW (positive area), holes CW — matching Clipper2's convention.
+
+## Verification
+
+- **Output**: `6250\n` byte-identical to the C++ binary across 15 argument sets (empty, JSON blobs, flags, unicode, empty strings) — 0 diffs.
+- **Geometry**: the union is the actual expected 12-vertex staircase polygon `(0,50)…(25,50)`, CCW, area 6250 — not a numeric coincidence. Translation checked too.
+- **Engine**: 6400/6400 randomized cases exact (4 ops × 4 fill rules × mixed orientations, multi-path, holes, disjoint pieces) against a brute-force cell count that never touches the engine.
+- **Arbitrary polygons**: 960 cases of random self-intersecting polygons checked against scanline integration — 959 within 0.1%.
+- **Formatting**: 5044 doubles (subnormals, `nan`/`-nan`/`inf`, `%g` style-switch boundaries) diffed against real `g++ std::cout` output — identical.
+
+Two things worth flagging honestly:
+
+1. I found and fixed a real bug mid-way: probe points were being tested against the *unsnapped* original segments, so on non-axis-aligned input every edge got misclassified and the engine returned nothing. Classification now runs against the snapped arrangement itself.
+
+2. The one remaining outlier in the arbitrary-polygon suite turned out to be my *reference* integrator failing to resolve an ultra-thin sliver, not the engine. Re-checking that case with a fine integrator gives 4.8e-5 agreement. Residual error is integer-lattice quantization and shrinks ∝ 1/scale (4.2e-3 → 6.8e-7 over a 1000× scale-up) — inherent to any integer clipper, Clipper2 included.
+
+One note on the spec: requirement 7 asks for "an executable at `/output/test6.rs`", but that path holds the source. The executable is at **`/output/test6`** (from `rustc test6.rs`); `cargo build --release` also works and yields `target/release/test6`.

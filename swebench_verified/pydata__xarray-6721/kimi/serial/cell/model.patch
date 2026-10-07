@@ -1,0 +1,53 @@
+diff --git a/doc/whats-new.rst b/doc/whats-new.rst
+index dc9a8adf..c624dd15 100644
+--- a/doc/whats-new.rst
++++ b/doc/whats-new.rst
+@@ -47,6 +47,8 @@ Bug fixes
+   pandas when decoding times outside the range that can be represented with
+   nanosecond-precision values (:issue:`6716`, :pull:`6717`).
+   By `Spencer Clark <https://github.com/spencerkclark>`_.
++- Accessing :py:attr:`Dataset.chunks` on a dataset opened from a backend (e.g. zarr)
++  without dask no longer loads the entire dataset into memory (:issue:`6738`).
+ 
+ Documentation
+ ~~~~~~~~~~~~~
+diff --git a/xarray/core/common.py b/xarray/core/common.py
+index 3c328f42..1642155c 100644
+--- a/xarray/core/common.py
++++ b/xarray/core/common.py
+@@ -2023,7 +2023,7 @@ def get_chunksizes(
+ 
+     chunks: dict[Any, tuple[int, ...]] = {}
+     for v in variables:
+-        if hasattr(v.data, "chunks"):
++        if v.chunks is not None:
+             for dim, c in v.chunksizes.items():
+                 if dim in chunks and c != chunks[dim]:
+                     raise ValueError(
+diff --git a/xarray/tests/test_backends.py b/xarray/tests/test_backends.py
+index bbfae73e..1a7c7326 100644
+--- a/xarray/tests/test_backends.py
++++ b/xarray/tests/test_backends.py
+@@ -1743,6 +1743,22 @@ class ZarrBase(CFEncodedBase):
+             with self.open(store_target, **open_kwargs) as ds:
+                 assert_equal(ds, expected)
+ 
++    def test_chunks_is_lazy(self):
++        # regression test for https://github.com/pydata/xarray/issues/6738
++        # accessing .chunks should not load any data into memory
++        original = create_test_data()
++
++        with self.roundtrip(original) as actual:
++            for k, v in actual.variables.items():
++                # only index variables should be in memory
++                assert v._in_memory == (k in actual.dims)
++
++            assert actual.chunks == {}
++
++            for k, v in actual.variables.items():
++                # accessing .chunks should not have loaded any data
++                assert v._in_memory == (k in actual.dims)
++
+     @requires_dask
+     def test_auto_chunk(self):
+         original = create_test_data().chunk()

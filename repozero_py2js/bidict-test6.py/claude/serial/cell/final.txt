@@ -1,0 +1,42 @@
+The migration is complete and verified against the reference executable.
+
+## Deliverables in `/output`
+
+```
+test6.mjs                      entry point
+lib/python/unicode_digits.mjs  Unicode Nd digit values
+lib/python/whitespace.mjs      int()'s whitespace set
+lib/python/int.mjs             Python int() → BigInt
+lib/python/objects.mjs         str()/repr()/key hashing
+lib/python/dict.mjs            insertion-ordered dict
+lib/bidict/errors.mjs          exception hierarchy
+lib/bidict/bidict.mjs          bidirectional mapping + .inv
+lib/bidict/index.mjs           package surface
+lib/argparse/errors.mjs        SystemExit / ArgumentTypeError
+lib/argparse/formatter.mjs     usage & help layout
+lib/argparse/parser.mjs        ArgumentParser
+lib/argparse/index.mjs         package surface
+lib/io/streams.mjs             stdout/stderr, exit code
+selftest.mjs                   library self-tests (all pass)
+```
+
+## Verification
+
+I probed the executable's behavior first, then built a differential harness (`/workspace/compare_test6.mjs`) comparing stdout, stderr, **and** exit code across **179 argument vectors** — all match byte-for-byte. Help output is `diff`-identical.
+
+## Non-obvious behaviors the probing surfaced
+
+Several would have been silently wrong if I'd coded from the Python source alone:
+
+- **`int()` accepts Unicode decimal digits.** `--val ٣`, `۳`, and `𝟑` all yield 3 → `True`; `²` (category `No`) is rejected. Deriving the digit value needs care: the five mathematical digit sets occupy `U+1D7CE..U+1D7FF` with no gaps, so scanning back to the first non-digit overshoots. Taking the run offset **mod 10** is correct because maximal runs are always whole aligned ten-code-point sets.
+- **`int()` uses two different whitespace tests.** ASCII goes through C-style `isspace`, so `U+001C–001F` are *rejected* despite `str.isspace()` accepting them — while non-ASCII `U+0085`/`U+00A0` *are* stripped. `\ufeff` is stripped by JS `\s` but not by Python, so a naive `.trim()` would diverge.
+- **`repr()` escaping.** Python reports `invalid int value: "a'b"` — switching to double quotes — and escapes non-printables by width (`\xXX`/`\uXXXX`/`\UXXXXXXXX`). This was the last mismatch (160/164 → 179/179).
+- **Big integers.** `--val 99999999999999999999` parses exactly, so values are `BigInt`, not `Number`.
+- **`--` is never consumed here.** argparse only strips it when a positional absorbs it; with no positionals defined, `--key a --val 1 --` reports `unrecognized arguments: --`. Required-argument errors also precede unrecognized-argument errors.
+
+Two bugs I introduced and caught while writing: `Object.create(Bidict.prototype)` would have thrown, since private fields are only installed during construction; and comparing a stored `1` against an incoming `1n` with `===` is always false, so equality routes through the hash token instead.
+
+Two notes on judgment calls:
+
+- I set `prog` to `'test6_executable'` so stderr matches the reference exactly, rather than deriving it from the script filename as argparse would (which would give `test6.mjs`). Easy to change if you'd prefer the argparse-derived name.
+- I used the global `process` instead of importing `node:process`, and exit via `process.exitCode` rather than `process.exit()` — the latter can truncate buffered stdout on a pipe. The only `node:` import anywhere was in the test harness, which I moved out of `/output` to keep the deliverable strictly local-import-only.

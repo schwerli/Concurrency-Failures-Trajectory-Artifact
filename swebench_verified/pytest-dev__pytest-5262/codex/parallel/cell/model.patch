@@ -1,0 +1,60 @@
+diff --git a/src/_pytest/capture.py b/src/_pytest/capture.py
+index 25eab7fd..6c0cc187 100644
+--- a/src/_pytest/capture.py
++++ b/src/_pytest/capture.py
+@@ -429,6 +429,13 @@ class EncodedFile(object):
+         self.buffer = buffer
+         self.encoding = encoding
+ 
++    @property
++    def mode(self):
++        mode = getattr(self.buffer, "mode", None)
++        if mode is None:
++            raise AttributeError("mode")
++        return mode.replace("b", "")
++
+     def write(self, obj):
+         if isinstance(obj, six.text_type):
+             obj = obj.encode(self.encoding, "replace")
+diff --git a/testing/test_capture.py b/testing/test_capture.py
+index 5d80eb63..70020a24 100644
+--- a/testing/test_capture.py
++++ b/testing/test_capture.py
+@@ -952,6 +952,13 @@ def test_dupfile_on_textio():
+     assert not hasattr(f, "name")
+ 
+ 
++@needsosdup
++def test_dupfile_mode_is_text(tmpfile):
++    f = capture.safe_text_dupfile(tmpfile, "wb+")
++    assert "b" not in f.mode
++    f.close()
++
++
+ @contextlib.contextmanager
+ def lsof_check():
+     pid = os.getpid()
+@@ -1574,3 +1581,23 @@ def test_typeerror_encodedfile_write(testdir):
+         )
+     else:
+         assert result_with_capture.ret == 0
++
++
++@needsosdup
++def test_fdcapture_mode_does_not_claim_binary(testdir):
++    p = testdir.makepyfile(
++        """
++        def write_string(s, out):
++            if "b" in out.mode:
++                out.write(s.encode("utf-8"))
++            else:
++                out.write(s)
++
++        def test_writes_text_to_stdout():
++            import sys
++            write_string("hello", sys.stdout)
++    """
++    )
++
++    result = testdir.runpytest("--capture=fd", str(p))
++    result.assert_outcomes(passed=1)

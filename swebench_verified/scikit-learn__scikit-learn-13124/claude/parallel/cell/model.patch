@@ -1,0 +1,1138 @@
+diff --git a/cmp.py b/cmp.py
+new file mode 100644
+index 000000000..b9a5c4699
+--- /dev/null
++++ b/cmp.py
+@@ -0,0 +1,38 @@
++import numpy as np, warnings, importlib, sys
++warnings.simplefilter('ignore')
++from sklearn.model_selection import StratifiedKFold
++old = StratifiedKFold._make_test_folds
++import skfplugin  # applies patch
++new = StratifiedKFold._make_test_folds
++
++def folds(fn, skf, X, y):
++    return fn(skf, X, y)
++
++cases = [
++  ("y=[1,1,0,0] n=2", [1,1,0,0], 2),
++  ("y=[1,1,1,0,0,0,0] n=2", [1,1,1,0,0,0,0], 2),
++  ("y=[0]*7+[1]*8 n=3", [0]*7+[1]*8, 3),
++  ("y=[0]*8+[1]*8 n=3", [0]*8+[1]*8, 3),
++  ("y=[0]*3+[1]*14 n=3", [0]*3+[1]*14, 3),
++  ("y=[3,3,-1,-1,3] n=3", [3,3,-1,-1,3], 3),
++  ("y=[1,1,1,0,0] n=2", [1,1,1,0,0], 2),
++  ("iris n=5", list(np.repeat([0,1,2],50)), 5),
++  ("iris n=3", list(np.repeat([0,1,2],50)), 3),
++  ("y=[0,1,0,1,0,0,1,1,1] n=3", [0,1,0,1,0,0,1,1,1], 3),
++  ("y=[0,1,0,1,2,1,2,0,2] n=3", [0,1,0,1,2,1,2,0,2], 3),
++  ("digits600 n=3", None, 3),
++]
++from sklearn.datasets import load_digits
++d = load_digits()
++for name, y, n in cases:
++    if y is None:
++        y = list(d.target[:600])
++    y = np.asarray(y)
++    X = np.ones(len(y))
++    for shuffle, rs in ((False, None), (True, 0), (True, 1)):
++        skf = StratifiedKFold(n, shuffle=shuffle, random_state=rs)
++        o = old(skf, X, y); nn = new(skf, X, y)
++        same = np.array_equal(o, nn)
++        osz = sorted(np.bincount(o, minlength=n).tolist())
++        nsz = sorted(np.bincount(nn, minlength=n).tolist())
++        print(f"{name:32s} shuffle={shuffle} rs={rs}  identical={same}  sizes old={osz} new={nsz}")
+diff --git a/doc/tutorial/text_analytics/skeletons/exercise_01_language_train_model.py b/doc/tutorial/text_analytics/skeletons/exercise_01_language_train_model.py
+index 438481120..1fa11e872 100644
+--- a/doc/tutorial/text_analytics/skeletons/exercise_01_language_train_model.py
++++ b/doc/tutorial/text_analytics/skeletons/exercise_01_language_train_model.py
+@@ -46,7 +46,7 @@ print(metrics.classification_report(y_test, y_predicted,
+ cm = metrics.confusion_matrix(y_test, y_predicted)
+ print(cm)
+ 
+-#import matplotlib.pyplot as plt
++#import matlotlib.pyplot as plt
+ #plt.matshow(cm, cmap=plt.cm.jet)
+ #plt.show()
+ 
+diff --git a/doc/tutorial/text_analytics/skeletons/exercise_02_sentiment.py b/doc/tutorial/text_analytics/skeletons/exercise_02_sentiment.py
+index 11b1ff07a..0ccefeb1e 100644
+--- a/doc/tutorial/text_analytics/skeletons/exercise_02_sentiment.py
++++ b/doc/tutorial/text_analytics/skeletons/exercise_02_sentiment.py
+@@ -44,8 +44,8 @@ if __name__ == "__main__":
+     # more useful.
+     # Fit the pipeline on the training set using grid search for the parameters
+ 
+-    # TASK: print the cross-validated scores for the each parameters set
+-    # explored by the grid search
++    # TASK: print the mean and std for each candidate along with the parameter
++    # settings for all the candidates explored by grid search.
+ 
+     # TASK: Predict the outcome on the testing set and store it in a variable
+     # named y_predicted
+diff --git a/doc/whats_new/v0.21.rst b/doc/whats_new/v0.21.rst
+index 7bc4389e5..6d96aa396 100644
+--- a/doc/whats_new/v0.21.rst
++++ b/doc/whats_new/v0.21.rst
+@@ -24,6 +24,8 @@ random sampling procedures.
+   :class:`linear_model.LogisticRegressionCV` with 'saga' solver. |Fix|
+ - :class:`ensemble.GradientBoostingClassifier` for multiclass
+   classification. |Fix|
++- :class:`model_selection.StratifiedKFold` with ``shuffle=True`` and an integer
++  ``random_state``, and any estimator or function using it. |Fix|
+ 
+ Details are listed in the changelog below.
+ 
+@@ -208,6 +210,13 @@ Support for Python 3.4 and below has been officially dropped.
+   :func:`~model_selection.validation_curve` only the latter is required.
+   :issue:`12613` and :issue:`12669` by :user:`Marc Torrellas <marctorrellas>`.
+ 
++- |Fix| Fixed a bug where :class:`model_selection.StratifiedKFold` shuffled
++  each class's samples with the same ``random_state``, making the shuffling
++  correlated across classes. As a consequence, ``shuffle=True`` could merely
++  reorder the folds instead of producing genuinely different folds for
++  different values of ``random_state``.
++  :issue:`13124` by :user:`Hanmin Qin <qinhanmin2014>`.
++
+ :mod:`sklearn.neighbors`
+ ........................
+ 
+diff --git a/rskf_check.py b/rskf_check.py
+new file mode 100644
+index 000000000..94c3be072
+--- /dev/null
++++ b/rskf_check.py
+@@ -0,0 +1,8 @@
++import numpy as np
++import skfplugin
++from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold
++X = np.array([[1, 2], [3, 4], [1, 2], [3, 4]])
++y = np.array([0, 0, 1, 1])
++rskf = RepeatedStratifiedKFold(n_splits=2, n_repeats=2, random_state=36851234)
++for tr, te in rskf.split(X, y):
++    print("TRAIN:", tr, "TEST:", te)
+diff --git a/skf/ceiling.py b/skf/ceiling.py
+new file mode 100644
+index 000000000..4939a6570
+--- /dev/null
++++ b/skf/ceiling.py
+@@ -0,0 +1,33 @@
++import sys, itertools, warnings
++sys.path.insert(0, '/workspace/skf')
++import numpy as np
++from design import make_test_folds as mtf
++from sklearn.utils import check_random_state
++warnings.simplefilter("ignore")
++f = lambda y, k, sh=False, sd=None: mtf(y, k, sh, check_random_state(sd))
++part = lambda tf, k: frozenset(frozenset(np.flatnonzero(tf == i).tolist()) for i in range(k))
++
++def reachable(y, k, cap=300000):
++    y = np.asarray(y); tf0 = f(y, k)
++    cls = list(dict.fromkeys(y.tolist())); per = []; tot = 1
++    for c in cls:
++        pos = np.flatnonzero(y == c)
++        opts = sorted(set(itertools.permutations(tf0[pos].tolist())))
++        per.append((pos, opts)); tot *= len(opts)
++        if tot > cap: return None
++    seen = set()
++    for combo in itertools.product(*[o for _, o in per]):
++        tf = np.empty(len(y), dtype=int)
++        for (pos, _), labs in zip(per, combo): tf[pos] = labs
++        seen.add(part(tf, k))
++    return len(seen)
++
++print("smallest shapes: observed distinct partitions (500 seeds) vs exhaustive ceiling")
++for counts, k in [((2,2),2), ((3,3),3), ((4,4),2), ((1,5),2), ((2,3),2),
++                  ((1,1,4),2), ((5,5),5), ((3,4),3), ((2,2,2),2)]:
++    y = np.concatenate([[i]*counts[i] for i in range(len(counts))])
++    obs = set(part(f(y, k, True, s), k) for s in range(500))
++    r = reachable(y, k)
++    flag = "OK" if (r is not None and len(obs) == min(r, 500)) else ("OK" if r is None else "check")
++    print("   counts=%-11s k=%d  observed=%-4d ceiling=%-6s %s"
++          % (list(counts), k, len(obs), r, flag))
+diff --git a/skf/controls.py b/skf/controls.py
+new file mode 100644
+index 000000000..a1d7f2e7e
+--- /dev/null
++++ b/skf/controls.py
+@@ -0,0 +1,75 @@
++"""Negative controls: does the harness actually catch the failure modes?"""
++import sys, itertools, warnings
++sys.path.insert(0, '/workspace/skf')
++import numpy as np
++from design import make_test_folds
++from sklearn.utils import check_random_state
++from sklearn.model_selection import StratifiedKFold
++warnings.simplefilter("ignore")
++part = lambda tf, k: frozenset(frozenset(np.flatnonzero(tf == i).tolist())
++                               for i in range(k))
++
++def good(y, k, seed):
++    return make_test_folds(y, k, True, check_random_state(seed))
++
++def bad_lockstep(y, k, seed):
++    """variant that permutes every class with the SAME seed (the old #13124 bug)"""
++    tf0 = make_test_folds(y, k, False, None)
++    y = np.asarray(y); tf = tf0.copy()
++    for c in dict.fromkeys(y.tolist()):
++        pos = np.flatnonzero(y == c)
++        labs = tf0[pos].copy()
++        check_random_state(seed).shuffle(labs)     # fresh rng, same seed each class
++        tf[pos] = labs
++    return tf
++
++def bad_relabel(y, k, seed):
++    """variant that only permutes the fold *labels* (same partition, renamed)"""
++    tf0 = make_test_folds(y, k, False, None)
++    perm = check_random_state(seed).permutation(k)
++    return perm[tf0]
++
++def old(y, k, seed):
++    cv = StratifiedKFold(k, shuffle=True, random_state=seed)
++    tf = np.empty(len(y), dtype=int)
++    for i, (_, te) in enumerate(cv.split(np.zeros(len(y)), y)):
++        tf[te] = i
++    return tf
++
++shapes = [([0]*5 + [1]*5, 5), ([0]*4 + [1]*4, 2), ([0]*10 + [1]*10, 5),
++          ([0]*6 + [1]*6 + [2]*6, 3)]
++print("%-28s %s" % ("impl", "distinct partitions over 200 seeds, per shape"))
++for name, impl in [("NEW design", good), ("ctrl: same seed per class", bad_lockstep),
++                   ("ctrl: permute fold labels", bad_relabel),
++                   ("OLD /testbed impl", old)]:
++    row = []
++    for y, k in shapes:
++        y = np.asarray(y)
++        row.append(len(set(part(impl(y, k, s), k) for s in range(200))))
++    print("%-28s %s" % (name, row))
++print()
++print("shapes:", [(np.bincount(np.asarray(y)).tolist(), k) for y, k in shapes])
++print()
++print("--- fold-size balance, same shapes, shuffle=True ---")
++for name, impl in [("NEW design", good), ("OLD /testbed impl", old)]:
++    worst = 0; ex = None
++    for y, k in shapes:
++        for s in range(50):
++            sz = np.bincount(impl(np.asarray(y), k, s), minlength=k)
++            if sz.max() - sz.min() > worst:
++                worst = sz.max() - sz.min(); ex = (np.bincount(np.asarray(y)).tolist(), k, sz.tolist())
++    print("%-28s worst max-min = %d  %s" % (name, worst, ex or ""))
++
++print()
++print("--- ValueError / warning behaviour (requirement 6) ---")
++for y, k in [([0, 0, 1], 5), ([0]*1 + [1]*10, 3), ([0]*2 + [1]*2 + [2]*9, 4)]:
++    y = np.asarray(y)
++    try:
++        with warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            tf = make_test_folds(y, k, False, None)
++        print("   counts=%-12s k=%d -> folds=%s sizes=%s warned=%s"
++              % (np.bincount(y).tolist(), k, tf.tolist(),
++                 np.bincount(tf, minlength=k).tolist(), bool(w)))
++    except ValueError as e:
++        print("   counts=%-12s k=%d -> ValueError: %s" % (np.bincount(y).tolist(), k, e))
+diff --git a/skf/design.py b/skf/design.py
+new file mode 100644
+index 000000000..d0af5791b
+--- /dev/null
++++ b/skf/design.py
+@@ -0,0 +1,94 @@
++"""Independent redesign of StratifiedKFold._make_test_folds.
++
++DESIGN
++------
++Think of building the fold assignment as *dealing cards*.  Sort the samples by
++class (label-invariant class order, see below) and deal them round-robin into
++n_splits piles, WITHOUT restarting the deal at each class boundary.
++
++    class:   A A A A | B B B | C C
++    fold:    0 1 2 0   1 2 0   1 2      (n_splits = 3, deal never restarts)
++
++Because the deal never restarts, two properties fall out simultaneously:
++
++  * globally, pile i receives |{j : j = i (mod n_splits)}| = ceil((n-i)/k)
++    samples  ->  overall fold sizes differ by at most 1;
++  * each class occupies a *contiguous* run of the dealt sequence, and the
++    number of elements of a contiguous run hitting an arithmetic progression
++    of step k is either floor(count/k) or ceil(count/k)  ->  per-class fold
++    counts differ by at most 1, i.e. maximal stratification.
++
++The old code instead ran an independent KFold per class, which is the same as
++restarting the deal at every class boundary: every class donates its remainder
++to fold 0, 1, 2 ... in that order, so fold 0 can be up to n_classes samples
++larger than the last fold.
++
++That deal only gives us the *allocation* -- a matrix
++
++    allocation[i, k] = number of samples of class k that belong to test fold i
++
++which is all stratification and balance care about.  WHICH samples of class k
++fill those allocation[i, k] slots is a separate, free choice:
++
++  * shuffle=False -> hand out the fold labels in ascending order,
++    ``[0]*a[0,k] + [1]*a[1,k] + ...``, so the samples of class k inside one
++    fold are contiguous in y (ignoring other classes): data-order dependencies
++    are preserved as far as the stratification constraint allows.
++  * shuffle=True  -> randomly permute that same label vector.  This keeps the
++    allocation (hence balance + stratification) exactly, while randomising
++    which samples land together.  Each class is permuted with its own draws
++    from the RNG, so the classes are not shuffled "in lockstep" (which would
++    only ever relabel the same partition).
++
++LABEL INVARIANCE.  Everything above depends on the *order* of the classes
++(through the cumulative offset that starts each class's deal, and through the
++order in which the classes draw from the RNG).  ``np.unique`` orders classes by
++sorted value, which changes under relabelling ("Happy" < "Sad" but 1 > 0).  So
++classes are encoded by **order of first appearance in y**, which is a function
++of positions only and therefore invariant under any renaming of the labels.
++"""
++
++import warnings
++import numpy as np
++
++
++def make_test_folds(y, n_splits, shuffle=False, rng=None):
++    """Standalone equivalent of StratifiedKFold._make_test_folds."""
++    y = np.asarray(y)
++
++    # --- class encoding, invariant to relabelling -------------------------
++    # y_idx[j] is the first position in y at which the j-th *sorted* class
++    # occurs; ranking those positions turns "sorted class order" into
++    # "order of first appearance", which no renaming of labels can change.
++    _, y_idx, y_inv = np.unique(y, return_index=True, return_inverse=True)
++    _, class_perm = np.unique(y_idx, return_inverse=True)
++    y_encoded = class_perm[y_inv]
++
++    n_classes = len(y_idx)
++    y_counts = np.bincount(y_encoded, minlength=n_classes)
++    min_groups = np.min(y_counts)
++    if np.all(n_splits > y_counts):
++        raise ValueError("n_splits=%d cannot be greater than the number of "
++                         "members in each class." % n_splits)
++    if n_splits > min_groups:
++        warnings.warn("The least populated class in y has only %d members, "
++                      "which is too few. The minimum number of members in any "
++                      "class cannot be less than n_splits=%d."
++                      % (min_groups, n_splits), Warning)
++
++    # --- allocation: deal the class-sorted samples round-robin ------------
++    # y_order == np.sort(y_encoded), built in O(n).
++    y_order = np.repeat(np.arange(n_classes), y_counts)
++    allocation = np.asarray(
++        [np.bincount(y_order[i::n_splits], minlength=n_classes)
++         for i in range(n_splits)])
++
++    # --- realise the allocation, class by class --------------------------
++    test_folds = np.empty(len(y), dtype='i')
++    for k in range(n_classes):
++        # ascending run-length expansion => contiguous blocks per class
++        folds_for_class = np.arange(n_splits).repeat(allocation[:, k])
++        if shuffle:
++            rng.shuffle(folds_for_class)
++        test_folds[y_encoded == k] = folds_for_class
++    return test_folds
+diff --git a/skf/edges.py b/skf/edges.py
+new file mode 100644
+index 000000000..d9e7c92f6
+--- /dev/null
++++ b/skf/edges.py
+@@ -0,0 +1,77 @@
++import sys, warnings, itertools, time
++sys.path.insert(0, '/workspace/skf')
++import numpy as np
++from design import make_test_folds as mtf
++from sklearn.utils import check_random_state
++from sklearn.model_selection import StratifiedKFold
++warnings.simplefilter("ignore")
++f = lambda y, k, sh=False, sd=None: mtf(y, k, sh, check_random_state(sd))
++
++print("1) extreme shapes")
++for y, k in [(np.array([0]+[1]*9), 10), (np.array([0]*10+[1]*10), 20),
++             (np.array([0,0,1,1,2,2]), 6), (np.array([0]+[1]+[2]*28), 10),
++             (np.array([-3]*4+[7]*5), 3), (np.array([0]*30+[1]*1), 2)]:
++    try:
++        tf = f(y, k)
++        sz = np.bincount(tf, minlength=k)
++        pc = max(int(np.bincount(tf[y==c], minlength=k).ptp()) for c in np.unique(y))
++        print("   counts=%-14s k=%-3d sizes=%-28s ptp=%d per-class ptp=%d"
++              % (np.unique(y, return_counts=True)[1].tolist(), k, sz.tolist(),
++                 sz.ptp(), pc))
++    except ValueError as e:
++        print("   counts=%-14s k=%-3d ValueError: %s"
++              % (np.unique(y, return_counts=True)[1].tolist(), k, e))
++
++print()
++print("2) heavily imbalanced 1000 samples (89/10/1 %), k=5, shuffle both ways")
++y = np.array([4]*100 + [0]*890 + [1]*10)
++for sh in (False, True):
++    tf = f(y, 5, sh, 0)
++    sz = np.bincount(tf, minlength=5)
++    print("   shuffle=%-5s sizes=%s  per-class matrix=\n%s" % (sh, sz.tolist(),
++          np.array([np.bincount(tf[y==c], minlength=5) for c in [4,0,1]])))
++
++print()
++print("3) interleaved y: contiguity is judged ignoring other classes")
++y = np.array([0,1,0,1,0,1,0,1,0,1,0,1])
++tf = f(y, 3)
++print("   y  =", y.tolist())
++print("   tf =", tf.tolist())
++print("   class0 fold seq =", tf[y==0].tolist(), " non-decreasing:", bool(np.all(np.diff(tf[y==0])>=0)))
++print("   class1 fold seq =", tf[y==1].tolist(), " non-decreasing:", bool(np.all(np.diff(tf[y==1])>=0)))
++
++print()
++print("4) marginal uniformity of the shuffle (y=[0]*10+[1]*10, k=5, 20000 seeds)")
++y = np.array([0]*10+[1]*10)
++rng = check_random_state(0)
++hits = np.zeros((3, 5), int)
++for _ in range(20000):
++    tf = mtf(y, 5, True, rng)
++    for r, s in enumerate([0, 4, 15]):
++        hits[r, tf[s]] += 1
++print("   sample->fold frequencies (expect ~4000 each):")
++for r, s in enumerate([0, 4, 15]):
++    print("     sample %-2d %s" % (s, hits[r].tolist()))
++
++print()
++print("5) determinism / RandomState semantics through the real class")
++Xd = np.zeros(15); yd = np.array([0]*7+[1]*8)
++cv = StratifiedKFold(3, shuffle=True, random_state=0)
++a = [t.tolist() for _, t in cv.split(Xd, yd)]
++b = [t.tolist() for _, t in cv.split(Xd, yd)]
++print("   int seed, two calls identical:", a == b)
++cv = StratifiedKFold(3, shuffle=True, random_state=np.random.RandomState(0))
++c = [t.tolist() for _, t in cv.split(Xd, yd)]
++d = [t.tolist() for _, t in cv.split(Xd, yd)]
++print("   RandomState instance, two calls differ (expected):", c != d)
++
++print()
++print("6) list / object / bool / float labels accepted")
++for y in ([1,1,0,0,0], np.array(['a','a','b','b'], dtype=object),
++          np.array([True,True,False,False]), np.array([1.5,1.5,2.5,2.5])):
++    print("   %-40s -> %s" % (str(y), f(np.asarray(y), 2).tolist()))
++
++print()
++print("7) runtime, n=200000, 5 classes, k=10")
++y = np.repeat(np.arange(5), [40000]*5)
++t = time.time(); f(y, 10, True, 0); print("   %.3fs" % (time.time()-t))
+diff --git a/skf/exhaustive.py b/skf/exhaustive.py
+new file mode 100644
+index 000000000..332cba2da
+--- /dev/null
++++ b/skf/exhaustive.py
+@@ -0,0 +1,94 @@
++"""Exhaustive grid sweep: every 2-class count pair 1..30, every k 2..10,
++plus a 3/4/5-class grid.  Compares new design vs. old implementation."""
++import sys, itertools, warnings
++sys.path.insert(0, '/workspace/skf')
++import numpy as np
++from design import make_test_folds
++from sklearn.utils import check_random_state
++from sklearn.model_selection import StratifiedKFold
++warnings.simplefilter("ignore")
++
++
++def new_impl(y, k, shuffle=False, seed=None):
++    return make_test_folds(y, k, shuffle, check_random_state(seed))
++
++
++def old_impl(y, k, shuffle=False, seed=None):
++    cv = StratifiedKFold(k, shuffle=shuffle, random_state=seed)
++    tf = np.empty(len(y), dtype=int)
++    for i, (_, te) in enumerate(cv.split(np.zeros(len(y)), y)):
++        tf[te] = i
++    return tf
++
++
++def checks(tf, y, k):
++    y = np.asarray(y)
++    s = np.bincount(tf, minlength=k)
++    out = {}
++    out['balance'] = int(s.max() - s.min())
++    out['covered'] = (s.sum() == len(y)) and tf.min() >= 0 and tf.max() < k
++    worst = 0
++    for c in np.unique(y):
++        sc = np.bincount(tf[y == c], minlength=k)
++        worst = max(worst, int(sc.max() - sc.min()))
++    out['per_class'] = worst
++    out['contig'] = all(np.all(np.diff(tf[y == c]) >= 0) for c in np.unique(y))
++    return out
++
++
++def grid(count_tuples, ks, impl, label_style):
++    res = dict(n=0, bal_bad=0, pc_bad=0, cov_bad=0, contig_bad=0,
++               worst_bal=0, worst_pc=0, examples=[])
++    for counts in count_tuples:
++        for k in ks:
++            counts = np.asarray(counts)
++            if np.all(k > counts):
++                continue
++            labs = label_style(len(counts))
++            y = np.concatenate([[labs[i]] * counts[i] for i in range(len(counts))])
++            y = np.asarray(y)
++            tf = impl(y, k, False)
++            c = checks(tf, y, k)
++            res['n'] += 1
++            res['worst_bal'] = max(res['worst_bal'], c['balance'])
++            res['worst_pc'] = max(res['worst_pc'], c['per_class'])
++            if c['balance'] > 1:
++                res['bal_bad'] += 1
++                if len(res['examples']) < 3:
++                    res['examples'].append(('balance', counts.tolist(), k,
++                                            np.bincount(tf, minlength=k).tolist()))
++            if c['per_class'] > 1:
++                res['pc_bad'] += 1
++                if len(res['examples']) < 6:
++                    res['examples'].append(('per_class', counts.tolist(), k))
++            res['cov_bad'] += (not c['covered'])
++            if not c['contig']:
++                res['contig_bad'] += 1
++                if len(res['examples']) < 9:
++                    res['examples'].append(('contig', counts.tolist(), k))
++    return res
++
++
++ints = lambda n: list(range(n))
++strs = lambda n: ["Happy", "Sad", "Meh", "Wow", "Zzz"][:n]
++
++pairs = [(a, b) for a in range(1, 31) for b in range(1, 31)]
++triples = [(a, b, c) for a in range(1, 31, 3) for b in range(1, 31, 3)
++           for c in range(1, 31, 3)]
++quads = [(a, b, c, d) for a in range(1, 31, 7) for b in range(1, 31, 7)
++         for c in range(1, 31, 7) for d in range(1, 31, 7)]
++quints = [(a, b, c, d, e) for a in range(1, 31, 9) for b in range(1, 31, 9)
++          for c in range(1, 31, 9) for d in range(1, 31, 9) for e in range(1, 31, 9)]
++ks = list(range(2, 11))
++
++for name, cts in [("2 classes", pairs), ("3 classes", triples),
++                  ("4 classes", quads), ("5 classes", quints)]:
++    for impl_name, impl in [("NEW", new_impl), ("OLD", old_impl)]:
++        r = grid(cts, ks, impl, ints)
++        print("%-10s %-4s cases=%-6d balance>1: %-5d (worst %d)  "
++              "per-class>1: %-4d (worst %d)  coverage bad: %-3d  contiguity bad: %d"
++              % (name, impl_name, r['n'], r['bal_bad'], r['worst_bal'],
++                 r['pc_bad'], r['worst_pc'], r['cov_bad'], r['contig_bad']))
++        if r['examples']:
++            print("            e.g. %s" % (r['examples'][:2],))
++    print()
+diff --git a/skf/expected_changes.py b/skf/expected_changes.py
+new file mode 100644
+index 000000000..add393a18
+--- /dev/null
++++ b/skf/expected_changes.py
+@@ -0,0 +1,32 @@
++import sys, warnings
++sys.path.insert(0, '/workspace/skf')
++import numpy as np
++from design import make_test_folds
++from sklearn.model_selection import StratifiedKFold
++from sklearn.datasets import make_blobs
++warnings.simplefilter("ignore")
++
++def sizes(y, k, new):
++    if new:
++        tf = make_test_folds(y, k, False, None)
++        return np.bincount(tf, minlength=k).tolist()
++    tf = np.empty(len(y), dtype=int)
++    for i, (_, te) in enumerate(StratifiedKFold(k).split(np.zeros(len(y)), y)):
++        tf[te] = i
++    return np.bincount(tf, minlength=k).tolist()
++
++print("test_*_search_with_fit_params: y=[0]*5+[1]*5, cv=2")
++y = np.array([0]*5 + [1]*5)
++for new in (False, True):
++    s = sizes(y, 2, new)
++    print("   %-4s test sizes %s -> train sizes %s   (test hardcodes 'expected 4')"
++          % ("NEW" if new else "OLD", s, [len(y)-t for t in s]))
++
++print()
++print("test_deprecated_grid_search_iid: make_blobs(54, centers=2), cv=2")
++X, y = make_blobs(n_samples=54, random_state=0, centers=2)
++for new in (False, True):
++    s = sizes(y, 2, new)
++    print("   %-4s test sizes %s -> unequal? %s (warning fires only if unequal)"
++          % ("NEW" if new else "OLD", s, len(set(s)) > 1))
++print("   class counts:", np.bincount(y).tolist())
+diff --git a/skf/harness.py b/skf/harness.py
+new file mode 100644
+index 000000000..7713803cb
+--- /dev/null
++++ b/skf/harness.py
+@@ -0,0 +1,175 @@
++"""Brute-force verification of the 7 required properties."""
++import sys, itertools, warnings
++sys.path.insert(0, '/workspace/skf')
++import numpy as np
++from design import make_test_folds
++from sklearn.utils import check_random_state
++
++warnings.simplefilter("ignore")
++NSEEDS = 25
++
++
++def folds_of(tf, k):
++    return [frozenset(np.flatnonzero(tf == i).tolist()) for i in range(k)]
++
++
++def partition(tf, k):
++    return frozenset(folds_of(tf, k))
++
++
++def call(y, k, shuffle=False, seed=None):
++    return make_test_folds(y, k, shuffle, check_random_state(seed))
++
++
++# ---------------------------------------------------------------- properties
++def p_wellformed(tf, y, k):
++    """every sample assigned exactly once to a fold in range(k)"""
++    return len(tf) == len(y) and tf.min() >= 0 and tf.max() < k
++
++
++def p_balance(tf, y, k):
++    """(3) overall fold sizes differ by at most 1"""
++    s = np.bincount(tf, minlength=k)
++    return s.max() - s.min() <= 1 and s.sum() == len(y)
++
++
++def p_strat(tf, y, k):
++    """(2)+(3) per class, fold counts differ by at most 1 = best possible"""
++    y = np.asarray(y)
++    for c in np.unique(y):
++        s = np.bincount(tf[y == c], minlength=k)
++        if s.max() - s.min() > 1:
++            return False
++    return True
++
++
++def p_contiguous(tf, y, k):
++    """(4) class-k samples inside one fold are contiguous in y"""
++    y = np.asarray(y)
++    for c in np.unique(y):
++        seq = tf[y == c]                      # fold ids in y order
++        if np.any(np.diff(seq) < 0):          # must be non-decreasing
++            return False
++    return True
++
++
++def p_label_invariant(y, k, shuffle, seed, rows):
++    """(5) renaming labels cannot change the indices produced"""
++    y = np.asarray(y)
++    base = call(y, k, shuffle, seed)
++    classes = list(dict.fromkeys(y.tolist()))
++    ok = True
++    # try every bijection onto ints, and onto strings with a different sort order
++    perms = list(itertools.permutations(range(len(classes))))
++    for perm in (perms if len(perms) <= 6 else
++                 [perms[i] for i in np.random.RandomState(0).choice(len(perms), 6, replace=False)]):
++        m = dict(zip(classes, perm))
++        y2 = np.array([m[v] for v in y.tolist()])
++        if not np.array_equal(base, call(y2, k, shuffle, seed)):
++            ok = False
++            rows.append(("label-invariance", y.tolist(), y2.tolist(), k, shuffle, seed))
++    names = ["zz", "aa", "mm", "bb", "yy"]
++    m = dict(zip(classes, names))
++    y3 = np.array([m[v] for v in y.tolist()])
++    if not np.array_equal(base, call(y3, k, shuffle, seed)):
++        ok = False
++        rows.append(("label-invariance-str", y.tolist(), y3.tolist(), k, shuffle, seed))
++    return ok
++
++
++def n_possible_partitions(y, k, cap=30000):
++    """exhaustively count distinct partitions reachable by permuting each
++    class's fold-label vector (None if too many combinations)"""
++    y = np.asarray(y)
++    tf0 = call(y, k, shuffle=False)
++    classes = list(dict.fromkeys(y.tolist()))
++    per_class = []
++    total = 1
++    for c in classes:
++        pos = np.flatnonzero(y == c)
++        labs = tf0[pos]
++        opts = sorted(set(itertools.permutations(labs.tolist())))
++        per_class.append((pos, opts))
++        total *= len(opts)
++        if total > cap:
++            return None
++    seen = set()
++    for combo in itertools.product(*[o for _, o in per_class]):
++        tf = np.empty(len(y), dtype=int)
++        for (pos, _), labs in zip(per_class, combo):
++            tf[pos] = labs
++        seen.add(partition(tf, k))
++    return len(seen)
++
++
++# ---------------------------------------------------------------- main sweep
++def sweep(rng_seed=0, n_cases=1200):
++    rs = np.random.RandomState(rng_seed)
++    fails = {name: [] for name in
++             ["wellformed", "balance", "stratification", "contiguity",
++              "label-invariance", "seed-diversity", "determinism",
++              "coverage-vs-iter"]}
++    stats = dict(cases=0, warned=0, shuffled_cases=0, diversity_checked=0)
++    seed_div_hist = []
++
++    for _ in range(n_cases):
++        n_classes = rs.randint(2, 6)
++        counts = rs.randint(1, 31, size=n_classes)
++        k = rs.randint(2, 11)
++        if np.all(k > counts):          # would raise, checked separately
++            continue
++        labels = rs.permutation(np.array(["Happy", "Sad", "Meh", "Wow", "Zzz"],
++                                         dtype=object)[:n_classes])
++        y = np.concatenate([[labels[i]] * counts[i] for i in range(n_classes)])
++        y = y[rs.permutation(len(y))] if rs.rand() < .5 else y   # interleave sometimes
++        y = np.asarray(y, dtype=object)
++        stats["cases"] += 1
++        if counts.min() < k:
++            stats["warned"] += 1
++
++        # ---- shuffle = False
++        tf = call(y, k, False)
++        for nm, fn in [("wellformed", p_wellformed), ("balance", p_balance),
++                       ("stratification", p_strat), ("contiguity", p_contiguous)]:
++            if not fn(tf, y, k):
++                fails[nm].append((y.tolist(), k, False, None, tf.tolist()))
++
++        # ---- shuffle = True, many seeds
++        parts = set()
++        for seed in range(NSEEDS):
++            tf = call(y, k, True, seed)
++            stats["shuffled_cases"] += 1
++            for nm, fn in [("wellformed", p_wellformed), ("balance", p_balance),
++                           ("stratification", p_strat)]:
++                if not fn(tf, y, k):
++                    fails[nm].append((y.tolist(), k, True, seed, tf.tolist()))
++            if not np.array_equal(tf, call(y, k, True, seed)):
++                fails["determinism"].append((y.tolist(), k, seed))
++            parts.add(partition(tf, k))
++        seed_div_hist.append(len(parts))
++
++        # (1) different seeds -> genuinely different partitions
++        if len(parts) == 1:
++            npp = n_possible_partitions(y, k)
++            stats["diversity_checked"] += 1
++            if npp is None or npp > 1:
++                fails["seed-diversity"].append((y.tolist(), k, npp))
++
++        # (5) label invariance
++        for shuffle in (False, True):
++            p_label_invariant(y, k, shuffle, 3 if shuffle else None,
++                              fails["label-invariance"])
++
++    return fails, stats, seed_div_hist
++
++
++if __name__ == "__main__":
++    fails, stats, hist = sweep()
++    print("cases: %(cases)d  (with under-populated classes: %(warned)d)  "
++          "shuffled calls: %(shuffled_cases)d" % stats)
++    print("distinct partitions over %d seeds: min=%d median=%d max=%d"
++          % (NSEEDS, min(hist), int(np.median(hist)), max(hist)))
++    print("cases needing exhaustive diversity proof: %d" % stats["diversity_checked"])
++    print()
++    for nm, v in fails.items():
++        print("%-20s %s" % (nm, "PASS" if not v else "FAIL (%d) e.g. %s" % (len(v), v[0])))
+diff --git a/skf/patch_plugin.py b/skf/patch_plugin.py
+new file mode 100644
+index 000000000..951eaae0c
+--- /dev/null
++++ b/skf/patch_plugin.py
+@@ -0,0 +1,70 @@
++"""pytest plugin: monkeypatch the proposed _make_test_folds into sklearn.
++
++Loaded with `-p patch_plugin` so /testbed is never modified.
++"""
++import warnings
++import numpy as np
++from sklearn.model_selection import _split as S
++from sklearn.utils import check_random_state
++from sklearn.utils.validation import column_or_1d
++from sklearn.utils.multiclass import type_of_target
++
++
++def _make_test_folds(self, X, y=None):
++    rng = check_random_state(self.random_state)
++    y = np.asarray(y)
++    type_of_target_y = type_of_target(y)
++    allowed_target_types = ('binary', 'multiclass')
++    if type_of_target_y not in allowed_target_types:
++        raise ValueError(
++            'Supported target types are: {}. Got {!r} instead.'.format(
++                allowed_target_types, type_of_target_y))
++
++    y = column_or_1d(y)
++
++    _, y_idx, y_inv = np.unique(y, return_index=True, return_inverse=True)
++    # y_inv encodes y according to sorted order. We invert y_idx to
++    # map the classes so that they are encoded by order of first appearance
++    # in y, which makes the result invariant to a renaming of the labels.
++    _, class_perm = np.unique(y_idx, return_inverse=True)
++    y_encoded = class_perm[y_inv]
++
++    n_classes = len(y_idx)
++    y_counts = np.bincount(y_encoded)
++    min_groups = np.min(y_counts)
++    if np.all(self.n_splits > y_counts):
++        raise ValueError("n_splits=%d cannot be greater than the"
++                         " number of members in each class."
++                         % (self.n_splits))
++    if self.n_splits > min_groups:
++        warnings.warn(("The least populated class in y has only %d"
++                       " members, which is too few. The minimum"
++                       " number of members in any class cannot"
++                       " be less than n_splits=%d."
++                       % (min_groups, self.n_splits)), Warning)
++
++    # Determine the optimal number of samples from each class in each fold,
++    # by dealing the class-sorted samples round robin over the folds without
++    # restarting the deal at each class boundary. This keeps both the total
++    # fold sizes and the per-class fold counts balanced to within one sample.
++    y_order = np.sort(y_encoded)
++    allocation = np.asarray(
++        [np.bincount(y_order[i::self.n_splits], minlength=n_classes)
++         for i in range(self.n_splits)])
++
++    # To maintain the data order dependencies as best as possible within
++    # the stratification constraint, we assign samples from each class in
++    # blocks (and then mess that up when shuffle=True).
++    test_folds = np.empty(len(y), dtype='i')
++    for k in range(n_classes):
++        # since the kth column of allocation stores the number of samples
++        # of class k in each test set, this generates blocks of fold
++        # indices corresponding to the allocation for class k.
++        folds_for_class = np.arange(self.n_splits).repeat(allocation[:, k])
++        if self.shuffle:
++            rng.shuffle(folds_for_class)
++        test_folds[y_encoded == k] = folds_for_class
++    return test_folds
++
++
++S.StratifiedKFold._make_test_folds = _make_test_folds
+diff --git a/skf/rng_variants.py b/skf/rng_variants.py
+new file mode 100644
+index 000000000..2b5f58dcd
+--- /dev/null
++++ b/skf/rng_variants.py
+@@ -0,0 +1,50 @@
++"""Requirement 7: how should the RNG be consumed across classes?"""
++import sys, warnings
++sys.path.insert(0, '/workspace/skf')
++import numpy as np
++from sklearn.utils import check_random_state
++warnings.simplefilter("ignore")
++
++def core(y, k, shuffle, rng, mode):
++    y = np.asarray(y)
++    _, y_idx, y_inv = np.unique(y, return_index=True, return_inverse=True)
++    _, class_perm = np.unique(y_idx, return_inverse=True)
++    y_enc = class_perm[y_inv]
++    nc = len(y_idx)
++    cnt = np.bincount(y_enc, minlength=nc)
++    order = np.repeat(np.arange(nc), cnt)
++    alloc = np.asarray([np.bincount(order[i::k], minlength=nc) for i in range(k)])
++    seeds = (rng.randint(np.iinfo(np.int32).max, size=nc)
++             if (shuffle and mode == "seeds") else None)
++    tf = np.empty(len(y), dtype='i')
++    for c in range(nc):
++        fc = np.arange(k).repeat(alloc[:, c])
++        if shuffle:
++            (check_random_state(seeds[c]) if mode == "seeds" else rng).shuffle(fc)
++        tf[y_enc == c] = fc
++    return tf
++
++# --- A: does sequential consumption couple the classes?
++print("A) coupling probe: class B permutation as class A's count varies")
++for mode in ("sequential", "seeds"):
++    rows = []
++    for nA in (4, 5, 6):
++        y = np.array([0]*nA + [1]*6)
++        tf = core(y, 3, True, check_random_state(0), mode)
++        rows.append(tf[y == 1].tolist())
++    print("   %-11s class-B folds for nA=4,5,6: %s   -> B depends on A: %s"
++          % (mode, rows, len(set(map(tuple, rows))) > 1))
++
++# --- B: which variant reproduces the repo's hardcoded deterministic test?
++print()
++print("B) RepeatedStratifiedKFold(n_splits=2, n_repeats=2, random_state=1944695409)")
++print("   y=[1,1,1,0,0]; repo test hardcodes test sets [0,2,3] then [1,4] then [0,1,4] then [2,3]")
++y = np.array([1, 1, 1, 0, 0])
++for mode in ("sequential", "seeds"):
++    rng = check_random_state(1944695409)
++    got = []
++    for _ in range(2):                     # 2 repeats, rng shared, as in the class
++        tf = core(y, 2, True, rng, mode)
++        got += [sorted(np.flatnonzero(tf == i).tolist()) for i in range(2)]
++    print("   %-11s -> %s  %s" % (mode, got,
++          "MATCHES repo test" if got == [[0, 2, 3], [1, 4], [0, 1, 4], [2, 3]] else "differs"))
+diff --git a/skf/shuffled.py b/skf/shuffled.py
+new file mode 100644
+index 000000000..2d82123e3
+--- /dev/null
++++ b/skf/shuffled.py
+@@ -0,0 +1,100 @@
++"""shuffle=True properties over the exhaustive grid + diversity ceilings."""
++import sys, itertools, warnings
++sys.path.insert(0, '/workspace/skf')
++import numpy as np
++from design import make_test_folds
++from sklearn.utils import check_random_state
++warnings.simplefilter("ignore")
++
++f = lambda y, k, sh=False, seed=None: make_test_folds(y, k, sh, check_random_state(seed))
++part = lambda tf, k: frozenset(frozenset(np.flatnonzero(tf == i).tolist())
++                               for i in range(k))
++
++def reachable(y, k, cap=200000):
++    """exhaustive count of partitions reachable by permuting each class's
++    fold-label multiset (the theoretical ceiling for shuffle=True)"""
++    y = np.asarray(y); tf0 = f(y, k)
++    cls = list(dict.fromkeys(y.tolist())); per = []; tot = 1
++    for c in cls:
++        pos = np.flatnonzero(y == c)
++        opts = sorted(set(itertools.permutations(tf0[pos].tolist())))
++        per.append((pos, opts)); tot *= len(opts)
++        if tot > cap:
++            return None
++    seen = set()
++    for combo in itertools.product(*[o for _, o in per]):
++        tf = np.empty(len(y), dtype=int)
++        for (pos, _), labs in zip(per, combo):
++            tf[pos] = labs
++        seen.add(part(tf, k))
++    return len(seen)
++
++SEEDS = 12
++bad_bal = bad_pc = bad_cov = bad_det = 0
++bad_inv = []
++low_div = []
++n = 0
++for counts in [(a, b) for a in range(1, 31, 2) for b in range(1, 31, 2)] + \
++              [(a, b, c) for a in range(1, 31, 6) for b in range(1, 31, 6)
++               for c in range(1, 31, 6)] + \
++              [(a, b, c, d, e) for a in range(1, 31, 11) for b in range(1, 31, 11)
++               for c in range(1, 31, 11) for d in range(1, 31, 11)
++               for e in range(1, 31, 11)]:
++    for k in range(2, 11):
++        counts = np.asarray(counts)
++        if np.all(k > counts):
++            continue
++        nc = len(counts)
++        # label the classes so that *sorted* order is the reverse of appearance
++        labs = ["Zzz", "Yyy", "Xxx", "Www", "Vvv"][:nc]
++        y = np.concatenate([[labs[i]] * counts[i] for i in range(nc)])
++        y = np.asarray(y)
++        n += 1
++        parts = set()
++        for seed in range(SEEDS):
++            tf = f(y, k, True, seed)
++            s = np.bincount(tf, minlength=k)
++            bad_bal += (s.max() - s.min() > 1)
++            bad_cov += (s.sum() != len(y))
++            for c in np.unique(y):
++                sc = np.bincount(tf[y == c], minlength=k)
++                bad_pc += (sc.max() - sc.min() > 1)
++            bad_det += (not np.array_equal(tf, f(y, k, True, seed)))
++            parts.add(part(tf, k))
++        # ---- (5) label invariance under a relabelling that flips sort order
++        m = {labs[i]: i for i in range(nc)}          # Zzz->0 ... reverses order
++        y2 = np.array([m[v] for v in y.tolist()])
++        for sh, sd in [(False, None), (True, 7), (True, 12345)]:
++            if not np.array_equal(f(y, k, sh, sd), f(y2, k, sh, sd)):
++                bad_inv.append((counts.tolist(), k, sh, sd))
++        # ---- (1) diversity
++        if len(parts) < 2:
++            low_div.append((counts.tolist(), k, reachable(y, k)))
++
++print("configs=%d  seeds/config=%d" % (n, SEEDS))
++print("shuffled balance>1 : %d" % bad_bal)
++print("shuffled per-class>1: %d" % bad_pc)
++print("coverage bad        : %d" % bad_cov)
++print("non-deterministic   : %d" % bad_det)
++print("label-invariance bad: %d %s" % (len(bad_inv), bad_inv[:3]))
++print("configs where %d seeds gave only ONE partition: %d" % (SEEDS, len(low_div)))
++for c, k, r in low_div:
++    print("    counts=%s k=%d  reachable partitions (exhaustive)=%s  -> %s"
++          % (c, k, r, "OK, ceiling is 1" if r == 1 else "*** FAILURE ***"))
++
++# ---- the pathological shapes called out in the requirements
++print()
++print("--- y = [0]*5 + [1]*5, k=5 (only one partition per class allocation) ---")
++y = np.array([0] * 5 + [1] * 5)
++for seed in range(4):
++    tf = f(y, 5, True, seed)
++    print("   seed=%d folds=%s" % (seed, sorted(tuple(sorted(np.flatnonzero(tf == i).tolist()))
++                                                for i in range(5))))
++print("   reachable partitions =", reachable(y, 5))
++print()
++print("--- diversity ceiling for a few small shapes ---")
++for counts, k in [((2, 2), 2), ((1, 1), 2), ((3, 3), 3), ((4, 4), 2), ((1, 5), 2)]:
++    y = np.concatenate([[i] * counts[i] for i in range(len(counts))])
++    got = set(part(f(y, k, True, s), k) for s in range(400))
++    print("   counts=%s k=%d  observed=%d  reachable=%s" %
++          (list(counts), k, len(got), reachable(y, k)))
+diff --git a/skfpatch/conftest.py b/skfpatch/conftest.py
+new file mode 100644
+index 000000000..e8bbcd1c4
+--- /dev/null
++++ b/skfpatch/conftest.py
+@@ -0,0 +1,54 @@
++import numpy as np
++import warnings
++from sklearn.model_selection import _split as S
++from sklearn.utils import check_random_state
++from sklearn.utils.multiclass import type_of_target
++from sklearn.utils.validation import column_or_1d
++
++
++def _make_test_folds(self, X, y=None):
++    rng = check_random_state(self.random_state)
++    y = np.asarray(y)
++    type_of_target_y = type_of_target(y)
++    allowed_target_types = ('binary', 'multiclass')
++    if type_of_target_y not in allowed_target_types:
++        raise ValueError(
++            'Supported target types are: {}. Got {!r} instead.'.format(
++                allowed_target_types, type_of_target_y))
++
++    y = column_or_1d(y)
++
++    _, y_idx, y_inv = np.unique(y, return_index=True, return_inverse=True)
++    _, class_perm = np.unique(y_idx, return_inverse=True)
++    y_encoded = class_perm[y_inv]
++
++    n_classes = len(y_idx)
++    y_counts = np.bincount(y_encoded)
++    min_groups = np.min(y_counts)
++    if np.all(self.n_splits > y_counts):
++        raise ValueError("n_splits=%d cannot be greater than the"
++                         " number of members in each class."
++                         % (self.n_splits))
++    if self.n_splits > min_groups:
++        warnings.warn(("The least populated class in y has only %d"
++                       " members, which is too few. The minimum"
++                       " number of members in any class cannot"
++                       " be less than n_splits=%d."
++                       % (min_groups, self.n_splits)), Warning)
++
++    y_order = np.sort(y_encoded)
++    allocation = np.asarray(
++        [np.bincount(y_order[i::self.n_splits], minlength=n_classes)
++         for i in range(self.n_splits)])
++
++    test_folds = np.empty(len(y), dtype='i')
++    for k in range(n_classes):
++        folds_for_class = np.arange(self.n_splits).repeat(allocation[:, k])
++        if self.shuffle:
++            rng.shuffle(folds_for_class)
++        test_folds[y_encoded == k] = folds_for_class
++    return test_folds
++
++
++S.StratifiedKFold._make_test_folds = _make_test_folds
++print("PATCHED StratifiedKFold._make_test_folds")
+diff --git a/skfpatch/skfplugin.py b/skfpatch/skfplugin.py
+new file mode 100644
+index 000000000..e8bbcd1c4
+--- /dev/null
++++ b/skfpatch/skfplugin.py
+@@ -0,0 +1,54 @@
++import numpy as np
++import warnings
++from sklearn.model_selection import _split as S
++from sklearn.utils import check_random_state
++from sklearn.utils.multiclass import type_of_target
++from sklearn.utils.validation import column_or_1d
++
++
++def _make_test_folds(self, X, y=None):
++    rng = check_random_state(self.random_state)
++    y = np.asarray(y)
++    type_of_target_y = type_of_target(y)
++    allowed_target_types = ('binary', 'multiclass')
++    if type_of_target_y not in allowed_target_types:
++        raise ValueError(
++            'Supported target types are: {}. Got {!r} instead.'.format(
++                allowed_target_types, type_of_target_y))
++
++    y = column_or_1d(y)
++
++    _, y_idx, y_inv = np.unique(y, return_index=True, return_inverse=True)
++    _, class_perm = np.unique(y_idx, return_inverse=True)
++    y_encoded = class_perm[y_inv]
++
++    n_classes = len(y_idx)
++    y_counts = np.bincount(y_encoded)
++    min_groups = np.min(y_counts)
++    if np.all(self.n_splits > y_counts):
++        raise ValueError("n_splits=%d cannot be greater than the"
++                         " number of members in each class."
++                         % (self.n_splits))
++    if self.n_splits > min_groups:
++        warnings.warn(("The least populated class in y has only %d"
++                       " members, which is too few. The minimum"
++                       " number of members in any class cannot"
++                       " be less than n_splits=%d."
++                       % (min_groups, self.n_splits)), Warning)
++
++    y_order = np.sort(y_encoded)
++    allocation = np.asarray(
++        [np.bincount(y_order[i::self.n_splits], minlength=n_classes)
++         for i in range(self.n_splits)])
++
++    test_folds = np.empty(len(y), dtype='i')
++    for k in range(n_classes):
++        folds_for_class = np.arange(self.n_splits).repeat(allocation[:, k])
++        if self.shuffle:
++            rng.shuffle(folds_for_class)
++        test_folds[y_encoded == k] = folds_for_class
++    return test_folds
++
++
++S.StratifiedKFold._make_test_folds = _make_test_folds
++print("PATCHED StratifiedKFold._make_test_folds")
+diff --git a/sklearn/model_selection/_split.py b/sklearn/model_selection/_split.py
+index 24394f869..0c09ff3b0 100644
+--- a/sklearn/model_selection/_split.py
++++ b/sklearn/model_selection/_split.py
+@@ -576,8 +576,7 @@ class StratifiedKFold(_BaseKFold):
+             ``n_splits`` default value will change from 3 to 5 in v0.22.
+ 
+     shuffle : boolean, optional
+-        Whether to shuffle each stratification of the data before splitting
+-        into batches.
++        Whether to shuffle each class's samples before splitting into batches.
+ 
+     random_state : int, RandomState instance or None, optional, default=None
+         If int, random_state is the seed used by the random number generator;
+@@ -620,7 +619,7 @@ class StratifiedKFold(_BaseKFold):
+         super().__init__(n_splits, shuffle, random_state)
+ 
+     def _make_test_folds(self, X, y=None):
+-        rng = self.random_state
++        rng = check_random_state(self.random_state)
+         y = np.asarray(y)
+         type_of_target_y = type_of_target(y)
+         allowed_target_types = ('binary', 'multiclass')
+diff --git a/sklearn/model_selection/tests/test_split.py b/sklearn/model_selection/tests/test_split.py
+index 5981df285..4d55b5f3c 100644
+--- a/sklearn/model_selection/tests/test_split.py
++++ b/sklearn/model_selection/tests/test_split.py
+@@ -493,6 +493,17 @@ def test_shuffle_stratifiedkfold():
+         assert_not_equal(set(test0), set(test1))
+     check_cv_coverage(kf0, X_40, y, groups=None, expected_n_splits=5)
+ 
++    # Ensure that we shuffle each class's samples with different
++    # random_state in StratifiedKFold
++    # See https://github.com/scikit-learn/scikit-learn/pull/13124
++    X = np.arange(10)
++    y = [0] * 5 + [1] * 5
++    kf1 = StratifiedKFold(5, shuffle=True, random_state=0)
++    kf2 = StratifiedKFold(5, shuffle=True, random_state=1)
++    test_set1 = sorted([tuple(s[1]) for s in kf1.split(X, y)])
++    test_set2 = sorted([tuple(s[1]) for s in kf2.split(X, y)])
++    assert test_set1 != test_set2
++
+ 
+ def test_kfold_can_detect_dependent_samples_on_digits():  # see #2372
+     # The digits samples are dependent: they are apparently grouped by authors

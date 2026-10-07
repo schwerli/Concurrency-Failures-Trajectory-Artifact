@@ -1,0 +1,78 @@
+diff --git a/sympy/codegen/ast.py b/sympy/codegen/ast.py
+index a02714b174..be9a18fcf7 100644
+--- a/sympy/codegen/ast.py
++++ b/sympy/codegen/ast.py
+@@ -869,6 +869,35 @@ def _construct_iterable(cls, itr):
+         return _sympify(itr)
+ 
+ 
++class _StringFunc:
++    """Callable proxy preserving reconstruction for String-like tokens."""
++
++    __slots__ = ('_cls', '_text')
++
++    def __init__(self, cls, text):
++        self._cls = cls
++        self._text = text
++
++    def __call__(self, *args, **kwargs):
++        if not args and not kwargs:
++            return self._cls(self._text)
++        return self._cls(*args, **kwargs)
++
++    def __eq__(self, other):
++        if isinstance(other, _StringFunc):
++            return self._cls == other._cls
++        return self._cls == other
++
++    def __hash__(self):
++        return hash(self._cls)
++
++    def __getattr__(self, attr):
++        return getattr(self._cls, attr)
++
++    def __repr__(self):
++        return self._cls.__name__
++
++
+ class String(Token):
+     """ SymPy object representing a string.
+ 
+@@ -904,6 +933,13 @@ def _construct_text(cls, text):
+             raise TypeError("Argument text is not a string type.")
+         return text
+ 
++    @property
++    def func(self):
++        return _StringFunc(self.__class__, self.text)
++
++    def __getnewargs__(self):
++        return (self.text,)
++
+     def _sympystr(self, printer, *args, **kwargs):
+         return self.text
+ 
+diff --git a/sympy/codegen/tests/test_ast.py b/sympy/codegen/tests/test_ast.py
+index 00c5d4cf28..11ef490115 100644
+--- a/sympy/codegen/tests/test_ast.py
++++ b/sympy/codegen/tests/test_ast.py
+@@ -266,7 +266,10 @@ def test_String():
+     assert st.is_Atom
+     assert st == String('foobar')
+     assert st.text == 'foobar'
++    assert st.func == String
++    assert st.func(*st.args) == st
+     assert st.func(**st.kwargs()) == st
++    assert st.copy() == st
+ 
+ 
+     class Signifier(String):
+@@ -275,6 +278,8 @@ class Signifier(String):
+     si = Signifier('foobar')
+     assert si != st
+     assert si.text == st.text
++    assert si.func == Signifier
++    assert si.func(*si.args) == si
+     s = String('foo')
+     assert str(s) == 'foo'
+     assert repr(s) == "String('foo')"

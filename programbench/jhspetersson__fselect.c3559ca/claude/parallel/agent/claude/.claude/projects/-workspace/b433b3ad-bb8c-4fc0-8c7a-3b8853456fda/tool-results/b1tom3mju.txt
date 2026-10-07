@@ -1,0 +1,964 @@
+# fselect
+
+Find files with SQL-like queries.
+
+[Basic usage](#basic-usage)  
+[Restrictions](#its-not-a-real-sql)  
+[Columns and fields](#columns-and-fields)  
+[File naming terminology](#file-naming-terminology)  
+[Functions](#functions)  
+[File size units](#file-size-units)  
+[Search roots](#search-roots)  
+[Operators](#operators)  
+[Arithmetic operators](#arithmetic-operators)  
+[Subqueries for IN and EXISTS](#subqueries-for-in-and-exists)  
+[Date and time specifiers](#date-and-time-specifiers)  
+[Regular expressions](#regular-expressions)  
+[MIME and file types](#mime-and-file-types)  
+[MP3 support](#mp3-support)  
+[File hashes](#file-hashes)  
+[Output formats](#output-formats)  
+[Configuration file](#configuration-file)  
+[Bash completion](#bash-completion)  
+[Command-line arguments](#command-line-arguments)  
+[Interactive mode](#interactive-mode)  
+[Environment variables](#environment-variables)  
+[Exit values](#exit-values)
+
+### Basic usage
+
+    fselect [ARGS] COLUMN[, COLUMN...] [from ROOT[, ROOT...]] [where EXPR] [group by COLUMNS] [order by COLUMNS] [limit N] [offset N] [into FORMAT]
+
+You write an SQL-like query, that's it.
+
+**fselect** command itself is like a first keyword (`select`, i.e., *file select*).
+But if you put one more `select` behind occasionally, that's not a problem.
+
+Next you put columns you are interested in. It could be a file name or path, size, modification date, etc.
+See the full list of possible columns. You can add columns with arbitrary text (put in quotes if it contains spaces). 
+A few functions (aggregating and formatting) are there for your service. You can use arithmetic expressions when it makes sense.
+
+Where to search? Specify with `from` keyword. You can list one or more directories separated with comma.
+If you leave the `from`, then current directory will be processed.
+
+What to search? Use `where` with any number of conditions.
+
+Order results like in real SQL with `order by`. All columns are supported for ordering by, 
+as well as `asc`/`desc` parameters and positional numeric shortcuts.
+
+Limiting search results is possible with `limit` and `offset`. Formatting options are supported with `into` keyword.
+
+If you want to use operators containing `>` or `<`, 
+put the whole query into the double quotes. 
+This will protect a query from the shell and output redirection.
+The same applies to queries with parentheses or `*`, `?` and other special shell
+metacharacters.
+
+It's ok to use any metacharacters in interactive mode.
+
+### It's not a real SQL
+
+Directories to search at are listed with comma separators.
+In a real SQL, such syntax would make a cross-product. Here it means just search at A, next at B, and so on.
+
+You can use curly braces instead of the regular parentheses! This helps to avoid a few of the shell pitfalls a little bit.
+Functions with no arguments don't require parentheses at all.
+
+String literals don't really need quotes. 
+You will need to put them just in case you query something with spaces inside. 
+And yes, you should use quotes for glob-patterns or regular expressions in the query 
+on Linux or macOS to prevent parameter expansion from the shell. 
+If you are on Windows, feel free to omit most of the quotes.
+
+Commas for column separation aren't needed as well. Column aliasing (with or without `as` keyword) is not supported.
+
+`where` section can contain short syntax conditions for boolean columns (like `is_audio` or `other_write`).
+
+`into` keyword specifies output format, not output table.
+
+Joins and unions are not supported (yet?).
+Subqueries have only limited support.
+
+### Columns and fields
+
+| Column                                       | Meaning                                                                                                                       | Comment                                                       |
+|----------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------|
+| `name`                                       | Returns the name (with extension) of the file                                                                                 |                                                               |
+| `filename` or `fname`                        | Returns the file name without extension                                                                                       |                                                               |
+| `extension` or `ext`                         | Returns the extension of the file                                                                                             |                                                               |
+| `path`                                       | Returns the relative path of the file                                                                                         |                                                               |
+| `abspath`                                    | Returns the absolute path of the file                                                                                         |                                                               |
+| `directory` or `dirname` or `dir`            | Returns the directory of the file                                                                                             |                                                               |
+| `absdir`                                     | Returns the absolute directory of the file                                                                                    |                                                               |
+| `size`                                       | Returns the size of the file in bytes                                                                                         |                                                               |
+| `fsize` or `hsize`                           | Returns the size of the file accompanied with the unit                                                                        |                                                               |
+| `uid`                                        | Returns the UID of the owner                                                                                                  |                                                               |
+| `gid`                                        | Returns the GID of the owner's group                                                                                          |                                                               |
+| `accessed`                                   | Returns the time the file was last accessed (YYYY-MM-DD HH:MM:SS)                                                             |                                                               |
+| `created`                                    | Returns the file creation date (YYYY-MM-DD HH:MM:SS)                                                                          | Windows, macOS, and Linux (kernel 4.11+ with ext4/btrfs/XFS)  |
+| `modified`                                   | Returns the time the file was last modified (YYYY-MM-DD HH:MM:SS)                                                             |                                                               |
+| `atime`                                      | Returns the last access time as a Unix timestamp (seconds since epoch)                                                        | Available only on Unix                                        |
+| `mtime`                                      | Returns the last modification time as a Unix timestamp (seconds since epoch)                                                  | Available only on Unix                                        |
+| `ctime`                                      | Returns the last status change time as a Unix timestamp (seconds since epoch)                                                 | Available only on Unix                                        |
+| `is_dir`                                     | Returns a boolean signifying whether the file path is a directory                                                             |                                                               |
+| `is_file`                                    | Returns a boolean signifying whether the file path is a file                                                                  |                                                               |
+| `is_symlink`                                 | Returns a boolean signifying whether the file path is a symlink                                                               |                                                               |
+| `is_pipe` or `is_fifo`                       | Returns a boolean signifying whether the file path is a FIFO or pipe file                                                     |                                                               |
+| `is_char` or `is_character`                  | Returns a boolean signifying whether the file path is a character device or character special file                            |                                                               |
+| `is_block`                                   | Returns a boolean signifying whether the file path is a block or block special file                                           |                                                               |
+| `is_socket`                                  | Returns a boolean signifying whether the file path is a socket file                                                           |                                                               |
+| `is_hidden`                                  | Returns a boolean signifying whether the file is a hidden file (e.g., files that start with a dot on *nix)                    |                                                               |
+| `has_xattrs`                                 | Returns a boolean signifying whether the file has extended attributes or alternate data streams on Windows                    |                                                               |
+| `xattr_count`                                | Returns the count of extended attributes on the file or alternate data streams on Windows                                     |                                                               |
+| `extattrs`                                   | Returns the extended file attributes as a string of chattr/lsattr flag letters                                                | Available only on Linux                                       |
+| `has_extattrs`                               | Returns a boolean signifying whether the file has any extended file attributes set                                            | Available only on Linux                                       |
+| `acl`                                        | Returns all ACL entries in standard form (POSIX on Linux, DACL on Windows)                                                    | Available only on Linux and Windows                           |
+| `has_acl`                                    | Returns a boolean signifying whether the file has POSIX ACL entries beyond standard Unix permissions or Windows explicit ACEs | Available only on Linux and Windows                           |
+| `default_acl`                                | Returns all default POSIX ACL entries in standard form                                                                        | Available only on Linux                                       |
+| `has_default_acl`                            | Returns a boolean signifying whether the directory has default POSIX ACL entries                                              | Available only on Linux                                       |
+| `has_capabilities` or `has_caps`             | Returns a boolean signifying whether the file has capabilities                                                                | Available only on Linux                                       |
+| `capabilities` or `caps`                     | Returns a string describing Linux capabilities assigned to a file                                                             | Available only on Linux                                       |
+| `device`                                     | Returns the code of device the file is stored on                                                                              | Available only on Unix                                        |
+| `rdev`                                       | Returns the device ID for special files (character and block devices)                                                         | Available only on Unix                                        |
+| `inode`                                      | Returns the number of inode                                                                                                   | Available only on Linux                                       |
+| `blocks`                                     | Returns the number of blocks (256 bytes) the file occupies                                                                    | Available only on Linux                                       |
+| `hardlinks`                                  | Returns the number of hardlinks of the file                                                                                   | Available only on Linux                                       |
+| `mode`                                       | Returns the permissions of the owner, group, and everybody (similar to the first field in `ls -la`)                           |                                                               |
+| `user`                                       | Returns the name of the owner for this file                                                                                   | Available only on *nix platforms with `users` feature enabled |
+| `user_read`                                  | Returns a boolean signifying whether the file can be read by the owner                                                        |                                                               |
+| `user_write`                                 | Returns a boolean signifying whether the file can be written by the owner                                                     |                                                               |
+| `user_exec`                                  | Returns a boolean signifying whether the file can be executed by the owner                                                    |                                                               |
+| `user_all`                                   | Returns a boolean signifying whether the file can be fully accessed by the owner                                              |                                                               |
+| `group`                                      | Returns the name of the owner's group for this file                                                                           | Available only on *nix platforms with `users` feature enabled |
+| `group_read`                                 | Returns a boolean signifying whether the file can be read by the owner's group                                                |                                                               |
+| `group_write`                                | Returns a boolean signifying whether the file can be written by the owner's group                                             |                                                               |
+| `group_exec`                                 | Returns a boolean signifying whether the file can be executed by the owner's group                                            |                                                               |
+| `group_all`                                  | Returns a boolean signifying whether the file can be fully accessed by the group                                              |                                                               |
+| `other_read`                                 | Returns a boolean signifying whether the file can be read by others                                                           |                                                               |
+| `other_write`                                | Returns a boolean signifying whether the file can be written by others                                                        |                                                               |
+| `other_exec`                                 | Returns a boolean signifying whether the file can be executed by others                                                       |                                                               |
+| `other_all`                                  | Returns a boolean signifying whether the file can be fully accessed by the others                                             |                                                               |
+| `suid` or `is_suid`                          | Returns a boolean signifying whether the file permissions have a SUID bit set                                                 |                                                               |
+| `sgid` or `is_sgid`                          | Returns a boolean signifying whether the file permissions have a SGID bit set                                                 |                                                               |
+| `sticky` or `is_sticky`                      | Returns a boolean signifying whether the file permissions have a sticky bit set                                               |                                                               |
+| `width`                                      | Returns the number of pixels along the width of the photo or MP4 file                                                         |                                                               |
+| `height`                                     | Returns the number of pixels along the height of the photo or MP4 file                                                        |                                                               |
+| `mime`                                       | Returns MIME type of the file                                                                                                 |                                                               |
+| `is_binary`                                  | Returns a boolean signifying whether the file has binary contents                                                             |                                                               |
+| `is_text`                                    | Returns a boolean signifying whether the file has text contents                                                               |                                                               |
+| `line_count`                                 | Returns a number of lines in a text file                                                                                      |                                                               |
+| `exif_datetime`                              | Returns date and time of taken photo                                                                                          |                                                               |
+| `exif_datetime_original` or `exif_dto`       | Returns original date and time when the photo was taken                                                                       |                                                               |
+| `exif_altitude` or `exif_alt`                | Returns GPS altitude of taken photo                                                                                           |                                                               |
+| `exif_latitude` or `exif_lat`                | Returns GPS latitude of taken photo                                                                                           |                                                               |
+| `exif_longitude` or `exif_lng` or `exif_lon` | Returns GPS longitude of taken photo                                                                                          |                                                               |
+| `exif_make`                                  | Returns name of the camera manufacturer                                                                                       |                                                               |
+| `exif_model`                                 | Returns camera model                                                                                                          |                                                               |
+| `exif_software`                              | Returns software name with which the photo was taken                                                                          |                                                               |
+| `exif_version`                               | Returns the version of EXIF metadata                                                                                          |                                                               |
+| `exif_exposure_time` or `exif_exptime`       | Returns exposure time of the photo taken                                                                                      |                                                               |
+| `exif_aperture`                              | Returns aperture value of the photo taken                                                                                     |                                                               |
+| `exif_shutter_speed`                         | Returns shutter speed of the photo taken                                                                                      |                                                               |
+| `exif_f_number` or `exif_f_num`              | Returns F-number of the photo taken                                                                                           |                                                               |
+| `exif_iso_speed` or `exif_iso`               | Returns ISO speed of the photo taken (EXIF 2.3 ISOSpeed tag)                                                                  |                                                               |
+| `exif_sensitivity` or `exif_photo_sensitivity` | Returns photographic sensitivity (ISO) of the photo taken                                                                   |                                                               |
+| `exif_focal_length` or `exif_focal_len`      | Returns focal length of the photo taken                                                                                       |                                                               |
+| `exif_lens_make`                             | Returns lens manufacturer used to take the photo                                                                              |                                                               |
+| `exif_lens_model`                            | Returns lens model used to take the photo                                                                                     |                                                               |
+| `exif_description` or `exif_desc`            | Returns image description from EXIF metadata                                                                                  |                                                               |
+| `exif_artist`                                | Returns the artist or photographer name                                                                                       |                                                               |
+| `exif_copyright`                             | Returns the copyright information                                                                                             |                                                               |
+| `exif_orientation`                           | Returns the image orientation                                                                                                 |                                                               |
+| `exif_flash`                                 | Returns the flash status when the photo was taken                                                                             |                                                               |
+| `exif_color_space`                           | Returns the color space of the image                                                                                          |                                                               |
+| `exif_exposure_program` or `exif_exp_program` | Returns the exposure program used                                                                                            |                                                               |
+| `exif_exposure_bias` or `exif_exp_bias`      | Returns the exposure bias value                                                                                               |                                                               |
+| `exif_white_balance` or `exif_wb`            | Returns the white balance mode                                                                                                |                                                               |
+| `exif_metering_mode`                         | Returns the metering mode                                                                                                     |                                                               |
+| `exif_scene_type` or `exif_scene`            | Returns the scene capture type                                                                                                |                                                               |
+| `exif_contrast`                              | Returns the contrast setting                                                                                                  |                                                               |
+| `exif_saturation`                            | Returns the saturation setting                                                                                                |                                                               |
+| `exif_sharpness`                             | Returns the sharpness setting                                                                                                 |                                                               |
+| `exif_body_serial` or `exif_serial`          | Returns the camera body serial number                                                                                         |                                                               |
+| `exif_lens_serial`                           | Returns the lens serial number                                                                                                |                                                               |
+| `exif_user_comment` or `exif_comment`        | Returns the user comment from EXIF metadata                                                                                   |                                                               |
+| `exif_image_width` or `exif_width`           | Returns the image width from EXIF metadata                                                                                    |                                                               |
+| `exif_image_height` or `exif_height`         | Returns the image height from EXIF metadata                                                                                   |                                                               |
+| `exif_max_aperture`                          | Returns the max aperture value of the lens                                                                                    |                                                               |
+| `exif_digital_zoom` or `exif_dzoom`          | Returns the digital zoom ratio                                                                                                |                                                               |
+| `mp3_title` or `title`                       | Returns the title of the audio file taken from the file's metadata                                                            |                                                               |
+| `mp3_album` or `album`                       | Returns the album name of the audio file taken from the file's metadata                                                       |                                                               |
+| `mp3_artist` or `artist`                     | Returns the artist of the audio file taken from the file's metadata                                                           |                                                               |
+| `mp3_genre` or `genre`                       | Returns the genre of the audio file taken from the file's metadata                                                            |                                                               |
+| `mp3_year`                                   | Returns the year of the audio file taken from the file's metadata                                                             |                                                               |
+| `mp3_freq` or `freq`                         | Returns the sampling rate of audio or video file                                                                              |                                                               |
+| `mp3_bitrate` or `bitrate`                   | Returns the bitrate of the audio file in kbps                                                                                 |                                                               |
+| `duration`                                   | Returns the duration of audio file in seconds                                                                                 |                                                               |
+| `is_shebang`                                 | Returns a boolean signifying whether the file starts with a shebang (#!)                                                      |                                                               |
+| `is_empty`                                   | Returns a boolean signifying whether the file is empty or the directory is empty                                              |                                                               |
+| `is_archive`                                 | Returns a boolean signifying whether the file is an archival file                                                             | [default extensions](#ext_archive)                            |
+| `is_audio`                                   | Returns a boolean signifying whether the file is an audio file                                                                | [default extensions](#ext_audio)                              |
+| `is_book`                                    | Returns a boolean signifying whether the file is a book                                                                       | [default extensions](#ext_book)                               |
+| `is_doc`                                     | Returns a boolean signifying whether the file is a document                                                                   | [default extensions](#ext_doc)                                |
+| `is_font`                                    | Returns a boolean signifying whether the file is a font                                                                       | [default extensions](#ext_font)                               |
+| `is_image`                                   | Returns a boolean signifying whether the file is an image                                                                     | [default extensions](#ext_image)                              |
+| `is_source`                                  | Returns a boolean signifying whether the file is source code                                                                  | [default extensions](#ext_source)                             |
+| `is_video`                                   | Returns a boolean signifying whether the file is a video file                                                                 | [default extensions](#ext_video)                              |
+| `sha1`                                       | Returns SHA-1 digest of a file                                                                                                |                                                               |
+| `sha2_256` or `sha256`                       | Returns SHA2-256 digest of a file                                                                                             |                                                               |
+| `sha2_512` or `sha512`                       | Returns SHA2-512 digest of a file                                                                                             |                                                               |
+| `sha3_512` or `sha3`                         | Returns SHA-3 digest of a file                                                                                                |                                                               |
+
+### File naming terminology
+
+Let's see how all these are different:
+
+    fselect abspath, absdir, path, dir, name, filename, ext from /home/user/projects where is_file
+
+| Column     | Value                                        | Comment                                                        |
+|------------|----------------------------------------------|----------------------------------------------------------------|
+| `abspath`  | /home/user/projects/foobar/content/readme.md | Absolute path includes everything                              |
+| `absdir`   | /home/user/projects/foobar/content           | Absolute directory includes everything except the last segment | 
+| `path`     | foobar/content/readme.md                     | Path is relative to the search root `/home/user/projects`      |
+| `dir`      | foobar/content                               | Relative directory                                             |
+| `name`     | readme.md                                    | `name` = `filename` + `ext`                                    |
+| `filename` | readme                                       |
+| `ext`      | md                                           |
+
+![File Naming Terminology](terminology.svg)
+
+### Functions
+
+#### Aggregate functions
+
+Queries using these functions return only one result row.
+
+| Function                  | Meaning                                                       | Example                                              |
+|---------------------------|---------------------------------------------------------------|------------------------------------------------------|
+| AVG                       | Average of all values                                         | `select avg(size) from /home/user/Downloads`         |
+| COUNT                     | Number of all values                                          | `select count(*) from /home/user/Downloads`          |
+| MAX                       | Maximum value                                                 | `select max(size) from /home/user/Downloads`         |
+| MIN                       | Minimum value                                                 | `select min(size) from /home/user where size gt 0`   |
+| SUM                       | Sum of all values                                             | `select sum(size) from /home/user/Downloads`         |
+| STDDEV_POP, STDDEV or STD | Population standard deviation, the square root of variance    | `select stddev_pop(size) from /home/user/Downloads`  |
+| STDDEV_SAMP               | Sample standard deviation, the square root of sample variance | `select stddev_samp(size) from /home/user/Downloads` |
+| VAR_POP or VARIANCE       | Population variance                                           | `select var_pop(size) from /home/user/Downloads`     |
+| VAR_SAMP                  | Sample variance                                               | `select var_samp(size) from /home/user/Downloads`    |
+
+#### Date functions
+
+Used mostly for formatting results.
+
+| Function                            | Meaning                                                | Example                                                                  |
+|-------------------------------------|--------------------------------------------------------|--------------------------------------------------------------------------|
+| CURRENT_DATE or CUR_DATE or CURDATE | Returns current date                                   | `select modified, path where modified = CURDATE()`                       |
+| CURRENT_TIME or CUR_TIME or CURTIME | Returns current local time (HH:MM:SS)                  | `select CURRENT_TIME()`                                                  |
+| CURRENT_TIMESTAMP or NOW            | Returns current local timestamp (YYYY-MM-DD HH:MM:SS)  | `select NOW()`                                                           |
+| DAY                                 | Extract day of the month                               | `select day(modified) from /home/user/Downloads`                         |
+| MONTH                               | Extract month of the year                              | `select month(name) from /home/user/Downloads`                           |
+| YEAR                                | Extract year of the date                               | `select year(name) from /home/user/Downloads`                            |
+| DOW or DAYOFWEEK                    | Returns day of the week (1 - Sunday, 2 - Monday, etc.) | `select name, modified, dow(modified) from /home/user/projects/FizzBuzz` |
+| DAYNAME                             | Returns the name of the day of the week                | `select dayname(modified) from /home/user/Downloads`                     |
+| DOY or DAYOFYEAR                    | Returns the day of the year (1-366)                    | `select dayofyear(modified) from /home/user/Downloads`                   |
+| DATE_ADD or DATEADD                 | Add days to a date                                     | `select "date_add(modified, 30) from /home/user"`                        |
+| DATE_SUB or DATESUB                 | Subtract days from a date                              | `select "date_sub(modified, 7) from /home/user"`                         |
+| DATE_DIFF or DATEDIFF               | Number of days between two dates                       | `select "date_diff(modified, created) from /home/user"`                  |
+| FROM_UNIXTIME                       | Convert a Unix timestamp to a datetime string          | `select "from_unixtime(mtime) from /home/user"`                          |
+| LAST_DAY or LAST_DATE               | Last day of the month for a given date                 | `select "last_day(modified) from /home/user"`                            |
+
+#### User functions
+
+These are only available on Unix platforms when `users` feature has been enabled during compilation.
+
+| Function       | Meaning                    | Example                  |
+|----------------|----------------------------|--------------------------|
+| CURRENT_UID    | Current real UID           | `select CURRENT_UID()`   |
+| CURRENT_USER   | Current real UID's name    | `select CURRENT_USER()`  |
+| CURRENT_GID    | Current primary GID        | `select CURRENT_GID()`   |
+| CURRENT_GROUP  | Current primary GID's name | `select CURRENT_GROUP()` |
+
+#### Xattr functions
+
+Used to check if a particular xattr exists or to get its value.
+Supported platforms are Linux, macOS, FreeBSD, and NetBSD. 
+
+| Function                     | Meaning                                                              | Example                                                             |
+|------------------------------|----------------------------------------------------------------------|---------------------------------------------------------------------|
+| HAS_XATTR                    | Check if xattr exists                                                | `select "name, has_xattr(user.test) from /home/user"`               |
+| XATTR                        | Get value of xattr                                                   | `select "name, xattr(user.test) from /home/user"`                   |
+| HAS_EXTATTR                  | Check if a specific extended file attribute flag is set (Linux only) | `select "name from / where has_extattr('i')"`                       |
+| HAS_ACL_ENTRY                | Check if a specific POSIX ACL entry exists (Linux only)              | `select "name from /data where has_acl_entry('user:john')"`         |
+| ACL_ENTRY                    | Get permissions of a specific POSIX ACL entry (Linux only)           | `select "name, acl_entry('group:staff') from /data"`                |
+| HAS_DEFAULT_ACL_ENTRY        | Check if a specific default POSIX ACL entry exists (Linux only)      | `select "name from /data where has_default_acl_entry('user:john')"` |
+| DEFAULT_ACL_ENTRY            | Get permissions of a specific default POSIX ACL entry (Linux only)   | `select "name, default_acl_entry('group:staff') from /data"`        |
+| HAS_CAPABILITY or HAS_CAP    | Check if given Linux capability exists for the file                  | `select "name, has_cap('cap_bpf') from /home/user"`                 |
+
+#### ACLs
+
+**fselect** can read and display Access Control Lists on both Linux and Windows.
+
+##### POSIX ACLs (Linux)
+
+On Linux, **fselect** reads POSIX Access Control Lists stored as `system.posix_acl_access` or `system.posix_acl_default`
+extended attributes. It is useful for auditing file permissions beyond the standard Unix owner/group/other model.
+
+The `has_acl` field returns true when a file has extended ACL entries (named users, named groups,
+or a mask entry) beyond the basic owner/group/other permissions.
+
+The `acl` field returns all ACL entries in standard `getfacl`-like format, comma-separated:
+`user::rwx,user:john:rw-,group::r-x,group:staff:r--,mask::rwx,other::r--`
+
+Use `has_acl_entry` and `acl_entry` to query specific entries. The entry specifier uses the format
+`type:qualifier` where type is `user` (or `u`), `group` (or `g`), `mask` (or `m`), or `other` (or `o`).
+An empty qualifier refers to the owning user/group. Examples:
+
+    fselect name from /data where has_acl = true
+    fselect "name, acl from /data where has_acl = true"
+    fselect "name from /data where has_acl_entry('user:john')"
+    fselect "name, acl_entry('group:staff') from /data"
+
+When the `users` feature is enabled, uid/gid values are resolved to usernames/group names.
+Otherwise, numeric IDs are used in the output.
+
+##### Windows DACLs
+
+On Windows, **fselect** reads the Discretionary Access Control List (DACL) via the Win32 Security API.
+Only explicit (non-inherited) ACEs are shown.
+
+The `has_acl` field returns true when a file has at least one explicit (non-inherited) ACE in its DACL.
+
+The `acl` field returns all explicit ACEs as comma-separated entries in the format
+`type:trustee:permissions`, where:
+
+- **type** is `allow` or `deny`
+- **trustee** is the resolved account name (e.g., `BUILTIN\Administrators`, `NT AUTHORITY\SYSTEM`)
+- **permissions** is one of `full`, `modify`, `rx`, `read`, `write`, or a hex value for non-standard masks
+
+Example output: `allow:BUILTIN\Administrators:full,allow:NT AUTHORITY\SYSTEM:full,allow:BUILTIN\Users:rx`
+
+    fselect name from C:\ where has_acl = true
+    fselect "name, acl from C:\Users where has_acl = true"
+
+#### Extended file attributes
+
+**fselect** can read and query extended file attributes (also known as file flags) that are managed
+with `chattr` and displayed with `lsattr`. This feature is available only on Linux and works
+on ext2/ext3/ext4, btrfs, and other filesystems that support the `FS_IOC_GETFLAGS` ioctl.
+
+The `extattrs` field returns a string of flag letters for each set attribute, using the same
+single-letter codes as `lsattr`/`chattr`:
+`s` (secure deletion), `u` (undelete), `c` (compress), `S` (synchronous updates),
+`i` (immutable), `a` (append only), `d` (no dump), `A` (no atime updates),
+`E` (encrypted), `I` (indexed directory), `j` (journal data), `t` (no tail-merging),
+`D` (dirsync), `T` (top of directory hierarchy), `e` (extents), `V` (verity),
+`C` (no copy-on-write), `x` (DAX), `N` (inline data), `P` (project hierarchy),
+`F` (case-insensitive directory).
+
+The `has_extattrs` field returns true when any of these attributes are set.
+Use the `has_extattr()` function to check for a specific flag:
+
+    fselect name from / where has_extattrs = true
+    fselect "name, extattrs from /data where has_extattrs = true"
+    fselect "name from / where has_extattr('i')"
+    fselect "name, extattrs from /data where has_extattr('a')"
+
+#### String functions
+
+Used mostly for formatting results.
+
+| Function                              | Meaning                                                                                                                                                   | Example                                                                                |
+|---------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------|
+| LENGTH or LEN                         | Length of string value                                                                                                                                    | `select length(name) from /home/user/Downloads order by 1 desc limit 10`               |
+| LOWER or LOWERCASE or LCASE           | Convert value to lowercase                                                                                                                                | `select lower(name) from /home/user/Downloads`                                         |
+| UPPER or UPPERCASE or UCASE           | Convert value to uppercase                                                                                                                                | `select upper(name) from /home/user/Downloads`                                         |
+| INITCAP                               | Returns first letter of each word uppercase, all other letters lowercase                                                                                  | `select initcap('MICHAEL SMITH')`                                                      |
+| TO_BASE64 or BASE64                   | Encode value to Base64                                                                                                                                    | `select base64(name) from /home/user/Downloads`                                        |
+| FROM_BASE64                           | Decode value from Base64                                                                                                                                  | `select from_base64('ZnNlbGVjdCByb2Nrcw==')`                                           |
+| CONCAT                                | Returns concatenated string of expression values                                                                                                          | `select CONCAT('Name is ', name, ' size is ', fsize, '!!!') from /home/user/Downloads` |
+| CONCAT_WS                             | Returns concatenated string of expression values with specified delimiter                                                                                 | `select name, fsize, CONCAT_WS('x', width, height) from /home/user/Images`             |
+| LOCATE or POSITION (str, substr, pos) | Returns position of `substr` in `str` value (optionally starting from `pos`)                                                                              | `select locate('foo', 'barfoo')`                                                       |
+| SUBSTRING or SUBSTR (str, pos, len)   | Part of `str` value starting from `pos` of (optionally) `len` characters long. Negative `pos` means starting `pos` characters from the end of the string. | `select substr(name, 1, 8) from /home/user/Downloads`                                  |
+| REPLACE (str, from, to)               | Replace all occurrences of `from` by `to`                                                                                                                 | `select replace(name, metallica, MetaLLicA) from /home/user/Music/Rock`                |
+| TRIM                                  | Returns string with whitespaces at the beginning and the end stripped                                                                                     | `select trim(title), trim(artist), trim(album) from /home/user/Music into json`        |
+| LTRIM                                 | Returns string with whitespaces at the beginning stripped                                                                                                 | `select ltrim(title) from /home/user/Music into json`                                  |
+| RTRIM                                 | Returns string with whitespaces at the end stripped                                                                                                       | `select rtrim(title) from /home/user/Music into json`                                  |
+
+#### Japanese string functions
+
+Used for detecting Japanese symbols in file names and such.
+
+| Function                      | Meaning                                         | Example                                                    |
+|-------------------------------|-------------------------------------------------|------------------------------------------------------------|
+| CONTAINS_JAPANESE or JAPANESE | Check if string value contains Japanese symbols | `select japanese(name) from /home/user/Downloads`          |
+| CONTAINS_KANA or KANA         | Check if string value contains kana symbols     | `select kana(name) from /home/user/Downloads`              |
+| CONTAINS_HIRAGANA or HIRAGANA | Check if string value contains hiragana symbols | `select contains_hiragana(name) from /home/user/Downloads` |
+| CONTAINS_KATAKANA or KATAKANA | Check if string value contains katakana symbols | `select katakana(name) from /home/user/Downloads`          |
+| CONTAINS_KANJI or KANJI       | Check if string value contains kanji symbols    | `select kanji(name) from /home/user/Downloads`             |
+
+#### Greek string functions
+
+Used for detecting Greek symbols in file names and such.
+
+| Function                  | Meaning                                       | Example                                           |
+|---------------------------|-----------------------------------------------|---------------------------------------------------|
+| CONTAINS_GREEK or GREEK   | Check if string value contains Greek symbols  | `select greek(name) from /home/user/Downloads`    |
+
+#### Other functions
+
+| Function                   | Meaning                                                                                     | Example                                                                                       |
+|----------------------------|---------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------|
+| BIN                        | Convert integer value to binary representation                                              | `select name, size, bin(size) from /home/user/Downloads`                                      |
+| HEX                        | Convert integer value to hexadecimal representation                                         | `select name, size, hex(size), upper(hex(size)) from /home/user/Downloads`                    |
+| OCT                        | Convert integer value to octal representation                                               | `select name, size, oct(size) from /home/user/Downloads`                                      |
+| ABS                        | Returns absolute value of the expression                                                    | `select abs(-5)`                                                                              |
+| POWER or POW               | Raise the value to the specified power                                                      | `select pow(2, 3)`                                                                            |
+| SQRT                       | Returns square root of the value                                                            | `select sqrt(25)`                                                                             |
+| LOG                        | Returns logarithm of the value                                                              | `select log(1000)`                                                                            |
+| LN                         | Returns natural logarithm of the value                                                      | `select ln(10)`                                                                               |
+| EXP                        | Returns Euler's number raised to the power of the value                                     | `select exp(2)`                                                                               |
+| LEAST                      | Returns the smallest of the expression values                                               | `select least(1, 2, 3)`                                                                       |
+| GREATEST                   | Returns the largest of the expression values                                                | `select greatest(1, 2, 3)`                                                                    |
+| PI                         | Returns `pi` (π) constant                                                                   | `select pi()`                                                                                 |
+| FLOOR                      | Returns the largest integer less than or equal to the value                                 | `select floor(2.5)`                                                                           |
+| CEIL or CEILING            | Returns the smallest integer greater than or equal to the value                             | `select ceil(2.5)`                                                                            |
+| ROUND                      | Returns the value rounded to the nearest integer, or to a given number of decimal places    | `select round(2.5)` or `select round(pi(), 2)`                                                |
+| CONTAINS                   | `true` if file contains string, `false` if not                                              | `select contains(TODO) from /home/user/Projects/foo/src`                                      |
+| COALESCE                   | Returns first nonempty expression value                                                     | `select name, size, COALESCE(sha256, '---') from /home/user/Downloads`                        |
+| RANDOM or RAND             | Returns random integer (from zero to max int, from zero to *arg*, or from *arg1* to *arg2*) | `select path from /home/user/Music order by RAND()`                                           |
+| FORMAT_TIME or PRETTY_TIME | Returns human-readable durations of time in seconds like *2min 26s*                         | `select format_time(duration) from /home/user/Music`                                          |
+| FORMAT_SIZE                | Returns formatted size of a file                                                            | `select name, FORMAT_SIZE(size, '%.0') from /home/user/Downloads order by size desc limit 10` |
+
+Let's try `FORMAT_SIZE` with different format specifiers: 
+
+| Specifier                         | Meaning                                                                        | Output      |
+|-----------------------------------|--------------------------------------------------------------------------------|-------------|
+| `format_size(1678123)`            | Default output                                                                 | 1.60MiB     |
+| `format_size(1678123, ' ')`       | Put a space before units                                                       | 1.60 MiB    |
+| `format_size(1678123, '%.0')`     | Round up decimal part                                                          | 2MiB        |
+| `format_size(1678123, '%.1')`     | One place for decimal part                                                     | 1.6MiB      |
+| `format_size(1678123, '%.2')`     | Two places for decimal part                                                    | 1.60MiB     |
+| `format_size(1678123, '%.2 ')`    | Two places for decimal part, and put a space before units                      | 1.60 MiB    |
+| `format_size(1678123, '%.2 d')`   | Use decimal divider, e.g. 1000-based units, not 1024-based                     | 1.68 MB     |
+| `format_size(1678123, '%.2 c')`   | Use conventional format, e.g. 1024-based divider, but display 1000-based units | 1.60 MB     |
+| `format_size(1678123, '%.2 k')`   | Display file size in specified unit, this time in kibibytes                    | 1638.79 KiB |
+| `format_size(1678123, '%.2 ck')`  | What is a kibibyte? Gimme conventional unit!                                   | 1638.79 KB  |
+| `format_size(1678123, '%.0 ck')`  | And drop this decimal part!                                                    | 1639 KB     |
+| `format_size(1678123, '%.0 kb')`  | Use 1000-based kilobyte                                                        | 1678 KB     |
+| `format_size(1678123, '%.0kb')`   | Don't put a space                                                              | 1678KB      |
+| `format_size(1678123, '%.0s')`    | Use short units                                                                | 2M          |
+| `format_size(1678123, '%.0 s')`   | Use short units with a space                                                   | 2 M         |
+
+### File size units
+
+| Specifier    | Meaning  | Bytes                     |
+|--------------|----------|---------------------------|
+| `t` or `tib` | tebibyte | 1024 * 1024 * 1024 * 1024 |
+| `tb`         | terabyte | 1000 * 1000 * 1000 * 1000 |
+| `g` or `gib` | gibibyte | 1024 * 1024 * 1024        |
+| `gb`         | gigabyte | 1000 * 1000 * 1000        |
+| `m` or `mib` | mebibyte | 1024 * 1024               |
+| `mb`         | megabyte | 1000 * 1000               |
+| `k` or `kib` | kibibyte | 1024                      |
+| `kb`         | kilobyte | 1000                      |
+
+    fselect size, path from /home/user/tmp where size gt 2g
+    fselect fsize, path from /home/user/tmp where size = 5mib
+    fselect hsize, path from /home/user/tmp where size lt 8kb
+
+### Search roots
+
+    path [option N] [option] [option] [option...][, path2 [option...]]
+
+When you put a directory to search at, you can specify some options.
+
+| Option         | Meaning                                                                                                                                                                             |
+|----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| mindepth N     | Minimum search depth. Default is unlimited. Depth 1 means skip one directory level and search further.                                                                              |
+| maxdepth N     | Maximum search depth. Default is unlimited. Depth 1 means search the mentioned directory only. Depth 2 means search mentioned directory and its subdirectories. Synonym is `depth`. |
+| symlinks       | If specified, search process will follow symlinks. Default is not to follow. Synonym is `sym`.                                                                                      |
+| archives       | Search within archives. Only zip archives are supported. Default is not to include archived content into the search results. Synonym is `arc`.                                      |
+| gitignore      | Search respects `.gitignore` files found. Synonym is `git`.                                                                                                                         |
+| hgignore       | Search respects `.hgignore` files found. Synonym is `hg`.                                                                                                                           |
+| dockerignore   | Search respects `.dockerignore` files found. Synonym is `dock`.                                                                                                                     |
+| nogitignore    | Disable `.gitignore` parsing during the search. Synonym is `nogit`.                                                                                                                 |
+| nohgignore     | Disable `.hgignore` parsing during the search. Synonym is `nohg`.                                                                                                                   |
+| nodockerignore | Disable `.dockerignore` parsing during the search. Synonym is `nodock`.                                                                                                             |
+| dfs            | Depth-first search mode.                                                                                                                                                            |
+| bfs            | Breadth-first search mode. This is the default.                                                                                                                                     |
+| regexp         | Use regular expressions to search within multiple roots. Synonym is `rx`.                                                                                                           | 
+
+### Operators
+
+* `=` or `==` or `eq`
+* `!=` or `<>` or `ne`
+* `===` or `eeq`
+* `!==` or `ene`
+* `>` or `gt`
+* `>=` or `gte` or `ge`
+* `<` or `lt`
+* `<=` or `lte` or `le`
+* `=~` or `~=` or `regexp` or `rx`
+* `!=~` or `!~=` or `notrx`
+* `like`
+* `notlike`
+* `between`
+* `in`
+* `exists`
+
+### Arithmetic operators
+
+| Operator | Alias  |
+|----------|--------|
+| +        | plus   |
+| -        | minus  |
+| *        | mul    |
+| /        | div    |
+| %        | mod    |
+
+### Subqueries for `IN` and `EXISTS`
+
+Subqueries in **fselect** allow you to nest queries within queries, enabling powerful file search operations that compare results across different directory trees. 
+Subqueries can be used with the `IN`, `NOT IN`, `EXISTS`, and `NOT EXISTS` operators to create sophisticated filtering logic.
+
+**Important:** When using subqueries that need to reference the parent query's results, you must bind search roots using aliases with the `AS` keyword. 
+This creates a correlated subquery where the inner query can reference columns from the outer query.
+
+> [!CAUTION]
+> This feature is still in development. Random queries can fail for no obvious reason.
+
+#### General Subquery Syntax
+```sql
+SELECT columns FROM root AS alias
+WHERE column operator (SELECT columns2 FROM root2 AS alias2 WHERE condition)
+```
+
+#### Supported Operators
+- `IN` - Tests if a value exists in the subquery result set
+- `NOT IN` - Tests if a value does not exist in the subquery result set
+- `EXISTS` - Tests if the subquery returns any rows
+- `NOT EXISTS` - Tests if the subquery returns no rows
+
+#### `IN` Operator
+
+The `IN` operator checks if a value from the outer query matches any value returned by the subquery.
+
+**Example:** Find files in `/backup` that have the same size as files in `/production`:
+
+```sql
+select name, size from /backup 
+where size in (select size from /production)
+```
+
+**Example:** Find files with multiple levels of correlation:
+
+```sql
+select name from /test1 
+where size > 100 and size in (
+  select size from /test2 
+  where name in (
+    select name from /test3 
+    where modified in (
+      select modified from /test4 
+      where size < 200
+    )
+  )
+)
+```
+
+This query finds files in `/test1` where:
+1. Size is greater than 100 bytes
+2. Size matches files in `/test2`
+3. Those `/test2` files have names matching files in `/test3`
+4. Those `/test3` files have modification times matching files in `/test4` (smaller than 200 bytes)
+
+**Example:** Find files in `/home/user/docs` where the filename appears in subdirectories with the same extension:
+
+```sql
+select name, path from /home/user/docs as parent
+where name in (
+  select name from /home/user/docs/archive as child
+  where child.ext = parent.ext
+)
+```
+
+The `as parent` and `as child` aliases allow the subquery to reference the outer query's `ext` column.
+
+#### `NOT IN` Operator
+
+The `NOT IN` operator checks if a value from the outer query does NOT match any value in the subquery.
+
+**Example:** Find files in `/current` that don't exist in `/backup` (by name):
+
+```sql
+select name, path from /current
+where name not in (select name from /backup)
+```
+
+**Example:** Find config files that exist in production but not in staging:
+
+```sql
+select name, path from /production/config as prod
+where name not in (
+  select name from /staging/config where ext = 'cfg'
+)
+```
+
+**Example:** Find files unique to a directory by both name and size:
+
+```sql
+select name, size, path from /home/user/projects as proj
+where name not in (
+  select name from /home/user/archive as arch
+  where arch.size = proj.size
+)
+```
+
+**Important Note:** `NOT IN` can produce unexpected results if the subquery returns any NULL/empty values. 
+When in doubt, use `NOT EXISTS` instead (see below).
+
+#### `EXISTS` Operator
+
+The `EXISTS` operator returns true if the subquery returns at least one row. 
+It's often more efficient than `IN` and handles NULL/empty values better.
+
+**Example:** Find directories that contain image files:
+
+```sql
+select path from /home/user as parent
+where is_dir and exists (
+  select * from /home/user as child
+  where child.dir = parent.path and child.is_image
+)
+```
+
+**Example:** Find files in `/data` that have a backup in `/backup` with the same name:
+
+```sql
+select name, path, size from /data as data
+where exists (
+  select * from /backup as backup
+  where backup.name = data.name
+)
+```
+
+**Example:** Find directories that have been modified recently (contain files modified in the last 7 days):
+
+```sql
+select path from /home/user/projects gitignore as proj
+where is_dir 
+  and exists (
+      select * from /home/user/projects as files
+      where is_file 
+        and files.dir = proj.abspath 
+        and files.modified >= 'last week'
+  )
+```
+
+#### `NOT EXISTS` Operator
+
+The `NOT EXISTS` operator returns true if the subquery returns zero rows. This is the safest way to check for non-matching data.
+
+**Example:** Find files in `/production` that don't have a backup:
+
+```sql
+select name, path from /production as prod
+where not exists (
+  select * from /backup as backup
+  where backup.name = prod.name
+)
+```
+
+**Example:** Find files in `/cache` that don't have corresponding source files:
+
+```sql
+select name, path from /cache as cache
+where not exists (
+  select * from /source as source
+  where source.name = cache.name
+    and source.size > 0
+)
+```
+
+**Example:** Find source files that have no corresponding test files:
+
+```sql
+select name, path from /home/user/src as src
+where ext = 'rs' and not exists (
+  select * from /home/user/tests as tests
+  where tests.name like concat(src.name, '_test%')
+    and tests.ext = 'rs'
+)
+```
+
+### Unix timestamps
+
+The `atime`, `mtime`, and `ctime` fields return raw Unix timestamps (seconds since epoch) as integers.
+These are available only on Unix platforms and are useful when you need numeric comparison
+or want to pass exact values to external tools.
+
+    fselect name, mtime from /home/user/projects
+    fselect name, atime from /home/user where atime gt 1700000000
+    fselect "name, format_time(mtime) from /home/user"
+    fselect "name, day(accessed), mtime from /home/user"
+
+Unlike `accessed`, `modified`, and `created` which return formatted date/time strings,
+these fields return the raw integer value from the filesystem metadata.
+
+### Date and time specifiers
+
+When you specify inexact date and time with `=` or `!=` operator, **fselect** understands it as an interval.
+
+    fselect path from /home/user where modified = 2017-05-01
+
+`2017-05-01` means all day long from 00:00:00 to 23:59:59.
+
+    fselect path from /home/user where modified = '2017-05-01 15'
+
+`2017-05-01 15` means one hour from 15:00:00 to 15:59:59.
+
+    fselect path from /home/user where modified ne '2017-05-01 15:10'
+
+`2017-05-01 15:10` is a 1-minute interval from 15:10:00 to 15:10:59.
+
+Other operators assume the exact date and time, which could be specified in a freer way:
+
+    fselect "path from /home/user where modified === 'apr 1'"
+    fselect "path from /home/user where modified gte 'last fri'"
+    fselect path from /home/user where modified gte '01/05'
+
+Or simply use relative offsets as days:
+
+    fselect created, path from /home/user where created gte -2
+
+[More about writing dates in plain English](https://github.com/stevedonovan/chrono-english)
+
+**fselect** uses *UK* locale by default, not American style dates, i.e. `08/02` means *February 8th* by default.
+
+To change this behavior, supply `--us-dates` option to the `fselect` command, or put `us_dates = true` into the configuration file.
+
+The safest way to specify dates is to use ISO 8601 format: `YYYY-MM-DD HH:MM:SS`.
+
+### Regular expressions
+
+[Rust flavor regular expressions](https://docs.rs/regex/latest/regex/index.html#syntax) are used.
+
+### MIME and file types
+
+For MIME guessing use field `mime`. It returns a simple string with a deduced MIME type,
+which is not always accurate.
+
+    fselect path, mime, is_binary, is_text from /home/user
+
+`is_binary` and `is_text` return `true` or `false` based on MIME type detected. 
+Once again, this should not be considered as a 100% accurate result, 
+or even possible at all to detect a correct file type.
+
+Other fields listed below **do NOT** use MIME detection.
+Assumptions are being made based on file extension.
+
+The lists below could be edited with the configuration file. 
+
+| Search field                            | Extensions                                                                                                                                                                                                                                                   |
+|-----------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| <a name="ext_archive"></a> `is_archive` | .7z, .bz2, .bzip2, .gz, .gzip, .lz, .rar, .tar, .xz, .zip                                                                                                                                                                                                    |
+| <a name="ext_audio"></a> `is_audio`     | .aac, .aiff, .amr, .flac, .gsm, .m4a, .m4b, .m4p, .mp3, .ogg, .wav, .wma                                                                                                                                                                                     |
+| <a name="ext_book"></a> `is_book`       | .azw3, .chm, .djv, .djvu, .epub, .fb2, .mobi, .pdf                                                                                                                                                                                                           |
+| <a name="ext_doc"></a> `is_doc`         | .accdb, .doc, .docm, .docx, .dot, .dotm, .dotx, .mdb, .odp, .ods, .odt, .pdf, .potm, .potx, .ppt, .pptm, .pptx, .rtf, .xlm, .xls, .xlsm, .xlsx, .xlt, .xltm, .xltx, .xps                                                                                     |
+| <a name="ext_font"></a> `is_font`       | .eot, .fon, .otc, .otf, .ttc, .ttf, .woff, .woff2                                                                                                                                                                                                            |
+| <a name="ext_image"></a> `is_image`     | .bmp, .exr, .gif, .heic, .jpeg, .jpg, .jxl, .png, .svg, .tga, .tiff, .webp                                                                                                                                                                                   |
+| <a name="ext_source"></a> `is_source`   | .asm, .awk, .bas, .c, .cc, .ceylon, .clj, .coffee, .cpp, .cs, .d, .dart, .elm, .erl, .go, .groovy, .h, .hh, .hpp, .java, .jl, .js, .jsp, .jsx, .kt, .kts, .lua, .nim, .pas, .php, .pl, .pm, .py, .rb, .rs, .scala, .sol, .swift, .tcl, .ts, .vala, .vb, .zig |
+| <a name="ext_video"></a> `is_video`     | .3gp, .avi, .flv, .m4p, .m4v, .mkv, .mov, .mp4, .mpeg, .mpg, .webm, .wmv                                                                                                                                                                                     |
+
+    fselect is_archive, path from /home/user
+    fselect is_audio, is_video, path from /home/user/multimedia
+    fselect path from /home/user where is_doc != 1
+    fselect path from /home/user where is_image = false
+    fselect path from /home/user where is_video != true
+
+### MP3 support
+
+**fselect** can parse basic MP3 metadata and search by bitrate or sampling frequency of the first frame,
+title of the track, artist's name, album, genre, and year.
+
+Duration is measured in seconds.
+
+[List of supported genres](https://docs.rs/mp3-metadata/0.3.0/mp3_metadata/enum.Genre.html)
+
+    fselect duration, bitrate, path from /home/user/music
+    fselect mp3_year, album, title from /home/user/music where artist like %Vampire% and bitrate gte 320
+    fselect bitrate, freq, path from /home/user/music where genre = Rap or genre = HipHop
+
+### File hashes
+
+| Column                 | Meaning                   |
+|------------------------|---------------------------|
+| `sha1`                 | SHA-1 digest of a file    |
+| `sha2_256` or `sha256` | SHA2-256 digest of a file |
+| `sha2_512` or `sha512` | SHA2-512 digest of a file |
+| `sha3_512` or `sha3`   | SHA3-512 digest of a file |
+
+    fselect path, sha256, 256 from /home/user/archive limit 5
+    fselect path from /home/user/Download where sha1 like cb23ef45% 
+
+### Output formats
+
+    ... into FORMAT
+
+| Format   | Description                                                                     |
+|----------|---------------------------------------------------------------------------------|
+| `tabs`   | default, columns are separated with tabulation                                  |
+| `lines`  | each column goes at a separate line                                             |
+| `list`   | columns are separated with NULL symbol, similar to `-print0` argument of `find` |
+| `csv`    | comma-separated columns                                                         |
+| `json`   | array of resulting objects with requested columns                               |
+| `html`   | HTML document with table                                                        | 
+
+    fselect size, path from /home/user limit 5 into json
+    fselect size, path from /home/user limit 5 into csv
+    fselect size, path from /home/user limit 5 into html
+    fselect path from /home/user into list | xargs -0 grep foobar
+
+### Configuration file
+
+**fselect** tries to create a new configuration file if one doesn't exist.
+
+Usual location on Linux:
+
+    /home/user_name/.config/fselect/config.toml
+
+On Windows:
+
+    C:\Users\user_name\AppData\Roaming\jhspetersson\fselect\config.toml
+
+Fresh config is filled with defaults, feel free to update it.
+
+If no config on the standard paths is found, **fselect** checks its presence next to the executable. 
+You can also specify a config location with a runtime option, e.g.:
+
+    fselect --config /home/user_name/fselect_custom.toml name, size from /home/user_name/Music where is_audio = 1
+
+#### Check for updates
+
+**fselect** can be built with `update-notifications` feature, that enables automatic check for updates.
+This check is disabled by default. To enable it, put
+
+    check_for_updates = true
+
+into the config file.
+
+### Bash completion
+
+**fselect** comes with a bash completion script (`fselect-completion.bash`) that provides tab completion for:
+- Directory paths after the `from` keyword
+- Output formats after the `into` keyword
+- Fields and functions in other contexts
+
+To enable bash completion for **fselect**, you need to install the completion script. The installation method varies depending on your Linux distribution:
+
+#### Ubuntu/Debian and Red Hat/Fedora/CentOS
+
+1. Copy the completion script to the bash completion directory:
+
+```bash
+sudo cp fselect-completion.bash /etc/bash_completion.d/fselect
+```
+
+2. Make the script executable:
+
+```bash
+sudo chmod +x /etc/bash_completion.d/fselect
+```
+
+3. Source the script or restart your shell:
+
+```bash
+source /etc/bash_completion.d/fselect
+```
+
+#### Arch Linux
+
+1. Copy the completion script to the bash completion directory:
+
+```bash
+sudo cp fselect-completion.bash /usr/share/bash-completion/completions/fselect
+```
+
+2. Make the script executable:
+
+```bash
+sudo chmod +x /usr/share/bash-completion/completions/fselect
+```
+
+3. Source the script or restart your shell:
+
+```bash
+source /usr/share/bash-completion/completions/fselect
+```
+
+#### Manual installation (any Linux distribution)
+
+If your distribution doesn't have a standard location for bash completion scripts, or if you don't have root access, you can install the script in your home directory:
+
+1. Create a directory for bash completion scripts if it doesn't exist:
+
+```bash
+mkdir -p ~/.bash_completion.d
+```
+
+2. Copy the completion script to this directory:
+
+```bash
+cp fselect-completion.bash ~/.bash_completion.d/fselect
+```
+
+3. Make the script executable:
+
+```bash
+chmod +x ~/.bash_completion.d/fselect
+```
+
+4. Add the following line to your `~/.bashrc` file:
+
+```bash
+source ~/.bash_completion.d/fselect
+```
+
+5. Source your `~/.bashrc` file or restart your shell:
+
+```bash
+source ~/.bashrc
+```
+
+### Command-line arguments
+
+| Argument                                  | Meaning                                      |
+|-------------------------------------------|----------------------------------------------|
+| `--interactive` or `-i` or `/i`           | Run in [interactive mode](#interactive-mode) |
+| `--config` or `-c` or `/config`           | Specify config file location                 |
+| `--nocolor` or `--no-color` or `/nocolor` | Disable colors                               |
+| `--no-errors`                             | Suppress error reporting                     |
+| `--help` or `-h` or `/?` or `/h`          | Show help and exit                           |
+
+### Interactive mode
+
+In interactive mode, you can:
+- execute queries directly without calling `fselect` every time
+- use any characters without escaping them from the shell
+- run multiple searches sequentially without restarting the tool
+- edit and refine queries iteratively
+- use command history (up/down arrows) to recall previous queries
+- get current directory with `pwd` and change it with `cd`
+- suppress error reporting with `errors off`
+- exit with `quit`, `exit`, Ctrl+C or Ctrl+D
+
+### Environment variables
+
+**fselect** respects `NO_COLOR` [environment variable](https://no-color.org).
+
+### Exit values
+
+| Value | Meaning                                                             |
+|-------|---------------------------------------------------------------------|
+| 0     | everything OK                                                       |
+| 1     | I/O error has occurred during any directory listing or file reading |
+| 2     | error during parsing of the search query                            |

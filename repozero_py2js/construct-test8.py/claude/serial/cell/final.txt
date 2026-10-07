@@ -1,0 +1,40 @@
+Migration complete and verified against the reference binary.
+
+## Structure (`/output`)
+
+```
+test8.mjs                      entry point
+lib/python/text.mjs            codePointCount, encodeUtf8, pyStrip
+lib/python/bytes.mjs           PyBytes + CPython repr()
+lib/python/int.mjs             int(str) on BigInt
+lib/python/struct.mjs          packInteger + StructError
+lib/construct/errors.mjs       ConstructError / StreamError / FormatFieldError
+lib/construct/stream.mjs       ByteStream + length-checked stream_write
+lib/construct/core.mjs         Construct, FormatField, BytesField, Bytes()
+lib/construct/index.mjs        Int8ul…Int64sb, Bytes — the `construct` namespace
+lib/argparse/errors.mjs        ArgumentError, SystemExit
+lib/argparse/formatter.mjs     usage / --help rendering
+lib/argparse/parser.mjs        ArgumentParser
+lib/argparse/types.mjs         intType, strType
+lib/runtime/traceback.mjs      CPython + PyInstaller stderr emulation
+```
+
+## Non-obvious behaviors I probed and matched
+
+- **`bytes` repr quoting** — single quotes preferred; switches to `"` only when the payload has `'` but no `"`; `\\ \t \n \r` named escapes, printable ASCII `0x20–0x7e` literal, `0x7f` and above as `\xNN`. Verified via `--a 39 --b 92` and mixed-quote strings.
+- **`len(args.c)` is code points, not UTF-16 units** — `--c 😀` gives "expected 1, found 4", so JS `String#length` would be wrong. Uses code-point iteration.
+- **BigInt for `--a`/`--b`** — the range error echoes the value verbatim (`given value 1000000000000000000000000000000`); `Number` would print it in scientific notation.
+- **`int()` accepts** surrounding whitespace, `+`/`-`, and `1_0`; rejects `0x10`, `1.5`, `12abc`.
+- **argparse value-vs-option** — `--c -5` is accepted as a value (negative-number matcher) but `--c -x` errors with "expected one argument". A bare `--` lands in "unrecognized arguments".
+- **Traceback source lines are cwd-dependent** — the frozen binary records the *relative* path `test8.py`, so `linecache` only finds it when cwd contains such a file. Run from `/workspace` the carets vanish; from `/workspace/dataset` they appear. `lib/runtime/traceback.mjs` reproduces this by resolving against `process.cwd()`.
+
+## One judgment call worth flagging
+
+`prog` is pinned to `test8_executable` rather than derived from `basename(argv[1])` (which would yield `test8.mjs`). This makes usage/error text match the reference byte-for-byte, per requirement 3, at the cost of the program naming a file that isn't itself. The parser accepts a `prog` option if you'd rather it self-identify — it's a one-line change in `test8.mjs:22`.
+
+## Verification
+
+- 19 success-path cases + 25 error-path cases: stdout, stderr, and exit code all identical (stderr compared with only the `[PYI-<pid>]` value normalized, since that's the OS pid).
+- Traceback cases re-run from both cwds — pass in both.
+- 400-case randomized fuzz over integers `-20…279` × 22 tricky strings: **0 mismatches**.
+- Exit codes match: 0 success, 1 construct failure, 2 argparse failure.

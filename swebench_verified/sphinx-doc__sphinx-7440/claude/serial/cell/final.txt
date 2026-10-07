@@ -1,0 +1,17 @@
+Done. The fix, in `sphinx/domains/std.py`:
+
+**Root cause:** `make_glossary_term()` registered every glossary term lowercased (`std.note_object('term', termtext.lower(), ...)`) because the `:term:` role used `XRefRole(lowercase=True)`. So `MySQL` and `mysql` collapsed to the same key and the second one warned as a duplicate — even though they get distinct node ids (`term-MySQL` / `term-mysql`).
+
+**Changes** (`sphinx/domains/std.py:308`, `:568`, `:786`, `:942`):
+- Terms are now registered with their original case, so terms differing only in case are distinct objects.
+- Dropped `lowercase=True` from the `term` role, so `:term:` targets keep their case and match exactly.
+- Added `_resolve_term_xref()`, wired into `resolve_xref()`: exact match first, then a case-insensitive scan as fallback — so existing docs that write `:term:`mysql`` for a term defined as `MySQL` keep resolving.
+- `resolve_any_xref()` now routes terms through that resolver instead of looking them up by lowercased key (which would have silently broken `:any:` for capitalized terms).
+
+**Verification** — built a doc defining both `MySQL` and `mysql` plus `Sphinx`, with `-W`:
+- Previously-failing build now succeeds; no `duplicate term description` warning.
+- `:term:`MySQL`` → `#term-MySQL`, `:term:`mysql`` → `#term-mysql` (distinct targets), `:term:`SPHINX``/`:term:`sphinx``/`:any:`Sphinx`` → `#term-Sphinx` (fallback still works).
+
+**Tests:** added `test_glossary_terms_with_different_case` and `test_term_xref_is_case_insensitive` to `tests/test_domain_std.py`; both pass. I diffed the full failure set of the term/glossary-touching test files before and after — identical, all pre-existing environment drift (docutils/pygments versions), including `test_domain_std.py::test_productionlist`, which fails on master too.
+
+One residual behavior worth knowing: `objects.inv` now records terms with their original case, so `:term:` via intersphinx against an inventory built by Sphinx ≤ 3.0.0 (lowercased terms) won't match a capitalized target — intersphinx has no case-insensitive fallback. I left that alone as out of scope, but say the word and I'll add one.

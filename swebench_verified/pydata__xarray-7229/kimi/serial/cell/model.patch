@@ -1,0 +1,75 @@
+diff --git a/doc/whats-new.rst b/doc/whats-new.rst
+index 0c9ff5bd..95579753 100644
+--- a/doc/whats-new.rst
++++ b/doc/whats-new.rst
+@@ -62,6 +62,9 @@ Bug fixes
+   By `Michael Niklas <https://github.com/headtr1ck>`_.
+ - Fix static typing of :py:meth:`xr.polyval` (:issue:`7312`, :pull:`7315`).
+   By `Michael Niklas <https://github.com/headtr1ck>`_.
++- Ensure :py:func:`where` with ``keep_attrs=True`` does not overwrite the
++  attributes of coordinates with the attributes of the input variable
++  (:issue:`7183`).
+ 
+ Documentation
+ ~~~~~~~~~~~~~
+diff --git a/xarray/core/computation.py b/xarray/core/computation.py
+index 3f7e8f74..3d034906 100644
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -1857,13 +1857,9 @@ def where(cond, x, y, keep_attrs=None):
+     """
+     if keep_attrs is None:
+         keep_attrs = _get_keep_attrs(default=False)
+-    if keep_attrs is True:
+-        # keep the attributes of x, the second parameter, by default to
+-        # be consistent with the `where` method of `DataArray` and `Dataset`
+-        keep_attrs = lambda attrs, context: getattr(x, "attrs", {})
+ 
+     # alignment for three arguments is complicated, so don't support it yet
+-    return apply_ufunc(
++    result = apply_ufunc(
+         duck_array_ops.where,
+         cond,
+         x,
+@@ -1874,6 +1870,16 @@ def where(cond, x, y, keep_attrs=None):
+         keep_attrs=keep_attrs,
+     )
+ 
++    if keep_attrs is True:
++        # keep the attributes of x, the second parameter, by default to
++        # be consistent with the `where` method of `DataArray` and `Dataset`
++        # (applied after the fact so the attributes of the coordinates are
++        # not overwritten, see GH7183)
++        if hasattr(result, "attrs"):
++            result.attrs = getattr(x, "attrs", {})
++
++    return result
++
+ 
+ @overload
+ def polyval(
+diff --git a/xarray/tests/test_computation.py b/xarray/tests/test_computation.py
+index da1bd014..4e883bc3 100644
+--- a/xarray/tests/test_computation.py
++++ b/xarray/tests/test_computation.py
+@@ -1937,6 +1937,20 @@ def test_where_attrs() -> None:
+     assert actual.attrs == {}
+ 
+ 
++def test_where_attrs_on_coords() -> None:
++    # GH7183: keep_attrs=True should not overwrite coordinate attributes
++    # with the attributes of the input variable
++    x = xr.DataArray(
++        [1, 1],
++        dims="x",
++        coords={"x": ("x", [0, 1], {"attr": "coord"})},
++        attrs={"attr": "x"},
++    )
++    actual = xr.where(True, x, x, keep_attrs=True)
++    assert actual.attrs == {"attr": "x"}
++    assert actual.x.attrs == {"attr": "coord"}
++
++
+ @pytest.mark.parametrize(
+     "use_dask", [pytest.param(False, id="nodask"), pytest.param(True, id="dask")]
+ )

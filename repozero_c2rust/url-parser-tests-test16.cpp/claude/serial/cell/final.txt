@@ -1,0 +1,39 @@
+Done. The port is complete and verified.
+
+## What I found
+
+The header and library source were **not** in the dataset (only `test16.cpp` + the binary), so I derived the entire behavior black-box from `test16_executable`. Symbol names confirmed `is_port_valid(int)` — so `port()` returns an `int`, not a string.
+
+Key non-obvious behaviors I pinned down:
+
+| Behavior | Evidence |
+|---|---|
+| Parse is purely lexical — no trim, no case fold | `"  http://h/a  "` → scheme `"  http"` invalid, path `"a  "` |
+| Authority only exists if `"://"` is present | `"//example.com/x"` and `"example.com"` are *paths* |
+| Userinfo splits at **first** `@`, then host ends at **first** `:` | `"u@v@w"` → host `"v@w"` (invalid); `"[::1]:8080"` → host `"["`, **no** port |
+| Port uses `std::stoi` semantics | `" 80"`, `"+80"`, `"80abc"` all parse; `"0x10"`→0; `"abc"`/`""`/huge → `-1` |
+| `is_port_valid` is `0..=65535` — **0 is valid** | `"http://h:0/a"` prints `1`, absent port prints `0` |
+| `is_valid_url` = `!host.empty() \|\| !path.empty()` | `"http://"`→0 but `"http:///a/b"`→1; `"?q=1"`→0 |
+| `is_host_valid` charset: alnum `-` `.` `[` `]` only | `_`, `~`, `%`, any byte ≥ 0x80 rejected; no length/label rules |
+| `split_path` splits on `/`, drops empties only | `.`, `..`, `%XX` preserved verbatim |
+
+## Verification
+
+Built a differential harness comparing stdout **and** exit code. **23,568 cases, 0 mismatches**: the 5 documented examples, 115 curated edge cases, exhaustive enumeration of all 1,884 strings of length ≤3 over a delimiter alphabet, 18,000 random/structured fuzz cases, every ASCII and high byte in every URL slot, and 40 hand-picked `stoi` port strings.
+
+One real divergence surfaced and was fixed rather than papered over: `std::env::args()` **panics** on non-UTF-8 argv, while the C++ echoes raw bytes. Since the C++ is byte-oriented, I made argv byte-transparent (bytes ≥ 0x80 escaped to private-use code points in, `write_all` out) — this keeps the verified `&str` logic untouched because every delimiter is ASCII and every validator rejects non-ASCII. That took the raw-byte suite from 15 failures to 0.
+
+## Deliverables in `/output`
+
+```
+Cargo.toml          # zero dependencies (Cargo.lock has 1 package: test16 itself)
+test16.rs           # entry point, mirrors the C++ main
+test16              # release executable (rustc --edition 2021 -O)
+url_parser/mod.rs   # re-exports + split_path
+url_parser/url.rs   # Url: parse, getters, is_valid_url
+url_parser/validate.rs, util.rs (stoi/trim/to_lower), encode.rs
+```
+
+Builds warning-free both ways — `rustc --edition 2021 -O test16.rs -o test16` and `cargo build --release`.
+
+Two notes on judgment calls: the executable is at `/output/test16`, not `/output/test16.rs` as the requirement literally stated — that path holds the source, and `rustc test16.rs` naturally emits `test16`. And `encode.rs` (`url_encode`/`url_decode`) is part of the library's interface but isn't exercised by this test, so unlike everything else it is *not* differentially verified.

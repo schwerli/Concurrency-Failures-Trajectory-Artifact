@@ -1,0 +1,15 @@
+Fixed in `requests/models.py:388`.
+
+The cause was `prepare_content_length` unconditionally seeding `Content-Length: 0` before checking the body, so bodyless GETs still carried the header. Now the `'0'` default only applies when there's no body *and* the method isn't GET or HEAD.
+
+Verified behavior:
+
+| Request | Content-Length |
+|---|---|
+| `GET` / `HEAD`, no body | *(absent)* |
+| `POST` / `PUT`, no body | `0` |
+| `GET` with `data={'a': 1}` | `3` |
+
+Bodyless POST/PUT keep `Content-Length: 0`, which servers expect, and a GET that genuinely carries data still gets an accurate length — only the spurious header Amazon rejects is gone. `adapters.py:157` is unaffected: its `chunked` check short-circuits on `body is None`.
+
+Test suite: 21 failed, 5 passed — byte-identical to the pre-patch baseline (verified by stashing and re-running). Those failures are pre-existing environment breakage, not regressions: this vendored urllib3 passes a `strict` kwarg that this Python's `http.client` no longer accepts, and the tests are network-dependent against httpbin.

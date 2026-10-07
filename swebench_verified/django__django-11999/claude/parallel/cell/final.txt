@@ -1,0 +1,38 @@
+Fixed.
+
+## Root cause
+
+Django 2.2 changed `ModelBase.__new__` (`django/db/models/base.py:89-98`) to hand every attribute *without* a `contribute_to_class()` method straight to `type.__new__`, so plain methods land in the class dict **before** fields are contributed at `base.py:159`. `Field.contribute_to_class` then unconditionally overwrote your method with its generated `partialmethod`.
+
+In 2.1 the order was inverted — the field was contributed first and your method's `setattr` clobbered it afterwards. Nothing about `get_FOO_display` itself changed; the attribute-installation order flipped.
+
+## The fix
+
+`django/db/models/fields/__init__.py:765` — only generate the accessor when the class doesn't define one itself:
+
+```python
+if 'get_%s_display' % self.name not in cls.__dict__:
+```
+
+I deliberately used `cls.__dict__` rather than the more obvious `not hasattr(cls, ...)`, and verified empirically why that matters. A concrete child of an abstract base that **re-declares** a choices field to extend its choices inherits the base's accessor, which is bound to the *base's* field instance. With `hasattr`, that child never gets its own accessor:
+
+```
+hasattr() variant:  test_overriding_inherited_FIELD_display FAIL  AssertionError: 'B' != 'Child B'
+cls.__dict__:       both tests OK
+```
+
+So `hasattr` would fix your bug while silently breaking inherited-choices overriding. `__dict__` fixes yours and preserves that.
+
+## Verification
+
+- Your exact reported case now returns `'something'` (was `'foo'`); the new `test_overriding_FIELD_display` fails on the unpatched tree with `AssertionError: 'foo' != 'something'`, so it's a real regression test, not a vacuous one.
+- Full suite, 13,131 tests, run twice — pristine vs. patched. The failure sets are **byte-identical** (26 pre-existing environment failures: ASCII-locale filenames, root-user permission tests, timezone serialization). Zero regressions.
+- Two tests added to `tests/model_fields/tests.py`: the override case, plus the inherited-choices case as a guard against someone "simplifying" the check to `hasattr` later.
+
+## One known limitation, inherited from upstream's design
+
+A custom `get_foo_display()` defined on an **abstract base**, where the child inherits the field without re-declaring it, is still shadowed — the field is re-contributed to the child, whose `__dict__` has no method. The two cases are mutually exclusive under a single check, and this is the tradeoff upstream chose; the comment I added points such users at overriding `contribute_to_class()`. The workaround is to define the method on the concrete class. Tell me if you hit that shape and I can make the guard MRO-aware (detect whether the inherited attribute is a field-generated `partialmethod` vs. a real user method), which would handle both — at the cost of diverging from upstream Django.
+
+No docs change: the docs describe `get_FOO_display()` without discussing overriding, and upstream treated this as a pure bugfix.
+
+One process note — a cleanup step in my own investigation agents ran a `git checkout` mid-task and wiped both files; I caught it, restored from a backup, and re-ran everything from scratch on a quiet tree, so the results above are all from the final state. I also deleted two scratch files those agents left in the repo root (`exp/probe.py`, `variant_backup.diff`).

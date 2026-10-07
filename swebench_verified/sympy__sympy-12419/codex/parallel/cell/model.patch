@@ -1,0 +1,132 @@
+diff --git a/sympy/concrete/summations.py b/sympy/concrete/summations.py
+index 372487664..5c66d6f53 100644
+--- a/sympy/concrete/summations.py
++++ b/sympy/concrete/summations.py
+@@ -866,6 +866,13 @@ def eval_sum(f, limits):
+                     return None
+                 newargs.append((newexpr, arg.cond))
+             return f.func(*newargs)
++        if len(f.args) == 2 and f.args[1].expr is S.Zero and f.args[1].cond == True:
++            from sympy import Interval
++            if f.args[0].cond == Interval(a, b).as_relational(i):
++                value = eval_sum(f.args[0].expr, limits)
++                if value is not None:
++                    return value
++                return Sum(f.args[0].expr, limits)
+ 
+     if f.has(KroneckerDelta) and _has_simple_delta(f, limits[0]):
+         return deltasummation(f, limits)
+diff --git a/sympy/concrete/tests/test_sums_products.py b/sympy/concrete/tests/test_sums_products.py
+index 1e3a81141..75300d3c5 100644
+--- a/sympy/concrete/tests/test_sums_products.py
++++ b/sympy/concrete/tests/test_sums_products.py
+@@ -557,6 +557,8 @@ def test_Sum_doit():
+     assert Sum(KroneckerDelta(m, n), (m, -oo, oo)).doit() == Piecewise((1, And(-oo < n, n < oo)), (0, True))
+     assert Sum(x*KroneckerDelta(m, n), (m, -oo, oo)).doit() == Piecewise((x, And(-oo < n, n < oo)), (0, True))
+     assert Sum(Sum(KroneckerDelta(m, n), (m, 1, 3)), (n, 1, 3)).doit() == 3
++    p = Symbol('p', integer=True, positive=True)
++    assert Sum(Sum(KroneckerDelta(m, n), (m, 0, p - 1)), (n, 0, p - 1)).doit() == p
+     assert Sum(Sum(KroneckerDelta(k, m), (m, 1, 3)), (n, 1, 3)).doit() == \
+            3 * Piecewise((1, And(S(1) <= k, k <= 3)), (0, True))
+     assert Sum(f(n) * Sum(KroneckerDelta(m, n), (m, 0, oo)), (n, 1, 3)).doit() == \
+@@ -570,7 +572,7 @@ def test_Sum_doit():
+     # issue 2597
+     nmax = symbols('N', integer=True, positive=True)
+     pw = Piecewise((1, And(S(1) <= n, n <= nmax)), (0, True))
+-    assert Sum(pw, (n, 1, nmax)).doit() == Sum(pw, (n, 1, nmax))
++    assert Sum(pw, (n, 1, nmax)).doit() == nmax
+ 
+     q, s = symbols('q, s')
+     assert summation(1/n**(2*s), (n, 1, oo)) == Piecewise((zeta(2*s), 2*s > 1),
+diff --git a/sympy/matrices/expressions/diagonal.py b/sympy/matrices/expressions/diagonal.py
+index a0dc57a35..958d0907b 100644
+--- a/sympy/matrices/expressions/diagonal.py
++++ b/sympy/matrices/expressions/diagonal.py
+@@ -1,14 +1,15 @@
+ from __future__ import print_function, division
+ 
+-from sympy.matrices.expressions import MatrixExpr
+ from sympy.core import S
++from sympy.matrices.expressions import MatrixExpr
+ 
+ class DiagonalMatrix(MatrixExpr):
+     arg = property(lambda self: self.args[0])
+     shape = property(lambda self: (self.arg.shape[0], self.arg.shape[0]))
+ 
+     def _entry(self, i, j):
+-        return S.Zero if i != j else self.arg[i, 0]
++        from sympy import KroneckerDelta
++        return KroneckerDelta(i, j)*self.arg[i, 0]
+ 
+ class DiagonalOf(MatrixExpr):
+     arg = property(lambda self: self.args[0])
+diff --git a/sympy/matrices/expressions/matexpr.py b/sympy/matrices/expressions/matexpr.py
+index b4d759836..cd6770d69 100644
+--- a/sympy/matrices/expressions/matexpr.py
++++ b/sympy/matrices/expressions/matexpr.py
+@@ -476,10 +476,8 @@ def conjugate(self):
+         return self
+ 
+     def _entry(self, i, j):
+-        if i == j:
+-            return S.One
+-        else:
+-            return S.Zero
++        from sympy import KroneckerDelta
++        return KroneckerDelta(i, j)
+ 
+     def _eval_determinant(self):
+         return S.One
+diff --git a/sympy/matrices/expressions/tests/test_diagonal.py b/sympy/matrices/expressions/tests/test_diagonal.py
+index d6aa947e2..aafeda2b8 100644
+--- a/sympy/matrices/expressions/tests/test_diagonal.py
++++ b/sympy/matrices/expressions/tests/test_diagonal.py
+@@ -1,6 +1,6 @@
+ from sympy.matrices.expressions import MatrixSymbol
+ from sympy.matrices.expressions.diagonal import DiagonalMatrix, DiagonalOf
+-from sympy import Symbol, ask, Q
++from sympy import Symbol, ask, Q, KroneckerDelta, Sum, symbols
+ 
+ n = Symbol('n')
+ x = MatrixSymbol('x', n, 1)
+@@ -13,6 +13,16 @@ def test_DiagonalMatrix():
+     assert D[1, 2] == 0
+     assert D[1, 1] == x[1, 0]
+ 
++def test_DiagonalMatrix_symbolic_index():
++    p = Symbol('p', integer=True, positive=True)
++    i, j = symbols('i j', integer=True)
++    y = MatrixSymbol('y', p, 1)
++    D = DiagonalMatrix(y)
++    result = Sum(Sum(D[i, j], (i, 0, p - 1)), (j, 0, p - 1)).doit()
++    assert D[i, j] == KroneckerDelta(i, j)*y[i, 0]
++    assert result.function.subs(result.variables[0], i) == y[i, 0]
++    assert result.limits == ((result.variables[0], 0, p - 1),)
++
+ def test_DiagonalMatrix_Assumptions():
+     assert ask(Q.diagonal(D))
+ 
+diff --git a/sympy/matrices/expressions/tests/test_indexing.py b/sympy/matrices/expressions/tests/test_indexing.py
+index d69ef682d..52fb051eb 100644
+--- a/sympy/matrices/expressions/tests/test_indexing.py
++++ b/sympy/matrices/expressions/tests/test_indexing.py
+@@ -1,5 +1,5 @@
+ from sympy import (symbols, MatrixSymbol, MatPow, BlockMatrix,
+-        Identity, ZeroMatrix, ImmutableMatrix, eye, Sum)
++        Identity, ZeroMatrix, ImmutableMatrix, eye, Sum, KroneckerDelta)
+ from sympy.utilities.pytest import raises
+ 
+ k, l, m, n = symbols('k l m n', integer=True)
+@@ -54,6 +54,12 @@ def test_Identity_index():
+     assert I[1, 0] == I[0, 1] == I[2, 1] == 0
+     raises(IndexError, lambda: I[3, 3])
+ 
++def test_Identity_symbolic_index():
++    p = symbols('p', integer=True, positive=True)
++    I = Identity(p)
++    assert I[i, j] == KroneckerDelta(i, j)
++    assert Sum(Sum(I[i, j], (i, 0, p - 1)), (j, 0, p - 1)).doit() == p
++
+ 
+ def test_block_index():
+     I = Identity(3)

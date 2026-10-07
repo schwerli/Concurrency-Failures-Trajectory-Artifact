@@ -1,0 +1,577 @@
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..6122117da2 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -11,6 +11,7 @@ import logging
+ import socket
+ import socketserver
+ import sys
++from collections import deque
+ from wsgiref import simple_server
+ 
+ from django.core.exceptions import ImproperlyConfigured
+@@ -147,6 +148,18 @@ class ServerHandler(simple_server.ServerHandler):
+         self.get_stdin().read()
+         super().close()
+ 
++    def finish_response(self):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            try:
++                deque(self.result, maxlen=0)  # Consume iterator needed for CONTENT_LENGTH.
++            except TypeError:
++                pass  # Don't choke if the response isn't iterable.
++            else:
++                self.finish_content()
++            self.close()
++        else:
++            super().finish_response()
++
+ 
+ class WSGIRequestHandler(simple_server.WSGIRequestHandler):
+     protocol_version = "HTTP/1.1"
+diff --git a/probe/harness.py b/probe/harness.py
+new file mode 100644
+index 0000000000..b63aab100e
+--- /dev/null
++++ b/probe/harness.py
+@@ -0,0 +1,167 @@
++"""Probe wsgiref/Django ServerHandler behavior for HEAD requests.
++
++Usage: python harness.py <variant>
++variants: baseline, deque_sendheaders, deque_finish_content, close_only,
++          write_noop, write_noop_bookkeeping, finally_close
++"""
++import os, socket, sys, threading, time
++from collections import deque
++
++import django
++from django.conf import settings
++
++settings.configure(DEBUG=False, ALLOWED_HOSTS=["*"], DATABASES={}, SECRET_KEY="x")
++django.setup()
++
++from django.core.servers import basehttp
++
++VARIANT = sys.argv[1]
++
++
++class V(basehttp.ServerHandler):
++    pass
++
++
++if VARIANT == "deque_sendheaders":
++    def finish_response(self):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            try:
++                deque(self.result, maxlen=0)  # Consume iterator.
++                self.send_headers()
++            except:  # noqa
++                if hasattr(self.result, "close"):
++                    self.result.close()
++                raise
++            else:
++                self.close()
++        else:
++            super(V, self).finish_response()
++    V.finish_response = finish_response
++elif VARIANT == "finally_close":
++    def finish_response(self):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            try:
++                deque(self.result, maxlen=0)
++                self.send_headers()
++            finally:
++                self.close()
++        else:
++            super(V, self).finish_response()
++    V.finish_response = finish_response
++elif VARIANT == "deque_finish_content":
++    def finish_response(self):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            try:
++                deque(self.result, maxlen=0)
++                self.finish_content()
++            finally:
++                self.close()
++        else:
++            super(V, self).finish_response()
++    V.finish_response = finish_response
++elif VARIANT == "close_only":
++    def finish_response(self):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            self.close()   # nothing else at all
++        else:
++            super(V, self).finish_response()
++    V.finish_response = finish_response
++elif VARIANT == "write_noop":
++    def write(self, data):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            return
++        super(V, self).write(data)
++    V.write = write
++elif VARIANT == "write_noop_bookkeeping":
++    def write(self, data):
++        if self.environ["REQUEST_METHOD"] != "HEAD":
++            return super(V, self).write(data)
++        if not self.status:
++            raise AssertionError("write() before start_response()")
++        elif not self.headers_sent:
++            self.bytes_sent = len(data)
++            self.send_headers()
++        else:
++            self.bytes_sent += len(data)
++    V.write = write
++
++basehttp.ServerHandler = V   # patched into handle_one_request
++
++
++def app(environ, start_response):
++    path = environ["PATH_INFO"]
++    if path == "/cl/":            # app sets Content-Length (like CommonMiddleware)
++        body = b"hello world body"
++        start_response("200 OK", [("Content-Type", "text/plain"),
++                                  ("Content-Length", str(len(body)))])
++        return [body]
++    if path == "/nocl/":          # single-block list, no Content-Length
++        start_response("200 OK", [("Content-Type", "text/plain")])
++        return [b"hello world body"]
++    if path == "/stream/":        # streaming, no Content-Length, len() fails
++        start_response("200 OK", [("Content-Type", "text/plain")])
++        def gen():
++            yield b"chunk1"
++            yield b"chunk2"
++        return gen()
++    if path == "/boom/":          # raises while iterating
++        start_response("200 OK", [("Content-Type", "text/plain")])
++        def gen():
++            yield b"partial"
++            raise ValueError("boom while iterating")
++        return gen()
++    if path == "/boom-first/":    # raises on first next()
++        start_response("200 OK", [("Content-Type", "text/plain")])
++        def gen():
++            raise ValueError("boom immediately")
++            yield b""
++        return gen()
++    start_response("404 Not Found", [("Content-Type", "text/plain"),
++                                     ("Content-Length", "0")])
++    return [b""]
++
++
++srv = basehttp.ThreadedWSGIServer(("127.0.0.1", 0), basehttp.WSGIRequestHandler)
++srv.set_app(app)
++port = srv.server_address[1]
++threading.Thread(target=srv.serve_forever, daemon=True).start()
++
++
++def req(method, path, keepalive=True):
++    s = socket.create_connection(("127.0.0.1", port), timeout=3)
++    hdr = "Connection: keep-alive" if keepalive else "Connection: close"
++    s.sendall(f"{method} {path} HTTP/1.1\r\nHost: t\r\n{hdr}\r\n\r\n".encode())
++    buf = b""
++    try:
++        while True:
++            d = s.recv(65536)
++            if not d:
++                break
++            buf += d
++            if b"\r\n\r\n" in buf and method == "HEAD":
++                # give server a moment to send a (wrong) body if it will
++                time.sleep(0.15)
++                s.settimeout(0.3)
++                try:
++                    while True:
++                        d = s.recv(65536)
++                        if not d:
++                            break
++                        buf += d
++                except socket.timeout:
++                    pass
++                break
++    except socket.timeout:
++        buf += b"<<TIMEOUT: server sent nothing / kept connection open>>"
++    s.close()
++    return buf
++
++
++print("=" * 70)
++print("VARIANT:", VARIANT)
++for path in ["/cl/", "/nocl/", "/stream/", "/boom/", "/boom-first/"]:
++    for method in ["GET", "HEAD"]:
++        raw = req(method, path)
++        print("-" * 70)
++        print(f"{method} {path} ->")
++        print(repr(raw))
+diff --git a/probe/harness2.py b/probe/harness2.py
+new file mode 100644
+index 0000000000..5699b3d1a4
+--- /dev/null
++++ b/probe/harness2.py
+@@ -0,0 +1,318 @@
++"""Exhaustive probe of HEAD-suppression strategies for Django's ServerHandler.
++
++Usage: python harness2.py <variant>
++variants: baseline, deque_finish_content, deque_send_headers, close_only,
++          write_noop, write_noop_bookkeeping, recommended
++"""
++import logging
++import os
++import socket
++import sys
++import tempfile
++import threading
++import time
++from collections import deque
++
++import django
++from django.conf import settings
++
++settings.configure(DEBUG=False, ALLOWED_HOSTS=["*"], DATABASES={}, SECRET_KEY="x")
++django.setup()
++
++from django.core.servers import basehttp  # noqa: E402
++
++VARIANT = sys.argv[1]
++
++LOGS = []
++
++
++class Collect(logging.Handler):
++    def emit(self, record):
++        LOGS.append(record.getMessage())
++
++
++logging.getLogger("django.server").addHandler(Collect())
++logging.getLogger("django.server").setLevel(logging.DEBUG)
++logging.getLogger("django.server").propagate = False
++
++CLOSED = []
++
++
++class V(basehttp.ServerHandler):
++    pass
++
++
++if VARIANT == "baseline":
++    # Pure stdlib BaseHandler.finish_response (revert Django's override).
++    V.finish_response = basehttp.simple_server.ServerHandler.finish_response
++elif VARIANT == "deque_finish_content":
++    def finish_response(self):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            try:
++                deque(self.result, maxlen=0)  # Consume iterator for CONTENT_LENGTH.
++            except TypeError:
++                pass  # Don't choke if the response isn't iterable.
++            else:
++                self.finish_content()
++            self.close()
++        else:
++            super(V, self).finish_response()
++    V.finish_response = finish_response
++elif VARIANT == "deque_send_headers":
++    def finish_response(self):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            try:
++                deque(self.result, maxlen=0)
++                self.send_headers()
++            except Exception:
++                if hasattr(self.result, "close"):
++                    self.result.close()
++                raise
++            else:
++                self.close()
++        else:
++            super(V, self).finish_response()
++    V.finish_response = finish_response
++elif VARIANT == "close_only":
++    def finish_response(self):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            self.close()
++        else:
++            super(V, self).finish_response()
++    V.finish_response = finish_response
++elif VARIANT == "write_noop":
++    def write(self, data):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            return
++        super(V, self).write(data)
++    V.write = write
++elif VARIANT == "write_noop_bookkeeping":
++    def write(self, data):
++        if self.environ["REQUEST_METHOD"] != "HEAD":
++            return super(V, self).write(data)
++        assert type(data) is bytes
++        if not self.status:
++            raise AssertionError("write() before start_response()")
++        elif not self.headers_sent:
++            self.bytes_sent = len(data)
++            self.send_headers()
++        else:
++            self.bytes_sent += len(data)
++    V.write = write
++elif VARIANT == "recommended":
++    def finish_response(self):
++        if self.environ["REQUEST_METHOD"] == "HEAD":
++            try:
++                for data in self.result:
++                    # Account for the body without writing it: keeps
++                    # bytes_sent/set_content_length identical to a GET.
++                    if not self.headers_sent:
++                        self.bytes_sent = len(data)
++                        self.send_headers()
++                    else:
++                        self.bytes_sent += len(data)
++                self.finish_content()
++            except Exception:
++                if hasattr(self.result, "close"):
++                    self.result.close()
++                raise
++            else:
++                self.close()
++        else:
++            super(V, self).finish_response()
++    V.finish_response = finish_response
++
++basehttp.ServerHandler = V
++
++
++BIG = tempfile.NamedTemporaryFile(suffix=".bin", delete=False)
++BIG.write(b"x" * 40000)
++BIG.close()
++
++
++class TrackedIterable:
++    """Single-block iterable that records close() calls (PEP 3333 §Middleware)."""
++
++    def __init__(self, blocks, tag):
++        self.blocks = blocks
++        self.tag = tag
++
++    def __iter__(self):
++        return iter(self.blocks)
++
++    def __len__(self):
++        return len(self.blocks)
++
++    def close(self):
++        CLOSED.append(self.tag)
++
++
++def app(environ, start_response):
++    path = environ["PATH_INFO"]
++    if path == "/cl/":  # app sets Content-Length (Django + CommonMiddleware)
++        body = b"example view"
++        start_response(
++            "200 OK",
++            [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))],
++        )
++        return [body]
++    if path == "/nocl/":  # single block, no Content-Length
++        start_response("200 OK", [("Content-Type", "text/plain")])
++        return [b"example view"]
++    if path == "/multi/":  # multi-block list, no Content-Length
++        start_response("200 OK", [("Content-Type", "text/plain")])
++        return [b"aaaaa", b"bbbbbbb"]
++    if path == "/stream/":  # generator, no len(), no Content-Length
++        start_response("200 OK", [("Content-Type", "text/plain")])
++
++        def gen():
++            yield b"chunk1"
++            yield b"chunk2"
++
++        return gen()
++    if path == "/filewrap/":  # FileResponse-like: wsgi.file_wrapper + CL
++        f = open(BIG.name, "rb")
++        size = os.path.getsize(BIG.name)
++        start_response(
++            "200 OK",
++            [
++                ("Content-Type", "application/octet-stream"),
++                ("Content-Length", str(size)),
++            ],
++        )
++        return environ["wsgi.file_wrapper"](f, 8192)
++    if path == "/tracked/":  # verifies result.close() is invoked
++        start_response("200 OK", [("Content-Type", "text/plain")])
++        return TrackedIterable([b"tracked-body"], "tracked")
++    if path == "/boom/":  # raises mid-iteration
++        start_response("200 OK", [("Content-Type", "text/plain")])
++
++        def gen():
++            yield b"partial"
++            raise ValueError("boom while iterating")
++
++        return gen()
++    if path == "/boom-type/":  # app raises TypeError mid-iteration
++        start_response("200 OK", [("Content-Type", "text/plain")])
++
++        def gen():
++            yield b"partial"
++            raise TypeError("app bug: TypeError from the app, not from iter()")
++
++        return gen()
++    if path == "/noniter/":  # PEP 3333 violation: not iterable at all
++        start_response("200 OK", [("Content-Type", "text/plain")])
++        return None
++    if path == "/tracked-boom/":  # closeable iterable that raises mid-iteration
++
++        class T:
++            def __iter__(self):
++                yield b"partial"
++                raise ValueError("boom")
++
++            def close(self):
++                CLOSED.append("tracked-boom")
++
++        start_response("200 OK", [("Content-Type", "text/plain")])
++        return T()
++    if path == "/empty/":  # 304-ish: single empty block, no CL
++        start_response("304 Not Modified", [])
++        return [b""]
++    start_response("404 Not Found", [("Content-Length", "0")])
++    return [b""]
++
++
++srv = basehttp.ThreadedWSGIServer(("127.0.0.1", 0), basehttp.WSGIRequestHandler)
++srv.set_app(app)
++PORT = srv.server_address[1]
++threading.Thread(target=srv.serve_forever, daemon=True).start()
++
++
++def drain(s, method):
++    buf = b""
++    s.settimeout(0.6)
++    try:
++        while True:
++            d = s.recv(65536)
++            if not d:
++                break
++            buf += d
++            if method == "HEAD" and b"\r\n\r\n" in buf:
++                # Wait to see whether a (wrong) body follows the headers.
++                time.sleep(0.15)
++                try:
++                    while True:
++                        d = s.recv(65536)
++                        if not d:
++                            break
++                        buf += d
++                except (socket.timeout, TimeoutError):
++                    buf += b"<<open>>"
++                break
++    except (socket.timeout, TimeoutError):
++        buf += b"<<TIMEOUT>>"
++    return buf
++
++
++def req(method, path):
++    s = socket.create_connection(("127.0.0.1", PORT), timeout=2)
++    s.sendall(
++        f"{method} {path} HTTP/1.1\r\nHost: t\r\nConnection: keep-alive\r\n\r\n".encode()
++    )
++    buf = drain(s, method)
++    s.close()
++    return buf
++
++
++def keepalive_pair(path):
++    """Two HEADs on one connection: does the second one get served?"""
++    s = socket.create_connection(("127.0.0.1", PORT), timeout=2)
++    out = []
++    for _ in range(2):
++        try:
++            s.sendall(f"HEAD {path} HTTP/1.1\r\nHost: t\r\n\r\n".encode())
++        except OSError as e:
++            out.append(b"<<send failed: %s>>" % str(e).encode())
++            break
++        out.append(drain(s, "HEAD"))
++    s.close()
++    return out
++
++
++def show(label, raw):
++    print("-" * 72)
++    print(label)
++    print("   ", repr(raw))
++
++
++print("=" * 72)
++print("VARIANT:", VARIANT)
++for path in [
++    "/cl/",
++    "/nocl/",
++    "/multi/",
++    "/stream/",
++    "/filewrap/",
++    "/tracked/",
++    "/empty/",
++    "/boom/",
++    "/boom-type/",
++    "/noniter/",
++    "/tracked-boom/",
++]:
++    for method in ["GET", "HEAD"]:
++        del LOGS[:]
++        del CLOSED[:]
++        raw = req(method, path)
++        time.sleep(0.05)
++        show(f"{method} {path}", raw)
++        print("     log:", LOGS, " closed:", CLOSED)
++
++print("-" * 72)
++print("keep-alive, two HEAD /cl/ on one connection:")
++for i, r in enumerate(keepalive_pair("/cl/")):
++    print(f"    #{i}:", repr(r))
++print("keep-alive, two HEAD /stream/ on one connection:")
++for i, r in enumerate(keepalive_pair("/stream/")):
++    print(f"    #{i}:", repr(r))
++os.unlink(BIG.name)
+diff --git a/tests/servers/tests.py b/tests/servers/tests.py
+index 8796db9749..820f86489e 100644
+--- a/tests/servers/tests.py
++++ b/tests/servers/tests.py
+@@ -280,6 +280,44 @@ class LiveServerViews(LiveServerBase):
+         finally:
+             conn.close()
+ 
++    def test_head_request_does_not_return_body(self):
++        conn = HTTPConnection(
++            LiveServerViews.server_thread.host,
++            LiveServerViews.server_thread.port,
++            timeout=1,
++        )
++        try:
++            conn.request("HEAD", "/example_view/", headers={"Connection": "close"})
++            response = conn.getresponse()
++            self.assertEqual(response.status, 200)
++            self.assertEqual(response.getheader("Content-Length"), "12")
++            self.assertEqual(response.read(), b"")
++        finally:
++            conn.close()
++
++    def test_head_request_raw_socket(self):
++        s = socket.create_connection(
++            (LiveServerViews.server_thread.host, LiveServerViews.server_thread.port),
++            timeout=1,
++        )
++        try:
++            s.sendall(
++                b"HEAD /example_view/ HTTP/1.1\r\n"
++                b"Host: localhost\r\nConnection: close\r\n\r\n"
++            )
++            chunks = []
++            while True:
++                data = s.recv(4096)
++                if not data:
++                    break
++                chunks.append(data)
++        finally:
++            s.close()
++        raw = b"".join(chunks)
++        print("RAW RESPONSE:", raw)
++        headers, _, body = raw.partition(b"\r\n\r\n")
++        self.assertEqual(body, b"")
++
+     def test_404(self):
+         with self.assertRaises(HTTPError) as err:
+             self.urlopen("/")

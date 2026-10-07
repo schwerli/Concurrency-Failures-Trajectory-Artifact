@@ -1,0 +1,34 @@
+## Root cause
+
+`make html epub` shares one doctree/env directory (`-d _build/doctrees`). The old code only guarded the *read* phase:
+
+```python
+if app.builder.name.startswith("epub") and not env.config.viewcode_enable_epub:
+    return   # in doctree_read
+```
+
+By the time the epub build runs, the html build has already populated `env._viewcode_modules` and written doctrees containing the `[source]` xrefs. The epub build reads nothing new (nothing outdated), so that guard never fires — and `collect_pages` happily wrote `_modules/*.xhtml` from the inherited env.
+
+## Fix (`sphinx/ext/viewcode.py`)
+
+Because the doctree is shared between builders, the decision can't be made at read time — it has to be made per-builder, at resolve time:
+
+- Added `is_supported_builder(builder)` — one place encoding "html format, not singlehtml, not epub unless `viewcode_enable_epub`".
+- `doctree_read` now inserts a placeholder `viewcode_anchor` node instead of an `only(expr='html')` + `pending_xref`, and no longer bails out per-builder (so the collected info is builder-independent and deterministic).
+- New `ViewcodeAnchorTransform` post-transform converts those anchors into real refnodes for supported builders and **removes** them otherwise.
+- `collect_pages` returns early for unsupported builders.
+- `missing_reference` is kept (with a `RemovedInSphinx50Warning`) so doctrees pickled by older Sphinx still resolve.
+
+## Verification
+
+Reproduced the bug first, on a copy of `tests/roots/test-ext-viewcode`:
+
+| build order (shared doctrees) | before | after |
+|---|---|---|
+| html → epub | `epub/_modules/spam/mod{1,2}.xhtml` created | no `_modules`, 0 `[source]` links in epub, html keeps its 10 |
+| epub → html | — | no epub pages; html still gets pages + links |
+| `viewcode_enable_epub=1` | pages created | pages created (unchanged) |
+
+The naive fix (guard in `collect_pages` only) left dangling `[source]` links in `index.xhtml` pointing at pages that no longer existed; the transform approach fixes that too, in both build orders. singlehtml/latex/text still build clean with anchors stripped.
+
+Tests: added `test_viewcode_epub_default` / `test_viewcode_epub_enabled`; both pass. Full suite is unchanged — **130 failures before and after, identical set** (pre-existing pygments/docutils version drift in this env, e.g. `test_viewcode`'s `<span class="k">` expectations). Also added a CHANGES entry.

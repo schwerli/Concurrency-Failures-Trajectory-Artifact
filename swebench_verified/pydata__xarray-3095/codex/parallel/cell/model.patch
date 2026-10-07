@@ -1,0 +1,98 @@
+diff --git a/xarray/core/variable.py b/xarray/core/variable.py
+index 379be8f5..4dc056af 100644
+--- a/xarray/core/variable.py
++++ b/xarray/core/variable.py
+@@ -1947,7 +1947,8 @@ class IndexVariable(Variable):
+                 # point, which doesn't have a copy method, so make a deep copy
+                 # of the underlying `pandas.MultiIndex` and create a new
+                 # `PandasIndexAdapter` instance with it.
+-                data = PandasIndexAdapter(self._data.array.copy(deep=True))
++                data = PandasIndexAdapter(self._data.array.copy(deep=True),
++                                          dtype=self._data.dtype)
+             else:
+                 data = self._data
+         else:
+diff --git a/xarray/tests/test_dataarray.py b/xarray/tests/test_dataarray.py
+index 5697704b..38817ce7 100644
+--- a/xarray/tests/test_dataarray.py
++++ b/xarray/tests/test_dataarray.py
+@@ -2,7 +2,7 @@ import pickle
+ import sys
+ import warnings
+ from collections import OrderedDict
+-from copy import deepcopy
++from copy import copy, deepcopy
+ from textwrap import dedent
+ 
+ import numpy as np
+@@ -3480,6 +3480,24 @@ class TestDataArray:
+ 
+         assert_identical(da['a'], expected_orig)
+ 
++    @pytest.mark.parametrize('copier', [
++        lambda da: da.copy(deep=True),
++        lambda da: da.copy(deep=False),
++        deepcopy,
++        copy,
++    ])
++    def test_copy_preserves_unicode_index_dtype(self, copier):
++        da = xr.DataArray(
++            ['baz'],
++            dims='x',
++            coords={'x': ['foo'], 'y': ('x', ['bar'])})
++
++        copied = copier(da)
++
++        assert_identical(da, copied)
++        assert copied.x.dtype == da.x.dtype
++        assert copied.x.dtype.kind == 'U'
++
+     def test_real_and_imag(self):
+         array = DataArray(1 + 2j)
+         assert_identical(array.real, DataArray(1))
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index fc6f7f36..fa0ca753 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -2069,6 +2069,22 @@ class TestDataset:
+ 
+             assert data.attrs['Test'] is not copied.attrs['Test']
+ 
++    @pytest.mark.parametrize('copier', [
++        lambda ds: ds.copy(deep=True),
++        deepcopy,
++        copy,
++    ])
++    def test_copy_preserves_unicode_index_dtype(self, copier):
++        data = Dataset(
++            coords={'x': ['foo'], 'y': ('x', ['bar'])},
++            data_vars={'z': ('x', ['baz'])})
++
++        copied = copier(data)
++
++        assert_identical(data, copied)
++        assert copied.x.dtype == data.x.dtype
++        assert copied.x.dtype.kind == 'U'
++
+     def test_copy_with_data(self):
+         orig = create_test_data()
+         new_data = {k: np.random.randn(*v.shape)
+diff --git a/xarray/tests/test_variable.py b/xarray/tests/test_variable.py
+index 73d2a40b..45b0656d 100644
+--- a/xarray/tests/test_variable.py
++++ b/xarray/tests/test_variable.py
+@@ -1897,6 +1897,14 @@ class TestIndexVariable(VariableSubclassobjects):
+         v = IndexVariable('t', t)
+         assert v[0].data == t[0]
+ 
++    @pytest.mark.parametrize('deep', [True, False])
++    def test_copy_unicode_index(self, deep):
++        v = IndexVariable('x', np.array(['foo', 'bar']))
++        w = v.copy(deep=deep)
++        assert_identical(v, w)
++        assert v.dtype == w.dtype
++        assert w.dtype.kind == 'U'
++
+     # These tests make use of multi-dimensional variables, which are not valid
+     # IndexVariable objects:
+     @pytest.mark.xfail

@@ -1,0 +1,58 @@
+diff --git a/django/contrib/sessions/backends/base.py b/django/contrib/sessions/backends/base.py
+index b5453160a5..ff0c286485 100644
+--- a/django/contrib/sessions/backends/base.py
++++ b/django/contrib/sessions/backends/base.py
+@@ -104,10 +104,13 @@ class SessionBase:
+     def _hash(self, value):
+         # RemovedInDjango40Warning: pre-Django 3.1 format will be invalid.
+         key_salt = "django.contrib.sessions" + self.__class__.__name__
+-        return salted_hmac(key_salt, value).hexdigest()
++        return salted_hmac(key_salt, value, algorithm='sha256').hexdigest()  # MUTATION D
+ 
+     def encode(self, session_dict):
+         "Return the given session dictionary serialized and encoded as a string."
++        # RemovedInDjango40Warning: DEFAULT_HASHING_ALGORITHM will be removed.
++        if settings.DEFAULT_HASHING_ALGORITHM == 'sha1':
++            return self._legacy_encode(session_dict)
+         return signing.dumps(
+             session_dict, salt=self.key_salt, serializer=self.serializer,
+             compress=True,
+@@ -121,6 +124,12 @@ class SessionBase:
+         except Exception:
+             return self._legacy_decode(session_data)
+ 
++    def _legacy_encode(self, session_dict):
++        # RemovedInDjango40Warning.
++        serialized = self.serializer().dumps(session_dict)
++        hash = self._hash(serialized)
++        return base64.b64encode(hash.encode() + b';' + serialized).decode('ascii')
++
+     def _legacy_decode(self, session_data):
+         # RemovedInDjango40Warning: pre-Django 3.1 format will be invalid.
+         encoded_data = base64.b64decode(session_data.encode('ascii'))
+diff --git a/tests/sessions_tests/tests.py b/tests/sessions_tests/tests.py
+index 248dae82aa..bae9ecf402 100644
+--- a/tests/sessions_tests/tests.py
++++ b/tests/sessions_tests/tests.py
+@@ -34,6 +34,7 @@ from django.test import (
+     RequestFactory, TestCase, ignore_warnings, override_settings,
+ )
+ from django.utils import timezone
++from django.utils.deprecation import RemovedInDjango40Warning
+ 
+ from .models import SessionStore as CustomDatabaseSession
+ 
+@@ -330,6 +331,13 @@ class SessionTestsMixin:
+         # The failed decode is logged.
+         self.assertIn('corrupted', cm.output[0])
+ 
++    @ignore_warnings(category=RemovedInDjango40Warning)
++    def test_default_hashing_algorith_legacy_decode(self):
++        with override_settings(DEFAULT_HASHING_ALGORITHM='sha1'):
++            data = {'a test key': 'a test value'}
++            encoded = self.session.encode(data)
++            self.assertEqual(self.session._legacy_decode(encoded), data)
++
+     def test_actual_expiry(self):
+         # this doesn't work with JSONSerializer (serializing timedelta)
+         with override_settings(SESSION_SERIALIZER='django.contrib.sessions.serializers.PickleSerializer'):

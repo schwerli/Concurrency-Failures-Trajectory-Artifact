@@ -1,0 +1,39 @@
+Done. The migration is complete and verified.
+
+## Project structure (`/output`)
+
+```
+Cargo.toml              lib url_parser + [[bin]] test18 → test18.rs
+test18.rs               entry point (package root, as required)
+test18                  compiled executable
+src/lib.rs              crate root
+src/url_parser/mod.rs   URL struct, getters, has_*, Display, is_valid
+src/url_parser/split.rs component-splitting rules
+src/url_parser/port.rs  std::stoi emulation
+tests/url_parser.rs     10 regression tests
+```
+
+Pure `std`, edition 2021, zero dependencies, zero warnings.
+
+## Behaviors recovered black-box from the binary
+
+The header was not present, so I reverse-engineered the semantics by probing. The non-obvious ones:
+
+- **Scheme needs literal `://`** — `mailto:user@example.com` and `http:/example.com` have *no* scheme; the whole string lands in the path. Scheme is ASCII-lowercased; nothing else is (`HTTPÉ://host` → `httpÉ`).
+- **Parse order is fragment → query → scheme.** This was the bug the fuzzer caught in my first version: a `://` sitting inside a query or fragment must not create a scheme, so `-1?://://Ahttp#x` is a path-only URL.
+- **`authority()` is reconstructed, not the original slice** — so an unparseable port is silently dropped: `http://example.com:99999` reports authority `example.com` and round-trips *lossily*.
+- **`has_authority()` tracks the host alone** — `http://user@` renders a non-empty authority yet reports `has_authority() == 0`.
+- **Port is `std::stoi` + a range check**: skips leading whitespace, takes a sign, ignores trailing garbage (`80x` → 80, `8 0` → 8), and yields `-1` outside `0..=65535`. `-0` → port 0.
+- **Host splits on the first `:`**, so IPv6 literals are truncated: `http://[::1]:8080/p` → host `[`, port `-1`. Faithfully reproduced rather than "fixed".
+- **`to_string()` emits the authority only alongside a scheme** — `://host` parses to host `host` but renders as the empty string.
+- **`is_valid()` = has a host **or** a path**, independent of scheme.
+
+## Verification
+
+- 5 documented examples: **byte-identical** via `cmp`.
+- 72-case curated edge-case suite: **72/72**.
+- Differential fuzzing against the C++ binary, alphabet including `://`, control chars, whitespace and multi-byte UTF-8: **~85,000 cases, 0 mismatches** across 6 seeds.
+- Exit codes match (`1` on missing arg, `0` otherwise); stderr empty.
+- `cargo test --release`: 10/10 pass.
+
+One note on a requirement: item 7 asks for "an executable at `/output/test18.rs`". I read that as a typo, since that path is the entry source file — writing a binary there would destroy it. The executable is at `/output/test18` (and `/output/target/release/test18`), with the source preserved at `/output/test18.rs`. Say the word if you actually want the binary at that exact path.

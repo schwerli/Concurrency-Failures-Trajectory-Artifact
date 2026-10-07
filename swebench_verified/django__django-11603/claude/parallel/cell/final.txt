@@ -1,0 +1,20 @@
+Done. `Avg` and `Sum` now accept `distinct=True`.
+
+**The change** — `django/db/models/aggregates.py`: `allow_distinct = True` on `Avg` and `Sum`. The base `Aggregate.as_sql()` already interpolates `DISTINCT ` into the template, so no other code was needed.
+
+**Scope decision — Min/Max deliberately excluded.** The ticket floats them as "although pointless," and they are: `MIN(DISTINCT x) == MIN(x)` for every backend. Adding the flag would expand the public API surface with an argument that can never change a result, so `Min`/`Max` keep raising `TypeError`. `test_non_distinct_aggregate` pins that as intentional rather than an oversight. Say the word if you'd rather have them.
+
+`StdDev`/`Variance` also excluded, and this one is a correctness constraint, not taste: SQLite implements them as Python aggregates via `connection.create_aggregate` (`django/db/backends/sqlite3/base.py`), which receives every row and cannot honour `DISTINCT`. Enabling it there would silently return different numbers on SQLite than on other backends.
+
+**Verification.** Beyond the test suites (1260 tests across `aggregation`, `aggregation_regress`, `expressions`, `annotations`, `queries`, `backends`, `db_functions` — all pass), I drove the feature end-to-end against a live SQLite DB, 30 checks, all passing. The parts worth calling out:
+
+- Emitted SQL is `SELECT AVG(DISTINCT "rating")` / `SUM(DISTINCT "rating")`; non-distinct calls emit no `DISTINCT`.
+- Correct values on `FloatField`, `DecimalField`, and `DurationField` — the last one confirms `FixDurationInputMixin` (on both classes) still composes with the distinct template.
+- `distinct` + `filter` together produce `SUM(DISTINCT CASE WHEN … END)` and the right value on the `Case/When` fallback path taken when `supports_aggregate_filter_clause` is False — worth checking, since that path rebuilds source expressions.
+- `annotate()` + GROUP BY, distinct-over-expression, and `repr()` round-trips.
+
+**Two things to flag:**
+
+1. One of the investigation subagents I fanned out was writing scratch tests into `tests/aggregation/tests.py` and briefly reverted `aggregates.py` mid-run. It restored things itself, but I stopped the workflow and re-verified the tree against `git diff` before the final test run. The diff above is the real, stable state. My earlier broad test run overlapped that window, so I re-ran everything afterward — the 1260-test result is from the clean tree.
+
+2. Unrelated pre-existing bug I noticed at `django/db/backends/sqlite3/operations.py:60`: the "SQLite doesn't support DISTINCT on aggregate functions accepting multiple arguments" guard fires on *any* multi-argument aggregate, without checking `expression.distinct`. So a non-distinct multi-arg aggregate raises `NotSupportedError` spuriously. It needs `expression.distinct and` in the condition. Not touched here — out of scope for this ticket, and `Avg`/`Sum` are single-expression so this change doesn't interact with it.

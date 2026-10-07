@@ -1,0 +1,86 @@
+diff --git a/django/db/backends/sqlite3/schema.py b/django/db/backends/sqlite3/schema.py
+index 6752a8e3c0..bca512cc10 100644
+--- a/django/db/backends/sqlite3/schema.py
++++ b/django/db/backends/sqlite3/schema.py
+@@ -324,10 +324,11 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
+ 
+     def add_field(self, model, field):
+         """Create a field on a model."""
+-        # Fields with default values cannot by handled by ALTER TABLE ADD
+-        # COLUMN statement because DROP DEFAULT is not supported in
+-        # ALTER TABLE.
+-        if not field.null or self.effective_default(field) is not None:
++        # Fields with default values or UNIQUE constraints cannot be handled
++        # by ALTER TABLE ADD COLUMN. DROP DEFAULT is not supported in ALTER
++        # TABLE and SQLite raises "Cannot add a UNIQUE column" for UNIQUE
++        # columns.
++        if field.unique or not field.null or self.effective_default(field) is not None:
+             self._remake_table(model, create_field=field)
+         else:
+             super().add_field(model, field)
+diff --git a/tests/schema/tests.py b/tests/schema/tests.py
+index cd6a52f6af..6c214acf91 100644
+--- a/tests/schema/tests.py
++++ b/tests/schema/tests.py
+@@ -531,6 +531,61 @@ class SchemaTests(TransactionTestCase):
+         self.assertEqual(columns['age'][0], connection.features.introspected_field_types['IntegerField'])
+         self.assertTrue(columns['age'][1][6])
+ 
++    @skipUnlessDBFeature('supports_foreign_keys')
++    @isolate_apps('schema')
++    def test_add_nullable_o2o_field(self):
++        class LocalAuthor(Model):
++            name = CharField(max_length=255)
++
++            class Meta:
++                app_label = 'schema'
++
++        class LocalBook(Model):
++            title = CharField(max_length=100)
++
++            class Meta:
++                app_label = 'schema'
++
++        class LocalBookWithAuthor(Model):
++            title = CharField(max_length=100)
++            author = OneToOneField(LocalAuthor, CASCADE, null=True)
++
++            class Meta:
++                app_label = 'schema'
++                db_table = LocalBook._meta.db_table
++
++        with connection.schema_editor() as editor:
++            editor.create_model(LocalAuthor)
++            editor.create_model(LocalBook)
++        self.isolated_local_models = [LocalAuthor, LocalBook]
++        LocalBook.objects.create(title='The Book')
++        new_field = LocalBookWithAuthor._meta.get_field('author')
++        with connection.schema_editor() as editor:
++            editor.add_field(LocalBook, new_field)
++
++        with connection.cursor() as cursor:
++            cursor.execute(
++                'SELECT title, author_id FROM %s' % connection.ops.quote_name(
++                    LocalBook._meta.db_table,
++                )
++            )
++            self.assertEqual(cursor.fetchall(), [('The Book', None)])
++            author_column = next(
++                field
++                for field in connection.introspection.get_table_description(
++                    cursor,
++                    LocalBook._meta.db_table,
++                )
++                if field.name == 'author_id'
++            )
++            self.assertTrue(author_column.null_ok)
++        self.assertIn('author_id', self.get_uniques(LocalBook._meta.db_table))
++        self.assertForeignKeyExists(
++            LocalBook,
++            'author_id',
++            LocalAuthor._meta.db_table,
++        )
++
+     def test_add_field_remove_field(self):
+         """
+         Adding a field and removing it removes all deferred sql referring to it.

@@ -1,0 +1,25 @@
+Fixed with a one-line change in `sympy/geometry/point.py:155`.
+
+**Root cause:** the imaginary-coordinate guard relied on the *truthiness* of `im(a)`:
+
+```python
+if any(a.is_number and im(a) for a in coords):
+```
+
+Under `evaluate(False)`, `im(Integer(1))` doesn't fold to `0` — it stays as an unevaluated `im(1)` object. SymPy `Basic` objects have no `__bool__`, so Python's default applies and every such object is truthy. The guard therefore fired on *any* numeric coordinate, rejecting the perfectly real point `(1, 2)`. Without `evaluate(False)`, `im(1)` collapses to `Integer(0)`, which is falsy, so the bug was invisible.
+
+**Fix:** query the assumption instead of the object's truthiness:
+
+```python
+if any(a.is_number and im(a).is_zero is False for a in coords):
+```
+
+`.is_zero` resolves correctly even on the unevaluated form (`im(1).is_zero` is `True`, `im(2*I).is_zero` is `False`), so the check now behaves identically in both evaluation modes. Using `is False` rather than `not ...` matters: it keeps the indeterminate case (`is_zero is None`) from being treated as imaginary, preserving the existing lenient handling of symbolic coordinates.
+
+**Verification:**
+- All three forms from the issue return `Point2D(1, 2)`.
+- Imaginary input is still rejected under both `evaluate(True)` and `evaluate(False)` — checked `Point(I, 2)`, `Point(2*I, 2)`, `Point(1+I, 2)`, plus symbolic and `Point3D` cases.
+- `sympy/geometry/` (110 passed), and `sympy/parsing/`, `test_sympify.py`, `test_parameters.py`, `sympy/vector/` (146 passed) — no regressions.
+- Added a regression test in `test_Point2D`, confirmed failing before the fix and passing after.
+
+One thing worth flagging: under `evaluate(False)` the Float-to-Rational normalization is also skipped, so `Point(0.5, 0.25)` stays `Point2D(0.500000000000000, 0.250000000000000)` instead of `Point2D(1/2, 1/4)`. That's pre-existing and arguably the intent of `evaluate(False)` — I left it alone since it's outside this issue's scope.

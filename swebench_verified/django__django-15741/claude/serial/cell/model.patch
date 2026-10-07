@@ -1,0 +1,50 @@
+diff --git a/django/utils/formats.py b/django/utils/formats.py
+index 3f38322d84..b0a66e4e25 100644
+--- a/django/utils/formats.py
++++ b/django/utils/formats.py
+@@ -113,6 +113,7 @@ def get_format(format_type, lang=None, use_l10n=None):
+             use_l10n = settings.USE_L10N
+     if use_l10n and lang is None:
+         lang = get_language()
++    format_type = str(format_type)  # format_type may be lazy.
+     cache_key = (format_type, lang)
+     try:
+         return _format_cache[cache_key]
+diff --git a/docs/releases/4.0.5.txt b/docs/releases/4.0.5.txt
+index 15461a3f54..c05d6aa65f 100644
+--- a/docs/releases/4.0.5.txt
++++ b/docs/releases/4.0.5.txt
+@@ -17,3 +17,6 @@ Bugfixes
+ 
+ * Fixed a bug in Django 4.0 where a hidden quick filter toolbar in the admin's
+   navigation sidebar was focusable (:ticket:`33725`).
++
++* Fixed a regression in Django 4.0 that caused a crash of the ``date`` template
++  filter when the given format was a lazy string (:ticket:`33742`).
+diff --git a/tests/i18n/tests.py b/tests/i18n/tests.py
+index 0093181f64..3a6307d709 100644
+--- a/tests/i18n/tests.py
++++ b/tests/i18n/tests.py
+@@ -1652,6 +1652,22 @@ class FormattingTests(SimpleTestCase):
+     def test_format_arbitrary_settings(self):
+         self.assertEqual(get_format("DEBUG"), "DEBUG")
+ 
++    def test_get_format_lazy_format(self):
++        self.assertEqual(get_format(gettext_lazy("DATE_FORMAT")), "N j, Y")
++
++    def test_date_filter_with_lazy_format(self):
++        self.assertEqual(
++            Template("{{ some_date|date:fmt }}").render(
++                Context(
++                    {
++                        "some_date": datetime.date(2009, 12, 31),
++                        "fmt": gettext_lazy("d/m/Y"),
++                    }
++                )
++            ),
++            "31/12/2009",
++        )
++
+     def test_get_custom_format(self):
+         reset_format_cache()
+         with self.settings(FORMAT_MODULE_PATH="i18n.other.locale"):

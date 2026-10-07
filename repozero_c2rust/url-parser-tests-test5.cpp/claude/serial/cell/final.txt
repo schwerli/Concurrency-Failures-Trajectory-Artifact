@@ -1,0 +1,38 @@
+Migration complete and verified against the reference binary.
+
+## Project layout (`/output`)
+
+```
+Cargo.toml              lib + [[bin]] test5 (path = "test5.rs")
+test5.rs                entry point (package root, as required)
+test5                   compiled executable (rustc -O test5.rs)
+src/lib.rs              library root
+src/url_parser/mod.rs   module wiring
+src/url_parser/url.rs   the Url type — parsing
+src/url_parser/port.rs  stoi-compatible port parsing
+src/url_parser/tests.rs 13 regression tests
+```
+
+Builds both ways, warning-free: `rustc test5.rs` and `cargo build --release`.
+
+## Behavior recovered by black-box probing
+
+The library source wasn't present, so I reverse-engineered the rules from the binary. Several are non-obvious and would have been easy to get wrong:
+
+- **Parse order is fragment → query → scheme → authority.** Splitting the query *before* searching for `://` is load-bearing: `/path?x=http://y.com` yields path `/path`, not scheme `/path?x=http`.
+- **`://` is mandatory for an authority.** `mailto:a@b`, `//host/p`, and `no-scheme.com/path` all parse as a bare path with empty scheme *and* empty host. But `://ex.com/p` (separator at index 0) *does* parse a host, with an empty scheme.
+- **Only the scheme is case-folded**, byte-wise ASCII — host keeps its spelling. `HTTPÄ://Ex.cÖm` → scheme `httpÄ`, host `Ex.cÖm`.
+- **Port is `std::stoi` + a `0..=65535` check.** It skips leading whitespace, accepts `+`/`-`, and stops at the first non-digit — so `:80abc` → 80, `:0x50` → 0, `:-0` → 0, but `:-5`, `:2147483647`, and `:65536` all → -1.
+- **Userinfo drops at the *first* `@`**: `a@b@c.com:80` hosts at `b@c.com`. A `@` after the first `/` is plain path text.
+- **Host ends at the first `:`**, so IPv6 literals break mid-address (`[::1]:8080` → host `[`). I preserved this rather than "fixing" it.
+- No scheme character validation (`ht tp://` → scheme `ht tp`).
+
+## Verification
+
+- **207 hand-built cases**, 0 failures — the 5 documented examples plus schemes, ports, userinfo, fragments, IPv6, degenerate inputs, and argc handling (stdout, stderr, and exit code all compared).
+- **6000 randomized fuzz cases**, 0 failures, using `cmp` for exact byte comparison (`$(...)` would have hidden trailing-newline differences).
+- **13 unit tests** pinning each quirk above, so the reasoning is documented in executable form.
+
+## One known divergence
+
+Requirement 2 specifies `std::env::args()`, which **panics on non-UTF-8 argv**, whereas the C++ binary passes raw bytes through (`http://ex\xFF.com` → host `ex\xFF.com`). I kept `std::env::args()` as instructed rather than silently switching to `args_os()` + `OsStrExt::as_bytes()`. This is unreachable from a JSON-driven test harness, but if you want byte-exact parity on arbitrary argv, that's the one-line change to make — say the word and I'll apply it.

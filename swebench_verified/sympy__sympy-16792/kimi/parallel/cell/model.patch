@@ -1,0 +1,120 @@
+diff --git a/sympy/utilities/codegen.py b/sympy/utilities/codegen.py
+index f0befb2bd..83643a354 100644
+--- a/sympy/utilities/codegen.py
++++ b/sympy/utilities/codegen.py
+@@ -739,7 +739,11 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+                 try:
+                     new_args.append(name_arg_dict[symbol])
+                 except KeyError:
+-                    new_args.append(InputArgument(symbol))
++                    metadata = {}
++                    if isinstance(symbol, MatrixSymbol):
++                        metadata = {'dimensions': tuple(
++                            [(S.Zero, dim - 1) for dim in symbol.shape])}
++                    new_args.append(InputArgument(symbol, **metadata))
+             arg_list = new_args
+ 
+         return Routine(name, arg_list, return_val, local_vars, global_vars)
+@@ -1402,7 +1406,11 @@ def routine(self, name, expr, argument_sequence, global_vars):
+                 try:
+                     new_args.append(name_arg_dict[symbol])
+                 except KeyError:
+-                    new_args.append(InputArgument(symbol))
++                    metadata = {}
++                    if isinstance(symbol, MatrixSymbol):
++                        metadata = {'dimensions': tuple(
++                            [(S.Zero, dim - 1) for dim in symbol.shape])}
++                    new_args.append(InputArgument(symbol, **metadata))
+             arg_list = new_args
+ 
+         return Routine(name, arg_list, return_vals, local_vars, global_vars)
+@@ -1610,7 +1618,11 @@ def routine(self, name, expr, argument_sequence, global_vars):
+                 try:
+                     new_args.append(name_arg_dict[symbol])
+                 except KeyError:
+-                    new_args.append(InputArgument(symbol))
++                    metadata = {}
++                    if isinstance(symbol, MatrixSymbol):
++                        metadata = {'dimensions': tuple(
++                            [(S.Zero, dim - 1) for dim in symbol.shape])}
++                    new_args.append(InputArgument(symbol, **metadata))
+             arg_list = new_args
+ 
+         return Routine(name, arg_list, return_vals, local_vars, global_vars)
+@@ -1841,7 +1853,11 @@ def routine(self, name, expr, argument_sequence, global_vars):
+                 try:
+                     new_args.append(name_arg_dict[symbol])
+                 except KeyError:
+-                    new_args.append(InputArgument(symbol))
++                    metadata = {}
++                    if isinstance(symbol, MatrixSymbol):
++                        metadata = {'dimensions': tuple(
++                            [(S.Zero, dim - 1) for dim in symbol.shape])}
++                    new_args.append(InputArgument(symbol, **metadata))
+             arg_list = new_args
+ 
+         return Routine(name, arg_list, return_vals, local_vars, global_vars)
+diff --git a/sympy/utilities/tests/test_autowrap.py b/sympy/utilities/tests/test_autowrap.py
+index 47fe933dc..2647e1988 100644
+--- a/sympy/utilities/tests/test_autowrap.py
++++ b/sympy/utilities/tests/test_autowrap.py
+@@ -7,14 +7,19 @@
+ 
+ from sympy.core import symbols, Eq
+ from sympy.core.compatibility import StringIO
++from sympy.external import import_module
++from sympy.matrices import MatrixSymbol
+ from sympy.utilities.autowrap import (autowrap, binary_function,
+             CythonCodeWrapper, UfuncifyCodeWrapper, CodeWrapper)
+ from sympy.utilities.codegen import (
+     CCodeGen, C99CodeGen, CodeGenArgumentListError, make_routine
+ )
+-from sympy.utilities.pytest import raises
++from sympy.utilities.pytest import raises, skip
+ from sympy.utilities.tmpfiles import TmpFileManager
+ 
++numpy = import_module('numpy')
++Cython = import_module('Cython', min_module_version='0.15.1')
++
+ 
+ def get_string(dump_fn, routines, prefix="file", **kwargs):
+     """Wrapper for dump_fn. dump_fn writes its results to a stream object and
+@@ -246,6 +251,17 @@ def test_autowrap_args():
+     assert f.args == "y, x, z"
+     assert f.returns == "z"
+ 
++
++def test_autowrap_cython_unused_MatrixSymbol_argument():
++    # Regression test for the issue where autowrap with backend='cython'
++    # failed when a MatrixSymbol argument did not appear in the expression
++    # (it was wrongly declared as a scalar instead of an array).
++    if not Cython or not numpy:
++        skip("Couldn't import Cython or numpy.")
++    x = MatrixSymbol('x', 2, 1)
++    f = autowrap(1.0, args=(x,), backend='cython')
++    assert f(numpy.array([[1.0, 2.0]])) == 1.0
++
+ def test_autowrap_store_files():
+     x, y = symbols('x y')
+     tmp = tempfile.mkdtemp()
+diff --git a/sympy/utilities/tests/test_codegen.py b/sympy/utilities/tests/test_codegen.py
+index 1cd56e12d..b87c37f19 100644
+--- a/sympy/utilities/tests/test_codegen.py
++++ b/sympy/utilities/tests/test_codegen.py
+@@ -56,6 +56,16 @@ def test_Routine_argument_order():
+     assert [ arg.name for arg in r.arguments ] == [z, x, a, y]
+ 
+ 
++def test_Routine_arguments_with_unused_MatrixSymbol():
++    # Regression test: a MatrixSymbol in argument_sequence that does not
++    # appear in the expression must still get proper dimensions, so it is
++    # declared as an array (pointer) rather than a scalar.
++    x = MatrixSymbol('x', 2, 1)
++    r = make_routine('test', 1.0, argument_sequence=[x])
++    assert [ arg.name for arg in r.arguments ] == [x]
++    assert r.arguments[0].dimensions == ((0, 1), (0, 0))
++
++
+ def test_empty_c_code():
+     code_gen = C89CodeGen()
+     source = get_string(code_gen.dump_c, [])

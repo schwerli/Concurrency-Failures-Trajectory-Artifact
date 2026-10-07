@@ -1,0 +1,752 @@
+===== bb875b5f2a7e
+diff --git a/src/chart/candlestick/CandlestickView.ts b/src/chart/candlestick/CandlestickView.ts
+index 22c3d43f90..728291424c 100644
+--- a/src/chart/candlestick/CandlestickView.ts
++++ b/src/chart/candlestick/CandlestickView.ts
+@@ -110,9 +110,6 @@ class CandlestickView extends ChartView {
+             .add(function (newIdx) {
+                 if (data.hasValue(newIdx)) {
+                     const itemLayout = data.getItemLayout(newIdx) as CandlestickItemLayout;
+-                    if (!itemLayout) {
+-                        return;
+-                    }
+ 
+                     if (needsClip && isNormalBoxClipped(clipArea, itemLayout)) {
+                         return;
+@@ -138,10 +135,6 @@ class CandlestickView extends ChartView {
+                 }
+ 
+                 const itemLayout = data.getItemLayout(newIdx) as CandlestickItemLayout;
+-                if (!itemLayout) {
+-                    group.remove(el);
+-                    return;
+-                }
+                 if (needsClip && isNormalBoxClipped(clipArea, itemLayout)) {
+                     group.remove(el);
+                     return;
+@@ -198,9 +191,6 @@ class CandlestickView extends ChartView {
+         let dataIndex;
+         while ((dataIndex = params.next()) != null) {
+             const itemLayout = data.getItemLayout(dataIndex) as CandlestickItemLayout;
+-            if (!itemLayout) {
+-                continue;
+-            }
+             const el = createNormalBox(itemLayout, dataIndex);
+             setBoxCommon(el, data, dataIndex, isSimpleBox);
+ 
+diff --git a/src/chart/helper/whiskerBoxCommon.ts b/src/chart/helper/whiskerBoxCommon.ts
+index fe4ffdcbe0..a1235e076f 100644
+--- a/src/chart/helper/whiskerBoxCommon.ts
++++ b/src/chart/helper/whiskerBoxCommon.ts
+@@ -17,17 +17,17 @@
+ * under the License.
+ */
+ 
+-import createSeriesDataSimply from './createSeriesDataSimply';
+ import * as zrUtil from 'zrender/src/core/util';
+-import {getDimensionTypeByAxis} from '../../data/helper/dimensionHelper';
+-import {makeSeriesEncodeForAxisCoordSys} from '../../data/helper/sourceHelper';
+-import type { SeriesOption, SeriesOnCartesianOptionMixin, LayoutOrient } from '../../util/types';
+-import type GlobalModel from '../../model/Global';
+-import type SeriesModel from '../../model/Series';
+-import type CartesianAxisModel from '../../coord/cartesian/AxisModel';
+-import type SeriesData from '../../data/SeriesData';
+ import type Axis2D from '../../coord/cartesian/Axis2D';
++import type CartesianAxisModel from '../../coord/cartesian/AxisModel';
+ import { CoordDimensionDefinition } from '../../data/helper/createDimensions';
++import { getDimensionTypeByAxis } from '../../data/helper/dimensionHelper';
++import { makeSeriesEncodeForAxisCoordSys } from '../../data/helper/sourceHelper';
++import type SeriesData from '../../data/SeriesData';
++import type GlobalModel from '../../model/Global';
++import type SeriesModel from '../../model/Series';
++import type { LayoutOrient, SeriesOnCartesianOptionMixin, SeriesOption } from '../../util/types';
++import createSeriesDataSimply from './createSeriesDataSimply';
+ 
+ interface CommonOption extends SeriesOption, SeriesOnCartesianOptionMixin {
+     layout?: LayoutOrient
+@@ -76,37 +76,7 @@ class WhiskerBoxCommonMixin<Opts extends CommonOption> {
+         const yAxisType = yAxisModel.get('type');
+         let addOrdinal;
+ 
+-        const encodeRules = this.getEncode();
+-        const hasXEncode = encodeRules && encodeRules.get('x') != null;
+-        const hasYEncode = encodeRules && encodeRules.get('y') != null;
+-
+-        if (hasXEncode && hasYEncode) {
+-            const xEncode = encodeRules.get('x');
+-            const yEncode = encodeRules.get('y');
+-            const xIsArray = zrUtil.isArray(xEncode) && xEncode.length > 1;
+-            const yIsArray = zrUtil.isArray(yEncode) && yEncode.length > 1;
+-
+-            if (yIsArray && !xIsArray) {
+-                option.layout = 'horizontal';
+-            }
+-            else if (xIsArray && !yIsArray) {
+-                option.layout = 'vertical';
+-            }
+-            else if (xAxisType === 'category') {
+-                option.layout = 'horizontal';
+-                ordinalMeta = xAxisModel.getOrdinalMeta();
+-                addOrdinal = !this._hasEncodeRule('x');
+-            }
+-            else if (yAxisType === 'category') {
+-                option.layout = 'vertical';
+-                ordinalMeta = yAxisModel.getOrdinalMeta();
+-                addOrdinal = !this._hasEncodeRule('y');
+-            }
+-            else {
+-                option.layout = option.layout || 'horizontal';
+-            }
+-        }
+-        else if (xAxisType === 'category') {
++        if (xAxisType === 'category') {
+             option.layout = 'horizontal';
+             ordinalMeta = xAxisModel.getOrdinalMeta();
+             addOrdinal = !this._hasEncodeRule('x');
+@@ -116,6 +86,12 @@ class WhiskerBoxCommonMixin<Opts extends CommonOption> {
+             ordinalMeta = yAxisModel.getOrdinalMeta();
+             addOrdinal = !this._hasEncodeRule('y');
+         }
++        else if (xAxisType === 'time') {
++            option.layout = 'horizontal';
++        }
++        else if (yAxisType === 'time') {
++            option.layout = 'vertical';
++        }
+         else {
+             option.layout = option.layout || 'horizontal';
+         }
+===== 8eb93d090a05
+diff --git a/src/chart/candlestick/candlestickVisual.ts b/src/chart/candlestick/candlestickVisual.ts
+index a1bcd2d793..a665ea3b69 100644
+--- a/src/chart/candlestick/candlestickVisual.ts
++++ b/src/chart/candlestick/candlestickVisual.ts
+@@ -65,11 +65,7 @@ const candlestickVisual: StageHandler = {
+                 let dataIndex;
+                 while ((dataIndex = params.next()) != null) {
+                     const itemModel = data.getItemModel(dataIndex);
+-                    const itemLayout = data.getItemLayout(dataIndex);
+-                    if (!itemLayout) {
+-                        continue;
+-                    }
+-                    const sign = itemLayout.sign;
++                    const sign = data.getItemLayout(dataIndex).sign;
+ 
+                     const style = itemModel.getItemStyle();
+                     style.fill = getColor(sign, itemModel);
+diff --git a/src/chart/helper/whiskerBoxCommon.ts b/src/chart/helper/whiskerBoxCommon.ts
+index a1235e076f..891a0dd698 100644
+--- a/src/chart/helper/whiskerBoxCommon.ts
++++ b/src/chart/helper/whiskerBoxCommon.ts
+@@ -17,17 +17,17 @@
+ * under the License.
+ */
+ 
++import createSeriesDataSimply from './createSeriesDataSimply';
+ import * as zrUtil from 'zrender/src/core/util';
+-import type Axis2D from '../../coord/cartesian/Axis2D';
+-import type CartesianAxisModel from '../../coord/cartesian/AxisModel';
+-import { CoordDimensionDefinition } from '../../data/helper/createDimensions';
+-import { getDimensionTypeByAxis } from '../../data/helper/dimensionHelper';
+-import { makeSeriesEncodeForAxisCoordSys } from '../../data/helper/sourceHelper';
+-import type SeriesData from '../../data/SeriesData';
++import {getDimensionTypeByAxis} from '../../data/helper/dimensionHelper';
++import {makeSeriesEncodeForAxisCoordSys} from '../../data/helper/sourceHelper';
++import type { SeriesOption, SeriesOnCartesianOptionMixin, LayoutOrient } from '../../util/types';
+ import type GlobalModel from '../../model/Global';
+ import type SeriesModel from '../../model/Series';
+-import type { LayoutOrient, SeriesOnCartesianOptionMixin, SeriesOption } from '../../util/types';
+-import createSeriesDataSimply from './createSeriesDataSimply';
++import type CartesianAxisModel from '../../coord/cartesian/AxisModel';
++import type SeriesData from '../../data/SeriesData';
++import type Axis2D from '../../coord/cartesian/Axis2D';
++import { CoordDimensionDefinition } from '../../data/helper/createDimensions';
+ 
+ interface CommonOption extends SeriesOption, SeriesOnCartesianOptionMixin {
+     layout?: LayoutOrient
+diff --git a/test/candlestick-horizontal.html b/test/candlestick-horizontal.html
+index f3aeb924ef..49bf05f880 100644
+--- a/test/candlestick-horizontal.html
++++ b/test/candlestick-horizontal.html
+@@ -34,118 +34,201 @@
+ 
+         <div id="main0"></div>
+         <div id="main1"></div>
+ 
+         <script>
+             require(["echarts"], function (echarts) {
+                 var daval = [
+-                    { value: ["2017-10-24", 20, 34, 10, 38] },
+-                    { value: ["2017-10-25", 40, 35, 30, 50] },
+-                    { value: ["2017-10-26", 31, 38, 33, 44] },
+-                    { value: ["2017-10-27", 38, 15, 5, 42] },
++                    { value: ["2017-10-24", 20, 34, 10, 38, 25] },
++                    { value: ["2017-10-25", 40, 35, 30, 50, 42] },
++                    { value: ["2017-10-26", 31, 38, 33, 44, 35] },
++                    { value: ["2017-10-27", 38, 15, 5, 42, 28] },
+                 ];
+                 var daray = [
+-                    ["2017-10-24", 20, 34, 10, 38],
+-                    ["2017-10-25", 40, 35, 30, 50],
+-                    ["2017-10-26", 31, 38, 33, 44],
+-                    ["2017-10-27", 38, 15, 5, 42],
++                    ["2017-10-24", 20, 34, 10, 38, 25],
++                    ["2017-10-25", 40, 35, 30, 50, 42],
++                    ["2017-10-26", 31, 38, 33, 44, 35],
++                    ["2017-10-27", 38, 15, 5, 42, 28],
+                 ];
+-                var option = {
+-                    tooltip: {
+-                        trigger: "axis",
+-                        axisPointer: {
+-                            type: "shadow",
++                var reversedaray = [
++                    [20, 34, 10, 38, 25, "2017-10-24"],
++                    [40, 35, 30, 50, 42, "2017-10-25"],
++                    [31, 38, 33, 44, 35, "2017-10-26"],
++                    [38, 15, 5, 42, 28, "2017-10-27"],
++                ];
++
++                // Helper function to create chart option
++                function createChartOption(
++                    chartType,
++                    xAxisType,
++                    yAxisType,
++                    encode,
++                    data
++                ) {
++                    var itemStyle =
++                        chartType === "candlestick"
++                            ? {
++                                  color: "#ec0000",
++                                  color0: "#00da3c",
++                                  borderColor: "#8A0000",
++                                  borderColor0: "#008F28",
++                              }
++                            : {
++                                  color: "#ec0000",
++                                  borderColor: "#8A0000",
++                              };
++
++                    return {
++                        tooltip: {
++                            trigger: "axis",
++                            axisPointer: { type: "shadow" },
++                        },
++                        grid: {
++                            left: "15%",
++                            right: "10%",
++                            bottom: "10%",
+                         },
++                        xAxis: xAxisType ? { type: xAxisType } : {},
++                        yAxis: yAxisType ? { type: yAxisType } : {},
++                        series: [
++                            {
++                                type: chartType,
++                                encode: encode,
++                                data: data,
++                                itemStyle: itemStyle,
++                            },
++                        ],
++                    };
++                }
++
++                // Test cases
++                var tests = [
++                    // xAxis is time
++                    {
++                        id: "main0",
++                        title: "xAxis is time (candlestick, daval)",
++                        option: createChartOption(
++                            "candlestick",
++                            "time",
++                            null,
++                            { x: 0, y: [1, 3, 2, 4] },
++                            daval
++                        ),
+                     },
+-                    grid: {
+-                        left: "15%",
+-                        right: "10%",
+-                        bottom: "10%",
++
++                    // xAxis is category
++                    {
++                        id: "main1",
++                        title: "xAxis is category (candlestick, daval)",
++                        option: createChartOption(
++                            "candlestick",
++                            "category",
++                            null,
++                            { x: 0, y: [1, 3, 2, 4] },
++                            daval
++                        ),
+                     },
+-                    xAxis: {
+-                        type: "time",
++
++                    // yAxis is time
++                    {
++                        id: "main2",
++                        title: "yAxis is time (candlestick, daval)",
++                        option: createChartOption(
++                            "candlestick",
++                            null,
++                            "time",
++                            { x: [1, 3, 2, 4], y: 0 },
++                            daval
++                        ),
+                     },
+-                    yAxis: {},
+-                    series: [
+-                        {
+-                            type: "candlestick",
+-                            encode: {
+-                                x: 0,
+-                                y: [1, 3, 2, 4],
+-                            },
+-                            data: daval,
+-                            // data: daray,
+-                            itemStyle: {
+-                                color: "#ec0000",
+-                                color0: "#00da3c",
+-                                borderColor: "#8A0000",
+-                                borderColor0: "#008F28",
+-                            },
+-                        },
+-                    ],
+-                };
+ 
+-                var chart = testHelper.create(echarts, "main0", {
+-                    title: [
+-                        "Vertical candlestick with dataset and encode",
+-                    ],
+-                    option: option,
+-                });
+-            });
+-        </script>
++                    // yAxis is category
++                    {
++                        id: "main3",
++                        title: "yAxis is category (candlestick, daval)",
++                        option: createChartOption(
++                            "candlestick",
++                            null,
++                            "category",
++                            { x: [1, 3, 2, 4], y: 0 },
++                            daval
++                        ),
++                    },
+ 
+-        <script>
+-            require(["echarts"], function (echarts) {
+-                var daval = [
+-                    { value: ["2017-10-24", 20, 34, 10, 38] },
+-                    { value: ["2017-10-25", 40, 35, 30, 50] },
+-                    { value: ["2017-10-26", 31, 38, 33, 44] },
+-                    { value: ["2017-10-27", 38, 15, 5, 42] },
+-                ];
+-                var daray = [
+-                    ["2017-10-24", 20, 34, 10, 38],
+-                    ["2017-10-25", 40, 35, 30, 50],
+-                    ["2017-10-26", 31, 38, 33, 44],
+-                    ["2017-10-27", 38, 15, 5, 42],
+-                ];
+-                var option = {
+-                    tooltip: {
+-                        trigger: "axis",
+-                        axisPointer: {
+-                            type: "shadow",
+-                        },
++                    // encode 0 as y / x
++                    {
++                        id: "main4",
++                        title: "encode 0 as y (horizontal candlestick)",
++                        option: createChartOption(
++                            "candlestick",
++                            null,
++                            "category",
++                            { y: 0 },
++                            daval
++                        ),
+                     },
+-                    grid: {
+-                        left: "15%",
+-                        right: "10%",
+-                        bottom: "10%",
++                    {
++                        id: "main5",
++                        title: "encode 0 as x (vertical candlestick)",
++                        option: createChartOption(
++                            "candlestick",
++                            "category",
++                            null,
++                            { x: 0 },
++                            daval
++                        ),
+                     },
+-                    xAxis: {},
+-                    yAxis: {
+-                        type: "time",
++
++                    // data uses daray
++                    {
++                        id: "main6",
++                        title: "data uses daray (candlestick)",
++                        option: createChartOption(
++                            "candlestick",
++                            "time",
++                            null,
++                            { x: 0, y: [1, 3, 2, 4] },
++                            daray
++                        ),
+                     },
+-                    series: [
+-                        {
+-                            type: "candlestick",
+-                            encode: {
+-                                x: [1, 3, 2, 4],
+-                                y: 0,
+-                            },
+-                            data: daval,
+-                            itemStyle: {
+-                                color: "#ec0000",
+-                                color0: "#00da3c",
+-                                borderColor: "#8A0000",
+-                                borderColor0: "#008F28",
+-                            },
+-                        },
+-                    ],
+-                };
+ 
+-                var chart = testHelper.create(echarts, "main1", {
+-                    title: [
+-                        "Horizontal candlestick with dataset and encode",
+-                    ],
+-                    option: option,
++                    // boxplot tests
++                    {
++                        id: "main7",
++                        title: "boxplot with xAxis time",
++                        option: createChartOption(
++                            "boxplot",
++                            "time",
++                            null,
++                            { x: 5, y: [0, 1, 2, 3, 4] },
++                            reversedaray
++                        ),
++                    },
++                    {
++                        id: "main8",
++                        title: "boxplot with yAxis time",
++                        option: createChartOption(
++                            "boxplot",
++                            null,
++                            "time",
++                            { x: [0, 1, 2, 3, 4], y: 5 },
++                            reversedaray
++                        ),
++                    },
++                ];
++
++                // Create all charts
++                tests.forEach(function (test) {
++                    testHelper.create(echarts, test.id, {
++                        title: [test.title],
++                        option: test.option,
++                    });
+                 });
+             });
+         </script>
+===== f94f2214f637
+diff --git a/src/chart/boxplot/BoxplotView.ts b/src/chart/boxplot/BoxplotView.ts
+index f48cdf67b0..0d88309773 100644
+--- a/src/chart/boxplot/BoxplotView.ts
++++ b/src/chart/boxplot/BoxplotView.ts
+@@ -46,7 +46,7 @@ class BoxplotView extends ChartView {
+             group.removeAll();
+         }
+ 
+-        const constDim = seriesModel.get('layout') === 'horizontal' ? 1 : 0;
++        const constDim = seriesModel.getWhiskerBoxesLayout() === 'horizontal' ? 1 : 0;
+ 
+         data.diff(oldData)
+             .add(function (newIdx) {
+diff --git a/src/chart/boxplot/boxplotLayout.ts b/src/chart/boxplot/boxplotLayout.ts
+index cf6017b3cb..053462d2f2 100644
+--- a/src/chart/boxplot/boxplotLayout.ts
++++ b/src/chart/boxplot/boxplotLayout.ts
+@@ -144,7 +144,7 @@ function layoutSingleSeries(seriesModel: BoxplotSeriesModel, offset: number, box
+     const coordSys = seriesModel.coordinateSystem;
+     const data = seriesModel.getData();
+     const halfWidth = boxWidth / 2;
+-    const cDimIdx = seriesModel.get('layout') === 'horizontal' ? 0 : 1;
++    const cDimIdx = seriesModel.getWhiskerBoxesLayout() === 'horizontal' ? 0 : 1;
+     const vDimIdx = 1 - cDimIdx;
+     const coordDims = ['x', 'y'];
+     const cDim = data.mapDimension(coordDims[cDimIdx]);
+diff --git a/src/chart/candlestick/CandlestickSeries.ts b/src/chart/candlestick/CandlestickSeries.ts
+index f152fce2cf..55938e3b48 100644
+--- a/src/chart/candlestick/CandlestickSeries.ts
++++ b/src/chart/candlestick/CandlestickSeries.ts
+@@ -37,6 +37,7 @@ import SeriesData from '../../data/SeriesData';
+ import Cartesian2D from '../../coord/cartesian/Cartesian2D';
+ import { BrushCommonSelectorsForSeries } from '../../component/brush/selector';
+ import { mixin } from 'zrender/src/core/util';
++import type Axis2D from '../../coord/cartesian/Axis2D';
+ 
+ type CandlestickDataValue = OptionDataValue[];
+ 
+@@ -158,6 +159,9 @@ class CandlestickSeriesModel extends SeriesModel<CandlestickSeriesOption> {
+     }
+ }
+ 
++    getBaseAxis(): Axis2D
++}
+ mixin(CandlestickSeriesModel, WhiskerBoxCommonMixin, true);
+ 
+ export default CandlestickSeriesModel;
+diff --git a/src/chart/candlestick/CandlestickView.ts b/src/chart/candlestick/CandlestickView.ts
+index 728291424c..706cae6fcc 100644
+--- a/src/chart/candlestick/CandlestickView.ts
++++ b/src/chart/candlestick/CandlestickView.ts
+@@ -106,6 +106,8 @@ class CandlestickView extends ChartView {
+             group.removeAll();
+         }
+ 
++        const transPointDim = getTransPointDimension(seriesModel);
++
+         data.diff(oldData)
+             .add(function (newIdx) {
+                 if (data.hasValue(newIdx)) {
+@@ -115,7 +117,7 @@ class CandlestickView extends ChartView {
+                         return;
+                     }
+ 
+-                    const el = createNormalBox(itemLayout, newIdx, true);
++                    const el = createNormalBox(itemLayout, newIdx, transPointDim, true);
+                     graphic.initProps(el, {shape: {points: itemLayout.ends}}, seriesModel, newIdx);
+ 
+                     setBoxCommon(el, data, newIdx, isSimpleBox);
+@@ -141,7 +143,7 @@ class CandlestickView extends ChartView {
+                 }
+ 
+                 if (!el) {
+-                    el = createNormalBox(itemLayout, newIdx);
++                    el = createNormalBox(itemLayout, newIdx, transPointDim);
+                 }
+                 else {
+                     graphic.updateProps(el, {
+@@ -188,10 +190,12 @@ class CandlestickView extends ChartView {
+         const data = seriesModel.getData();
+         const isSimpleBox = data.getLayout('isSimpleBox');
+ 
++        const transPointDim = getTransPointDimension(seriesModel);
++
+         let dataIndex;
+         while ((dataIndex = params.next()) != null) {
+             const itemLayout = data.getItemLayout(dataIndex) as CandlestickItemLayout;
+-            const el = createNormalBox(itemLayout, dataIndex);
++            const el = createNormalBox(itemLayout, dataIndex, transPointDim);
+             setBoxCommon(el, data, dataIndex, isSimpleBox);
+ 
+             el.incremental = true;
+@@ -262,12 +266,17 @@ class NormalBoxPath extends Path<NormalBoxPathProps> {
+ }
+ 
+ 
+-function createNormalBox(itemLayout: CandlestickItemLayout, dataIndex: number, isInit?: boolean) {
++function createNormalBox(
++    itemLayout: CandlestickItemLayout,
++    dataIndex: number,
++    constDim: number,
++    isInit?: boolean
++) {
+     const ends = itemLayout.ends;
+     return new NormalBoxPath({
+         shape: {
+             points: isInit
+-                ? transInit(ends, itemLayout)
++                ? transInit(ends, constDim, itemLayout)
+                 : ends
+         },
+         z2: 100
+@@ -310,14 +319,18 @@ function setBoxCommon(el: NormalBoxPath, data: SeriesData, dataIndex: number, is
+     toggleHoverEmphasis(el, emphasisModel.get('focus'), emphasisModel.get('blurScope'), emphasisModel.get('disabled'));
+ }
+ 
+-function transInit(points: number[][], itemLayout: CandlestickItemLayout) {
++function transInit(points: number[][], dim: number, itemLayout: CandlestickItemLayout) {
+     return zrUtil.map(points, function (point) {
+         point = point.slice();
+-        point[1] = itemLayout.initBaseline;
++        point[dim] = itemLayout.initBaseline;
+         return point;
+     });
+ }
+ 
++function getTransPointDimension(seriesModel: CandlestickSeriesModel): number {
++    return seriesModel.getWhiskerBoxesLayout() === 'horizontal' ? 1 : 0;
++}
++
+ 
+ 
+ class LargeBoxPathShape {
+diff --git a/src/chart/candlestick/candlestickLayout.ts b/src/chart/candlestick/candlestickLayout.ts
+index 77e5c65d88..6b6fa03a6e 100644
+--- a/src/chart/candlestick/candlestickLayout.ts
++++ b/src/chart/candlestick/candlestickLayout.ts
+@@ -51,8 +51,7 @@ const candlestickLayout: StageHandler = {
+         const coordSys = seriesModel.coordinateSystem;
+         const data = seriesModel.getData();
+         const candleWidth = calculateCandleWidth(seriesModel, data);
+-        const layout = seriesModel.get('layout');
+-        const cDimIdx = layout === 'horizontal' ? 0 : 1;
++        const cDimIdx = seriesModel.getWhiskerBoxesLayout() === 'horizontal' ? 0 : 1;
+         const vDimIdx = 1 - cDimIdx;
+         const coordDims = ['x', 'y'];
+         const cDimI = data.getDimensionIndex(data.mapDimension(coordDims[cDimIdx]));
+diff --git a/src/chart/helper/whiskerBoxCommon.ts b/src/chart/helper/whiskerBoxCommon.ts
+index 891a0dd698..294fd0eae2 100644
+--- a/src/chart/helper/whiskerBoxCommon.ts
++++ b/src/chart/helper/whiskerBoxCommon.ts
+@@ -30,6 +30,9 @@ import type Axis2D from '../../coord/cartesian/Axis2D';
+ import { CoordDimensionDefinition } from '../../data/helper/createDimensions';
+ 
+ interface CommonOption extends SeriesOption, SeriesOnCartesianOptionMixin {
++    // - 'horizontal': Multiple whisker boxes (each drawn vertically)
++    //      are arranged side by side horizontally.
++    // - 'vertical': The opposite.
+     layout?: LayoutOrient
+ 
+     // data?: (DataItemOption | number[])[]
+@@ -44,14 +47,15 @@ interface DataItemOption {
+ interface WhiskerBoxCommonMixin<Opts extends CommonOption> extends SeriesModel<Opts>{}
+ class WhiskerBoxCommonMixin<Opts extends CommonOption> {
+ 
+-    /**
+-     * @private
+-     * @type {string}
+-     */
+-    _baseAxisDim: string;
++    private _baseAxisDim: string;
+ 
+     defaultValueDimensions: CoordDimensionDefinition['dimsDef'];
+ 
++    /**
++     * Computed layout.
++     */
++    private _layout: CommonOption['layout'];
++
+     /**
+      * @private
+      */
+@@ -76,28 +80,33 @@ class WhiskerBoxCommonMixin<Opts extends CommonOption> {
+         const yAxisType = yAxisModel.get('type');
+         let addOrdinal;
+ 
++        // Theoretically, if `encode` and/or `layout` are not specified, they can be derived from
++        // the specified one (also according to axis types). However, only the logic for deriving
++        // `encode` from `layout` is implemented; the reverse direction is not implemented yet,
++        // due to its complexity and low priority.
++        let layout = option.layout;
++        // 'category' axis has historically been enforcing `layout` regardless of its presence.
++        // This behavior is preserved until it causes problems.
+         if (xAxisType === 'category') {
+-            option.layout = 'horizontal';
++            layout = 'horizontal';
+             ordinalMeta = xAxisModel.getOrdinalMeta();
+             addOrdinal = !this._hasEncodeRule('x');
+         }
+         else if (yAxisType === 'category') {
+-            option.layout = 'vertical';
++            layout = 'vertical';
+             ordinalMeta = yAxisModel.getOrdinalMeta();
+             addOrdinal = !this._hasEncodeRule('y');
+         }
+-        else if (xAxisType === 'time') {
+-            option.layout = 'horizontal';
+-        }
+-        else if (yAxisType === 'time') {
+-            option.layout = 'vertical';
+-        }
+-        else {
+-            option.layout = option.layout || 'horizontal';
++        if (!layout) {
++            layout = yAxisType === 'time' ? 'vertical' : 'horizontal';
++            // It is theoretically possible for an axis with type "time" to serve as the "value axis".
++            // `layout` can be explicitly specified for that case.
+         }
++        // Do not assign the computed `layout` to `option.layout`, otherwise the idempotent may be broken.
++        this._layout = layout;
+ 
+         const coordDims = ['x', 'y'];
+-        const baseAxisDimIndex = option.layout === 'horizontal' ? 0 : 1;
++        const baseAxisDimIndex = layout === 'horizontal' ? 0 : 1;
+         const baseAxisDim = this._baseAxisDim = coordDims[baseAxisDimIndex];
+         const otherAxisDim = coordDims[1 - baseAxisDimIndex];
+         const axisModels = [xAxisModel, yAxisModel];
+@@ -169,6 +178,10 @@ class WhiskerBoxCommonMixin<Opts extends CommonOption> {
+         ) as CartesianAxisModel).axis;
+     }
+ 
++    getWhiskerBoxesLayout() {
++        return this._layout;
++    }
++
+ };
+ 
+ 
+diff --git a/test/candlestick-horizontal.html b/test/candlestick-horizontal.html
+index 49bf05f880..bc5fb0db42 100644
+--- a/test/candlestick-horizontal.html
++++ b/test/candlestick-horizontal.html
+@@ -41,6 +41,7 @@
+         <div id="main6"></div>
+         <div id="main7"></div>
+         <div id="main8"></div>
+ 
+         <script>
+             require(["echarts"], function (echarts) {
+@@ -69,7 +70,8 @@
+                     xAxisType,
+                     yAxisType,
+                     encode,
+-                    data
++                    data,
++                    layout,
+                 ) {
+                     var itemStyle =
+                         chartType === "candlestick"
+@@ -101,6 +103,7 @@
+                                 type: chartType,
+                                 encode: encode,
+                                 data: data,
++                                layout: layout,
+                                 itemStyle: itemStyle,
+                             },
+                         ],
+@@ -221,6 +224,24 @@
+                             reversedaray
+                         ),
+                     },
++                    {
++                        id: "main9",
++                        title: "boxplot with dual time axes",
++                        option: createChartOption(
++                            "boxplot",
++                            "time",
++                            "time",
++                            { y: [0, 1, 2, 3, 4], x: 5 },
++                            reversedaray.map(item => {
++                                const newItem = item.slice();
++                                    newItem[i] = new Date(newItem[i] + 1761804046510).toISOString();
++                                }
++                                return newItem;
++                            }),
++                            'horizontal'
++                        ),
++                    },
+                 ];
+ 
+                 // Create all charts

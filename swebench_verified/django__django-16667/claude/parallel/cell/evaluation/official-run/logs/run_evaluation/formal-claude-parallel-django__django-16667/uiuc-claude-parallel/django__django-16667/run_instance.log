@@ -1,0 +1,122 @@
+2026-08-15 07:38:02,454 - INFO - Creating container for django__django-16667...
+2026-08-15 07:38:02,584 - INFO - Container for django__django-16667 created: c29bfcba2308817be6b74a16b27e3718fafb56614882109eed287554bdeaf015
+2026-08-15 07:38:02,937 - INFO - Container for django__django-16667 started: c29bfcba2308817be6b74a16b27e3718fafb56614882109eed287554bdeaf015
+2026-08-15 07:38:02,937 - INFO - Intermediate patch for django__django-16667 written to logs/run_evaluation/formal-claude-parallel-django__django-16667/uiuc-claude-parallel/django__django-16667/patch.diff, now applying to container...
+2026-08-15 07:38:03,068 - INFO - >>>>> Applied Patch:
+Checking patch audit/conf.py...
+Checking patch audit/t1.py...
+Checking patch audit/t2.py...
+Checking patch audit/t3.py...
+Checking patch audit/t4.py...
+Checking patch audit/t5.py...
+Checking patch audit/t6.py...
+Checking patch audit/t7.py...
+Checking patch django/forms/widgets.py...
+Checking patch fuzz1.py...
+Checking patch fuzz2.py...
+Checking patch fuzz3.py...
+Checking patch fuzz4.py...
+Checking patch fuzz5.py...
+Checking patch repro_refute.py...
+Checking patch s.py...
+Checking patch s2.py...
+Checking patch tests/forms_tests/widget_tests/test_selectdatewidget.py...
+Applied patch audit/conf.py cleanly.
+Applied patch audit/t1.py cleanly.
+Applied patch audit/t2.py cleanly.
+Applied patch audit/t3.py cleanly.
+Applied patch audit/t4.py cleanly.
+Applied patch audit/t5.py cleanly.
+Applied patch audit/t6.py cleanly.
+Applied patch audit/t7.py cleanly.
+Applied patch django/forms/widgets.py cleanly.
+Applied patch fuzz1.py cleanly.
+Applied patch fuzz2.py cleanly.
+Applied patch fuzz3.py cleanly.
+Applied patch fuzz4.py cleanly.
+Applied patch fuzz5.py cleanly.
+Applied patch repro_refute.py cleanly.
+Applied patch s.py cleanly.
+Applied patch s2.py cleanly.
+Applied patch tests/forms_tests/widget_tests/test_selectdatewidget.py cleanly.
+
+2026-08-15 07:38:03,851 - INFO - Git diff before:
+diff --git a/django/forms/widgets.py b/django/forms/widgets.py
+index 842b73e95c..3d6091c250 100644
+--- a/django/forms/widgets.py
++++ b/django/forms/widgets.py
+@@ -1161,6 +1161,8 @@ class SelectDateWidget(Widget):
+                 # Return pseudo-ISO dates with zeros for any unselected values,
+                 # e.g. '2017-0-23'.
+                 return "%s-%s-%s" % (y or 0, m or 0, d or 0)
++            except OverflowError:
++                return "0-0-0"
+             return date_value.strftime(input_format)
+         return data.get(name)
+ 
+diff --git a/tests/forms_tests/widget_tests/test_selectdatewidget.py b/tests/forms_tests/widget_tests/test_selectdatewidget.py
+index cfcd037987..b1aac06d45 100644
+--- a/tests/forms_tests/widget_tests/test_selectdatewidget.py
++++ b/tests/forms_tests/widget_tests/test_selectdatewidget.py
+@@ -621,6 +621,37 @@ class SelectDateWidgetTest(WidgetTest):
+                     self.widget.value_from_datadict(data, {}, "field"), expected
+                 )
+ 
++    def test_value_from_datadict_overflow(self):
++        # Values that overflow the C long used by datetime.date() don't crash,
++        # they're treated as an invalid date (#34495).
++        tests = [
++            ("1234567821345678", "1", "1"),
++            ("-1234567821345678", "1", "1"),
++            ("2000", "1234567821345678", "1"),
++            ("2000", "1", "1234567821345678"),
++        ]
++        for values in tests:
++            with self.subTest(values=values):
++                data = {
++                    "field_%s" % field_name: value
++                    for field_name, value in zip(("year", "month", "day"), values)
++                }
++                self.assertEqual(
++                    self.widget.value_from_datadict(data, {}, "field"), "0-0-0"
++                )
++
++    def test_form_with_overflow_year(self):
++        # A year that overflows the C long used by datetime.date() makes the
++        # form invalid instead of crashing with an OverflowError (#34495).
++        class TestForm(Form):
++            field = DateField(widget=self.widget)
++
++        form = TestForm(
++            {"field_year": "1234567821345678", "field_month": "1", "field_day": "1"}
++        )
++        self.assertIs(form.is_valid(), False)
++        self.assertEqual(form.errors, {"field": ["Enter a valid date."]})
++
+     def test_value_omitted_from_data(self):
+         self.assertIs(self.widget.value_omitted_from_data({}, {}, "field"), True)
+         self.assertIs(
+2026-08-15 07:38:03,851 - INFO - Eval script for django__django-16667 written to logs/run_evaluation/formal-claude-parallel-django__django-16667/uiuc-claude-parallel/django__django-16667/eval.sh; copying to container...
+2026-08-15 07:38:09,275 - INFO - Test runtime: 5.37 seconds
+2026-08-15 07:38:09,276 - INFO - Test output for django__django-16667 written to logs/run_evaluation/formal-claude-parallel-django__django-16667/uiuc-claude-parallel/django__django-16667/test_output.txt
+2026-08-15 07:38:09,340 - INFO - Git diff after:
+diff --git a/django/forms/widgets.py b/django/forms/widgets.py
+index 842b73e95c..3d6091c250 100644
+--- a/django/forms/widgets.py
++++ b/django/forms/widgets.py
+@@ -1161,6 +1161,8 @@ class SelectDateWidget(Widget):
+                 # Return pseudo-ISO dates with zeros for any unselected values,
+                 # e.g. '2017-0-23'.
+                 return "%s-%s-%s" % (y or 0, m or 0, d or 0)
++            except OverflowError:
++                return "0-0-0"
+             return date_value.strftime(input_format)
+         return data.get(name)
+2026-08-15 07:38:09,340 - INFO - Git diff changed after running eval script
+2026-08-15 07:38:09,340 - INFO - Grading answer for django__django-16667...
+2026-08-15 07:38:09,341 - INFO - report: {'django__django-16667': {'patch_is_None': False, 'patch_exists': True, 'patch_successfully_applied': True, 'resolved': True, 'tests_status': {'FAIL_TO_PASS': {'success': ['test_form_field (forms_tests.field_tests.test_datefield.DateFieldTest.test_form_field)', 'test_value_from_datadict (forms_tests.widget_tests.test_selectdatewidget.SelectDateWidgetTest.test_value_from_datadict)'], 'failure': []}, 'PASS_TO_PASS': {'success': ['test_datefield_1 (forms_tests.field_tests.test_datefield.DateFieldTest.test_datefield_1)', 'test_datefield_2 (forms_tests.field_tests.test_datefield.DateFieldTest.test_datefield_2)', 'test_datefield_3 (forms_tests.field_tests.test_datefield.DateFieldTest.test_datefield_3)', 'test_datefield_4 (forms_tests.field_tests.test_datefield.DateFieldTest.test_datefield_4)', 'test_datefield_5 (forms_tests.field_tests.test_datefield.DateFieldTest.test_datefield_5)', 'test_datefield_changed (forms_tests.field_tests.test_datefield.DateFieldTest.test_datefield_changed)', "field.strptime() doesn't raise a UnicodeEncodeError (#16123)", 'test_form_label_association (forms_tests.field_tests.test_datefield.DateFieldTest.test_form_label_association)', 'DateField.has_changed() with SelectDateWidget works with a localized', 'test_l10n_invalid_date_in (forms_tests.field_tests.test_datefield.DateFieldTest.test_l10n_invalid_date_in)', 'test_custom_input_format (forms_tests.widget_tests.test_selectdatewidget.SelectDateWidgetTest.test_custom_input_format)', 'test_custom_months (forms_tests.widget_tests.test_selectdatewidget.SelectDateWidgetTest.test_custom_months)', 'test_fieldset (forms_tests.widget_tests.test_selectdatewidget.SelectDateWidgetTest.test_fieldset)', 'test_format_value (forms_tests.widget_tests.test_selectdatewidget.SelectDateWidgetTest.test_format_value)', 'test_l10n (forms_tests.widget_tests.test_selectdatewidget.SelectDateWidgetTest.test_l10n)', 'test_render_datetime (forms_tests.widget_tests.test_selectdatewidget.SelectDateWidgetTest.test_render_datetime)', 'test_render_empty (forms_tests.widget_tests.test_selectdatewidget.SelectDateWidgetTest.test_render_empty)', 'Invalid dates should still render the failed date.', "Rendering the None or '' values should yield the same output.", 'test_render_string (forms_tests.widget_tests.test_selectdatewidget.SelectDateWidgetTest.test_render_string)', 'test_selectdate_empty_label (forms_tests.widget_tests.test_selectdatewidget.SelectDateWidgetTest.test_selectdate_empty_label)', 'test_selectdate_required (forms_tests.widget_tests.test_selectdatewidget.SelectDateWidgetTest.test_selectdate_required)', 'test_value_omitted_from_data (forms_tests.widget_tests.test_selectdatewidget.SelectDateWidgetTest.test_value_omitted_from_data)', 'test_years_rendered_without_separator (forms_tests.widget_tests.test_selectdatewidget.SelectDateWidgetTest.test_years_rendered_without_separator)'], 'failure': []}, 'FAIL_TO_FAIL': {'success': [], 'failure': []}, 'PASS_TO_FAIL': {'success': [], 'failure': []}}}}
+Result for django__django-16667: resolved: True
+2026-08-15 07:38:09,341 - INFO - Attempting to stop container sweb.eval.django__django-16667.formal-claude-parallel-django__django-16667...
+2026-08-15 07:38:24,923 - INFO - Container sweb.eval.django__django-16667.formal-claude-parallel-django__django-16667 stopped successfully.
+2026-08-15 07:38:24,923 - INFO - Attempting to remove container sweb.eval.django__django-16667.formal-claude-parallel-django__django-16667...
+2026-08-15 07:38:27,654 - INFO - Container sweb.eval.django__django-16667.formal-claude-parallel-django__django-16667 removed successfully.

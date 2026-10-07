@@ -1,0 +1,53 @@
+diff --git a/lib/matplotlib/dates.py b/lib/matplotlib/dates.py
+index 4d8ddf3ee5..6c97e2f1b2 100644
+--- a/lib/matplotlib/dates.py
++++ b/lib/matplotlib/dates.py
+@@ -797,8 +797,15 @@ class ConciseDateFormatter(ticker.Formatter):
+         # 3: hours, 4: minutes, 5: seconds, 6: microseconds
+         for level in range(5, -1, -1):
+             if len(np.unique(tickdate[:, level])) > 1:
+-                if level < 2:
++                if level == 0:
++                    # The year is shown in the labels, so the offset is
++                    # not needed.
+                     show_offset = False
++                elif level == 1:
++                    # The year is only shown in the labels if a tick
++                    # falls on January; otherwise it goes in the offset.
++                    if np.any(tickdate[:, 1] == 1):
++                        show_offset = False
+                 break
+             elif level == 0:
+                 # all tickdate are the same, so only micros might be different
+diff --git a/lib/matplotlib/tests/test_dates.py b/lib/matplotlib/tests/test_dates.py
+index a78c39c560..647ccb09bc 100644
+--- a/lib/matplotlib/tests/test_dates.py
++++ b/lib/matplotlib/tests/test_dates.py
+@@ -613,6 +613,27 @@ def test_concise_formatter_show_offset(t_delta, expected):
+     assert formatter.get_offset() == expected
+ 
+ 
++@pytest.mark.parametrize('initial, expected', [
++    # range of less than a year with no January tick, so the year
++    # must be shown in the offset
++    (datetime.datetime(2021, 2, 14), '2021'),
++    # range including a January tick, so the year is in the labels
++    (datetime.datetime(2021, 1, 1), '')
++])
++def test_concise_formatter_show_offset_year(initial, expected):
++    times = [initial + datetime.timedelta(days=x) for x in range(200)]
++
++    fig, ax = plt.subplots()
++    locator = mdates.AutoDateLocator()
++    formatter = mdates.ConciseDateFormatter(locator)
++    ax.xaxis.set_major_locator(locator)
++    ax.xaxis.set_major_formatter(formatter)
++
++    ax.plot(times, range(len(times)))
++    fig.canvas.draw()
++    assert formatter.get_offset() == expected
++
++
+ def test_offset_changes():
+     fig, ax = plt.subplots()
+ 

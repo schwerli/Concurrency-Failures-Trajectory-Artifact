@@ -1,0 +1,45 @@
+diff --git a/django/db/models/fields/files.py b/django/db/models/fields/files.py
+index 7a99b12691..652a1147a4 100644
+--- a/django/db/models/fields/files.py
++++ b/django/db/models/fields/files.py
+@@ -295,8 +295,10 @@ class FileField(Field):
+         if kwargs.get("max_length") == 100:
+             del kwargs["max_length"]
+         kwargs["upload_to"] = self.upload_to
+-        if self.storage is not default_storage:
+-            kwargs["storage"] = getattr(self, "_storage_callable", self.storage)
++        if hasattr(self, "_storage_callable"):
++            kwargs["storage"] = self._storage_callable
++        elif self.storage is not default_storage:
++            kwargs["storage"] = self.storage
+         return name, path, args, kwargs
+ 
+     def get_internal_type(self):
+diff --git a/tests/file_storage/tests.py b/tests/file_storage/tests.py
+index 4616aad10a..0738c78267 100644
+--- a/tests/file_storage/tests.py
++++ b/tests/file_storage/tests.py
+@@ -46,6 +46,10 @@ from .models import Storage, callable_storage, temp_storage, temp_storage_locati
+ FILE_SUFFIX_REGEX = "[A-Za-z0-9]{7}"
+ 
+ 
++def callable_default_storage():
++    return default_storage
++
++
+ class GetStorageClassTests(SimpleTestCase):
+     @ignore_warnings(category=RemovedInDjango51Warning)
+     def test_get_filesystem_storage(self):
+@@ -1018,6 +1022,12 @@ class FieldCallableFileStorageTests(SimpleTestCase):
+         storage = kwargs["storage"]
+         self.assertIs(storage, callable_storage)
+ 
++    def test_deconstruction_storage_callable_default(self):
++        field = FileField(storage=callable_default_storage)
++        *_, kwargs = field.deconstruct()
++        self.assertIs(field.storage, default_storage)
++        self.assertIs(kwargs["storage"], callable_default_storage)
++
+ 
+ # Tests for a race condition on file saving (#4948).
+ # This is written in such a way that it'll always pass on platforms

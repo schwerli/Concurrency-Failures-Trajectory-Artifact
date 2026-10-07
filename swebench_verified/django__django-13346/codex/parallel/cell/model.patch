@@ -1,0 +1,68 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fafc1beee8..8b497b2409 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -423,6 +423,30 @@ class KeyTransformExact(JSONExact):
+         return super().as_sql(compiler, connection)
+ 
+ 
++class KeyTransformIn(lookups.In):
++    def resolve_expression_parameter(self, compiler, connection, sql, param):
++        sql, params = super().resolve_expression_parameter(compiler, connection, sql, param)
++        if isinstance(param, KeyTransform):
++            return sql, params
++        if connection.vendor == 'oracle':
++            if len(params) != 1:
++                return sql, params
++            value = params[0]
++            if isinstance(value, str):
++                try:
++                    value = json.loads(value)
++                except json.JSONDecodeError:
++                    pass
++            function = 'JSON_QUERY' if isinstance(value, (list, dict)) else 'JSON_VALUE'
++            return "%s('%s', '$.value')" % (
++                function,
++                json.dumps({'value': value}),
++            ), []
++        if connection.vendor in {'mysql', 'sqlite'}:
++            return "JSON_EXTRACT(%s, '$')" % sql, params
++        return sql, params
++
++
+ class KeyTransformIExact(CaseInsensitiveMixin, KeyTransformTextLookupMixin, lookups.IExact):
+     pass
+ 
+@@ -480,6 +504,7 @@ class KeyTransformGte(KeyTransformNumericLookupMixin, lookups.GreaterThanOrEqual
+ 
+ 
+ KeyTransform.register_lookup(KeyTransformExact)
++KeyTransform.register_lookup(KeyTransformIn)
+ KeyTransform.register_lookup(KeyTransformIExact)
+ KeyTransform.register_lookup(KeyTransformIsNull)
+ KeyTransform.register_lookup(KeyTransformIContains)
+diff --git a/tests/model_fields/test_jsonfield.py b/tests/model_fields/test_jsonfield.py
+index a7648711ac..771437febb 100644
+--- a/tests/model_fields/test_jsonfield.py
++++ b/tests/model_fields/test_jsonfield.py
+@@ -653,6 +653,20 @@ class TestQuerying(TestCase):
+     def test_key_iregex(self):
+         self.assertIs(NullableJSONModel.objects.filter(value__foo__iregex=r'^bAr$').exists(), True)
+ 
++    def test_key_in(self):
++        tests = [
++            ('value__c__in', [14, 15], [self.objs[3], self.objs[4]]),
++            ('value__foo__in', ['bar', 'baz'], [self.objs[7]]),
++            ('value__baz__in', [{'a': 'b', 'c': 'd'}, {'e': 'f'}], [self.objs[7]]),
++            ('value__d__in', [['e', {'f': 'g'}], ['x']], [self.objs[4]]),
++        ]
++        for lookup, value, expected in tests:
++            with self.subTest(lookup=lookup, value=value):
++                self.assertSequenceEqual(
++                    NullableJSONModel.objects.filter(**{lookup: value}),
++                    expected,
++                )
++
+     @skipUnlessDBFeature('has_json_operators')
+     def test_key_sql_injection(self):
+         with CaptureQueriesContext(connection) as queries:

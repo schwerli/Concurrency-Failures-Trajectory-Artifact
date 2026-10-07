@@ -1,0 +1,28 @@
+Done. The port is complete and verified.
+
+## What was built
+
+A Cargo project in `/output` with **zero dependencies** (`Cargo.lock` contains only `test14`):
+
+| File | Role |
+|---|---|
+| `test14.rs` | Entry point — mirrors `test14.cpp` line for line |
+| `tsl/hopscotch_hash.rs` | The hopscotch table (mirrors `tsl/hopscotch_hash.h`) |
+| `tsl/hopscotch_map.rs` | `HopscotchMap` facade (mirrors `tsl/hopscotch_map.h`) |
+| `tsl/tests.rs` | Unit + differential tests |
+| `cxx/string.rs`, `cxx/mod.rs` | `std::stoi` and libstdc++ terminate behavior |
+
+The map is a genuine hopscotch implementation, not a `HashMap` wrapper: power-of-two bucket array over-allocated by `NEIGHBORHOOD_SIZE - 1` slots, a 62-bit neighborhood bitmap + overflow bit per bucket, backward hopping of the nearest empty slot on insert, and an overflow list fallback.
+
+C++ semantics kept where they differ from Rust idiom: `insert((k,v))` does **not** overwrite and returns `bool`; `map2[0] = 999` inserts a default via `IndexMut`; `==` compares size then per-key values; `bool` prints as `1`/`0`.
+
+## Verification
+
+- **Byte-identical output** (`cmp` on raw bytes: `31 20 30 0a` = `"1 0\n"`) vs the C++ binary across all 5 documented examples plus no-args, negative counts, `12abc`, `" 42"`, `0x10`, `--b 7`, and counts up to 8M.
+- **Error paths match too** — stdout, stderr and exit code: `--a` with no value, `--a notanumber`, and `--a 99999999999` all reproduce the libstdc++ `terminate called after throwing an instance of '…'` / `  what():  stoi` text and exit 134 via `std::process::abort()`.
+- **`cargo test --release`: 10 passed, 0 failed**, including a 40,000-operation differential check of insert/insert_or_assign/remove/get against `std::HashMap`, a degenerate all-collide hasher exercising the overflow path, and load-factor/`operator[]`/equality tests.
+- Clean build from `cargo clean`: **zero warnings** from both `cargo build --release` and `rustc -O --edition 2021 test14.rs -o test14`.
+
+One design note worth flagging: my first draft re-located an entry by hash after a rehash triggered mid-insert, which returns the *wrong* slot when two keys share a hash — so `map[k]` could have handed back a colliding entry's value. I restructured it so all growth decisions happen *before* placement (`grow_if_needed`), and added a non-decreasing overflow threshold so a bad hash function can't force a rehash on every insert.
+
+Performance is 0.75s vs the C++ 0.19s at 2M inserts; the gap is mostly SipHash-1-3 versus `std::hash<int>`'s identity hash. I kept `std`'s hasher rather than identity-hashing integers, since the module is generic and identity hashing is a footgun for other key types — say the word if you'd prefer matching the C++ hash exactly.

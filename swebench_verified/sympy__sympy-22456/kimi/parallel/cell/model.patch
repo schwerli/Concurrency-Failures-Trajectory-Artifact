@@ -1,0 +1,49 @@
+diff --git a/sympy/codegen/ast.py b/sympy/codegen/ast.py
+index a02714b174..35d0b35b41 100644
+--- a/sympy/codegen/ast.py
++++ b/sympy/codegen/ast.py
+@@ -895,7 +895,6 @@ class String(Token):
+ 
+     """
+     __slots__ = ('text',)
+-    not_in_args = ['text']
+     is_Atom = True
+ 
+     @classmethod
+diff --git a/sympy/codegen/tests/test_ast.py b/sympy/codegen/tests/test_ast.py
+index 00c5d4cf28..8cf3aeabda 100644
+--- a/sympy/codegen/tests/test_ast.py
++++ b/sympy/codegen/tests/test_ast.py
+@@ -266,6 +266,7 @@ def test_String():
+     assert st.is_Atom
+     assert st == String('foobar')
+     assert st.text == 'foobar'
++    assert st.func(*st.args) == st
+     assert st.func(**st.kwargs()) == st
+ 
+ 
+diff --git a/sympy/core/basic.py b/sympy/core/basic.py
+index 346169741a..e6dfb8103f 100644
+--- a/sympy/core/basic.py
++++ b/sympy/core/basic.py
+@@ -496,7 +496,8 @@ def atoms(self, *types):
+         if types:
+             result = {node for node in nodes if isinstance(node, types)}
+         else:
+-            result = {node for node in nodes if not node.args}
++            result = {node for node in nodes if isinstance(node, Basic)
++                      and all(not isinstance(a, Basic) for a in node.args)}
+         return result
+ 
+     @property
+@@ -1570,6 +1571,10 @@ def matches(self, expr, repl_dict=None, old=False):
+         for arg, other_arg in zip(self.args, expr.args):
+             if arg == other_arg:
+                 continue
++            if not isinstance(arg, Basic):
++                # non-Basic args (e.g. the ``str`` arg of
++                # ``sympy.codegen.ast.String``) only match when equal
++                return None
+             if arg.is_Relational:
+                 try:
+                     d = arg.xreplace(d).matches(other_arg, d, old=old)

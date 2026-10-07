@@ -1,0 +1,67 @@
+diff --git a/CHANGES b/CHANGES
+index 327dc5e43..c28e8f6db 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -92,6 +92,8 @@ Bugs fixed
+   accommodate infinite redirect loops on HEAD
+ * #8437: Makefile: ``make clean`` with empty BUILDDIR is dangerous
+ * #8352: std domain: Failed to parse an option that starts with bracket
++* #8586: py domain: ``:type:`` and ``:rtype:`` gives false ambiguous class
++  lookup warnings
+ * #8519: LaTeX: Prevent page brake in the middle of a seealso
+ 
+ Testing
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+index 79d7e4f46..226f893bb 100644
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -1233,6 +1233,13 @@ class PythonDomain(Domain):
+             if mod.docname in docnames:
+                 self.modules[modname] = mod
+ 
++    def process_field_xref(self, pnode: pending_xref) -> None:
++        """Process a pending xref created in a doc field.
++        For example, attach information about the current scope.
++        """
++        pnode['py:module'] = self.env.ref_context.get('py:module')
++        pnode['py:class'] = self.env.ref_context.get('py:class')
++
+     def find_obj(self, env: BuildEnvironment, modname: str, classname: str,
+                  name: str, type: str, searchmode: int = 0
+                  ) -> List[Tuple[str, ObjectEntry]]:
+diff --git a/tests/test_domain_py.py b/tests/test_domain_py.py
+index 2dc97bed9..8032d962c 100644
+--- a/tests/test_domain_py.py
++++ b/tests/test_domain_py.py
+@@ -132,6 +132,31 @@ def test_domain_py_xrefs(app, status, warning):
+     assert len(refnodes) == 2
+ 
+ 
++@pytest.mark.sphinx('dummy', testroot='domain-py')
++def test_domain_py_xrefs_in_info_fields(app, status, warning):
++    """Info fields resolve xrefs in the same scope as explicit roles (refs #8586)."""
++    text = (".. py:module:: mod\n"
++            "\n"
++            ".. py:class:: A\n"
++            "\n"
++            ".. py:currentmodule:: mod.submod\n"
++            "\n"
++            ".. py:class:: A\n"
++            "\n"
++            ".. py:function:: f()\n"
++            "\n"
++            "   :param A a:\n"
++            "   :rtype: A\n")
++    doctree = restructuredtext.parse(app, text)
++
++    refnodes = [node for node in doctree.traverse(pending_xref)
++                if node['reftarget'] == 'A']
++    assert len(refnodes) == 2
++    for node in refnodes:
++        assert node['py:module'] == 'mod.submod'
++        assert node['py:class'] is None
++
++
+ @pytest.mark.sphinx('dummy', testroot='domain-py')
+ def test_domain_py_objects(app, status, warning):
+     app.builder.build_all()

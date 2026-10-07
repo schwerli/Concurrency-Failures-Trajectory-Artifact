@@ -1,0 +1,817 @@
+     1	/*
+     2	 * Licensed to the Apache Software Foundation (ASF) under one
+     3	 * or more contributor license agreements.  See the NOTICE file
+     4	 * distributed with this work for additional information
+     5	 * regarding copyright ownership.  The ASF licenses this file
+     6	 * to you under the Apache License, Version 2.0 (the
+     7	 * "License"); you may not use this file except in compliance
+     8	 * with the License.  You may obtain a copy of the License at
+     9	 *
+    10	 *     http://www.apache.org/licenses/LICENSE-2.0
+    11	 *
+    12	 * Unless required by applicable law or agreed to in writing, software
+    13	 * distributed under the License is distributed on an "AS IS" BASIS,
+    14	 * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    15	 * See the License for the specific language governing permissions and
+    16	 * limitations under the License.
+    17	 */
+    18	
+    19	package org.apache.hadoop.fs.s3a.audit.impl;
+    20	
+    21	import javax.annotation.Nullable;
+    22	import java.io.IOException;
+    23	import java.lang.reflect.Constructor;
+    24	import java.util.ArrayList;
+    25	import java.util.List;
+    26	
+    27	import com.amazonaws.AmazonWebServiceRequest;
+    28	import com.amazonaws.HandlerContextAware;
+    29	import com.amazonaws.Request;
+    30	import com.amazonaws.Response;
+    31	import com.amazonaws.SdkBaseException;
+    32	import com.amazonaws.handlers.HandlerAfterAttemptContext;
+    33	import com.amazonaws.handlers.HandlerBeforeAttemptContext;
+    34	import com.amazonaws.handlers.RequestHandler2;
+    35	import com.amazonaws.http.HttpResponse;
+    36	import com.amazonaws.services.s3.transfer.Transfer;
+    37	import com.amazonaws.services.s3.transfer.internal.TransferStateChangeListener;
+    38	import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+    39	import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
+    40	import org.slf4j.Logger;
+    41	import org.slf4j.LoggerFactory;
+    42	
+    43	import org.apache.hadoop.classification.InterfaceAudience;
+    44	import org.apache.hadoop.conf.Configuration;
+    45	import org.apache.hadoop.fs.Path;
+    46	import org.apache.hadoop.fs.impl.WeakReferenceThreadMap;
+    47	import org.apache.hadoop.fs.permission.FsAction;
+    48	import org.apache.hadoop.fs.s3a.S3AFileStatus;
+    49	import org.apache.hadoop.fs.s3a.Statistic;
+    50	import org.apache.hadoop.fs.s3a.audit.AWSAuditEventCallbacks;
+    51	import org.apache.hadoop.fs.s3a.audit.AWSRequestAnalyzer;
+    52	import org.apache.hadoop.fs.s3a.audit.AuditFailureException;
+    53	import org.apache.hadoop.fs.s3a.audit.AuditIntegration;
+    54	import org.apache.hadoop.fs.s3a.audit.AuditManagerS3A;
+    55	import org.apache.hadoop.fs.s3a.audit.AuditSpanS3A;
+    56	import org.apache.hadoop.fs.s3a.audit.OperationAuditor;
+    57	import org.apache.hadoop.fs.s3a.audit.OperationAuditorOptions;
+    58	import org.apache.hadoop.fs.s3a.audit.S3AAuditConstants;
+    59	import org.apache.hadoop.fs.store.LogExactlyOnce;
+    60	import org.apache.hadoop.fs.statistics.impl.IOStatisticsStore;
+    61	import org.apache.hadoop.service.CompositeService;
+    62	import org.apache.hadoop.util.functional.FutureIO;
+    63	
+    64	import static java.util.Objects.requireNonNull;
+    65	import static org.apache.hadoop.fs.s3a.Statistic.AUDIT_FAILURE;
+    66	import static org.apache.hadoop.fs.s3a.Statistic.AUDIT_REQUEST_EXECUTION;
+    67	import static org.apache.hadoop.fs.s3a.audit.AuditIntegration.attachSpanToRequest;
+    68	import static org.apache.hadoop.fs.s3a.audit.AuditIntegration.retrieveAttachedSpan;
+    69	import static org.apache.hadoop.fs.s3a.audit.S3AAuditConstants.AUDIT_REQUEST_HANDLERS;
+    70	
+    71	/**
+    72	 * Thread management for the active audit.
+    73	 * This should be created by whatever wants to have active
+    74	 * audit span tracking.
+    75	 *
+    76	 * It creates and starts the actual
+    77	 * {@link OperationAuditor} for auditing.
+    78	 * It then stores the thread-local span and returns a wrapping
+    79	 * span.
+    80	 *
+    81	 * When the wrapper is closed/deactivated it
+    82	 * will deactivate the wrapped span and then
+    83	 * switch the active span to the unbounded span.
+    84	 *
+    85	 * The inner class {@link AWSAuditEventCallbacks} is returned
+    86	 * as a request handler in {@link #createRequestHandlers()};
+    87	 * this forwards all requests to the outer {@code ActiveAuditManagerS3A},
+    88	 * which then locates the active span and forwards the request.
+    89	 * If any such invocation raises an {@link AuditFailureException}
+    90	 * then the IOStatistics counter for {@code AUDIT_FAILURE}
+    91	 * is incremented.
+    92	 *
+    93	 * Uses a {@link WeakReferenceThreadMap} to store the active span
+    94	 * of each thread, rather than a {@code ThreadLocal} reference.
+    95	 * This means that the spans -and hence the audit manager and
+    96	 * filesystem instances they refer to- are not retained by
+    97	 * long-lived threads once all other references to a span have been
+    98	 * released (HADOOP-18091).
+    99	 * The cost of this is that if garbage collection takes place before
+   100	 * a thread switches to a new span, the reference is lost; the
+   101	 * unbonded span is then handed back and the auditor notified through
+   102	 * {@code OperationAuditor.noteSpanReferenceLost()}.
+   103	 */
+   104	@InterfaceAudience.Private
+   105	public final class ActiveAuditManagerS3A
+   106	    extends CompositeService
+   107	    implements AuditManagerS3A {
+   108	
+   109	  /**
+   110	   * Logging.
+   111	   */
+   112	  private static final Logger LOG =
+   113	      LoggerFactory.getLogger(ActiveAuditManagerS3A.class);
+   114	
+   115	  /**
+   116	   * One of logger for warnings about span retrieval.
+   117	   */
+   118	  public static final LogExactlyOnce WARN_OF_SPAN_TYPE =
+   119	      new LogExactlyOnce(LOG);
+   120	
+   121	  public static final String AUDIT_MANAGER_OPERATION = "AuditManagerS3A";
+   122	
+   123	  public static final String NOT_A_WRAPPED_SPAN
+   124	      = "Span attached to request is not a wrapped span";
+   125	
+   126	  /**
+   127	   * Audit service.
+   128	   */
+   129	  private OperationAuditor auditor;
+   130	
+   131	  /**
+   132	   * Some basic analysis for the logs.
+   133	   */
+   134	  private final AWSRequestAnalyzer analyzer = new AWSRequestAnalyzer();
+   135	
+   136	  /**
+   137	   * This is the span returned to after a wrapper is closed or
+   138	   * the span is reset to the unbonded span..
+   139	   */
+   140	  private WrappingAuditSpan unbondedSpan;
+   141	
+   142	  /**
+   143	   * Thread local span. This defaults to being
+   144	   * the unbonded span.
+   145	   */
+   146	  private final WeakReferenceThreadMap<WrappingAuditSpan> activeSpanMap =
+   147	      new WeakReferenceThreadMap<>(
+   148	          (k) -> getUnbondedSpan(),
+   149	          this::noteSpanReferenceLost);
+   150	
+   151	  /**
+   152	   * Destination for recording statistics, especially duration/count of
+   153	   * operations.
+   154	   */
+   155	  private final IOStatisticsStore ioStatisticsStore;
+   156	
+   157	  /**
+   158	   * Instantiate.
+   159	   * @param iostatistics statistics target
+   160	   */
+   161	  public ActiveAuditManagerS3A(final IOStatisticsStore iostatistics) {
+   162	    super("ActiveAuditManagerS3A");
+   163	    this.ioStatisticsStore = iostatistics;
+   164	  }
+   165	
+   166	  @Override
+   167	  protected void serviceInit(final Configuration conf) throws Exception {
+   168	    super.serviceInit(conf);
+   169	    // create and register the service so it follows the same lifecycle
+   170	    OperationAuditorOptions options =
+   171	        OperationAuditorOptions.builder()
+   172	            .withConfiguration(conf)
+   173	            .withIoStatisticsStore(ioStatisticsStore);
+   174	    auditor = AuditIntegration.createAndInitAuditor(
+   175	        getConfig(),
+   176	        S3AAuditConstants.AUDIT_SERVICE_CLASSNAME,
+   177	        options);
+   178	    addService(auditor);
+   179	    LOG.debug("Audit manager initialized with audit service {}", auditor);
+   180	  }
+   181	
+   182	  /**
+   183	   * After starting the auditor, it is queried for its
+   184	   * unbonded span, which is then wrapped and stored for
+   185	   * use.
+   186	   */
+   187	  @Override
+   188	  protected void serviceStart() throws Exception {
+   189	    super.serviceStart();
+   190	    setUnbondedSpan(new WrappingAuditSpan(
+   191	        auditor.getUnbondedSpan(), false));
+   192	    LOG.debug("Started audit service {}", auditor);
+   193	  }
+   194	
+   195	  @Override
+   196	  public String toString() {
+   197	    final StringBuilder sb = new StringBuilder(super.toString());
+   198	    sb.append(", auditor=").append(auditor);
+   199	    sb.append('}');
+   200	    return sb.toString();
+   201	  }
+   202	
+   203	  @Override
+   204	  public OperationAuditor getAuditor() {
+   205	    return auditor;
+   206	  }
+   207	
+   208	  /**
+   209	   * Get the active span map, for testing.
+   210	   * @return the map of thread ID to active span.
+   211	   */
+   212	  @VisibleForTesting
+   213	  public WeakReferenceThreadMap<WrappingAuditSpan> getActiveSpanMap() {
+   214	    return activeSpanMap;
+   215	  }
+   216	
+   217	  /**
+   218	   * Prune the map of spans whose weak references have been
+   219	   * lost to garbage collection.
+   220	   * @return the number of entries pruned.
+   221	   */
+   222	  @VisibleForTesting
+   223	  public int prune() {
+   224	    return activeSpanMap.prune();
+   225	  }
+   226	
+   227	  /**
+   228	   * Span reference lost from GC operations.
+   229	   * This is only called when an attempt is made to retrieve on
+   230	   * the active thread or when a prune operation is cleaning up.
+   231	   *
+   232	   * @param threadId thread ID.
+   233	   */
+   234	  private void noteSpanReferenceLost(long threadId) {
+   235	    auditor.noteSpanReferenceLost(threadId);
+   236	  }
+   237	
+   238	  /**
+   239	   * Get the unbounded span. Until this manager
+   240	   * is fully initialized it will return the no-op
+   241	   * span.
+   242	   * @return the unbounded span.
+   243	   */
+   244	  private WrappingAuditSpan getUnbondedSpan() {
+   245	    return unbondedSpan;
+   246	  }
+   247	
+   248	  /**
+   249	   * Set the unbonded span.
+   250	   * @param unbondedSpan the new unbonded span
+   251	   */
+   252	  private void setUnbondedSpan(final WrappingAuditSpan unbondedSpan) {
+   253	    this.unbondedSpan = unbondedSpan;
+   254	  }
+   255	
+   256	  /**
+   257	   * Return the active wrapped span.
+   258	   * @return a span.
+   259	   */
+   260	  @Override
+   261	  public AuditSpanS3A getActiveAuditSpan() {
+   262	    return activeSpan();
+   263	  }
+   264	
+   265	  /**
+   266	   * Get the active span.
+   267	   * This is the wrapped span, not the inner one, and it is
+   268	   * of that type.
+   269	   * @return the active WrappingAuditSpan
+   270	   */
+   271	  private WrappingAuditSpan activeSpan() {
+   272	    return activeSpanMap.getForCurrentThread();
+   273	  }
+   274	
+   275	  /**
+   276	   * Set a specific span as the active span.
+   277	   * This will wrap it.
+   278	   * @param span span to use.
+   279	   * @return the wrapped span.
+   280	   */
+   281	  private AuditSpanS3A setActiveThreadSpan(AuditSpanS3A span) {
+   282	    return switchToActiveSpan(
+   283	        new WrappingAuditSpan(span, span.isValidSpan()));
+   284	  }
+   285	
+   286	  /**
+   287	   * Switch to a given span. If it is null, use the
+   288	   * unbounded span.
+   289	   * @param span to switch to; may be null
+   290	   * @return the span switched to
+   291	   */
+   292	  private WrappingAuditSpan switchToActiveSpan(WrappingAuditSpan span) {
+   293	    if (span != null && span.isValidSpan()) {
+   294	      activeSpanMap.setForCurrentThread(span);
+   295	    } else {
+   296	      activeSpanMap.removeForCurrentThread();
+   297	    }
+   298	    return activeSpan();
+   299	  }
+   300	
+   301	  /**
+   302	   * The Span ID in the audit manager is the ID of the auditor,
+   303	   * which can be used in the filesystem toString() method
+   304	   * to assist in correlating client logs with S3 logs.
+   305	   * It is returned here as part of the implementation of
+   306	   * {@link AWSAuditEventCallbacks}.
+   307	   * @return the unique ID of the FS.
+   308	   */
+   309	  @Override
+   310	  public String getSpanId() {
+   311	    return auditor != null
+   312	        ? auditor.getAuditorId()
+   313	        : "(auditor not yet created)";
+   314	  }
+   315	
+   316	  @Override
+   317	  public String getOperationName() {
+   318	    return AUDIT_MANAGER_OPERATION;
+   319	  }
+   320	
+   321	  /**
+   322	   * Start an operation; as well as invoking the audit
+   323	   * service to do this, sets the operation as the
+   324	   * active operation for this thread.
+   325	   * @param operation operation name.
+   326	   * @param path1 first path of operation
+   327	   * @param path2 second path of operation
+   328	   * @return a wrapped audit span
+   329	   * @throws IOException failure
+   330	   */
+   331	  @Override
+   332	  public AuditSpanS3A createSpan(final String operation,
+   333	      @Nullable final String path1,
+   334	      @Nullable final String path2) throws IOException {
+   335	    // must be started
+   336	    Preconditions.checkState(isInState(STATE.STARTED),
+   337	        "Audit Manager %s is in wrong state: %s",
+   338	        this, getServiceState());
+   339	    ioStatisticsStore.incrementCounter(
+   340	        Statistic.AUDIT_SPAN_CREATION.getSymbol());
+   341	    return setActiveThreadSpan(auditor.createSpan(
+   342	        operation, path1, path2));
+   343	  }
+   344	
+   345	  /**
+   346	   * Return a request handler for the AWS SDK which
+   347	   * relays to this class.
+   348	   * @return a request handler.
+   349	   */
+   350	  @Override
+   351	  public List<RequestHandler2> createRequestHandlers()
+   352	      throws IOException {
+   353	
+   354	    // wire up the AWS SDK To call back into this class when
+   355	    // preparing to make S3 calls.
+   356	    List<RequestHandler2> requestHandlers = new ArrayList<>();
+   357	    requestHandlers.add(new SdkRequestHandler());
+   358	    // now look for any more handlers
+   359	    final Class<?>[] handlers = getConfig().getClasses(AUDIT_REQUEST_HANDLERS);
+   360	    if (handlers != null) {
+   361	      for (Class<?> handler : handlers) {
+   362	        try {
+   363	          Constructor<?> ctor = handler.getConstructor();
+   364	          requestHandlers.add((RequestHandler2)ctor.newInstance());
+   365	        } catch (ExceptionInInitializerError e) {
+   366	          throw FutureIO.unwrapInnerException(e);
+   367	        } catch (Exception e) {
+   368	          throw new IOException(e);
+   369	        }
+   370	      }
+   371	    }
+   372	    return requestHandlers;
+   373	  }
+   374	
+   375	  @Override
+   376	  public TransferStateChangeListener createStateChangeListener() {
+   377	    final WrappingAuditSpan span = activeSpan();
+   378	    return new TransferStateChangeListener() {
+   379	      @Override
+   380	      public void transferStateChanged(final Transfer transfer,
+   381	          final Transfer.TransferState state) {
+   382	        switchToActiveSpan(span);
+   383	      }
+   384	    };
+   385	  }
+   386	
+   387	  @Override
+   388	  public boolean checkAccess(final Path path,
+   389	      final S3AFileStatus status,
+   390	      final FsAction mode)
+   391	      throws IOException {
+   392	    return auditor.checkAccess(path, status, mode);
+   393	  }
+   394	
+   395	  /**
+   396	   * Attach a reference to the active thread span, then
+   397	   * invoke the same callback on that active thread.
+   398	   */
+   399	  @Override
+   400	  public <T extends AmazonWebServiceRequest> T requestCreated(
+   401	      final T request) {
+   402	    AuditSpanS3A span = getActiveAuditSpan();
+   403	    if (LOG.isTraceEnabled()) {
+   404	      LOG.trace("Created Request {} in span {}",
+   405	          analyzer.analyze(request), span);
+   406	    }
+   407	    attachSpanToRequest(request, span);
+   408	    try {
+   409	      return span.requestCreated(request);
+   410	    } catch (AuditFailureException e) {
+   411	      ioStatisticsStore.incrementCounter(AUDIT_FAILURE.getSymbol());
+   412	      throw e;
+   413	    }
+   414	  }
+   415	
+   416	  /**
+   417	   * Forward to the active span.
+   418	   * All invocations increment the statistics counter for
+   419	   * {@link Statistic#AUDIT_REQUEST_EXECUTION};
+   420	   * failures will also increment
+   421	   * {@link Statistic#AUDIT_FAILURE};
+   422	   * {@inheritDoc}
+   423	   */
+   424	  @Override
+   425	  public <T extends AmazonWebServiceRequest> T beforeExecution(
+   426	      final T request) {
+   427	    ioStatisticsStore.incrementCounter(AUDIT_REQUEST_EXECUTION.getSymbol());
+   428	
+   429	    // identify the span and invoke the callback
+   430	    try {
+   431	      return extractAndActivateSpanFromRequest(request)
+   432	          .beforeExecution(request);
+   433	    } catch (AuditFailureException e) {
+   434	      ioStatisticsStore.incrementCounter(AUDIT_FAILURE.getSymbol());
+   435	      throw e;
+   436	    }
+   437	  }
+   438	
+   439	  /**
+   440	   * Forward to active span.
+   441	   * @param request request
+   442	   * @param response response.
+   443	   */
+   444	  @Override
+   445	  public void afterResponse(final Request<?> request,
+   446	      final Response<?> response)
+   447	      throws AuditFailureException, SdkBaseException {
+   448	    try {
+   449	      extractAndActivateSpanFromRequest(request)
+   450	          .afterResponse(request, response);
+   451	    } catch (AuditFailureException e) {
+   452	      ioStatisticsStore.incrementCounter(AUDIT_FAILURE.getSymbol());
+   453	      throw e;
+   454	    }
+   455	  }
+   456	
+   457	  /**
+   458	   * Get the active span from the handler context,
+   459	   * falling back to the active thread span if there
+   460	   * is nothing in the context.
+   461	   * Provided the span is a wrapped span, the
+   462	   * @param request request
+   463	   * @param <T> type of request.
+   464	   * @return the callbacks
+   465	   */
+   466	  private <T extends HandlerContextAware> AWSAuditEventCallbacks
+   467	      extractAndActivateSpanFromRequest(final T request) {
+   468	    AWSAuditEventCallbacks span;
+   469	    span = retrieveAttachedSpan(request);
+   470	    if (span == null) {
+   471	      // no span is attached. Not unusual for the copy operations,
+   472	      // or for calls to GetBucketLocation made by the AWS client
+   473	      LOG.debug("No audit span attached to request {}",
+   474	          request);
+   475	      // fall back to the active thread span.
+   476	      // this will be the unbonded span if the thread is unbonded.
+   477	      span = getActiveAuditSpan();
+   478	    } else {
+   479	      if (span instanceof WrappingAuditSpan) {
+   480	        switchToActiveSpan((WrappingAuditSpan) span);
+   481	      } else {
+   482	        // warn/log and continue without switching.
+   483	        WARN_OF_SPAN_TYPE.warn(NOT_A_WRAPPED_SPAN + ": {}", span);
+   484	        LOG.debug(NOT_A_WRAPPED_SPAN + ": {}", span);
+   485	      }
+   486	    }
+   487	    return span;
+   488	  }
+   489	
+   490	  /**
+   491	   * Forward to active span.
+   492	   * @param request request
+   493	   * @param response response.
+   494	   * @param exception exception raised.
+   495	   */
+   496	  @Override
+   497	  public void afterError(final Request<?> request,
+   498	      final Response<?> response,
+   499	      final Exception exception)
+   500	      throws AuditFailureException, SdkBaseException {
+   501	    try {
+   502	      extractAndActivateSpanFromRequest(request)
+   503	          .afterError(request, response, exception);
+   504	    } catch (AuditFailureException e) {
+   505	      ioStatisticsStore.incrementCounter(AUDIT_FAILURE.getSymbol());
+   506	      throw e;
+   507	    }
+   508	  }
+   509	
+   510	  @Override
+   511	  public AmazonWebServiceRequest beforeMarshalling(
+   512	      final AmazonWebServiceRequest request) {
+   513	    try {
+   514	      return extractAndActivateSpanFromRequest(request)
+   515	          .beforeMarshalling(request);
+   516	    } catch (AuditFailureException e) {
+   517	      ioStatisticsStore.incrementCounter(AUDIT_FAILURE.getSymbol());
+   518	      throw e;
+   519	    }
+   520	  }
+   521	
+   522	  @Override
+   523	  public void beforeRequest(final Request<?> request) {
+   524	    try {
+   525	      extractAndActivateSpanFromRequest(request)
+   526	          .beforeRequest(request);
+   527	    } catch (AuditFailureException e) {
+   528	      ioStatisticsStore.incrementCounter(AUDIT_FAILURE.getSymbol());
+   529	      throw e;
+   530	    }
+   531	  }
+   532	
+   533	  @Override
+   534	  public void beforeAttempt(final HandlerBeforeAttemptContext context) {
+   535	    try {
+   536	      extractAndActivateSpanFromRequest(context.getRequest())
+   537	          .beforeAttempt(context);
+   538	    } catch (AuditFailureException e) {
+   539	      ioStatisticsStore.incrementCounter(AUDIT_FAILURE.getSymbol());
+   540	      throw e;
+   541	    }
+   542	  }
+   543	
+   544	  @Override
+   545	  public void afterAttempt(final HandlerAfterAttemptContext context) {
+   546	    try {
+   547	      extractAndActivateSpanFromRequest(context.getRequest())
+   548	          .afterAttempt(context);
+   549	    } catch (AuditFailureException e) {
+   550	      ioStatisticsStore.incrementCounter(AUDIT_FAILURE.getSymbol());
+   551	      throw e;
+   552	    }
+   553	  }
+   554	
+   555	  @Override
+   556	  public HttpResponse beforeUnmarshalling(final Request<?> request,
+   557	      final HttpResponse httpResponse) {
+   558	    try {
+   559	      extractAndActivateSpanFromRequest(request.getOriginalRequest())
+   560	          .beforeUnmarshalling(request, httpResponse);
+   561	    } catch (AuditFailureException e) {
+   562	      ioStatisticsStore.incrementCounter(AUDIT_FAILURE.getSymbol());
+   563	      throw e;
+   564	    }
+   565	    return httpResponse;
+   566	  }
+   567	
+   568	  /**
+   569	   * Callbacks from the AWS SDK; all forward to the ActiveAuditManagerS3A.
+   570	   * We need a separate class because the SDK requires the handler list
+   571	   * to be list of {@code RequestHandler2} instances.
+   572	   */
+   573	  private class SdkRequestHandler extends RequestHandler2 {
+   574	
+   575	    @Override
+   576	    public AmazonWebServiceRequest beforeExecution(
+   577	        final AmazonWebServiceRequest request) {
+   578	      return ActiveAuditManagerS3A.this.beforeExecution(request);
+   579	    }
+   580	
+   581	    @Override
+   582	    public void afterResponse(final Request<?> request,
+   583	        final Response<?> response) {
+   584	      ActiveAuditManagerS3A.this.afterResponse(request, response);
+   585	    }
+   586	
+   587	    @Override
+   588	    public void afterError(final Request<?> request,
+   589	        final Response<?> response,
+   590	        final Exception e) {
+   591	      ActiveAuditManagerS3A.this.afterError(request, response, e);
+   592	    }
+   593	
+   594	    @Override
+   595	    public AmazonWebServiceRequest beforeMarshalling(
+   596	        final AmazonWebServiceRequest request) {
+   597	      return ActiveAuditManagerS3A.this.beforeMarshalling(request);
+   598	    }
+   599	
+   600	    @Override
+   601	    public void beforeRequest(final Request<?> request) {
+   602	      ActiveAuditManagerS3A.this.beforeRequest(request);
+   603	    }
+   604	
+   605	    @Override
+   606	    public void beforeAttempt(
+   607	        final HandlerBeforeAttemptContext context) {
+   608	      ActiveAuditManagerS3A.this.beforeAttempt(context);
+   609	    }
+   610	
+   611	    @Override
+   612	    public HttpResponse beforeUnmarshalling(
+   613	        final Request<?> request,
+   614	        final HttpResponse httpResponse) {
+   615	      return ActiveAuditManagerS3A.this.beforeUnmarshalling(request,
+   616	          httpResponse);
+   617	    }
+   618	
+   619	    @Override
+   620	    public void afterAttempt(
+   621	        final HandlerAfterAttemptContext context) {
+   622	      ActiveAuditManagerS3A.this.afterAttempt(context);
+   623	    }
+   624	  }
+   625	
+   626	  /**
+   627	   * Wraps the plugged in spans with management of the active thread
+   628	   * span, including switching to the unbounded span when a valid
+   629	   * span is deactivated.
+   630	   * Package-private for testing.
+   631	   */
+   632	  private final class WrappingAuditSpan extends AbstractAuditSpanImpl {
+   633	
+   634	    /**
+   635	     * Inner span.
+   636	     */
+   637	    private final AuditSpanS3A span;
+   638	
+   639	    /**
+   640	     * Is this span considered valid?
+   641	     */
+   642	    private final boolean isValid;
+   643	
+   644	    /**
+   645	     * Create, wrapped.
+   646	     * The spanID, name, timestamp etc copied from the span being wrapped.
+   647	     * Why not the isValid state? We want to set our unbonded span without
+   648	     * relying on the auditor doing the right thing.
+   649	     * @param span inner span.
+   650	     * @param isValid is the span valid
+   651	     */
+   652	    private WrappingAuditSpan(
+   653	        final AuditSpanS3A span, final boolean isValid) {
+   654	      super(span.getSpanId(), span.getTimestamp(), span.getOperationName());
+   655	      this.span = requireNonNull(span);
+   656	      this.isValid = isValid;
+   657	    }
+   658	
+   659	    /**
+   660	     * Is the span active?
+   661	     * @return true if this span is the active one for the current thread.
+   662	     */
+   663	    private boolean isActive() {
+   664	      return this == getActiveAuditSpan();
+   665	    }
+   666	
+   667	    /**
+   668	     * Makes this the thread's active span and activate.
+   669	     * If the span was already active: no-op.
+   670	     */
+   671	    @Override
+   672	    public AuditSpanS3A activate() {
+   673	      if (!isActive()) {
+   674	        switchToActiveSpan(this);
+   675	        span.activate();
+   676	      }
+   677	      return this;
+   678	    }
+   679	
+   680	    /**
+   681	     * Switch to the unbounded span and then deactivate this span.
+   682	     * No-op for invalid spans,
+   683	     * so as to prevent the unbounded span from being closed
+   684	     * and everything getting very confused.
+   685	     */
+   686	    @Override
+   687	    public void deactivate() {
+   688	      // no-op for invalid spans,
+   689	      // so as to prevent the unbounded span from being closed
+   690	      // and everything getting very confused.
+   691	      if (!isValid || !isActive()) {
+   692	        return;
+   693	      }
+   694	      // deactivate the span
+   695	      span.deactivate();
+   696	      // and go to the unbounded one.
+   697	      switchToActiveSpan(getUnbondedSpan());
+   698	    }
+   699	
+   700	    /**
+   701	     * Forward to the wrapped span.
+   702	     * {@inheritDoc}
+   703	     */
+   704	    @Override
+   705	    public <T extends AmazonWebServiceRequest> T requestCreated(
+   706	        final T request) {
+   707	      return span.requestCreated(request);
+   708	    }
+   709	
+   710	    /**
+   711	     * This span is valid if the span isn't closed and the inner
+   712	     * span is valid.
+   713	     * @return true if the span is considered valid.
+   714	     */
+   715	    @Override
+   716	    public boolean isValidSpan() {
+   717	      return isValid && span.isValidSpan();
+   718	    }
+   719	
+   720	    /**
+   721	     * Forward to the inner span.
+   722	     * {@inheritDoc}
+   723	     */
+   724	    @Override
+   725	    public void set(final String key, final String value) {
+   726	      span.set(key, value);
+   727	    }
+   728	
+   729	    /**
+   730	     * Forward to the inner span.
+   731	     * @param request request
+   732	     * @param <T> type of request
+   733	     * @return an updated request.
+   734	     */
+   735	    @Override
+   736	    public <T extends AmazonWebServiceRequest> T beforeExecution(
+   737	        final T request) {
+   738	      return span.beforeExecution(request);
+   739	    }
+   740	
+   741	    /**
+   742	     * Forward to the inner span.
+   743	     * @param request request
+   744	     * @param response response.
+   745	     */
+   746	    @Override
+   747	    public void afterResponse(final Request<?> request,
+   748	        final Response<?> response) {
+   749	      span.afterResponse(request, response);
+   750	    }
+   751	
+   752	    /**
+   753	     * Forward to the inner span.
+   754	     * @param request request
+   755	     * @param response response.
+   756	     * @param exception exception raised.
+   757	     */
+   758	    @Override
+   759	    public void afterError(final Request<?> request,
+   760	        final Response<?> response,
+   761	        final Exception exception) {
+   762	      span.afterError(request, response, exception);
+   763	    }
+   764	
+   765	    /**
+   766	     * Forward to the inner span.
+   767	     * @param request request
+   768	     * @return request to marshall
+   769	     */
+   770	    @Override
+   771	    public AmazonWebServiceRequest beforeMarshalling(
+   772	        final AmazonWebServiceRequest request) {
+   773	      return span.beforeMarshalling(request);
+   774	    }
+   775	
+   776	    /**
+   777	     * Forward to the inner span.
+   778	     * @param request request
+   779	     */
+   780	    @Override
+   781	    public void beforeRequest(final Request<?> request) {
+   782	      span.beforeRequest(request);
+   783	    }
+   784	
+   785	    /**
+   786	     * Forward to the inner span.
+   787	     * @param context full context, including the request.
+   788	     */
+   789	    @Override
+   790	    public void beforeAttempt(
+   791	        final HandlerBeforeAttemptContext context) {
+   792	      span.beforeAttempt(context);
+   793	    }
+   794	
+   795	    /**
+   796	     * Forward to the inner span.
+   797	     *
+   798	     * @param context full context, including the request.
+   799	     */
+   800	    @Override
+   801	    public void afterAttempt(
+   802	        final HandlerAfterAttemptContext context) {
+   803	      span.afterAttempt(context);
+   804	    }
+   805	
+   806	    @Override
+   807	    public String toString() {
+   808	      final StringBuilder sb = new StringBuilder(
+   809	          "WrappingAuditSpan{");
+   810	      sb.append("span=").append(span);
+   811	      sb.append(", valid=").append(isValidSpan());
+   812	      sb.append('}');
+   813	      return sb.toString();
+   814	    }
+   815	  }
+   816	
+   817	}

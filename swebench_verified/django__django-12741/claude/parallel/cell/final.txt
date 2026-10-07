@@ -1,0 +1,27 @@
+Done. `execute_sql_flush()` now takes only `sql_list` and infers the alias from `self.connection.alias`.
+
+**`django/db/backends/base/operations.py:403`** — the signature change:
+
+```python
+def execute_sql_flush(self, sql_list):
+    """Execute a list of SQL statements to flush the database."""
+    with transaction.atomic(
+        using=self.connection.alias,
+        savepoint=self.connection.features.can_rollback_ddl,
+    ):
+```
+
+**Call sites updated** (all three; no backend overrides this method):
+- `django/core/management/commands/flush.py:63` — was passing `database`; the local is still used at line 80 for `emit_post_migrate_signal`, so nothing went dead
+- `tests/backends/base/test_operations.py:175` and `tests/backends/tests.py:165` — both were already passing `connection.alias`, exactly the redundancy the ticket describes
+
+**`docs/releases/3.1.txt:529`** — added a bullet to the existing "Database backend API" backwards-incompatible section, next to the sibling `sql_flush()` notes, since third-party backends may call or override this.
+
+Verification:
+- `backends` suite: 235 tests, OK. The two directly affected classes: 5 tests, OK.
+- Broader sweep (`backends test_utils multiple_database fixtures admin_scripts transactions empty migrations`): 1274 tests, 3 failures — all confirmed **pre-existing**, reproduced identically on a stashed clean tree (`DiffSettings.test_all`, `test_unified_all`, `test_startapp_unicode_name`; container locale is ASCII and euid is root).
+- Drove `manage.py flush --database=other` end-to-end against a two-database sqlite setup: only `other` was flushed, `default` untouched. Called the new one-arg form directly on the non-default connection and spied on `transaction.atomic` — it opens with `using='other'`, matching `connection.alias`.
+
+One note on the alias inference, since it's the only real risk of dropping the argument: `ConnectionHandler.__getitem__` (`django/db/utils.py`) constructs `DatabaseWrapper(db, alias)` and caches it under that same alias, so `connections[alias].alias == alias` holds by construction — the old `using` argument was provably redundant at every call site, not merely usually equal.
+
+A 14-agent adversarial audit (call-site completeness, behavioral equivalence, Django conventions, test coverage) raised 10 candidate findings; all 10 were refuted on verification, leaving zero confirmed defects. Worth knowing about the one it probed hardest: nothing in the suite *asserts* the alias equivalence directly, but a verifier mutation-tested it by restoring the old two-arg definition and got 4 failures / 40 errors — the change is covered loudly via `TransactionTestCase._fixture_teardown`, which exercises the new path on the non-default `other` alias ~98 times in a 115-test batch. I did not add a test for that, matching the upstream shape of this change; say the word if you'd like one pinning `transaction.atomic(using=...)`.

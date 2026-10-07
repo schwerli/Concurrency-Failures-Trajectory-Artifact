@@ -1,0 +1,117 @@
+{
+  "schema_version": 2,
+  "phase": "fixed",
+  "pair_id": "swebench_verified/django__django-16315/codex",
+  "task": {
+    "plain_summary_zh": "修复 Django QuerySet.bulk_create(update_conflicts=True) 在 unique_fields/update_fields 使用带 db_column 的字段时生成错误冲突 SQL 的问题。",
+    "acceptance_target_zh": "冲突目标和更新赋值必须使用数据库列名 field.column 而不是模型字段名，并用覆盖混合大小写 db_column 的回归测试验证。"
+  },
+  "modes": {
+    "parallel": {
+      "solution_passed": true,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 300.104
+    },
+    "serial": {
+      "solution_passed": false,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 31.886
+    }
+  },
+  "reconstruction": {
+    "parallel_strategy_zh": "并行主线程先定位 bulk_create 校验字段后仍把原始字段名传给后端冲突 SQL 的路径，随后修改 query/backend 代码并添加 bulk_create 的 db_column 回归模型和测试，官方评测通过。",
+    "serial_strategy_zh": "串行收到同一任务和提示，但在开始解题前发生 stream disconnected before response.completed，没有助手消息、工具调用、测试或补丁，评测只处理空补丁。",
+    "realized_parallelism_zh": "并行确实生成了 test_inspector 子代理；子代理从 02:06:13 到 02:08:45 独立检查测试和后端路径，主线程同期继续诊断、编辑和测试。但子代理建议到达时主线程已经采用并应用同一修复思路。",
+    "parallel_workers": 2,
+    "peak_overlapping_useful_workers": 2
+  },
+  "baseline_audit": {
+    "same_task_and_prompt": true,
+    "serial_run_valid": false,
+    "parallel_run_valid": true,
+    "external_or_harness_issues_zh": [
+      "串行 agent 进程约 3 秒后因 provider/stream 断开失败，last_agent_message 为 null，未产生任何可比较的单路径解题工作。"
+    ]
+  },
+  "decision": "exclude",
+  "exclusion_code": "serial_external_failure",
+  "decision_reason_zh": "虽然并行完成并通过官方评测，而且存在主线程与子代理的实际重叠工作，但串行基线在无助手输出、无工具调用、无补丁的情况下因 stream 断开失败，因此质量差异不能归因于并发机制。",
+  "advantage": null,
+  "new_pattern_candidate": {
+    "is_candidate": false,
+    "name_zh": null,
+    "mechanism_zh": null,
+    "why_existing_dimensions_fail_zh": null
+  },
+  "evidence": {
+    "parallel": [
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/13/rollout-2026-08-13T02-06-05-019ff8de-97e8-7503-be65-cd98e498b7cb.jsonl",
+        "line": 28,
+        "summary_zh": "主线程发起 test_inspector 子代理，开始并行检查路径。"
+      },
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/13/rollout-2026-08-13T02-06-05-019ff8de-97e8-7503-be65-cd98e498b7cb.jsonl",
+        "line": 162,
+        "summary_zh": "主线程在子代理最终报告前已经应用包含回归测试的补丁。"
+      },
+      {
+        "path": "parallel/agent/codex/sessions/2026/08/13/rollout-2026-08-13T02-06-13-019ff8de-b7d9-7401-a9e9-522b1cbe79f5.jsonl",
+        "line": 169,
+        "summary_zh": "子代理最终建议保留字段对象并使用 field.column，方向与主线程已经采用的修复一致。"
+      },
+      {
+        "path": "parallel/cell.json",
+        "line": 5,
+        "summary_zh": "并行 cell 记录总墙钟时间为 300.104 秒。"
+      }
+    ],
+    "serial": [
+      {
+        "path": "serial/agent/codex/sessions/2026/08/13/rollout-2026-08-13T02-22-49-019ff8ed-ec64-7a80-8cea-56714e02be44.jsonl",
+        "line": 13,
+        "summary_zh": "串行任务以 stream disconnected before response.completed 结束，last_agent_message 为 null。"
+      },
+      {
+        "path": "serial/cell.json",
+        "line": 21,
+        "summary_zh": "串行 usage 记录 LLM 请求数为 0，说明没有有效解题请求完成。"
+      },
+      {
+        "path": "serial/cell.json",
+        "line": 26,
+        "summary_zh": "串行 usage 记录工具调用数为 0，没有搜索、编辑或测试行为。"
+      },
+      {
+        "path": "serial/cell/status.json",
+        "line": 120,
+        "summary_zh": "串行状态记录 failure_mode 为 unknown_agent_error。"
+      }
+    ],
+    "evaluator": [
+      {
+        "path": "parallel/cell/evaluation/summary.json",
+        "line": 70,
+        "summary_zh": "官方评测记录并行 solution_passed 为 true。"
+      },
+      {
+        "path": "serial/cell/evaluation/summary.json",
+        "line": 40,
+        "summary_zh": "官方评测记录串行 patch_exists 为 false。"
+      },
+      {
+        "path": "serial/cell/evaluation/summary.json",
+        "line": 68,
+        "summary_zh": "官方评测记录串行 solution_passed 为 false。"
+      }
+    ]
+  },
+  "case_narrative_zh": "该任务要求 Django 在 bulk_create(update_conflicts=True) 的 ON CONFLICT 和更新赋值 SQL 中尊重字段的 db_column，尤其是混合大小写数据库列名。并行运行中主线程定位并修复 query/backend 路径，另一个 test_inspector 子代理同期检查测试和后端细节，最后官方评测通过；但子代理报告到达时主线程已采用并应用同一方向。串行运行不是正常失败的单路径基线：它在收到同一提示后约 3 秒因 stream 断开结束，last_agent_message 为 null，LLM 请求和工具调用均为 0，补丁为空。因此本例必须按 serial_external_failure 排除，不能把并行通过与串行未通过解释为并发带来的可测质量优势，也不进入三维 taxonomy 分类。",
+  "confidence": "high"
+}

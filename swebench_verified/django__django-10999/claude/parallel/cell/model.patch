@@ -1,0 +1,329 @@
+diff --git a/django/utils/dateparse.py b/django/utils/dateparse.py
+index 8d08b7d1d3..a037758784 100644
+--- a/django/utils/dateparse.py
++++ b/django/utils/dateparse.py
+@@ -29,7 +29,7 @@ datetime_re = re.compile(
+ standard_duration_re = re.compile(
+     r'^'
+     r'(?:(?P<days>-?\d+) (days?, )?)?'
+-    r'((?:(?P<hours>-?\d+):)(?=\d+:\d+))?'
++    r'((?:(?P<hours>-?\d+):)(?=-?\d+:-?\d+))?'
+     r'(?:(?P<minutes>-?\d+):)?'
+     r'(?P<seconds>-?\d+)'
+     r'(?:\.(?P<microseconds>\d{1,6})\d{0,6})?'
+diff --git a/probe/p1.py b/probe/p1.py
+new file mode 100644
+index 0000000000..00055de508
+--- /dev/null
++++ b/probe/p1.py
+@@ -0,0 +1,72 @@
++import sys, re, itertools, datetime
++sys.path.insert(0, '/testbed')
++import django.utils.dateparse as dp
++from django.utils.dateparse import parse_duration, standard_duration_re, postgres_interval_re, iso8601_duration_re
++from django.utils.duration import duration_string, duration_iso_string
++from datetime import timedelta
++
++print("dateparse from:", dp.__file__)
++print("live standard_duration_re:", standard_duration_re.pattern)
++print()
++
++OLD = re.compile(
++    r'^'
++    r'(?:(?P<days>-?\d+) (days?, )?)?'
++    r'((?:(?P<hours>-?\d+):)(?=\d+:\d+))?'
++    r'(?:(?P<minutes>-?\d+):)?'
++    r'(?P<seconds>-?\d+)'
++    r'(?:\.(?P<microseconds>\d{1,6})\d{0,6})?'
++    r'$'
++)
++
++def parse_with(std, value):
++    m = std.match(value) or iso8601_duration_re.match(value) or postgres_interval_re.match(value)
++    if not m:
++        return None
++    kw = m.groupdict()
++    days = timedelta(float(kw.pop('days', 0) or 0))
++    sign = -1 if kw.pop('sign', '+') == '-' else 1
++    if kw.get('microseconds'):
++        kw['microseconds'] = kw['microseconds'].ljust(6, '0')
++    if kw.get('seconds') and kw.get('microseconds') and kw['seconds'].startswith('-'):
++        kw['microseconds'] = '-' + kw['microseconds']
++    kw = {k: float(v) for k, v in kw.items() if v is not None}
++    return days + sign * timedelta(**kw)
++
++def which(value):
++    if standard_duration_re.match(value): return 'standard'
++    if iso8601_duration_re.match(value): return 'iso8601'
++    if postgres_interval_re.match(value): return 'postgres'
++    return '-none-'
++
++def groups(value):
++    m = standard_duration_re.match(value)
++    return m.groupdict() if m else None
++
++CASES = [
++ # explicitly requested
++ '-1:-15:-30', '-01:-01', '-15:-30', '1:-15:-30', '-4 -1:-15:-30', '-4 days, -1:-15:-30',
++ '-1:-15:30.1', '-0:-0:1.5',
++ # sign-loss / -0 probes
++ '-0:15:30', '-0:30', '-0:00:01.5', '-00:15:30', '-0.5', '-0:-0:-1.5',
++ '-1:-15:-0.5', '15:-30.1', '-0:00.1', '-0:0:0.5',
++ # mixed signs
++ '1:-15:30', '1:15:-30', '-1:15:-30', '-1:-15:30', '4 -1:-15:-30', '-4 1:15:30',
++ # days spellings
++ '-4 days -1:-15:-30', '-4 day, -1:-15:-30', '-4 days -15:00:30', '-4 days, -15:00:30',
++ '-1 day, -0:00:01', '-1 day -0:00:01',
++ # plus signs
++ '+30', '+15:30', '+1:15:30', '+0:00:01', '+1:-15:-30',
++ # already-supported baselines
++ '-4 15:30', '-172800', '-15:30', '-1:15:30', '-30.1', '30', '15:30', '10:15:30',
++ # iso
++ '-P1DT1H', 'P-1DT1H', 'P1DT-1H', '-PT1S', '+PT1S',
++]
++
++print("%-24s %-9s %-22s %s" % ("input", "matcher", "result", "std groups (h/m/s/us/days)"))
++print("-"*110)
++for c in CASES:
++    r = parse_duration(c)
++    g = groups(c)
++    gs = "" if g is None else "d=%s h=%s m=%s s=%s us=%s" % (g['days'], g['hours'], g['minutes'], g['seconds'], g['microseconds'])
++    print("%-24r %-9s %-22s %s" % (c, which(c), r, gs))
+diff --git a/redos_probe.py b/redos_probe.py
+new file mode 100644
+index 0000000000..cda314218f
+--- /dev/null
++++ b/redos_probe.py
+@@ -0,0 +1,218 @@
++#!/usr/bin/env python3
++"""
++ReDoS / performance probe for the standard_duration_re change in
++django/utils/dateparse.py.
++
++OLD hours lookahead:  (?=\d+:\d+)
++NEW hours lookahead:  (?=-?\d+:-?\d+)
++
++Times both compiled patterns (and the full parse_duration() path, which also
++runs iso8601_duration_re and postgres_interval_re) against adversarial inputs
++and estimates the growth exponent from a log-log fit over doubling n.
++"""
++import math
++import re
++import statistics
++import sys
++import time
++
++OLD = re.compile(
++    r'^'
++    r'(?:(?P<days>-?\d+) (days?, )?)?'
++    r'((?:(?P<hours>-?\d+):)(?=\d+:\d+))?'
++    r'(?:(?P<minutes>-?\d+):)?'
++    r'(?P<seconds>-?\d+)'
++    r'(?:\.(?P<microseconds>\d{1,6})\d{0,6})?'
++    r'$'
++)
++
++NEW = re.compile(
++    r'^'
++    r'(?:(?P<days>-?\d+) (days?, )?)?'
++    r'((?:(?P<hours>-?\d+):)(?=-?\d+:-?\d+))?'
++    r'(?:(?P<minutes>-?\d+):)?'
++    r'(?P<seconds>-?\d+)'
++    r'(?:\.(?P<microseconds>\d{1,6})\d{0,6})?'
++    r'$'
++)
++
++# ---------------------------------------------------------------- input family
++# Each entry: (name, lambda n -> str)
++FAMILIES = [
++    # long runs of the newly-permitted sign character
++    ('dash_run',            lambda n: '-' * n),
++    ('dash_run_digit',      lambda n: '-' * n + '1'),
++    ('digit_dash_run',      lambda n: '1' + '-' * n),
++    # long digit runs (force \d+ backtracking against required literals)
++    ('digit_run',           lambda n: '1' * n),
++    ('digit_run_colon',     lambda n: '1' * n + ':'),
++    ('digit_run_junk',      lambda n: '1' * n + 'x'),
++    ('digit_run_dot',       lambda n: '1' * n + '.' + '9' * n),
++    ('digit_run_space',     lambda n: '1' * n + ' '),
++    # near-miss: hours group binds, lookahead runs, then whole match fails
++    ('d_colon_d_junk',      lambda n: '1' * n + ':' + '1' * n + 'x'),
++    ('nd_colon_nd_junk',    lambda n: '-' + '1' * n + ':-' + '1' * n + 'x'),
++    ('d_c_d_c_d_junk',      lambda n: ('1' * n + ':') * 2 + '1' * n + 'x'),
++    ('nd_c_nd_c_nd_junk',   lambda n: ('-' + '1' * n + ':') * 2 + '-' + '1' * n + 'x'),
++    # many colons
++    ('colon_run',           lambda n: ':' * n),
++    ('one_colon_run',       lambda n: '1' + ':' * n),
++    ('colons_signed',       lambda n: ':-' * n),
++    ('rep_1colon_junk',     lambda n: '1:' * n + 'x'),
++    ('rep_m1colon',         lambda n: '-1:' * n),
++    ('rep_m1colon_junk',    lambda n: '-1:' * n + 'x'),
++    ('rep_m1colon_tail',    lambda n: '-1:' * n + '-30'),
++    ('rep_colon_m1',        lambda n: ':-1' * n),
++    # spaces / days group interplay
++    ('rep_1space',          lambda n: '1 ' * n),
++    ('rep_m1space',         lambda n: '-1 ' * n),
++    ('rep_days',            lambda n: '1 days, ' * n),
++    ('days_then_colons',    lambda n: '-4 ' + '-1:' * n + '-30'),
++    ('days_big_hms',        lambda n: '1' * n + ' ' + '1' * n + ':' + '1' * n + ':' + '1' * n),
++    ('days_big_hms_junk',   lambda n: '1' * n + ' ' + '1' * n + ':' + '1' * n + ':' + '1' * n + 'x'),
++    # signed everything (the case the fix targets), scaled up + broken
++    ('neg_hms',             lambda n: '-' + '1' * n + ':-' + '1' * n + ':-' + '1' * n),
++    ('neg_hms_junk',        lambda n: '-' + '1' * n + ':-' + '1' * n + ':-' + '1' * n + 'x'),
++    ('neg_hms_micro',       lambda n: '-1:-15:-30.' + '1' * n),
++    ('neg_hms_trailzero',   lambda n: '-1:-15:-30' + '0' * n),
++    # alternating sign/digit noise, no colon anywhere -> lookahead can never win
++    ('alt_m1',              lambda n: '-1' * n),
++    ('alt_m1_junk',         lambda n: '-1' * n + 'x'),
++    ('alt_dash_digit_colon', lambda n: '-1' * n + ':'),
++    # dashes around colons (stresses the new -? specifically)
++    ('dashes_colon_dashes', lambda n: '-' * n + ':' + '-' * n + ':' + '-' * n),
++    ('dash_digit_groups',   lambda n: ('-' * n + '1:') * 3),
++]
++
++NS = [125, 250, 500, 1000, 2000, 4000]
++BIG_N = 20000        # single extra-large point for superlinearity detection
++REPEAT_BUDGET = 0.02  # seconds of repeated matching per measurement
++
++
++def timeit(fn, arg):
++    """Return (best_seconds_per_call, n_calls). Adaptive repeat count."""
++    # warmup / single-shot guard for a pathological case
++    t0 = time.perf_counter()
++    fn(arg)
++    single = time.perf_counter() - t0
++    if single > 0.5:
++        return single, 1
++    reps = max(1, min(20000, int(REPEAT_BUDGET / max(single, 1e-9))))
++    best = single
++    for _ in range(3):
++        t0 = time.perf_counter()
++        for _ in range(reps):
++            fn(arg)
++        dt = (time.perf_counter() - t0) / reps
++        best = min(best, dt)
++    return best, reps
++
++
++def fit_exponent(ns, ts):
++    """log-log least squares slope: t ~ n**k."""
++    pts = [(math.log(n), math.log(t)) for n, t in zip(ns, ts) if t > 0]
++    if len(pts) < 2:
++        return float('nan')
++    mx = statistics.fmean(x for x, _ in pts)
++    my = statistics.fmean(y for _, y in pts)
++    num = sum((x - mx) * (y - my) for x, y in pts)
++    den = sum((x - mx) ** 2 for x, _ in pts)
++    return num / den if den else float('nan')
++
++
++def main():
++    sys.path.insert(0, '/testbed')
++    from django.utils.dateparse import parse_duration, standard_duration_re
++    assert standard_duration_re.pattern == NEW.pattern, (
++        'checkout does not carry the NEW pattern:\n%r' % standard_duration_re.pattern
++    )
++
++    rows = []
++    print('%-22s %6s %12s %12s %8s   %s' %
++          ('family', 'n', 'old_us', 'new_us', 'ratio', 'len/match'))
++    print('-' * 92)
++    for name, gen in FAMILIES:
++        old_ts, new_ts = [], []
++        for n in NS:
++            s = gen(n)
++            to, _ = timeit(OLD.match, s)
++            tn, _ = timeit(NEW.match, s)
++            old_ts.append(to)
++            new_ts.append(tn)
++            if n == NS[-1]:
++                mo = 'old=%s new=%s' % (bool(OLD.match(s)), bool(NEW.match(s)))
++                print('%-22s %6d %12.3f %12.3f %8.2f   len=%d %s' %
++                      (name, n, to * 1e6, tn * 1e6, tn / to if to else float('inf'),
++                       len(s), mo))
++        ko = fit_exponent(NS, old_ts)
++        kn = fit_exponent(NS, new_ts)
++        # one very large point
++        s = gen(BIG_N)
++        tob, _ = timeit(OLD.match, s)
++        tnb, _ = timeit(NEW.match, s)
++        # full parse_duration() path (what DurationField actually calls)
++        tpd, _ = timeit(parse_duration, s)
++        rows.append((name, ko, kn, max(old_ts), max(new_ts), tob, tnb, tpd, len(s)))
++
++    print()
++    print('growth exponent (t ~ n^k) over n=%s, plus n=%d point' % (NS, BIG_N))
++    print('%-22s %7s %7s %11s %11s %8s %11s %11s %8s' %
++          ('family', 'k_old', 'k_new', 'old4k_us', 'new4k_us',
++           'ratio', 'oldBIG_ms', 'newBIG_ms', 'pd_ms'))
++    print('-' * 108)
++    worst_ratio = (0, None)
++    worst_new = (0, None)
++    for (name, ko, kn, mo, mn, tob, tnb, tpd, ln) in sorted(
++            rows, key=lambda r: -r[6]):
++        ratio = tnb / tob if tob else float('inf')
++        print('%-22s %7.2f %7.2f %11.3f %11.3f %8.2f %11.4f %11.4f %8.4f' %
++              (name, ko, kn, mo * 1e6, mn * 1e6, ratio, tob * 1e3, tnb * 1e3,
++               tpd * 1e3))
++        if ratio > worst_ratio[0]:
++            worst_ratio = (ratio, name)
++        if tnb > worst_new[0]:
++            worst_new = (tnb, name)
++
++    print()
++    print('WORST absolute NEW time @n=%d : %.4f ms  (%s)' % (BIG_N, worst_new[0] * 1e3, worst_new[1]))
++    print('WORST new/old ratio    @n=%d : %.2fx        (%s)' % (BIG_N, worst_ratio[0], worst_ratio[1]))
++    print('max growth exponent: k_old=%.2f  k_new=%.2f' %
++          (max(r[1] for r in rows), max(r[2] for r in rows)))
++
++    # ---------------------------------------------------------- doubling check
++    print()
++    print('doubling check on the slowest families (t(2n)/t(n) ~ 2 => linear, ~4 => quadratic)')
++    slow = [r[0] for r in sorted(rows, key=lambda r: -r[6])[:6]]
++    gens = dict(FAMILIES)
++    for name in slow:
++        gen = gens[name]
++        seq = []
++        for n in (2500, 5000, 10000, 20000, 40000, 80000):
++            s = gen(n)
++            to, _ = timeit(OLD.match, s)
++            tn, _ = timeit(NEW.match, s)
++            seq.append((n, to, tn))
++        print('  %s' % name)
++        prev = None
++        for n, to, tn in seq:
++            r_old = to / prev[1] if prev else float('nan')
++            r_new = tn / prev[2] if prev else float('nan')
++            print('    n=%-7d old=%9.4f ms new=%9.4f ms   x_old=%5.2f x_new=%5.2f'
++                  % (n, to * 1e3, tn * 1e3, r_old, r_new))
++            prev = (n, to, tn)
++
++    # ------------------------------------------- hard adversarial single shots
++    print()
++    print('single-shot stress (no repeats), 200k-char inputs:')
++    for name, gen in FAMILIES:
++        s = gen(200000)
++        t0 = time.perf_counter(); OLD.match(s); a = time.perf_counter() - t0
++        t0 = time.perf_counter(); NEW.match(s); b = time.perf_counter() - t0
++        if max(a, b) > 0.01:
++            print('    %-22s len=%-8d old=%8.2f ms new=%8.2f ms  ratio=%.2f'
++                  % (name, len(s), a * 1e3, b * 1e3, b / a if a else float('inf')))
++    print('    (families not listed stayed under 10 ms for both patterns)')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tests/utils_tests/test_dateparse.py b/tests/utils_tests/test_dateparse.py
+index 8d464278ce..69dbc17ac3 100644
+--- a/tests/utils_tests/test_dateparse.py
++++ b/tests/utils_tests/test_dateparse.py
+@@ -116,6 +116,9 @@ class DurationParseTests(unittest.TestCase):
+             ('-15:30', timedelta(minutes=-15, seconds=30)),
+             ('-1:15:30', timedelta(hours=-1, minutes=15, seconds=30)),
+             ('-30.1', timedelta(seconds=-30, milliseconds=-100)),
++            ('-1:-15:-30', timedelta(hours=-1, minutes=-15, seconds=-30)),
++            ('-1:-15:-30.1', timedelta(hours=-1, minutes=-15, seconds=-30, milliseconds=-100)),
++            ('-4 -1:-15:-30', timedelta(days=-4, hours=-1, minutes=-15, seconds=-30)),
+         )
+         for source, expected in test_values:
+             with self.subTest(source=source):

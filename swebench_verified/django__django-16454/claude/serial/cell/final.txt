@@ -1,0 +1,38 @@
+All 403 tests pass. Here's what changed:
+
+**`django/core/management/base.py`** — `CommandParser` now overrides `add_subparsers()` to propagate `called_from_command_line` into the parsers that `add_parser()` builds:
+
+```python
+def add_subparsers(self, **kwargs):
+    parser_class = kwargs.get("parser_class", type(self))
+    if issubclass(parser_class, CommandParser):
+        kwargs["parser_class"] = partial(
+            parser_class,
+            called_from_command_line=self.called_from_command_line,
+        )
+    return super().add_subparsers(**kwargs)
+```
+
+Notes on the design:
+- `kwargs.get("parser_class", type(self))` mirrors argparse's own `setdefault`, so a caller-supplied `parser_class` still wins.
+- The `issubclass` guard means a vanilla `ArgumentParser` passed as `parser_class` is left untouched (it would reject the extra kwarg).
+- `missing_args_message` is deliberately *not* propagated — it describes the top-level command's own required args, and subparsers go through `parse_known_args()`, not `parse_args()`.
+- `type(self)` resolves to the real class even for sub-sub-parsers built from the `partial`, so nesting works to any depth.
+
+**Verification** — I built a scratch project matching the ticket's `cheeses` command and drove it from a real `manage.py`:
+
+| invocation | before | after |
+|---|---|---|
+| `cheeses create` | `CommandError` traceback | `manage.py cheeses create: error: the following arguments are required: name` (rc=2) |
+| nested `nested one two` | traceback | usage + `manage.py nested one two: error: ...` (rc=2) |
+| `call_command("cheeses", "create")` | `CommandError` | `CommandError` (unchanged — programmatic callers still get the exception, not `SystemExit`) |
+
+I confirmed the "before" column by stashing the fix and re-running, so the new tests are pinned to actual behavior change rather than assumption.
+
+**Tests** — added `test_subparser_error_formatting` and `test_subparser_non_django_error_formatting` to `CommandRunTests` (these must run through the CLI: before the fix, `call_command()` already raised `CommandError` from subparsers, so only the command-line path distinguishes the bug), plus a new `subparser_vanilla` command using `parser_class=ArgumentParser` to cover the `issubclass` guard.
+
+Two things I left out, say the word if you want them:
+- **No release note.** This is an internal bugfix with no API change; `docs/releases/5.0.txt` is the open one here (`VERSION` is `5.0 alpha`) and bugfixes generally aren't listed.
+- **Prog name includes the subcommand** (`manage.py subparser foo: error: ...`), which is argparse's standard nesting behavior. I kept it rather than flattening to `manage.py subparser`.
+
+One unrelated observation: `black --check` reports `django/core/management/base.py` needs reformatting, but the diff is entirely on pre-existing lines (module-docstring blank line, a generator expression around line 527) — the installed black is newer than the one this tree was formatted with. I did not touch those.

@@ -1,0 +1,856 @@
+########## init ##########
+Initialize a StGit stack on a branch.
+
+Initializing a branch with a StGit stack commits initial, empty stack state for the
+branch to the repository. Theses stack metadata commits are tracked by the
+`refs/stacks/<branch>` reference. Updated stack state is committed by each StGit command
+that modifies the stack. StGit users do not have to do anything with the
+`refs/stacks/<branch>` ref directly.
+
+Some StGit commands, such as `stg new` and `stg uncommit`, will automatically initialize
+the stack, so it is often not necessary to explicitly initialize the stack on a branch.
+Also, branches created with `stg branch --create` are automatically initialized.
+
+The branch must already exist and point to a commit before initializing a StGit stack.
+
+StGit stack metadata can be deinitialized from a branch using `stg branch --cleanup`.
+See 'stg branch' for more details.
+
+Usage: stg init [OPTIONS]
+
+Options:
+  -b, --branch <branch>
+          Use <branch> instead of current branch
+
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')
+########## new ##########
+Create a new, empty patch on the current stack. The new patch is created on top of the
+currently applied patches, and is made the new top of the stack. Uncommitted changes in
+the work tree are not included in the patch -- that is handled by stg-refresh.
+
+The given patch name must be unique in the stack. If no name is given, one is generated
+from the first line of the patch's commit message.
+
+Patch names follow the rules for Git references with the additional constraint that
+patch names may not contain the '/' character. See git-check-ref-format(1) for details.
+
+Patch names may start with a leading '-'. When specifying such a patch name on the
+command line, the leading '-' may be escaped with a single backslash as in
+'\-patch-name' to disambiguate the patch name from command line options.
+
+An editor will be launched to edit the commit message to be used for the patch, unless
+the '--message' flag already specified one. The 'patchdescr.tmpl' template file (if
+available) is used to pre-fill the editor.
+
+Usage: stg new [OPTIONS] [patchname] [-- <path>...]
+       stg new [OPTIONS] [--name <patchname>] [-- <path>...]
+
+Arguments:
+  [patchname]
+          Name for new patch
+
+  [path]...
+          Refresh files matching path(s). Specifying paths implies '--refresh'. Using
+          '--refresh' without any paths will target all modified files.
+
+Options:
+  -n, --name <name>
+          Alternative to the [patchname] argument for specifying the name of the new
+          patch. This option allows the patch name to start with an unescaped leading
+          '-'.
+
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Refresh Options:
+  -r, --refresh
+          Refresh the new patch with changes from work tree. New patches are empty by
+          default, but with this option the new patch will capture outstanding changes
+          in the work tree as if 'stg refresh' was run. Use '--index' to refresh from
+          the index instead of the work tree.
+
+  -i, --index
+          Instead of refreshing the patch with the current contents of the worktree, use
+          the current contents of the index.
+
+  -F, --force
+          Force refresh with staged and unstaged changes.
+          
+          By default, if there are staged changes in the index along with unstaged
+          changes in the work tree, the command will abort. This option forces the
+          command to proceed using both the staged and unstaged changes.
+
+      --submodules
+          Include submodules in patch content
+
+      --no-submodules
+          Exclude submodules in patch content
+
+Patch Edit Options:
+  -e, --edit
+          Invoke editor for patch description
+
+  -d, --diff
+          Show diff when editing patch description
+
+  -m, --message <message>
+          Use message instead of invoking the editor
+
+  -f, --file <path>
+          Use the contents of file instead of invoking the editor. Use "-" to read from
+          stdin.
+
+      --no-verify
+          Disable commit-msg hook
+
+  -s, --signoff[=<value>]
+          Add "Signed-off-by" message trailer.
+          
+          The value is optional and defaults to the committer name and email. This
+          option may be provided multiple times.
+
+      --ack[=<value>]
+          Add "Acked-by" message trailer.
+          
+          The value is optional and defaults to the committer's name and email. This
+          option may be provided multiple times.
+
+      --review[=<value>]
+          Add "Reviewed-by" message trailer.
+          
+          The value is optional and defaults to the committer's name and email. This
+          option may be provided multiple times.
+
+      --author <name-and-email>
+          Set the author "name <email>"
+
+      --authname <name>
+          Set the author name
+
+      --authemail <email>
+          Set the author email
+
+      --authdate <date>
+          Set the date the patch was authored.
+          
+          Use "now" to use the current time and date.
+
+      --committer-date-is-author-date
+          Instead of using the current time as the committer date, use the author date
+          of the commit as the committer date.
+
+      --save-template <file>
+          Instead of running the command, just write the patch description to FILE, and
+          exit. (If FILE is "-", write to stdout.)
+          
+          When driving StGit from another program, it may be useful to first call a
+          command with '--save-template', then let the user edit the message, and then
+          call the same command with '--file'.
+########## refresh ##########
+Include the latest work tree and index changes in the current patch. This command
+generates a new git commit object for the patch; the old commit is no longer visible.
+
+Refresh will warn if the index is dirty, and require use of either the '--index' or
+'--force' options to override this check. This is to prevent accidental full refresh
+when only some changes were staged using git add interactive mode.
+
+You may optionally list one or more files or directories relative to the current working
+directory; if you do, only matching files will be updated.
+
+Behind the scenes, stg refresh first creates a new temporary patch with your updates,
+and then merges that patch into the patch you asked to have refreshed. If you asked to
+refresh a patch other than the topmost patch, there can be conflicts; in that case, the
+temporary patch will be left for you to take care of, for example with stg squash.
+
+The creation of the temporary patch is recorded in a separate entry in the patch stack
+log; this means that one undo step will undo the merge between the other patch and the
+temp patch, and two undo steps will additionally get rid of the temp patch.
+
+Usage: stg refresh [OPTIONS] [path]...
+
+Arguments:
+  [path]...
+          Only refresh files matching path
+
+Options:
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Refresh Options:
+  -u, --update
+          Only update the current patch files
+
+  -i, --index
+          Instead of setting the patch top to the current contents of the worktree, set
+          it to the current contents of the index.
+
+  -F, --force
+          Instead of warning the user when some work has already been staged (such as
+          with git add interactive mode) force a full refresh.
+
+      --conflicts[=<policy>]
+          Either "allow" or "disallow" pushing a patch with conflicts.
+          
+          Using `--conflicts=allow` (or just `--conflicts`) allows pushing a patch that
+          may result in unresolved merge conflicts. The patch will be pushed and files
+          with conflicts will be left with conflict markers to be resolved manually; or
+          the operation undone with `stg undo --hard`. This is the default behavior and
+          also corresponds to the "stgit.push.allow-conflicts" variable being set to
+          "true".
+          
+          Using `--conflicts=disallow` disallows pushing any patch that would result in
+          merge conflicts. The operation will stop on the last patch that can be pushed
+          without conflicts. This behavior can be configured by setting
+          "stgit.push.allow-conflicts" to "false".
+
+  -p, --patch <patch>
+          Refresh (applied) <patch> instead of the top patch
+
+  -a, --annotate <note>
+          Annotate the patch log entry with <note>
+
+      --submodules
+          Include submodules in patch content
+
+      --no-submodules
+          Exclude submodules in patch content
+
+Patch Edit Options:
+  -e, --edit
+          Invoke editor for patch description
+
+  -d, --diff
+          Show diff when editing patch description
+
+  -m, --message <message>
+          Use message instead of invoking the editor
+
+  -f, --file <path>
+          Use the contents of file instead of invoking the editor. Use "-" to read from
+          stdin.
+
+      --no-verify
+          Disable commit-msg hook
+
+  -s, --signoff[=<value>]
+          Add "Signed-off-by" message trailer.
+          
+          The value is optional and defaults to the committer name and email. This
+          option may be provided multiple times.
+
+      --ack[=<value>]
+          Add "Acked-by" message trailer.
+          
+          The value is optional and defaults to the committer's name and email. This
+          option may be provided multiple times.
+
+      --review[=<value>]
+          Add "Reviewed-by" message trailer.
+          
+          The value is optional and defaults to the committer's name and email. This
+          option may be provided multiple times.
+
+      --author <name-and-email>
+          Set the author "name <email>"
+
+      --authname <name>
+          Set the author name
+
+      --authemail <email>
+          Set the author email
+
+      --authdate <date>
+          Set the date the patch was authored.
+          
+          Use "now" to use the current time and date.
+
+      --committer-date-is-author-date
+          Instead of using the current time as the committer date, use the author date
+          of the commit as the committer date.
+########## series ##########
+Show all the patches in the series, or just those in the given range, ordered from
+bottom to top.
+
+The topmost applied patch is prefixed with '>'. All other applied patches are prefixed
+with '+'. Unapplied patches are prefixed with '-' and hidden patches with '!'.
+
+The --reverse option may be used to reverse the order in which patches are displayed.
+The reversed order is more stack-like, with the base of the stack appearing at the
+bottom of of the display.
+
+Empty patches are prefixed with a '*' when the --empty option is used.
+
+Usage: stg series [OPTIONS] [-A] [-U] [-H]
+       stg series [OPTIONS] --all
+       stg series [OPTIONS] --short
+       stg series [OPTIONS] [patch]...
+
+Arguments:
+  [patch]...
+          Patches to display
+
+Options:
+  -b, --branch <branch>
+          Use <branch> instead of current branch
+
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Select Options:
+  -a, --all
+          Select all patches, including hidden patches
+
+  -s, --short[=<n>]
+          Select <n> patches around the topmost patch only
+
+  -A, --applied
+          Select the applied patches only
+
+  -U, --unapplied
+          Select the unapplied patches only
+
+  -H, --hidden
+          Select the hidden patches only
+
+  -m, --missing <branch>
+          Select patches in <branch> not present in current branch
+
+Display Options:
+      --author
+          Display author name for each patch
+
+  -c, --count
+          Display the number of selected patches and exit
+
+  -i, --commit-id[=<length>]
+          Display the commit id for each patch.
+          
+          The optional length indicates how many prefix characters of the commit id to
+          display. The default is "full", which displays the full commit id, but may
+          alternatively be specified as a positive integer greater than or equal to 4.
+
+  -d, --description
+          Display short description for each patch
+
+  -e, --empty
+          Before the '+', '>', '-', and '!' prefixes, print a column that contains
+          either '0' (for empty patches) or a space (for non-empty patches).
+
+  -P, --no-prefix
+          Do not display the patch status prefix
+
+  -I, --indices
+          Display absolute patch indicies
+
+  -O, --offsets
+          Display relative offsets from topmost patch or from the stack base if no
+          patches are applied.
+
+  -r, --reverse
+          Display patches in reverse order.
+          
+          This causes the stack to be displayed "right-side up". By default, patches are
+          printed in order from bottom to top; i.e. the first patch in the stack is
+          printed first and the last patch is printed last. Thus with the default
+          ordering, the stack is displayed upside down. Reversing the order flips the
+          stack such that the bottom of the stack is spatially at the top of the
+          display, which may be more intuitive.
+
+      --showbranch
+          Display the branch name with the listed patches
+########## push ##########
+Push one or more unapplied patches from the series onto the stack.
+
+By default, the first unapplied patch is pushed.
+
+Unapplied patches may be pushed in arbitrary order, but out of order pushes may result
+in merge conflicts. If there are conflicts while pushing a patch, the conflicts are
+written to the work tree and the push command halts. Conflicts may then be resolved
+using the normal Git methods, or alternatively the push may be undone using 'stg undo'.
+
+Usage: stg push [OPTIONS] [patch]...
+       stg push [OPTIONS] -n <number>
+       stg push [OPTIONS] --all
+
+Arguments:
+  [patch]...
+          Patches to push
+
+Options:
+  -a, --all
+          Push all unapplied patches
+
+  -n, --number <n>
+          Push the specified number of patches.
+          
+          A negative number indicates to push all but that number of patches
+
+      --reverse
+          Push the patches in reverse order
+
+      --noapply
+          Reorder patches by pushing without applying
+
+      --set-tree
+          Push patches keeping their original trees.
+          
+          For each patch pushed, instead of performing a merge, the patch is pushed such
+          the resulting tree will be identical to the tree associated with the patch.
+          
+          This can be useful when splitting a patch by first popping the patch and
+          creating a new patch with some of the changes. Pushing the original patch with
+          '--set-tree' will avoid conflicts and only the remaining changes will be in
+          the patch.
+
+  -k, --keep
+          Keep the local changes
+
+  -m, --merged
+          Check for patches merged upstream
+
+      --committer-date-is-author-date
+          Instead of using the current time as the committer date, use the author date
+          of the commit as the committer date.
+
+      --conflicts[=<policy>]
+          Either "allow" or "disallow" pushing a patch with conflicts.
+          
+          Using `--conflicts=allow` (or just `--conflicts`) allows pushing a patch that
+          may result in unresolved merge conflicts. The patch will be pushed and files
+          with conflicts will be left with conflict markers to be resolved manually; or
+          the operation undone with `stg undo --hard`. This is the default behavior and
+          also corresponds to the "stgit.push.allow-conflicts" variable being set to
+          "true".
+          
+          Using `--conflicts=disallow` disallows pushing any patch that would result in
+          merge conflicts. The operation will stop on the last patch that can be pushed
+          without conflicts. This behavior can be configured by setting
+          "stgit.push.allow-conflicts" to "false".
+
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')
+########## pop ##########
+Pop (unapply) one or more applied patches.
+
+By default, the topmost applied patch is popped.
+
+If ranges of patches are specified, pop and push operations are performed such that only
+the patches specified on the command line are unapplied at the end of the operation. It
+is possible for some of these intermediate push operations to fail due to conflicts if
+patches are popped out of last-pushed first-popped order.
+
+Usage: stg pop [OPTIONS] [patch]...
+       stg pop [OPTIONS] --all
+       stg pop [OPTIONS] -n <number>
+
+Arguments:
+  [patch]...
+          Patches to pop
+
+Options:
+  -a, --all
+          Pop all applied patches
+
+  -n, --number <number>
+          Pop the specified <number> of patches.
+          
+          A negative number indicates to pop all but that number of patches
+
+  -s, --spill
+          Keep patches' modifications in index and worktree after popping
+
+  -k, --keep
+          Keep the local changes
+
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')
+########## goto ##########
+Go to patch by pushing or popping as necessary
+
+Usage: stg goto [OPTIONS] <patch>
+
+Arguments:
+  <patch>
+          Patch to go to
+
+Options:
+  -k, --keep
+          Keep the local changes
+
+  -m, --merged
+          Check for patches merged upstream
+
+      --committer-date-is-author-date
+          Instead of using the current time as the committer date, use the author date
+          of the commit as the committer date.
+
+      --conflicts[=<policy>]
+          Either "allow" or "disallow" pushing a patch with conflicts.
+          
+          Using `--conflicts=allow` (or just `--conflicts`) allows pushing a patch that
+          may result in unresolved merge conflicts. The patch will be pushed and files
+          with conflicts will be left with conflict markers to be resolved manually; or
+          the operation undone with `stg undo --hard`. This is the default behavior and
+          also corresponds to the "stgit.push.allow-conflicts" variable being set to
+          "true".
+          
+          Using `--conflicts=disallow` disallows pushing any patch that would result in
+          merge conflicts. The operation will stop on the last patch that can be pushed
+          without conflicts. This behavior can be configured by setting
+          "stgit.push.allow-conflicts" to "false".
+
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')
+########## top ##########
+Print the name of the top patch.
+
+The topmost patch is the currently applied patch. An error message will be printed if no
+patches are applied.
+
+Usage: stg top [OPTIONS]
+
+Options:
+  -b, --branch <branch>
+          Use <branch> instead of current branch
+
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')
+########## next ##########
+Print the name of the next patch.
+
+The next patch is the unapplied patch that follows the current, topmost patch. An error
+message will be printed if there are no unapplied patches.
+
+Usage: stg next [OPTIONS]
+
+Options:
+  -b, --branch <branch>
+          Use <branch> instead of current branch
+
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')
+########## prev ##########
+Print the name of the previous patch.
+
+The previous patch is the applied patch preceding the current, topmost patch. An error
+message will be printed if not enough patches are applied.
+
+Usage: stg prev [OPTIONS]
+
+Options:
+  -b, --branch <branch>
+          Use <branch> instead of current branch
+
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')
+########## delete ##########
+Delete patches
+
+Usage: stg delete [OPTIONS] [<patch>...]
+       stg delete [OPTIONS] [-A] [-U] [-H]
+       stg delete [OPTIONS] --all
+       stg delete [OPTIONS] --top
+
+Arguments:
+  [patch]...
+          Patches to delete
+
+Options:
+  -a, --all
+          Delete all patches
+
+  -A, --applied
+          Delete the applied patches
+
+  -U, --unapplied
+          Delete the unapplied patches
+
+  -H, --hidden
+          Delete the hidden patches
+
+  -t, --top
+          Delete topmost patch
+
+      --spill
+          Delete the patches, but without modifying the index and worktree. This only
+          works when deleting applied patches at the top of the stack. The effect is to
+          "spill" the patch contents into the index and worktree.
+          
+          This can be useful for splitting a patch into smaller pieces.
+
+  -b, --branch <branch>
+          Use <branch> instead of current branch
+
+      --conflicts[=<policy>]
+          Either "allow" or "disallow" pushing a patch with conflicts.
+          
+          Using `--conflicts=allow` (or just `--conflicts`) allows pushing a patch that
+          may result in unresolved merge conflicts. The patch will be pushed and files
+          with conflicts will be left with conflict markers to be resolved manually; or
+          the operation undone with `stg undo --hard`. This is the default behavior and
+          also corresponds to the "stgit.push.allow-conflicts" variable being set to
+          "true".
+          
+          Using `--conflicts=disallow` disallows pushing any patch that would result in
+          merge conflicts. The operation will stop on the last patch that can be pushed
+          without conflicts. This behavior can be configured by setting
+          "stgit.push.allow-conflicts" to "false".
+
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')
+########## rename ##########
+Rename [old-patch] to <new-patch>. If [old-patch] is not given, the topmost patch will
+be renamed.
+
+Usage: stg rename [OPTIONS] [old-patch] <new-patch>
+
+Arguments:
+  <patches>...
+          Optional old patch and the new patch name
+
+Options:
+  -b, --branch <branch>
+          Use <branch> instead of current branch
+
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')
+########## commit ##########
+Finalize one or more patches into the base of the current stack and remove them from the
+series. This is the opposite of 'stg uncommit'. Use this command when a patch is
+completed and no longer needs to be managed with StGit.
+
+By default, the bottommost patch is committed. If patch names are given, the stack is
+rearranged so that those patches are at the bottom, and then they are committed.
+
+The -n/--number option specifies the number of applied patches to commit (counting from
+the bottom of the stack). If -a/--all is given, all applied patches are committed.
+
+Usage: stg commit [OPTIONS] [patch]...
+       stg commit [OPTIONS] -n <number>
+       stg commit [OPTIONS] --all
+
+Arguments:
+  [patch]...
+          Patches to commit
+
+Options:
+  -n, --number <number>
+          Commit the specified number of applied patches
+
+  -a, --all
+          Commit all applied patches
+
+      --allow-empty
+          Allow empty patches to be committed
+
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')
+########## uncommit ##########
+Convert one or more Git commits from the base of the current stack into StGit patches.
+The original Git commits are not modified; the StGit stack extends to incorporate these
+commits as the bottommost applied patches. This is the opposite of 'stg commit'.
+
+By default, the number of patches to uncommit is determined by the number of patch names
+provided on the command line. The first provided name is used for the first patch to
+uncommit, i.e. for the newest patch.
+
+The -n/--number option specifies the number of patches to uncommit. In this case, at
+most one patch name may be specified. It is used as prefix to which the patch number is
+appended. If no patch names are provided on the command line, StGit automatically
+generates names based on the first lines of the commit messages.
+
+The -t/--to option specifies that all commits up to and including the given commit
+should be uncommitted. The -x/--exclusive option may be used to exclude the "to" commit.
+
+Only commits with exactly one parent can be uncommitted; in other words, merge commits
+may not be uncommitted.
+
+Usage: stg uncommit <patchname-1> [<patchname-2> ...]
+       stg uncommit -n number [<patchname-prefix>]
+       stg uncommit -t <committish> [-x]
+
+Arguments:
+  [patchname]...
+          Patch names for the uncommitted commits
+
+Options:
+  -n, --number <number>
+          Uncommit the specified number of commits
+
+  -t, --to <committish>
+          Uncommit to the specified committish
+
+  -x, --exclusive
+          Exclude the commit specified by the '--to' option
+
+      --color <when>
+          Specify when to colorize the output.
+          
+          `auto` (the default) enables colored output only when outputting to a terminal
+          or TTY. The `NO_COLOR` environment variable is respected.
+          
+          `always` and `never` unconditionlly enable/disable colored output,
+          respectively.
+          
+          `ansi` forces color to be output using ANSI escape sequences, even in a
+          Windows console.
+
+  -h, --help
+          Print help (see a summary with '-h')

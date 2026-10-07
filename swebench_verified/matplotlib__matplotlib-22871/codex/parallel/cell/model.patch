@@ -1,0 +1,93 @@
+diff --git a/lib/matplotlib/dates.py b/lib/matplotlib/dates.py
+index 4d8ddf3ee5..a059bc4b1d 100644
+--- a/lib/matplotlib/dates.py
++++ b/lib/matplotlib/dates.py
+@@ -605,6 +605,25 @@ def _wrap_in_tex(text):
+     return r"{\fontfamily{\familydefault}\selectfont " + text + "}"
+ 
+ 
++def _format_uses_year(fmt):
++    """Return whether *fmt* includes a strftime directive with year info."""
++    for i, char in enumerate(fmt):
++        if char != '%' or i + 1 >= len(fmt):
++            continue
++        j = i + 1
++        if fmt[j] == '%':
++            continue
++        while j < len(fmt) and fmt[j] in '-_0^#':
++            j += 1
++        while j < len(fmt) and fmt[j].isdigit():
++            j += 1
++        if j < len(fmt) and fmt[j] in 'EO':
++            j += 1
++        if j < len(fmt) and fmt[j] in 'cCxxyYDFgG':
++            return True
++    return False
++
++
+ ## date tickers and formatters ###
+ 
+ 
+@@ -797,8 +816,6 @@ class ConciseDateFormatter(ticker.Formatter):
+         # 3: hours, 4: minutes, 5: seconds, 6: microseconds
+         for level in range(5, -1, -1):
+             if len(np.unique(tickdate[:, level])) > 1:
+-                if level < 2:
+-                    show_offset = False
+                 break
+             elif level == 0:
+                 # all tickdate are the same, so only micros might be different
+@@ -838,6 +855,17 @@ class ConciseDateFormatter(ticker.Formatter):
+                     if '.' in labels[nn]:
+                         labels[nn] = labels[nn][:-trailing_zeros].rstrip('.')
+ 
++        if level == 0:
++            show_offset = False
++        elif level == 1:
++            # Only suppress the offset if a month-level label already shows
++            # the year.
++            labels_show_year = _format_uses_year(fmts[level])
++            if np.any(tickdate[:, level] == zerovals[level]):
++                labels_show_year |= _format_uses_year(zerofmts[level])
++            if labels_show_year:
++                show_offset = False
++
+         if show_offset:
+             # set the offset string:
+             self.offset_string = tickdatetime[-1].strftime(offsetfmts[level])
+diff --git a/lib/matplotlib/tests/test_dates.py b/lib/matplotlib/tests/test_dates.py
+index a78c39c560..af77069dfd 100644
+--- a/lib/matplotlib/tests/test_dates.py
++++ b/lib/matplotlib/tests/test_dates.py
+@@ -613,6 +613,31 @@ def test_concise_formatter_show_offset(t_delta, expected):
+     assert formatter.get_offset() == expected
+ 
+ 
++def test_concise_formatter_show_offset_for_months_without_january():
++    locator = mdates.AutoDateLocator()
++    formatter = mdates.ConciseDateFormatter(locator)
++    values = mdates.date2num([
++        datetime.datetime(1997, month, 1) for month in range(2, 8)])
++
++    assert formatter.format_ticks(values) == ['Feb', 'Mar', 'Apr',
++                                              'May', 'Jun', 'Jul']
++    assert formatter.get_offset() == '1997'
++
++
++def test_concise_formatter_show_offset_not_duplicated_for_month_formats():
++    locator = mdates.AutoDateLocator()
++    formatter = mdates.ConciseDateFormatter(
++        locator,
++        formats=['%Y', '%Y-%b', '%d', '%H:%M', '%H:%M', '%S.%f'])
++    values = mdates.date2num([
++        datetime.datetime(1997, month, 1) for month in range(2, 8)])
++
++    assert formatter.format_ticks(values) == ['1997-Feb', '1997-Mar',
++                                              '1997-Apr', '1997-May',
++                                              '1997-Jun', '1997-Jul']
++    assert formatter.get_offset() == ''
++
++
+ def test_offset_changes():
+     fig, ax = plt.subplots()
+ 

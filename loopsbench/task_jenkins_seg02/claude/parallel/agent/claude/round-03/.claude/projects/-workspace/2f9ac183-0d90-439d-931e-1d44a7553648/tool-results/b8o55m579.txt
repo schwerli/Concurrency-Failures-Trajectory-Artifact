@@ -1,0 +1,700 @@
+=========== administrativemonitor-at-since.yaml ===========
+title: Add missing at-since in AdministrativeMonitor
+category: feature
+requirement: '## Context
+
+
+  The AdministrativeMonitor API recently gained manager-aware permission helpers, but its Javadoc still does not say which Jenkins version introduced them.
+
+
+  ## Desired outcome
+
+
+  The API documentation should identify the correct release so plugin developers can make versioned compatibility decisions.
+
+
+  ## Acceptance signals
+
+
+  The behavior of administrative monitors is unchanged, but the new monitor permission helpers have explicit `@since` metadata.
+
+  '
+=========== agent-protocols-config-removal.yaml ===========
+title: Removing configurability of `Jenkins.agentProtocols`
+category: ci
+requirement: '## Context
+
+  A Jenkins administrator should not have to manually curate the list of built-in inbound agent protocols in the global security screen, because that configuration can drift away from the supported transport set and create confusion about what Jenkins actually allows.
+
+
+  ## Desired outcome
+
+  Jenkins should stop treating built-in agent protocols as an administrator-managed security setting and should instead expose the supported protocol set directly from core. The configuration UI and backing APIs should no longer offer agent protocol toggles that imply these built-in transports can be selectively disabled there.
+
+
+  ## Acceptance signals
+
+  The global security configuration no longer presents agent protocol selection as an editable admin setting, Jenkins reports the supported built-in protocols from core without relying on saved UI state, and upgrading preserves working agent connectivity without a manual protocol reconfiguration step.
+
+  '
+=========== atomicfilewriter-temp-names.yaml ===========
+title: Simplify AtomicFileWriter and use clearer temporary file names
+category: other
+requirement: '## Context
+
+  A Jenkins operator writing critical configuration files expects atomic writes to stay dependable and the resulting logs to be readable when the filesystem does not support true atomic moves, but the current implementation produces obscure temporary names and noisy duplicate failure reporting.
+
+
+  ## Desired outcome
+
+  `AtomicFileWriter` should create clearer temporary file names derived from the destination path and should remember after the first `AtomicMoveNotSupportedException` that the platform requires a non-atomic fallback. Once that fallback is known, Jenkins should replace the target cleanly without repeating the unsupported atomic attempt on every write.
+
+
+  ## Acceptance signals
+
+  Temporary files are easier to identify from their names, the first unsupported atomic move downgrades subsequent writes to the non-atomic replacement path, and operators no longer see duplicate stack traces caused by retry-and-rethrow logic when the filesystem lacks atomic move support.
+
+  '
+=========== autocomplete-query-parameters.yaml ===========
+title: '[JENKINS-37241] Support for query parameters in autocomplete'
+category: feature
+requirement: '## Context
+
+  A Jenkins administrator or plugin author exposing an autocomplete field may need extra query parameters to scope the results, but the current autocomplete widget only sends the search term and makes it impossible to express that richer filtering contract.
+
+
+  ## Desired outcome
+
+  Autocomplete endpoints should be able to declare additional query parameters through the descriptor contract, and the browser widget should include them when fetching suggestions. This should let server-side autocomplete logic honor contextual filters without changing the visible widget behavior for fields that do not need extra parameters.
+
+
+  ## Acceptance signals
+
+  Autocomplete requests include any descriptor-defined extra query parameters alongside the typed term, existing fields without extra parameters keep working as before, and filtered suggestion endpoints can finally distinguish context that was previously unavailable to them.
+
+  '
+=========== autocomplete-suggestion-count.yaml ===========
+title: Allow plugins to customize number of suggestions in autocomplete
+category: other
+requirement: '## Context
+
+
+  Some plugins need far more or far fewer autocomplete suggestions than Jenkins’s hard-coded default, but today they cannot express that preference in the rendered control.
+
+
+  ## Desired outcome
+
+
+  Plugin authors should be able to set the maximum suggestion count per autocomplete field without forking the widget.
+
+
+  ## Acceptance signals
+
+
+  The widget still defaults to 10 suggestions when nothing is specified, but a field can override that limit through the `data-maxsuggestions` attribute.
+
+  '
+=========== background-discarder-logging.yaml ===========
+title: '[JENKINS-73692] Turn off logging from `BackgroundGlobalBuildDiscarder`'
+category: ci
+requirement: '## Context
+
+
+  Background global build discarder maintenance can produce noisy per-job logging even when it is working normally, which makes administrative logs harder to scan.
+
+
+  ## Desired outcome
+
+
+  Keep the discarder behavior the same while removing routine chatter from its listener output.
+
+
+  ## Acceptance signals
+
+
+  The build discarder still evaluates jobs and applies matching retention strategies, but it no longer prints per-job progress lines for every processed job.
+
+  '
+=========== backport-24622-ui-fixes.yaml ===========
+title: Backporting for 2.462.2
+category: other
+requirement: '## Context
+
+
+  The 2.462.2 stabilization work included frontend fixes for add-item layouts, and users on the maintained line need the same polish instead of a visually inconsistent form experience.
+
+
+  ## Desired outcome
+
+
+  Backport the UI fixes so adding configurable blocks in Jenkins forms uses the corrected spacing and table styling from the stabilized release line.
+
+
+  ## Acceptance signals
+
+
+  Newly added items use the backported layout behavior instead of the older broken presentation, and the change stays confined to the front-end rendering of the add-item workflow.
+
+  '
+=========== boot-version-logging.yaml ===========
+title: Print Jenkins version on boot
+category: ci
+requirement: '## Context
+
+  A Jenkins operator starting or upgrading a controller often needs to confirm from the startup logs exactly which Jenkins version is coming up, but boot logs do not currently state that version explicitly.
+
+
+  ## Desired outcome
+
+  When Jenkins starts, the normal startup log should include the controller version so administrators can confirm the running build without inferring it from package metadata or the UI. The boot message should clearly report the value returned by `Jenkins.getVersion()`.
+
+
+  ## Acceptance signals
+
+  Startup logs include a message containing the current Jenkins version during initialization, operators can confirm the running version from boot output alone, and no extra manual step is required to verify which release started.
+
+  '
+=========== build-deletion-lts-backport.yaml ===========
+title: Backporting for 2.479.1 (part 3)
+category: other
+requirement: '## Context
+
+  A Jenkins administrator using build deletion, log rotation, or global build discarders expects running builds to be preserved until they have actually finished writing logs, but Jenkins can still try to delete a build while it is running or invoke discarding logic at the wrong point in finalization.
+
+
+  ## Desired outcome
+
+  Attempts to delete a running build must fail cleanly instead of partially removing it, with the user-visible message `Unable to delete <job> #<build> because it is still running`. Build discarding should run after finalization in a way that respects `isLogUpdated()`, avoids double-running job-level rotation, and only removes builds once Jenkins considers them finished.
+
+
+  ## Acceptance signals
+
+  Manual deletion of an active build is rejected with the exact `Unable to delete <job> #<build> because it is still running` message, log rotation skips builds whose logs are still being updated, and finalized builds are discarded once without duplicate job-level rotation passes.
+
+  '
+=========== buildhistory-refresh-all-pages.yaml ===========
+title: '[JENKINS-73613] refresh buildhistory widget in all cases'
+category: ci
+requirement: '## Context
+
+
+  The build history widget only refreshes reliably on the first page of results, so users looking at older pages can miss renamed builds, description changes, deletions, or updated running-build state until they manually reload.
+
+
+  ## Desired outcome
+
+
+  Build history should refresh whenever the page becomes active again and should keep the user on the same slice of history instead of snapping back to the top.
+
+
+  ## Acceptance signals
+
+
+  The widget refreshes on window focus, updates while viewing older pages, and preserves the current pagination context when reloading the build list.
+
+  '
+=========== build-number-assigner.yaml ===========
+title: '`Job.BuildNumberAssigner`'
+category: other
+requirement: '## Context
+
+
+  Some Jenkins distributions and plugins need to customize how build numbers are allocated, but today the core logic is hard-wired inside `Job`.
+
+
+  ## Desired outcome
+
+
+  Expose a supported extension point for build-number assignment while still allowing the implementation to persist the next build number through a controlled callback.
+
+
+  ## Acceptance signals
+
+
+  `Job.BuildNumberAssigner` can supply the allocation strategy, `SaveNextBuildNumber` gives that strategy a way to persist the sequence, and the default Jenkins behavior remains the built-in fallback.
+
+  '
+=========== buildwithparameters-303-redirects.yaml ===========
+title: '[JENKINS-66105] Allow follow redirects to work after 303 from `buildWithParameters`'
+category: ci
+requirement: '## Context
+
+
+  Some API clients trigger parameterized builds and then follow the redirect returned by `buildWithParameters`, but today a 303 chain can land on a queue item URL that is not useful to generic HTTP clients.
+
+
+  ## Desired outcome
+
+
+  Following the redirect from `buildWithParameters` should end on a stable queue item endpoint that both human operators and automation can consume.
+
+
+  ## Acceptance signals
+
+
+  A client that follows the initial 201 and later 303 response reaches a 200 response, and the queue item landing page points callers to `api/json?tree=cancelled,executable[url]` for status details.
+
+  '
+=========== cli-websocket-handshake-errors.yaml ===========
+title: Friendlier handling of `DeploymentHandshakeException` from CLI in `-webSocket` mode
+category: other
+requirement: '## Context
+
+
+  Users invoking the Jenkins CLI in `-webSocket` mode get an unhelpful failure when the WebSocket handshake is rejected, which makes authentication and reverse-proxy issues hard to diagnose.
+
+
+  ## Desired outcome
+
+
+  A handshake failure should tell the user what HTTP status came back and surface the response headers that matter for debugging.
+
+
+  ## Acceptance signals
+
+
+  On a rejected handshake the CLI prints `CLI handshake failed with status code 401`, includes headers such as `Server: Jetty` when available, and exits with status 15 instead of a generic stack trace.
+
+  '
+=========== command-palette-header-guard.yaml ===========
+title: '`headerCommandPaletteButton` undefined when `JenkinsHeader` not loaded'
+category: ci
+requirement: '## Context
+
+  A Jenkins page that does not render the standard `JenkinsHeader` should still be allowed to load frontend assets safely, but the Command Palette initializer currently assumes the header button exists and crashes on layouts that omit it.
+
+
+  ## Desired outcome
+
+  The Command Palette frontend should detect when `headerCommandPaletteButton` is absent and simply skip initialization on that page. Pages without `JenkinsHeader` should remain fully usable instead of failing because the palette tried to bind to a missing control.
+
+
+  ## Acceptance signals
+
+  On layouts without the standard header, the page loads without JavaScript errors, the palette code exits early when `headerCommandPaletteButton` is missing, and pages that do include the header keep the normal Command Palette behavior.
+
+  '
+=========== command-palette-icons.yaml ===========
+title: Add icons to Command Palette
+category: feature
+requirement: '## Context
+
+  A Jenkins user searching from the Command Palette needs enough visual context to distinguish jobs, users, views, agents, and other results at a glance, but the current results list is text-only and forces people to infer the target type from the name alone.
+
+
+  ## Desired outcome
+
+  Search results returned to the Command Palette should include both an `icon` and a `type` so the frontend can render the right symbol for each result class. Jobs should expose meaningful status-based icons, and the palette should present those icons consistently across the different result types Jenkins exports.
+
+
+  ## Acceptance signals
+
+  Command Palette result payloads include `icon` and `type`, jobs surface a status-derived search icon, and users can visually distinguish result categories in the palette without opening each match first.
+
+  '
+=========== command-palette-ui-refinement.yaml ===========
+title: Refine Command Palette UI
+category: other
+requirement: '## Context
+
+  A Jenkins user opening the Command Palette expects it to feel responsive and polished, but the current dialog can show awkward loading flicker, abrupt closing behavior, and visual rough edges that make the interaction feel unfinished.
+
+
+  ## Desired outcome
+
+  The Command Palette should load results with smoother spinner timing, cleaner open-and-close animation, and more consistent spacing and visual treatment so it feels like a first-class navigation surface. The interface should preserve existing search behavior while improving the perceived responsiveness of searching and dismissing the palette.
+
+
+  ## Acceptance signals
+
+  The loading spinner appears only when searches take long enough to warrant it, closing the palette uses a deliberate transition instead of an abrupt disappearance, and the updated palette styling reads as a polished UI refinement rather than a functional regression.
+
+  '
+=========== contextmenu-from-compatibility.yaml ===========
+title: '[JENKINS-73785] Restore `ContextMenu#from` with `StaplerRequest`/`Response` args'
+category: ci
+requirement: '## Context
+
+
+  Some plugins and adjunct code still call the older `ContextMenu#from` overload that accepts `StaplerRequest` and `StaplerResponse`, and that compatibility path disappeared during the newer request-type migration.
+
+
+  ## Desired outcome
+
+
+  Restore the legacy overload so existing integrations continue to build and run while the ecosystem migrates to the new request types.
+
+
+  ## Acceptance signals
+
+
+  `ContextMenu#from(ModelObjectWithContextMenu, StaplerRequest, StaplerResponse)` is available again and delegates to the newer request and response implementation instead of forcing every caller to migrate immediately.
+
+  '
+=========== deprecate-administrativemonitor-permission.yaml ===========
+title: Deprecate AdministrativeMonitor#getRequiredPermission
+category: other
+requirement: '## Context
+
+
+  Plugin authors still see `AdministrativeMonitor.getRequiredPermission()` as the obvious extension point even though newer permission-check helpers provide the safer contract Jenkins now expects.
+
+
+  ## Desired outcome
+
+
+  The older permission getter should remain available for compatibility but be clearly deprecated in favor of `checkRequiredPermission()` and `hasRequiredPermission()`.
+
+
+  ## Acceptance signals
+
+
+  Existing monitors continue to load, but developers are guided toward the newer helper methods instead of treating `getRequiredPermission()` as the preferred contract.
+
+  '
+=========== deprecate-subtask-getlastbuilton.yaml ===========
+title: Deprecating `SubTask.getLastBuiltOn`
+category: other
+requirement: '## Context
+
+
+  Queue scheduling still exposes `SubTask.getLastBuiltOn` even though Jenkins no longer relies on it in a meaningful way, which encourages plugin authors to depend on stale behavior.
+
+
+  ## Desired outcome
+
+
+  Mark this API as deprecated and communicate that it is no longer part of the supported scheduling contract, without changing how queued work is assigned or how builds run today.
+
+
+  ## Acceptance signals
+
+
+  Existing callers still compile and run, the deprecated entry points remain available for compatibility, and normal build execution behavior stays unchanged.
+
+  '
+=========== descriptor-newinstance-httpresponse.yaml ===========
+title: Tolerate `HttpResponse` thrown from `Descriptor.newInstance`
+category: feature
+requirement: '## Context
+
+
+  Some descriptors intentionally abort instantiation by throwing an `HttpResponse`, for example to redirect or return a structured form response, but Jenkins currently risks wrapping that control flow as an internal instantiation failure.
+
+
+  ## Desired outcome
+
+
+  Descriptor creation should let intentional `HttpResponse` escapes propagate normally instead of turning them into linkage-style errors.
+
+
+  ## Acceptance signals
+
+
+  If `Descriptor.newInstance` encounters an exception that is also an `HttpResponse`, Jenkins preserves that response behavior; only true instantiation failures are wrapped and logged as such.
+
+  '
+=========== detached-plugin-cache.yaml ===========
+title: Use detached plugins as a cache for the Update Center
+category: other
+requirement: '## Context
+
+
+  Initial setup and plugin installation can spend unnecessary time downloading plugin files that Jenkins already ships as detached plugins.
+
+
+  ## Desired outcome
+
+
+  Jenkins should treat detached plugins as a best-effort cache for Update Center downloads so setup is faster when the bundled copy already matches the expected checksums.
+
+
+  ## Acceptance signals
+
+
+  If a matching detached plugin is already available, Jenkins installs from that cached file instead of the network; if validation or lookup fails, installation falls back to the normal download path without user-visible breakage.
+
+  '
+=========== detached-plugin-origin-logging.yaml ===========
+title: Note the plugin responsible for loading a detached plugin
+category: other
+requirement: '## Context
+
+
+  When Jenkins auto-loads a detached plugin to satisfy an implied dependency, the current logging does not say which plugin caused that dependency to be pulled in.
+
+
+  ## Desired outcome
+
+
+  Operators should be able to see the originating plugin in the log message so dependency resolution is easier to audit.
+
+
+  ## Acceptance signals
+
+
+  The detached-plugin log line names both the detached plugin being loaded and the source plugin that required it.
+
+  '
+=========== disable-yui-default.yaml ===========
+title: '[JENKINS-73539] Disable YUI by default'
+category: ci
+requirement: '## Context
+
+  A Jenkins administrator upgrading the UI stack should get the YUI-free experience by default, because keeping the legacy library enabled unless someone opts in slows the transition and leaves obsolete dependencies active longer than necessary.
+
+
+  ## Desired outcome
+
+  The `RemoveYuiUserExperimentalFlag` should default to enabled so Jenkins removes YUI from pages unless an administrator explicitly opts back out through the `jenkins.model.experimentalflags.RemoveYuiUserExperimentalFlag.defaultValue` system property. Pages that no longer rely on YUI, including the old debug log reader hook, should continue to load without that library being initialized.
+
+
+  ## Acceptance signals
+
+  Fresh and upgraded controllers default to the YUI-removed path, administrators can still override the default with the `jenkins.model.experimentalflags.RemoveYuiUserExperimentalFlag.defaultValue` system property, and pages no longer initialize the legacy YUI debug log reader by default.
+
+  '
+=========== dosaferestart-compatibility.yaml ===========
+title: '[JENKINS-73838] Compatibility for `Jenkins#doSafeRestart(StaplerRequest, String)`'
+category: ci
+requirement: '## Context
+
+
+  Older callers still invoke `Jenkins#doSafeRestart(StaplerRequest, String)`, and the newer request-type migration should not break those integrations abruptly.
+
+
+  ## Desired outcome
+
+
+  Keep a compatibility overload for the old safe-restart signature while steering new development toward the `StaplerRequest2` form.
+
+
+  ## Acceptance signals
+
+
+  `Jenkins#doSafeRestart(StaplerRequest, String)` remains available as a deprecated bridge and delegates correctly to the newer safe-restart implementation.
+
+  '
+=========== dosaferestart-lts-backport.yaml ===========
+title: Backporting for 2.479.1 (part 4)
+category: other
+requirement: '## Context
+
+  Plugin or integration code that still calls the deprecated `doSafeRestart` overloads may pass a null request object in compatibility scenarios, and Jenkins currently throws before the restart flow can be delegated to the newer implementation.
+
+
+  ## Desired outcome
+
+  The deprecated `doSafeRestart(StaplerRequest)` and `doSafeRestart(StaplerRequest, String)` entry points should remain tolerant of `null` and forward that call through to the modern restart path without crashing. This is a compatibility fix for callers that still rely on those overloads in the 2.479.1 LTS line.
+
+
+  ## Acceptance signals
+
+  Calling either deprecated `doSafeRestart` overload with a null request no longer throws during request conversion, the restart path still reaches the current implementation, and existing LTS callers do not need to special-case null before invoking Jenkins.
+
+  '
+=========== dosaferestart-null-compatibility.yaml ===========
+title: Allow for null to be passed to `doSafeRestart`
+category: other
+requirement: '## Context
+
+  Plugin or integration code that still calls the deprecated `doSafeRestart` overloads may pass a null request object in compatibility scenarios, and Jenkins currently throws before the restart flow can be delegated to the newer implementation.
+
+
+  ## Desired outcome
+
+  The deprecated `doSafeRestart(StaplerRequest)` and `doSafeRestart(StaplerRequest, String)` entry points should remain tolerant of `null` and forward that call through to the modern restart path without crashing. This is a compatibility fix for callers that still rely on those overloads.
+
+
+  ## Acceptance signals
+
+  Calling either deprecated `doSafeRestart` overload with a null request no longer throws during request conversion, the restart path still reaches the current implementation, and existing callers do not need to special-case null before invoking Jenkins.
+
+  '
+=========== dropdown-reinitialization.yaml ===========
+title: Fix dropdowns being added multiple times to the same element
+category: bugfix
+requirement: '## Context
+
+
+  Some Jenkins pages can initialize the same dropdown host more than once, which produces stacked popovers and inconsistent interaction on a single control.
+
+
+  ## Desired outcome
+
+
+  Reinitializing a dropdown on an element should replace the previous dropdown instance instead of layering another one on top.
+
+
+  ## Acceptance signals
+
+
+  If the element already has a dropdown-themed `_tippy` instance, Jenkins destroys it before creating the new dropdown, so only one menu is attached to the element at a time.
+
+  '
+=========== ee9-core-migration.yaml ===========
+title: '[JENKINS-73278] Migrate core from EE 8 to EE 9'
+category: ci
+requirement: '## Context
+
+
+  Jenkins core must move from EE 8 to EE 9 to stay on supported platform dependencies, but plugin authors need a migration path that does not abruptly strand existing integrations.
+
+
+  ## Desired outcome
+
+
+  Core should adopt the Jakarta EE 9 stack while preserving compatibility bridges for established Jenkins extension APIs during the transition.
+
+
+  ## Acceptance signals
+
+
+  Jenkins exposes the EE9-oriented request and response contracts such as `StaplerRequest2` and `StaplerResponse2`, legacy entry points continue to delegate where possible, and existing plugins can keep running while they migrate to the new types.
+
+  '
+=========== executors-widget-interfaces.yaml ===========
+title: Extract interfaces for objects to be used through the executors widget
+category: refactor
+requirement: '## Context
+
+
+  The executors widget is tightly coupled to concrete controller-side classes, which makes it hard for alternate Jenkins distributions to present aggregated executor views while preserving core UI behavior.
+
+
+  ## Desired outcome
+
+
+  The widget should consume stable interfaces for computers, executors, and tasks so alternate implementations can participate without rewriting the whole page.
+
+
+  ## Acceptance signals
+
+
+  The widget can work with abstractions such as `IComputer`, `IExecutor`, `IDisplayExecutor`, and `ITask`, and the management UI still exposes actions like `Configure Monitors` and `Save` to the users who should see them.
+
+  '
+=========== fips-password-length-validation.yaml ===========
+title: '[JENKINS-74858]  Added validation for Password length in FIPS mode'
+category: feature
+requirement: '## Context
+
+  A Jenkins administrator running with FIPS-compliant cryptography expects local user creation and password changes to reject passwords that are too short for that mode, but Jenkins currently allows values that should not be accepted under the stricter policy.
+
+
+  ## Desired outcome
+
+  When FIPS mode is enabled, HudsonPrivateSecurityRealm should reject passwords shorter than 14 characters during account creation and password updates, while still allowing valid matching passwords that meet the minimum. The validation should attach to the password field so users understand what must be corrected.
+
+
+  ## Acceptance signals
+
+  In FIPS mode, passwords under 14 characters are rejected, matching passwords of 14 or more characters succeed, and administrators no longer end up with locally managed credentials that violate the active compliance policy.
+
+  '
+=========== flightrecorder-buffer-size.yaml ===========
+title: Reduce default size of diagnostic buffer for `FlightRecorderInputStream` from 1MiB to 1KiB
+category: other
+requirement: '## Context
+
+  A Jenkins administrator debugging CLI remoting failures needs the diagnostic ring buffer to preserve enough recent bytes to explain protocol corruption, but the current recorder is too small and can lose the context needed to troubleshoot intermittent failures.
+
+
+  ## Desired outcome
+
+  `FlightRecorderInputStream` should keep a larger default capture window and continue to make that size configurable through the `hudson.remoting.FlightRecorderInputStream.BUFFER_SIZE` system property. When CLI protocol parsing fails, the diagnostic output should retain enough recent traffic to make the corruption actionable.
+
+
+  ## Acceptance signals
+
+  The default recorder keeps a substantially larger recent byte history, operators can still override it with the `hudson.remoting.FlightRecorderInputStream.BUFFER_SIZE` property, and CLI corruption logs include enough buffered data to diagnose the failure instead of truncating the useful context.
+
+  '
+=========== heterolist-scroll-into-view.yaml ===========
+title: scroll fields from added hetero-list entry into viewport
+category: feature
+requirement: '## Context
+
+
+  When a user adds a new hetero-list entry containing many fields, Jenkins may leave the newly added content partly off-screen, forcing manual scrolling before the user can continue.
+
+
+  ## Desired outcome
+
+
+  The form should automatically bring the newly added block into view in a browser-native way, including tall entries that extend beyond the viewport.
+
+
+  ## Acceptance signals
+
+
+  After adding an entry, the relevant fields are scrolled into view instead of being hidden below the fold, and the behavior works without relying on the old YUI viewport helpers.
+
+  '
+=========== idiomatic-python-style.yaml ===========
+title: Follow idiomatic Python coding style
+category: other
+requirement: '## Context
+
+
+  The small Python maintenance script in this repository does not follow the project’s current Python style, which makes future edits noisier than they need to be.
+
+
+  ## Desired outcome
+
+
+  Align the script with idiomatic Python naming and environment checks without changing what the tool does.
+
+
+  ## Acceptance signals
+
+
+  The script behaves the same as before, but contributors see standard Python-style names and CI detection logic when they maintain it.
+
+  '
+=========== inbound-agent-websocket-default.yaml ===========
+title: Add -webSocket option by default when creating an inbound agent
+category: feature
+requirement: '## Context
+
+
+  The Jenkins UI still generates inbound agent launch commands that omit WebSocket mode unless the user notices and adds it manually, even though WebSocket is the safer default for many modern installations and reverse-proxy setups.
+
+
+  ## Desired outcome
+
+
+  The generated inbound-agent command should include WebSocket mode by default so new agents start with the recommended connection mode.
+
+
+  ## Acceptance signals
+
+
+  The launch snippet produced for an inbound agent includes `-webSocket` even when the user has not toggled an extra option.
+
+  '
+=========== inbound-remoting-version-bypass.yaml ===========
+title: '[JENKINS-73467] No facility to try unsupported Remoting versions when using inbound agents'
+category: feature
+requirement: '## Context
+
+
+  Some administrators intentionally allow older inbound remoting clients during upgrades, but WebSocket inbound agents still advertise the minimum supported version in a way that blocks those transitional rollouts.
+
+
+  ## Desired outcome
+
+
+  When the unsupported-remoting escape hatch is enabled, inbound agents connecting over WebSocket should be able to attempt the connection instead of being rejected up front by the version header.
+
+
+  ## Acceptance signals
+
+
+  If `SlaveComputer.ALLOW_UNSUPPORTED_REMOTING_VERSIONS` is true, the WebSocket agent endpoint no longer sends the minimum-version header that preemptively blocks the agent; otherwise the existing safeguard remains in place.
+
+  '
+=========== item-creation-error-message.yaml ===========
+title: Fix error message when creation of item by type is prohibited
+category: bugfix
+requirement: '## Context

@@ -1,0 +1,109 @@
+diff --git a/django/core/management/base.py b/django/core/management/base.py
+index abc6f79a15..631c761c00 100644
+--- a/django/core/management/base.py
++++ b/django/core/management/base.py
+@@ -6,6 +6,7 @@ import argparse
+ import os
+ import sys
+ from argparse import ArgumentParser, HelpFormatter
++from functools import partial
+ from io import TextIOBase
+ 
+ import django
+@@ -71,6 +72,15 @@ class CommandParser(ArgumentParser):
+         else:
+             raise CommandError("Error: %s" % message)
+ 
++    def add_subparsers(self, **kwargs):
++        parser_class = kwargs.get("parser_class", type(self))
++        if issubclass(parser_class, CommandParser):
++            kwargs["parser_class"] = partial(
++                parser_class,
++                called_from_command_line=self.called_from_command_line,
++            )
++        return super().add_subparsers(**kwargs)
++
+ 
+ def handle_default_options(options):
+     """
+diff --git a/tests/user_commands/management/commands/subparser_vanilla.py b/tests/user_commands/management/commands/subparser_vanilla.py
+new file mode 100644
+index 0000000000..8948ae11ee
+--- /dev/null
++++ b/tests/user_commands/management/commands/subparser_vanilla.py
+@@ -0,0 +1,13 @@
++from argparse import ArgumentParser
++
++from django.core.management.base import BaseCommand
++
++
++class Command(BaseCommand):
++    def add_arguments(self, parser):
++        subparsers = parser.add_subparsers(parser_class=ArgumentParser)
++        parser_foo = subparsers.add_parser("foo")
++        parser_foo.add_argument("bar", type=int)
++
++    def handle(self, *args, **options):
++        pass
+diff --git a/tests/user_commands/tests.py b/tests/user_commands/tests.py
+index e40632385c..1b3b3e3846 100644
+--- a/tests/user_commands/tests.py
++++ b/tests/user_commands/tests.py
+@@ -1,5 +1,5 @@
+ import os
+-from argparse import ArgumentDefaultsHelpFormatter
++from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+ from io import StringIO
+ from unittest import mock
+ 
+@@ -9,6 +9,7 @@ from django.apps import apps
+ from django.core import management
+ from django.core.checks import Tags
+ from django.core.management import BaseCommand, CommandError, find_commands
++from django.core.management.base import CommandParser
+ from django.core.management.utils import (
+     find_command,
+     get_random_secret_key,
+@@ -406,6 +407,42 @@ class CommandTests(SimpleTestCase):
+         with self.assertRaisesMessage(CommandError, msg):
+             management.call_command("subparser_dest", subcommand="foo", bar=12)
+ 
++    def test_subparser_error_formatting(self):
++        # Missing arguments to a subparser are reported as a CommandError
++        # rather than propagating an argparse SystemExit / stack trace.
++        msg = "Error: the following arguments are required: bar"
++        with self.assertRaisesMessage(CommandError, msg):
++            management.call_command("subparser", "foo")
++
++    def test_subparser_nested_error_formatting(self):
++        # Subparsers of subparsers also inherit the error formatting.
++        msg = "Error: the following arguments are required: --bar"
++        with self.assertRaisesMessage(CommandError, msg):
++            management.call_command("subparser_required", "foo_1", "foo_2")
++
++    def test_subparser_non_django_parser_class(self):
++        """
++        add_subparsers() leaves an explicitly passed non-CommandParser
++        parser_class alone.
++        """
++        parser = BaseCommand().create_parser("prog_name", "subcommand")
++        subparsers = parser.add_subparsers(parser_class=ArgumentParser)
++        subparser = subparsers.add_parser("foo")
++        self.assertNotIsInstance(subparser, CommandParser)
++
++    def test_subparser_parser_class_inherited(self):
++        """
++        add_subparsers() creates subparsers of the same class as the parent,
++        passing through the arguments that improve error formatting.
++        """
++        parser = BaseCommand().create_parser(
++            "prog_name", "subcommand", called_from_command_line=True
++        )
++        subparsers = parser.add_subparsers()
++        subparser = subparsers.add_parser("foo")
++        self.assertIsInstance(subparser, CommandParser)
++        self.assertIs(subparser.called_from_command_line, True)
++
+     def test_create_parser_kwargs(self):
+         """BaseCommand.create_parser() passes kwargs to CommandParser."""
+         epilog = "some epilog text"

@@ -1,0 +1,61 @@
+diff --git a/doc/whats-new.rst b/doc/whats-new.rst
+index 36c84e24..04cc073f 100644
+--- a/doc/whats-new.rst
++++ b/doc/whats-new.rst
+@@ -63,6 +63,9 @@ Bug fixes
+   By `Stephan Hoyer <https://github.com/shoyer>`_.
+ - Raise a TypeError when trying to plot empty data (:issue:`7156`, :pull:`7228`).
+   By `Michael Niklas <https://github.com/headtr1ck>`_.
++- Fix ``Dataset.coarsen.construct`` demoting non-dimensional coordinates to
++  variables (:issue:`7233`).
++  By `Tom Nicholas <https://github.com/TomNicholas>`_.
+ 
+ Documentation
+ ~~~~~~~~~~~~~
+diff --git a/xarray/core/rolling.py b/xarray/core/rolling.py
+index c194ec08..151f30e6 100644
+--- a/xarray/core/rolling.py
++++ b/xarray/core/rolling.py
+@@ -973,7 +973,9 @@ class Coarsen(CoarsenArithmetic, Generic[T_Xarray]):
+             else:
+                 reshaped[key] = var
+ 
+-        should_be_coords = set(window_dim) & set(self.obj.coords)
++        should_be_coords = (set(window_dim) | set(self.obj.coords)) & set(
++            reshaped.variables
++        )
+         result = reshaped.set_coords(should_be_coords)
+         if isinstance(self.obj, DataArray):
+             return self.obj._from_temp_dataset(result)
+diff --git a/xarray/tests/test_coarsen.py b/xarray/tests/test_coarsen.py
+index d4449985..58e206e9 100644
+--- a/xarray/tests/test_coarsen.py
++++ b/xarray/tests/test_coarsen.py
+@@ -318,3 +318,27 @@ def test_coarsen_construct(dask: bool) -> None:
+ 
+     with pytest.raises(ValueError):
+         ds.coarsen(time=12).construct(time=("bar",))
++
++
++def test_coarsen_construct_keeps_all_coords() -> None:
++    # GH7233: non-dimensional coordinates were demoted to data variables
++    da = xr.DataArray(np.arange(24), dims=["time"], name="T")
++    da = da.assign_coords(day=365 * da, scalar=1)
++    ds = da.to_dataset()
++
++    for obj in [ds, da]:
++        actual = obj.coarsen(time=12).construct(time=("year", "month"))
++        assert set(actual.coords) == set(obj.coords)
++        assert actual["day"].dims == ("year", "month")
++        np.testing.assert_array_equal(
++            actual["day"].data, obj["day"].data.reshape(2, 12)
++        )
++        assert actual["scalar"] == 1
++
++    # a coarsened dimension without a coordinate does not gain one
++    actual = (
++        xr.Dataset({"T": ("time", np.arange(24))})
++        .coarsen(time=12)
++        .construct(time=("year", "month"))
++    )
++    assert set(actual.coords) == set()

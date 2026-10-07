@@ -1,0 +1,15 @@
+Fixed.
+
+**Root cause:** `PyXrefMixin.make_xref` (`sphinx/domains/python.py:274`) unconditionally sets `refspecific=True` on info-field xrefs, which puts `find_obj` into searchmode 1. That mode is supposed to try `<module>.<name>` first and only fall back to a fuzzy whole-index scan — but `PythonDomain` never overrode `Domain.process_field_xref` (a no-op base at `sphinx/domains/__init__.py:312`), so field-generated `pending_xref` nodes carried **no** `py:module`/`py:class` attributes at all. With `modname=None`, every unqualified name skipped straight to the fuzzy `.endswith('.A')` scan, matching both `mod.A` and `mod.submod.A`. Explicit `:py:class:` roles were unaffected because `PyXRefRole.process_link` sets those attributes itself.
+
+**Fix:** added `PythonDomain.process_field_xref` to attach the current scope, mirroring what the explicit role does:
+
+```python
+def process_field_xref(self, pnode: pending_xref) -> None:
+    pnode['py:module'] = self.env.ref_context.get('py:module')
+    pnode['py:class'] = self.env.ref_context.get('py:class')
+```
+
+**Verification** — the issue's exact reproduction now builds with zero ambiguity warnings, and under `.. py:currentmodule:: mod.submod` both `:param A a:` and `:rtype: A` resolve to `mod.submod.A`, matching `:py:class:`A`` in all three module contexts. Added `test_domain_py_xrefs_in_info_fields`, confirmed it fails without the fix (`KeyError: 'py:module'`) and passes with it. Full-suite diff before/after shows zero regressions — the 130 pre-existing failures are environment-related (old docutils/babel/jinja pins) and identical either way. Also added a CHANGES entry.
+
+One behavior change worth flagging: `:ivar foo:` inside a class now resolves against the enclosing class scope rather than fuzzy-searching the whole index. That's the intended alignment with explicit roles, and no existing test depended on the old behavior.

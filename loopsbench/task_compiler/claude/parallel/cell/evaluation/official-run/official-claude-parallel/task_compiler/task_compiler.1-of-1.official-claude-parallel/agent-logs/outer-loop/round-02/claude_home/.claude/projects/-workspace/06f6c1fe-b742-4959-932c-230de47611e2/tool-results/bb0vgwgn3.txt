@@ -1,0 +1,815 @@
+diff --git a/Parser/SyntacticParser.cpp b/Parser/SyntacticParser.cpp
+index 40bcaf6..f0a1063 100644
+--- a/Parser/SyntacticParser.cpp
++++ b/Parser/SyntacticParser.cpp
+@@ -1,5 +1,6 @@
+ ﻿#include <iostream>
+ #include <fstream>
++#include <sstream>
+ #include <vector>
+ #include <set>
+ #include <iomanip>
+@@ -106,8 +107,20 @@ int main() {
+  **/
+ 
+ string load_file(string file_name) {
+-	/* TODO: implement */
+-	return "";
++	cout << "正在读取文法文件：" << file_name << endl;
++	ifstream in(file_name.c_str());
++	if (!in) {
++		cout << "文法文件打开失败，请检查文件是否存在：" << file_name << endl;
++		return "";
++	}
++	//把文件内容整体流入字符串缓冲区
++	stringstream buffer;
++	buffer << in.rdbuf();
++	in.close();
++	string text = buffer.str();
++	cout << "文法文件读取成功，文法内容如下：" << endl;
++	cout << text << endl << endl;
++	return text;
+ }
+ ostream& operator << (ostream& out, rule rule) {
+ 	/* TODO: implement */
+diff --git a/requirement_patches/lex_tokenizer.diff b/requirement_patches/lex_tokenizer.diff
+new file mode 100644
+index 0000000..815220e
+--- /dev/null
++++ b/requirement_patches/lex_tokenizer.diff
+@@ -0,0 +1,337 @@
++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
++index 94a9d79..a1592ae 100644
++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
+++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
++@@ -211,7 +211,7 @@ string findError(const string fileName, const string value) {
++ 	return position.str();
++ }
++ bool mainProcess(const string fileName, const string fileNameProcessed) {
++-	(void)fileNameProcessed;
+++	printTips("开始单词扫描与分析");
++ 	//读入预处理之后的源程序字符流
++ 	ifstream in(fileName.c_str());
++ 	if (!in) {
++@@ -258,35 +258,53 @@ bool mainProcess(const string fileName, const string fileNameProcessed) {
++ 		wtSeq.push_back(wtPair(idx, wtMatch(word), word));
++ 	}
++ 
+++	//分析结果先写入缓冲区，随后同时输出到控制台和结果文件
+++	ostringstream report;
+++
++ 	//输出单词-类别表：合法单词留在表中显示，非法单词跳过并收集到出错序列
++ 	vector<wtPair> errorSeq;
++-	cout << setw(8) << "单词序号" << setw(12) << "单词类别" << setw(12) << "单词" << endl;
+++	//表头的汉字按显示宽度手工对齐，setw按字节计数，对多字节汉字并不适用
+++	report << "单词序号" << "    " << "单词类别" << "        " << "单词" << endl;
++ 	for (unsigned int i = 0; i < wtSeq.size(); i++) {
++ 		if (wtSeq[i].type <= 0) {
++ 			errorSeq.push_back(wtSeq[i]);
++ 			continue;
++ 		}
++-		cout << setw(8) << wtSeq[i].idx << setw(12) << wtSeq[i].type << setw(12) << wtSeq[i].value << endl;
+++		report << setw(8) << wtSeq[i].idx << setw(12) << wtSeq[i].type << setw(12) << wtSeq[i].value << endl;
++ 	}
++ 
++ 	//输出出错信息：非法单词按拼写去重，同一个非法单词的所有序号与位置一并报告
++-	cout << "不合规单词：" << endl;
+++	report << "不合规单词：" << endl;
++ 	set<string> reported;
++ 	for (unsigned int i = 0; i < errorSeq.size(); i++) {
++ 		if (reported.count(errorSeq[i].value) > 0) {
++ 			continue;//该非法单词已经报告过
++ 		}
++ 		reported.insert(errorSeq[i].value);
++-		cout << "  " << errorSeq[i].value << ": " << endl;
++-		cout << "    ";
+++		report << "  " << errorSeq[i].value << ": " << endl;
+++		report << "    ";
++ 		for (unsigned int j = i; j < errorSeq.size(); j++) {
++ 			if (errorSeq[j].value == errorSeq[i].value) {
++-				cout << "第" << errorSeq[j].idx << "个单词;";
+++				report << "第" << errorSeq[j].idx << "个单词;";
++ 			}
++ 		}
++-		cout << endl;
++-		cout << "    位于" << findError(SOURCE_FILE, errorSeq[i].value) << endl;
+++		report << endl;
+++		report << "    位于" << findError(SOURCE_FILE, errorSeq[i].value) << endl;
++ 	}
+++
+++	//单词表与出错信息一起显示到控制台
+++	cout << report.str();
+++
+++	//同样的内容保存到词法分析结果文件中
+++	ofstream out(fileNameProcessed.c_str());
+++	if (!out) {
+++		cout << "词法分析结果文件创建失败：" << fileNameProcessed << endl;
+++		return false;
+++	}
+++	out << report.str();
+++	out.close();
+++	cout << endl << "词法分析结果已保存至：" << fileNameProcessed << endl << endl;
+++	printTips("单词扫描与分析已完成");
++ 	return true;
++ }
++ 
++diff --git a/requirement_patches/lex_token_error_report.diff b/requirement_patches/lex_token_error_report.diff
++new file mode 100644
++index 0000000..b2da2f7
++--- /dev/null
+++++ b/requirement_patches/lex_token_error_report.diff
++@@ -0,0 +1,256 @@
+++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
+++index ca60e85..94a9d79 100644
+++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
++++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
+++@@ -34,6 +34,9 @@ void printTips(const string tip) {
+++ 	cout << endl;
+++ }
+++ 
++++//原始源程序文件：非法单词的行列定位需要回到预处理之前的源文件中查找
++++const string SOURCE_FILE = "./testCpp.txt";
++++
+++ //单词类别信息
+++ struct wtPair{
+++ 	int idx;
+++@@ -265,6 +268,25 @@ bool mainProcess(const string fileName, const string fileNameProcessed) {
+++ 		}
+++ 		cout << setw(8) << wtSeq[i].idx << setw(12) << wtSeq[i].type << setw(12) << wtSeq[i].value << endl;
+++ 	}
++++
++++	//输出出错信息：非法单词按拼写去重，同一个非法单词的所有序号与位置一并报告
++++	cout << "不合规单词：" << endl;
++++	set<string> reported;
++++	for (unsigned int i = 0; i < errorSeq.size(); i++) {
++++		if (reported.count(errorSeq[i].value) > 0) {
++++			continue;//该非法单词已经报告过
++++		}
++++		reported.insert(errorSeq[i].value);
++++		cout << "  " << errorSeq[i].value << ": " << endl;
++++		cout << "    ";
++++		for (unsigned int j = i; j < errorSeq.size(); j++) {
++++			if (errorSeq[j].value == errorSeq[i].value) {
++++				cout << "第" << errorSeq[j].idx << "个单词;";
++++			}
++++		}
++++		cout << endl;
++++		cout << "    位于" << findError(SOURCE_FILE, errorSeq[i].value) << endl;
++++	}
+++ 	return true;
+++ }
+++ 
+++diff --git a/requirement_patches/lex_token_table_print.diff b/requirement_patches/lex_token_table_print.diff
+++new file mode 100644
+++index 0000000..705b44b
+++--- /dev/null
++++++ b/requirement_patches/lex_token_table_print.diff
+++@@ -0,0 +1,210 @@
++++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
++++index d2980c3..ca60e85 100644
++++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
+++++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
++++@@ -254,6 +254,17 @@ bool mainProcess(const string fileName, const string fileNameProcessed) {
++++ 		idx++;
++++ 		wtSeq.push_back(wtPair(idx, wtMatch(word), word));
++++ 	}
+++++
+++++	//输出单词-类别表：合法单词留在表中显示，非法单词跳过并收集到出错序列
+++++	vector<wtPair> errorSeq;
+++++	cout << setw(8) << "单词序号" << setw(12) << "单词类别" << setw(12) << "单词" << endl;
+++++	for (unsigned int i = 0; i < wtSeq.size(); i++) {
+++++		if (wtSeq[i].type <= 0) {
+++++			errorSeq.push_back(wtSeq[i]);
+++++			continue;
+++++		}
+++++		cout << setw(8) << wtSeq[i].idx << setw(12) << wtSeq[i].type << setw(12) << wtSeq[i].value << endl;
+++++	}
++++ 	return true;
++++ }
++++ 
++++diff --git a/requirement_patches/lex_token_scan_loop.diff b/requirement_patches/lex_token_scan_loop.diff
++++new file mode 100644
++++index 0000000..3433ef9
++++--- /dev/null
+++++++ b/requirement_patches/lex_token_scan_loop.diff
++++@@ -0,0 +1,182 @@
+++++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
+++++index 25b88ab..d2980c3 100644
+++++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
++++++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
+++++@@ -208,8 +208,53 @@ string findError(const string fileName, const string value) {
+++++ 	return position.str();
+++++ }
+++++ bool mainProcess(const string fileName, const string fileNameProcessed) {
+++++-	/* TODO: implement */
+++++-	return false;
++++++	(void)fileNameProcessed;
++++++	//读入预处理之后的源程序字符流
++++++	ifstream in(fileName.c_str());
++++++	if (!in) {
++++++		cout << "预处理结果文件打开失败：" << fileName << endl;
++++++		return false;
++++++	}
++++++	string code = "", line;
++++++	while (getline(in, line)) {
++++++		code += line;
++++++	}
++++++	in.close();
++++++
++++++	//扫描字符流进行分词，按出现顺序记录<序号,类别码,值>
++++++	vector<wtPair> wtSeq;
++++++	string word = "";
++++++	int idx = 0;
++++++	for (unsigned int i = 0; i < code.length(); i++) {
++++++		char c = code[i];
++++++		if (isalnum((unsigned char)c) || c == '_') {
++++++			word += c;//字母、数字、下划线归入当前单词
++++++			continue;
++++++		}
++++++		//遇到分隔符，先把已经累积起来的单词收尾
++++++		if (!word.empty()) {
++++++			idx++;
++++++			wtSeq.push_back(wtPair(idx, wtMatch(word), word));
++++++			word = "";
++++++		}
++++++		if (isspace((unsigned char)c)) {
++++++			continue;//空白只起分隔作用，本身不是单词
++++++		}
++++++		//界符与运算符自身也是一个单词，“<<”需要整体识别
++++++		string symbol(1, c);
++++++		if (c == '<' && i + 1 < code.length() && code[i + 1] == '<') {
++++++			symbol = "<<";
++++++			i++;
++++++		}
++++++		idx++;
++++++		wtSeq.push_back(wtPair(idx, wtMatch(symbol), symbol));
++++++	}
++++++	//字符流末尾可能还剩下一个单词
++++++	if (!word.empty()) {
++++++		idx++;
++++++		wtSeq.push_back(wtPair(idx, wtMatch(word), word));
++++++	}
++++++	return true;
+++++ }
+++++ 
+++++ 
+++++diff --git a/requirement_patches/lex_error_locator.diff b/requirement_patches/lex_error_locator.diff
+++++new file mode 100644
+++++index 0000000..1a62a45
+++++--- /dev/null
++++++++ b/requirement_patches/lex_error_locator.diff
+++++@@ -0,0 +1,116 @@
++++++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
++++++index 1c41439..25b88ab 100644
++++++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
+++++++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
++++++@@ -183,9 +183,29 @@ int wtMatch(const string word) {
++++++ 	//都不满足则是非法单词
++++++ 	return 0;
++++++ }
+++++++//在原始源程序中逐行定位非法单词，返回“第x行第y列”形式的位置描述
++++++ string findError(const string fileName, const string value) {
++++++-	/* TODO: implement */
++++++-	return "";
+++++++	ostringstream position;
+++++++	if (value.empty()) {
+++++++		return position.str();
+++++++	}
+++++++	ifstream in(fileName.c_str());
+++++++	if (!in) {
+++++++		return position.str();
+++++++	}
+++++++	string line;
+++++++	int row = 1;
+++++++	while (getline(in, line)) {
+++++++		//同一行中该单词可能出现多次，逐个定位
+++++++		string::size_type col = line.find(value);
+++++++		while (col != string::npos) {
+++++++			position << "第" << row << "行第" << col << "列";
+++++++			col = line.find(value, col + 1);
+++++++		}
+++++++		row++;
+++++++	}
+++++++	in.close();
+++++++	return position.str();
++++++ }
++++++ bool mainProcess(const string fileName, const string fileNameProcessed) {
++++++ 	/* TODO: implement */
++++++diff --git a/requirement_patches/lex_classification.diff b/requirement_patches/lex_classification.diff
++++++new file mode 100644
++++++index 0000000..1da195c
++++++--- /dev/null
+++++++++ b/requirement_patches/lex_classification.diff
++++++@@ -0,0 +1,74 @@
+++++++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
+++++++index 576efb1..1c41439 100644
+++++++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
++++++++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
+++++++@@ -145,9 +145,42 @@ bool IsNum(const string word) {
+++++++ 	}
+++++++ 	return true;
+++++++ }
++++++++//单词-类别对照表，非法单词统一用类别码0表示
++++++++static map<string, int> buildWordTypeTable() {
++++++++	map<string, int> table;
++++++++	table["void"] = 1;
++++++++	table["main"] = 2;
++++++++	table["int"] = 3;
++++++++	table["cout"] = 4;
++++++++	table["return"] = 5;
++++++++	table["("] = 6;
++++++++	table[")"] = 7;
++++++++	table["{"] = 8;
++++++++	table["}"] = 9;
++++++++	table["<<"] = 10;
++++++++	table[";"] = 11;
++++++++	table[","] = 12;
++++++++	table["="] = 13;
++++++++	table["*"] = 14;
++++++++	table["/"] = 15;
++++++++	return table;
++++++++}
+++++++ //判断单词类型
+++++++ int wtMatch(const string word) {
+++++++-	/* TODO: implement */
++++++++	static const map<string, int> wordType = buildWordTypeTable();
++++++++	//先查关键字与界符运算符表
++++++++	map<string, int>::const_iterator it = wordType.find(word);
++++++++	if (it != wordType.end()) {
++++++++		return it->second;
++++++++	}
++++++++	//再判断标识符与十进制整数
++++++++	if (IsIdentifier(word)) {
++++++++		return 16;
++++++++	}
++++++++	if (IsNum(word)) {
++++++++		return 17;
++++++++	}
++++++++	//都不满足则是非法单词
+++++++ 	return 0;
+++++++ }
+++++++ string findError(const string fileName, const string value) {
+++++++diff --git a/requirement_patches/lex_number_rules.diff b/requirement_patches/lex_number_rules.diff
+++++++new file mode 100644
+++++++index 0000000..3f88290
+++++++--- /dev/null
++++++++++ b/requirement_patches/lex_number_rules.diff
+++++++@@ -0,0 +1,20 @@
++++++++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
++++++++index 9cc43f7..576efb1 100644
++++++++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
+++++++++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
++++++++@@ -137,8 +137,13 @@ bool IsIdentifier(const string word) {
++++++++ }
++++++++ //判断单词是否是数字
++++++++ bool IsNum(const string word) {
++++++++-	/* TODO: implement */
++++++++-	return false;
+++++++++	//十进制整数：首位之后的每一个字符都必须是数字
+++++++++	for (unsigned int i = 1; i < word.length(); i++) {
+++++++++		if (!isdigit((unsigned char)word[i])) {
+++++++++			return false;
+++++++++		}
+++++++++	}
+++++++++	return true;
++++++++ }
++++++++ //判断单词类型
++++++++ int wtMatch(const string word) {
+====
+diff --git a/Parser/SyntacticParser.cpp b/Parser/SyntacticParser.cpp
+index f0a1063..f122a74 100644
+--- a/Parser/SyntacticParser.cpp
++++ b/Parser/SyntacticParser.cpp
+@@ -123,7 +123,14 @@ string load_file(string file_name) {
+ 	return text;
+ }
+ ostream& operator << (ostream& out, rule rule) {
+-	/* TODO: implement */
++	//规则以“左部::=右部1|右部2|...”的形式输出
++	out << rule.left << "::=";
++	for (unsigned int i = 0; i < rule.right.size(); i++) {
++		if (i > 0) {
++			out << "|";
++		}
++		out << rule.right[i];
++	}
+ 	return out;
+ }
+ void split_into_rules(const string text, vector<rule> &rules, set<char> &non_terminal, set<char> &terminal, set<string> &right_parts) {
+diff --git a/agent_tests/commit_req.sh b/agent_tests/commit_req.sh
+new file mode 100755
+index 0000000..9519491
+--- /dev/null
++++ b/agent_tests/commit_req.sh
+@@ -0,0 +1,28 @@
++#!/bin/sh
++# Record one requirement: stage the work, dump the staged diff to
++# requirement_patches/<slug>.diff, then commit the work together with its patch.
++#
++# Usage: agent_tests/commit_req.sh <slug>
++set -e
++SLUG=$1
++if [ -z "$SLUG" ]; then
++	echo "usage: $0 <requirement-slug>" >&2
++	exit 2
++fi
++cd "$(dirname "$0")/.."
++if [ ! -f "requirements/$SLUG.yaml" ]; then
++	echo "no such requirement: requirements/$SLUG.yaml" >&2
++	exit 2
++fi
++mkdir -p requirement_patches
++git add -A
++git diff --cached > "requirement_patches/$SLUG.diff"
++if [ ! -s "requirement_patches/$SLUG.diff" ]; then
++	echo "refusing to record an empty patch for $SLUG" >&2
++	rm -f "requirement_patches/$SLUG.diff"
++	exit 1
++fi
++git add -A
++git commit -q -m "impl: $SLUG"
++echo "recorded $SLUG ($(wc -c < "requirement_patches/$SLUG.diff") bytes)"
++git log --oneline -1
+diff --git a/requirement_patches/parser_load_file.diff b/requirement_patches/parser_load_file.diff
+new file mode 100644
+index 0000000..80ddd66
+--- /dev/null
++++ b/requirement_patches/parser_load_file.diff
+@@ -0,0 +1,377 @@
++diff --git a/Parser/SyntacticParser.cpp b/Parser/SyntacticParser.cpp
++index 40bcaf6..f0a1063 100644
++--- a/Parser/SyntacticParser.cpp
+++++ b/Parser/SyntacticParser.cpp
++@@ -1,5 +1,6 @@
++ ﻿#include <iostream>
++ #include <fstream>
+++#include <sstream>
++ #include <vector>
++ #include <set>
++ #include <iomanip>
++@@ -106,8 +107,20 @@ int main() {
++  **/
++ 
++ string load_file(string file_name) {
++-	/* TODO: implement */
++-	return "";
+++	cout << "正在读取文法文件：" << file_name << endl;
+++	ifstream in(file_name.c_str());
+++	if (!in) {
+++		cout << "文法文件打开失败，请检查文件是否存在：" << file_name << endl;
+++		return "";
+++	}
+++	//把文件内容整体流入字符串缓冲区
+++	stringstream buffer;
+++	buffer << in.rdbuf();
+++	in.close();
+++	string text = buffer.str();
+++	cout << "文法文件读取成功，文法内容如下：" << endl;
+++	cout << text << endl << endl;
+++	return text;
++ }
++ ostream& operator << (ostream& out, rule rule) {
++ 	/* TODO: implement */
++diff --git a/requirement_patches/lex_tokenizer.diff b/requirement_patches/lex_tokenizer.diff
++new file mode 100644
++index 0000000..815220e
++--- /dev/null
+++++ b/requirement_patches/lex_tokenizer.diff
++@@ -0,0 +1,337 @@
+++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
+++index 94a9d79..a1592ae 100644
+++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
++++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
+++@@ -211,7 +211,7 @@ string findError(const string fileName, const string value) {
+++ 	return position.str();
+++ }
+++ bool mainProcess(const string fileName, const string fileNameProcessed) {
+++-	(void)fileNameProcessed;
++++	printTips("开始单词扫描与分析");
+++ 	//读入预处理之后的源程序字符流
+++ 	ifstream in(fileName.c_str());
+++ 	if (!in) {
+++@@ -258,35 +258,53 @@ bool mainProcess(const string fileName, const string fileNameProcessed) {
+++ 		wtSeq.push_back(wtPair(idx, wtMatch(word), word));
+++ 	}
+++ 
++++	//分析结果先写入缓冲区，随后同时输出到控制台和结果文件
++++	ostringstream report;
++++
+++ 	//输出单词-类别表：合法单词留在表中显示，非法单词跳过并收集到出错序列
+++ 	vector<wtPair> errorSeq;
+++-	cout << setw(8) << "单词序号" << setw(12) << "单词类别" << setw(12) << "单词" << endl;
++++	//表头的汉字按显示宽度手工对齐，setw按字节计数，对多字节汉字并不适用
++++	report << "单词序号" << "    " << "单词类别" << "        " << "单词" << endl;
+++ 	for (unsigned int i = 0; i < wtSeq.size(); i++) {
+++ 		if (wtSeq[i].type <= 0) {
+++ 			errorSeq.push_back(wtSeq[i]);
+++ 			continue;
+++ 		}
+++-		cout << setw(8) << wtSeq[i].idx << setw(12) << wtSeq[i].type << setw(12) << wtSeq[i].value << endl;
++++		report << setw(8) << wtSeq[i].idx << setw(12) << wtSeq[i].type << setw(12) << wtSeq[i].value << endl;
+++ 	}
+++ 
+++ 	//输出出错信息：非法单词按拼写去重，同一个非法单词的所有序号与位置一并报告
+++-	cout << "不合规单词：" << endl;
++++	report << "不合规单词：" << endl;
+++ 	set<string> reported;
+++ 	for (unsigned int i = 0; i < errorSeq.size(); i++) {
+++ 		if (reported.count(errorSeq[i].value) > 0) {
+++ 			continue;//该非法单词已经报告过
+++ 		}
+++ 		reported.insert(errorSeq[i].value);
+++-		cout << "  " << errorSeq[i].value << ": " << endl;
+++-		cout << "    ";
++++		report << "  " << errorSeq[i].value << ": " << endl;
++++		report << "    ";
+++ 		for (unsigned int j = i; j < errorSeq.size(); j++) {
+++ 			if (errorSeq[j].value == errorSeq[i].value) {
+++-				cout << "第" << errorSeq[j].idx << "个单词;";
++++				report << "第" << errorSeq[j].idx << "个单词;";
+++ 			}
+++ 		}
+++-		cout << endl;
+++-		cout << "    位于" << findError(SOURCE_FILE, errorSeq[i].value) << endl;
++++		report << endl;
++++		report << "    位于" << findError(SOURCE_FILE, errorSeq[i].value) << endl;
+++ 	}
++++
++++	//单词表与出错信息一起显示到控制台
++++	cout << report.str();
++++
++++	//同样的内容保存到词法分析结果文件中
++++	ofstream out(fileNameProcessed.c_str());
++++	if (!out) {
++++		cout << "词法分析结果文件创建失败：" << fileNameProcessed << endl;
++++		return false;
++++	}
++++	out << report.str();
++++	out.close();
++++	cout << endl << "词法分析结果已保存至：" << fileNameProcessed << endl << endl;
++++	printTips("单词扫描与分析已完成");
+++ 	return true;
+++ }
+++ 
+++diff --git a/requirement_patches/lex_token_error_report.diff b/requirement_patches/lex_token_error_report.diff
+++new file mode 100644
+++index 0000000..b2da2f7
+++--- /dev/null
++++++ b/requirement_patches/lex_token_error_report.diff
+++@@ -0,0 +1,256 @@
++++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
++++index ca60e85..94a9d79 100644
++++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
+++++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
++++@@ -34,6 +34,9 @@ void printTips(const string tip) {
++++ 	cout << endl;
++++ }
++++ 
+++++//原始源程序文件：非法单词的行列定位需要回到预处理之前的源文件中查找
+++++const string SOURCE_FILE = "./testCpp.txt";
+++++
++++ //单词类别信息
++++ struct wtPair{
++++ 	int idx;
++++@@ -265,6 +268,25 @@ bool mainProcess(const string fileName, const string fileNameProcessed) {
++++ 		}
++++ 		cout << setw(8) << wtSeq[i].idx << setw(12) << wtSeq[i].type << setw(12) << wtSeq[i].value << endl;
++++ 	}
+++++
+++++	//输出出错信息：非法单词按拼写去重，同一个非法单词的所有序号与位置一并报告
+++++	cout << "不合规单词：" << endl;
+++++	set<string> reported;
+++++	for (unsigned int i = 0; i < errorSeq.size(); i++) {
+++++		if (reported.count(errorSeq[i].value) > 0) {
+++++			continue;//该非法单词已经报告过
+++++		}
+++++		reported.insert(errorSeq[i].value);
+++++		cout << "  " << errorSeq[i].value << ": " << endl;
+++++		cout << "    ";
+++++		for (unsigned int j = i; j < errorSeq.size(); j++) {
+++++			if (errorSeq[j].value == errorSeq[i].value) {
+++++				cout << "第" << errorSeq[j].idx << "个单词;";
+++++			}
+++++		}
+++++		cout << endl;
+++++		cout << "    位于" << findError(SOURCE_FILE, errorSeq[i].value) << endl;
+++++	}
++++ 	return true;
++++ }
++++ 
++++diff --git a/requirement_patches/lex_token_table_print.diff b/requirement_patches/lex_token_table_print.diff
++++new file mode 100644
++++index 0000000..705b44b
++++--- /dev/null
+++++++ b/requirement_patches/lex_token_table_print.diff
++++@@ -0,0 +1,210 @@
+++++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
+++++index d2980c3..ca60e85 100644
+++++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
++++++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
+++++@@ -254,6 +254,17 @@ bool mainProcess(const string fileName, const string fileNameProcessed) {
+++++ 		idx++;
+++++ 		wtSeq.push_back(wtPair(idx, wtMatch(word), word));
+++++ 	}
++++++
++++++	//输出单词-类别表：合法单词留在表中显示，非法单词跳过并收集到出错序列
++++++	vector<wtPair> errorSeq;
++++++	cout << setw(8) << "单词序号" << setw(12) << "单词类别" << setw(12) << "单词" << endl;
++++++	for (unsigned int i = 0; i < wtSeq.size(); i++) {
++++++		if (wtSeq[i].type <= 0) {
++++++			errorSeq.push_back(wtSeq[i]);
++++++			continue;
++++++		}
++++++		cout << setw(8) << wtSeq[i].idx << setw(12) << wtSeq[i].type << setw(12) << wtSeq[i].value << endl;
++++++	}
+++++ 	return true;
+++++ }
+++++ 
+++++diff --git a/requirement_patches/lex_token_scan_loop.diff b/requirement_patches/lex_token_scan_loop.diff
+++++new file mode 100644
+++++index 0000000..3433ef9
+++++--- /dev/null
++++++++ b/requirement_patches/lex_token_scan_loop.diff
+++++@@ -0,0 +1,182 @@
++++++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
++++++index 25b88ab..d2980c3 100644
++++++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
+++++++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
++++++@@ -208,8 +208,53 @@ string findError(const string fileName, const string value) {
++++++ 	return position.str();
++++++ }
++++++ bool mainProcess(const string fileName, const string fileNameProcessed) {
++++++-	/* TODO: implement */
++++++-	return false;
+++++++	(void)fileNameProcessed;
+++++++	//读入预处理之后的源程序字符流
+++++++	ifstream in(fileName.c_str());
+++++++	if (!in) {
+++++++		cout << "预处理结果文件打开失败：" << fileName << endl;
+++++++		return false;
+++++++	}
+++++++	string code = "", line;
+++++++	while (getline(in, line)) {
+++++++		code += line;
+++++++	}
+++++++	in.close();
+++++++
+++++++	//扫描字符流进行分词，按出现顺序记录<序号,类别码,值>
+++++++	vector<wtPair> wtSeq;
+++++++	string word = "";
+++++++	int idx = 0;
+++++++	for (unsigned int i = 0; i < code.length(); i++) {
+++++++		char c = code[i];
+++++++		if (isalnum((unsigned char)c) || c == '_') {
+++++++			word += c;//字母、数字、下划线归入当前单词
+++++++			continue;
+++++++		}
+++++++		//遇到分隔符，先把已经累积起来的单词收尾
+++++++		if (!word.empty()) {
+++++++			idx++;
+++++++			wtSeq.push_back(wtPair(idx, wtMatch(word), word));
+++++++			word = "";
+++++++		}
+++++++		if (isspace((unsigned char)c)) {
+++++++			continue;//空白只起分隔作用，本身不是单词
+++++++		}
+++++++		//界符与运算符自身也是一个单词，“<<”需要整体识别
+++++++		string symbol(1, c);
+++++++		if (c == '<' && i + 1 < code.length() && code[i + 1] == '<') {
+++++++			symbol = "<<";
+++++++			i++;
+++++++		}
+++++++		idx++;
+++++++		wtSeq.push_back(wtPair(idx, wtMatch(symbol), symbol));
+++++++	}
+++++++	//字符流末尾可能还剩下一个单词
+++++++	if (!word.empty()) {
+++++++		idx++;
+++++++		wtSeq.push_back(wtPair(idx, wtMatch(word), word));
+++++++	}
+++++++	return true;
++++++ }
++++++ 
++++++ 
++++++diff --git a/requirement_patches/lex_error_locator.diff b/requirement_patches/lex_error_locator.diff
++++++new file mode 100644
++++++index 0000000..1a62a45
++++++--- /dev/null
+++++++++ b/requirement_patches/lex_error_locator.diff
++++++@@ -0,0 +1,116 @@
+++++++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
+++++++index 1c41439..25b88ab 100644
+++++++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
++++++++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
+++++++@@ -183,9 +183,29 @@ int wtMatch(const string word) {
+++++++ 	//都不满足则是非法单词
+++++++ 	return 0;
+++++++ }
++++++++//在原始源程序中逐行定位非法单词，返回“第x行第y列”形式的位置描述
+++++++ string findError(const string fileName, const string value) {
+++++++-	/* TODO: implement */
+++++++-	return "";
++++++++	ostringstream position;
++++++++	if (value.empty()) {
++++++++		return position.str();
++++++++	}
++++++++	ifstream in(fileName.c_str());
++++++++	if (!in) {
++++++++		return position.str();
++++++++	}
++++++++	string line;
++++++++	int row = 1;
++++++++	while (getline(in, line)) {
++++++++		//同一行中该单词可能出现多次，逐个定位
++++++++		string::size_type col = line.find(value);
++++++++		while (col != string::npos) {
++++++++			position << "第" << row << "行第" << col << "列";
++++++++			col = line.find(value, col + 1);
++++++++		}
++++++++		row++;
++++++++	}
++++++++	in.close();
++++++++	return position.str();
+++++++ }
+++++++ bool mainProcess(const string fileName, const string fileNameProcessed) {
+++++++ 	/* TODO: implement */
+++++++diff --git a/requirement_patches/lex_classification.diff b/requirement_patches/lex_classification.diff
+++++++new file mode 100644
+++++++index 0000000..1da195c
+++++++--- /dev/null
++++++++++ b/requirement_patches/lex_classification.diff
+++++++@@ -0,0 +1,74 @@
++++++++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
++++++++index 576efb1..1c41439 100644
++++++++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
+++++++++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
++++++++@@ -145,9 +145,42 @@ bool IsNum(const string word) {
++++++++ 	}
++++++++ 	return true;
++++++++ }
+++++++++//单词-类别对照表，非法单词统一用类别码0表示
+++++++++static map<string, int> buildWordTypeTable() {
+++++++++	map<string, int> table;
+++++++++	table["void"] = 1;
+++++++++	table["main"] = 2;
+++++++++	table["int"] = 3;
+++++++++	table["cout"] = 4;
+++++++++	table["return"] = 5;
+++++++++	table["("] = 6;
+++++++++	table[")"] = 7;
+++++++++	table["{"] = 8;
+++++++++	table["}"] = 9;
+++++++++	table["<<"] = 10;
+++++++++	table[";"] = 11;
+++++++++	table[","] = 12;
+++++++++	table["="] = 13;
+++++++++	table["*"] = 14;
+++++++++	table["/"] = 15;
+++++++++	return table;
+++++++++}
++++++++ //判断单词类型
++++++++ int wtMatch(const string word) {
++++++++-	/* TODO: implement */
+++++++++	static const map<string, int> wordType = buildWordTypeTable();
+++++++++	//先查关键字与界符运算符表
+++++++++	map<string, int>::const_iterator it = wordType.find(word);
+++++++++	if (it != wordType.end()) {
+++++++++		return it->second;
+++++++++	}
+++++++++	//再判断标识符与十进制整数
+++++++++	if (IsIdentifier(word)) {
+++++++++		return 16;
+++++++++	}
+++++++++	if (IsNum(word)) {
+++++++++		return 17;
+++++++++	}
+++++++++	//都不满足则是非法单词
++++++++ 	return 0;
++++++++ }
++++++++ string findError(const string fileName, const string value) {
++++++++diff --git a/requirement_patches/lex_number_rules.diff b/requirement_patches/lex_number_rules.diff
++++++++new file mode 100644
++++++++index 0000000..3f88290
++++++++--- /dev/null
+++++++++++ b/requirement_patches/lex_number_rules.diff
++++++++@@ -0,0 +1,20 @@
+++++++++diff --git a/LexicalAnalyzer/LexicalAnalysis.cpp b/LexicalAnalyzer/LexicalAnalysis.cpp
+++++++++index 9cc43f7..576efb1 100644
+++++++++--- a/LexicalAnalyzer/LexicalAnalysis.cpp
++++++++++++ b/LexicalAnalyzer/LexicalAnalysis.cpp
+++++++++@@ -137,8 +137,13 @@ bool IsIdentifier(const string word) {
+++++++++ }
+++++++++ //判断单词是否是数字
+++++++++ bool IsNum(const string word) {
+++++++++-	/* TODO: implement */
+++++++++-	return false;
++++++++++	//十进制整数：首位之后的每一个字符都必须是数字
++++++++++	for (unsigned int i = 1; i < word.length(); i++) {
++++++++++		if (!isdigit((unsigned char)word[i])) {
++++++++++			return false;
++++++++++		}
++++++++++	}
++++++++++	return true;
+++++++++ }
+++++++++ //判断单词类型
+++++++++ int wtMatch(const string word) {

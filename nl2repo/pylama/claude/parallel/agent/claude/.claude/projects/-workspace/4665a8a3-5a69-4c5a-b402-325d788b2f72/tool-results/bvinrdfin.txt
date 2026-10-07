@@ -1,0 +1,1248 @@
+########## pylama/__init__.py ##########
+"""Code audit tool for python.
+
+:copyright: 2013 by Kirill Klenov.
+"""
+
+import logging
+
+__version__ = "8.4.1"
+
+LOGGER = logging.getLogger("pylama")
+
+
+# pylama:ignore=D
+########## pylama/__main__.py ##########
+"""Support the module execution."""
+
+from pylama.main import shell
+
+if __name__ == "__main__":
+    shell()
+########## pylama/check_async.py ##########
+"""Support for checking code asynchronously."""
+
+import logging
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from typing import List
+
+from pylama.config import Namespace
+from pylama.errors import Error
+
+try:
+    import multiprocessing
+
+    CPU_COUNT = multiprocessing.cpu_count()
+
+except (ImportError, NotImplementedError):
+    CPU_COUNT = 1
+
+from pylama.core import run
+
+LOGGER = logging.getLogger("pylama")
+
+
+def worker(params):
+    """Do work."""
+    path, code, options, rootdir = params
+    return run(path, code=code, rootdir=rootdir, options=options)
+
+
+def check_async(
+    paths: List[str], code: str = None, options: Namespace = None, rootdir: Path = None
+) -> List[Error]:
+    """Check given paths asynchronously."""
+    with ProcessPoolExecutor(CPU_COUNT) as pool:
+        return [
+            err
+            for res in pool.map(
+                worker, [(path, code, options, rootdir) for path in paths]
+            )
+            for err in res
+        ]
+
+
+# pylama:ignore=W0212,D210,F0001
+########## pylama/config.py ##########
+"""Parse arguments from command line and configuration files."""
+import fnmatch
+import logging
+import os
+import re
+import sys
+from argparse import ArgumentParser, Namespace
+from pathlib import Path
+from typing import Any, Collection, Dict, List, Optional, Set, Union
+
+from pylama import LOGGER, __version__
+from pylama.libs import inirama
+from pylama.lint import LINTERS
+
+try:
+    from pylama import config_toml
+    CONFIG_FILES = ["pylama.ini", "pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini"]
+except ImportError:
+    CONFIG_FILES = ["pylama.ini", "setup.cfg", "tox.ini", "pytest.ini"]
+
+
+#: A default checkers
+DEFAULT_LINTERS = "pycodestyle", "pyflakes", "mccabe"
+
+CURDIR = Path.cwd()
+HOMECFG = Path.home() / ".pylama.ini"
+DEFAULT_SECTION = "pylama"
+
+# Setup a logger
+LOGGER.propagate = False
+STREAM = logging.StreamHandler(sys.stdout)
+LOGGER.addHandler(STREAM)
+
+
+class _Default:
+    def __init__(self, value=None):
+        self.value = value
+
+    def __str__(self):
+        return str(self.value)
+
+    def __repr__(self):
+        return f"<_Default [{self.value}]>"
+
+
+def split_csp_str(val: Union[Collection[str], str]) -> Set[str]:
+    """Split comma separated string into unique values, keeping their order."""
+    if isinstance(val, str):
+        val = val.strip().split(",")
+    return set(x for x in val if x)
+
+
+def prepare_sorter(val: Union[Collection[str], str]) -> Optional[Dict[str, int]]:
+    """Parse sort value."""
+    if val:
+        types = split_csp_str(val)
+        return dict((v, n) for n, v in enumerate(types, 1))
+
+    return None
+
+
+def parse_linters(linters: str) -> List[str]:
+    """Initialize choosen linters."""
+    return [name for name in split_csp_str(linters) if name in LINTERS]
+
+
+def get_default_config_file(rootdir: Path = None) -> Optional[str]:
+    """Search for configuration file."""
+    if rootdir is None:
+        return DEFAULT_CONFIG_FILE
+
+    for filename in CONFIG_FILES:
+        path = rootdir / filename
+        if path.is_file() and os.access(path, os.R_OK):
+            return path.as_posix()
+
+    return None
+
+
+DEFAULT_CONFIG_FILE = get_default_config_file(CURDIR)
+
+
+def setup_parser() -> ArgumentParser:
+    """Create and setup parser for command line."""
+    parser = ArgumentParser(description="Code audit tool for python.")
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        default=_Default([CURDIR.as_posix()]),
+        help="Paths to files or directories for code check.",
+    )
+    parser.add_argument(
+        "--version", action="version", version="%(prog)s " + __version__
+    )
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose mode.")
+    parser.add_argument(
+        "--options",
+        "-o",
+        default=DEFAULT_CONFIG_FILE,
+        metavar="FILE",
+        help=(
+            "Specify configuration file. "
+            f"Looks for {', '.join(CONFIG_FILES[:-1])}, or {CONFIG_FILES[-1]}"
+            f" in the current directory (default: {DEFAULT_CONFIG_FILE})"
+        ),
+    )
+    parser.add_argument(
+        "--linters",
+        "-l",
+        default=_Default(",".join(DEFAULT_LINTERS)),
+        type=parse_linters,
+        help=(
+            f"Select linters. (comma-separated). Choices are {','.join(s for s in LINTERS)}."
+        ),
+    )
+    parser.add_argument(
+        "--from-stdin",
+        action="store_true",
+        help="Interpret the stdin as a python script, "
+        "whose filename needs to be passed as the path argument.",
+    )
+    parser.add_argument(
+        "--concurrent",
+        "--async",
+        action="store_true",
+        help="Enable async mode. Useful for checking a lot of files. ",
+    )
+
+    parser.add_argument(
+        "--format",
+        "-f",
+        default=_Default("pycodestyle"),
+        choices=["pydocstyle", "pycodestyle", "pylint", "parsable", "json"],
+        help="Choose output format.",
+    )
+    parser.add_argument(
+        "--abspath",
+        "-a",
+        action="store_true",
+        default=_Default(False),
+        help="Use absolute paths in output.",
+    )
+    parser.add_argument(
+        "--max-line-length",
+        "-m",
+        default=_Default(100),
+        type=int,
+        help="Maximum allowed line length",
+    )
+    parser.add_argument(
+        "--select",
+        "-s",
+        default=_Default(""),
+        type=split_csp_str,
+        help="Select errors and warnings. (comma-separated list)",
+    )
+    parser.add_argument(
+        "--ignore",
+        "-i",
+        default=_Default(""),
+        type=split_csp_str,
+        help="Ignore errors and warnings. (comma-separated)",
+    )
+    parser.add_argument(
+        "--skip",
+        default=_Default(""),
+        type=lambda s: [re.compile(fnmatch.translate(p)) for p in s.split(",") if p],
+        help="Skip files by masks (comma-separated, Ex. */messages.py)",
+    )
+    parser.add_argument(
+        "--sort",
+        default=_Default(),
+        type=prepare_sorter,
+        help="Sort result by error types. Ex. E,W,D",
+    )
+    parser.add_argument("--report", "-r", help="Send report to file [REPORT]")
+    parser.add_argument(
+        "--hook", action="store_true", help="Install Git (Mercurial) hook."
+    )
+
+    for linter_type in LINTERS.values():
+        linter_type.add_args(parser)
+
+    return parser
+
+
+def parse_options(  # noqa
+    args: List[str] = None, config: bool = True, rootdir: Path = CURDIR, **overrides
+) -> Namespace:
+    """Parse options from command line and configuration files."""
+    # Parse args from command string
+    parser = setup_parser()
+    actions = dict(
+        (a.dest, a) for a in parser._actions
+    )  # pylint: disable=protected-access
+
+    options = parser.parse_args(args or [])
+    options.file_params = {}
+    options.linters_params = {}
+
+    # Compile options from ini
+    if config:
+        cfg = get_config(options.options, rootdir=rootdir)
+        for opt, val in cfg.default.items():
+            LOGGER.info("Find option %s (%s)", opt, val)
+            passed_value = getattr(options, opt, _Default())
+            if isinstance(passed_value, _Default):
+                if opt == "paths":
+                    val = val.split()
+                if opt == "skip":
+                    val = fix_pathname_sep(val)
+                setattr(options, opt, _Default(val))
+
+        # Parse file related options
+        for name, opts in cfg.sections.items():
+
+            if name == cfg.default_section:
+                continue
+
+            if name.startswith("pylama"):
+                name = name[7:]
+
+            if name in LINTERS:
+                options.linters_params[name] = dict(opts)
+                continue
+
+            mask = re.compile(fnmatch.translate(fix_pathname_sep(name)))
+            options.file_params[mask] = dict(opts)
+
+    # Override options
+    for opt, val in overrides.items():
+        setattr(options, opt, process_value(actions, opt, val))
+
+    # Postprocess options
+    for name in options.__dict__:
+        value = getattr(options, name)
+        if isinstance(value, _Default):
+            setattr(options, name, process_value(actions, name, value.value))
+
+    if options.concurrent and "pylint" in options.linters:
+        LOGGER.warning("Can't parse code asynchronously with pylint enabled.")
+        options.concurrent = False
+
+    return options
+
+
+def process_value(actions: Dict, name: str, value: Any) -> Any:
+    """Compile option value."""
+    action = actions.get(name)
+    if not action:
+
+        return value
+
+    if callable(action.type):
+        return action.type(value)
+
+    if action.const:
+        return bool(int(value))
+
+    return value
+
+
+def get_config(user_path: str = None, rootdir: Path = None) -> inirama.Namespace:
+    """Load configuration from files."""
+    cfg_path = user_path or get_default_config_file(rootdir)
+    if not cfg_path and HOMECFG.exists():
+        cfg_path = HOMECFG.as_posix()
+
+    if cfg_path:
+        LOGGER.info("Read config: %s", cfg_path)
+        if cfg_path.endswith(".toml"):
+            return get_config_toml(cfg_path)
+        else:
+            return get_config_ini(cfg_path)
+
+    return inirama.Namespace()
+
+
+def get_config_ini(ini_path: str) -> inirama.Namespace:
+    """Load configuration from INI."""
+    config = inirama.Namespace()
+    config.default_section = DEFAULT_SECTION
+    config.read(ini_path)
+
+    return config
+
+
+def get_config_toml(toml_path: str) -> inirama.Namespace:
+    """Load configuration from TOML."""
+    config = config_toml.Namespace()
+    config.default_section = DEFAULT_SECTION
+    config.read(toml_path)
+
+    return config
+
+
+def setup_logger(options: Namespace):
+    """Do the logger setup with options."""
+    LOGGER.setLevel(logging.INFO if options.verbose else logging.WARN)
+    if options.report:
+        LOGGER.removeHandler(STREAM)
+        LOGGER.addHandler(logging.FileHandler(options.report, mode="w"))
+
+    if options.options:
+        LOGGER.info("Try to read configuration from: %r", options.options)
+
+
+def fix_pathname_sep(val: str) -> str:
+    """Fix pathnames for Win."""
+    return val.replace(os.altsep or "\\", os.sep)
+
+
+# pylama:ignore=W0212,D210,F0001
+########## pylama/config_toml.py ##########
+"""Pylama TOML configuration."""
+
+import toml
+
+from pylama.libs.inirama import Namespace as _Namespace
+
+
+class Namespace(_Namespace):
+    """Inirama-style wrapper for TOML config."""
+
+    def parse(self, source: str, update: bool = True, **params):
+        """Parse TOML source as string."""
+        content = toml.loads(source)
+        tool = content.get("tool", {})
+        pylama = tool.get("pylama", {})
+        linters = pylama.pop("linter", {})
+        files = pylama.pop("files", [])
+
+        for name, value in pylama.items():
+            self["pylama"][name] = value
+
+        for linter, options in linters.items():
+            for name, value in options.items():
+                self[f"pylama:{linter}"][name] = value
+
+        for file in files:
+            path = file.pop("path", None)
+            if path is None:
+                continue
+            for name, value in file.items():
+                self[f"pylama:{path}"][name] = value
+########## pylama/context.py ##########
+"""Manage resources."""
+
+import ast
+import os.path as op
+import re
+from argparse import Namespace
+from copy import copy
+from functools import lru_cache
+from pathlib import Path
+from tempfile import NamedTemporaryFile, mkdtemp
+from typing import Dict, List, Set
+
+from pylama.errors import Error
+from pylama.utils import read
+
+# Parse modeline
+MODELINE_RE = re.compile(
+    r"^\s*#\s+(?:pylama:)\s*((?:[\w_]*=[^:\n\s]+:?)+)", re.I | re.M
+).search
+
+SKIP_PATTERN = re.compile(r"# *noqa\b", re.I).search
+
+
+class RunContext:  # pylint: disable=R0902
+    """Manage resources."""
+
+    __slots__ = (
+        "errors",
+        "options",
+        "skip",
+        "ignore",
+        "select",
+        "linters",
+        "linters_params",
+        "filename",
+        "_ast",
+        "_from_stdin",
+        "_source",
+        "_tempfile",
+        "_lines",
+    )
+
+    def __init__(self, filename: str, source: str = None, options: Namespace = None):
+        """Initialize the class."""
+        self.errors: List[Error] = []
+        self.options = options
+        self.skip = False
+        self.ignore = set()
+        self.select = set()
+        self.linters = []
+        self.linters_params = {}
+
+        self._ast = None
+        self._from_stdin = source is not None
+        self._source = source
+        self._tempfile = None
+        self._lines = None
+
+        if options:
+            if options.abspath:
+                filename = op.abspath(filename)
+            self.skip = options.skip and any(
+                ptrn.match(filename) for ptrn in options.skip
+            )
+            self.linters.extend(options.linters)
+            self.ignore |= options.ignore
+            self.select |= options.select
+            self.linters_params.update(options.linters_params)
+
+            for mask in options.file_params:
+                if mask.match(filename):
+                    fparams = options.file_params[mask]
+                    self.update_params(**fparams)
+
+        self.filename = filename
+
+        # Read/parse modeline
+        if not self.skip:
+            modeline = MODELINE_RE(self.source)
+            if modeline:
+                values = modeline.group(1).split(":")
+                self.update_params(**dict(v.split("=", 1) for v in values))  # type: ignore
+
+    def __enter__(self):
+        """Enter to context."""
+        return self
+
+    def __exit__(self, etype, evalue, _):
+        """Exit from the context."""
+        if self._tempfile is not None:
+            tmpfile = Path(self._tempfile)
+            tmpfile.unlink()
+            tmpfile.parent.rmdir()
+
+        if evalue is not None:
+            if etype is IOError:
+                self.push(text=f"{evalue}", number="E001")
+            elif etype is UnicodeDecodeError:
+                self.push(text=f"UnicodeError: {self.filename}", number="E001")
+            elif etype is SyntaxError:
+                self.push(
+                    lnum=evalue.lineno,
+                    col=evalue.offset,
+                    text=f"SyntaxError: {evalue.args[0]}",
+                )
+            else:
+                self.push(lnum=1, col=1, text=str(evalue))
+                return False
+
+        return True
+
+    @property
+    def source(self):
+        """Get the current source code."""
+        if self._source is None:
+            self._source = read(self.filename)
+        return self._source
+
+    @property
+    def lines(self):
+        """Split source to lines."""
+        if self._lines is None:
+            self._lines = self.source.splitlines(True)
+        return self._lines
+
+    @property
+    def ast(self):
+        """Get the AST for the source."""
+        if self._ast is None:
+            self._ast = compile(self.source, self.filename, "exec", ast.PyCF_ONLY_AST)
+        return self._ast
+
+    @property
+    def temp_filename(self):
+        """Get a filename for run external command."""
+        if not self._from_stdin:
+            return self.filename
+
+        if self._tempfile is None:
+            file = NamedTemporaryFile(  # noqa
+                "w",
+                encoding="utf8",
+                suffix=".py",
+                dir=mkdtemp(prefix="pylama_"),
+                delete=False,
+            )
+            file.write(self.source)
+            file.close()
+            self._tempfile = file.name
+
+        return self._tempfile
+
+    def update_params(self, ignore=None, select=None, linters=None, skip=None, **_):
+        """Update general params (from file configs or modeline)."""
+        if select:
+            self.select |= set(select.split(","))
+        if ignore:
+            self.ignore |= set(ignore.split(","))
+        if linters:
+            self.linters = linters.split(",")
+        if skip is not None:
+            self.skip = bool(int(skip))
+
+    @lru_cache(42)
+    def get_params(self, name: str) -> Dict:
+        """Get params for a linter with the given name."""
+        lparams = copy(self.linters_params.get(name, {}))
+        for key in ("ignore", "select"):
+            if key in lparams and not isinstance(lparams[key], set):
+                lparams[key] = set(lparams[key].split(","))
+        return lparams
+
+    @lru_cache(42)
+    def get_filter(self, name: str, key: str) -> Set:
+        """Get select/ignore from linter params."""
+        lparams = self.get_params(name)
+        return lparams.get(key, set())
+
+    def push(self, filtrate: bool = True, **params):
+        """Record an error."""
+        err = Error(filename=self.filename, **params)
+        number = err.number
+
+        if len(self.lines) >= err.lnum and SKIP_PATTERN(self.lines[err.lnum - 1]):
+            return None
+
+        if filtrate:
+
+            for rule in self.select | self.get_filter(err.source, "select"):
+                if number.startswith(rule):
+                    return self.errors.append(err)
+
+            for rule in self.ignore | self.get_filter(err.source, "ignore"):
+                if number.startswith(rule):
+                    return None
+
+        return self.errors.append(err)
+########## pylama/core.py ##########
+"""Pylama's core functionality.
+
+Prepare params, check a modeline and run the checkers.
+"""
+import os.path as op
+from pathlib import Path
+from typing import List
+
+from pylama.config import CURDIR, LOGGER, Namespace
+from pylama.context import RunContext
+from pylama.errors import Error, default_sorter, remove_duplicates
+from pylama.lint import LINTERS, LinterV2
+
+
+def run(
+    path: str, code: str = None, rootdir: Path = CURDIR, options: Namespace = None
+) -> List[Error]:
+    """Run code checkers with the given params.
+
+    :param path: (str) A file's path.
+    """
+    path = op.relpath(path, rootdir)
+
+    with RunContext(path, code, options) as ctx:
+        if ctx.skip:
+            LOGGER.info("Skip checking for path: %s", path)
+
+        else:
+            for lname in ctx.linters or LINTERS:
+                linter_cls = LINTERS.get(lname)
+                if not linter_cls:
+                    continue
+                linter = linter_cls()
+                LOGGER.info("Run [%s] %s", lname, path)
+                if isinstance(linter, LinterV2):
+                    linter.run_check(ctx)
+                else:
+                    for err_info in linter.run(
+                        ctx.temp_filename, code=ctx.source, params=ctx.get_params(lname)
+                    ):
+                        ctx.push(source=lname, **err_info)
+
+    if not ctx.errors:
+        return ctx.errors
+
+    errors = list(remove_duplicates(ctx.errors))
+
+    sorter = default_sorter
+    if options and options.sort:
+        sort = options.sort
+        sorter = lambda err: (sort.get(err.etype, 999), err.lnum)  # pylint: disable=C3001
+
+    return sorted(errors, key=sorter)
+
+
+# pylama:ignore=R0912,D210,F0001,C3001
+########## pylama/errors.py ##########
+""" Don't duplicate same errors from different linters. """
+from __future__ import annotations
+
+import re
+from collections import defaultdict
+from typing import Any, DefaultDict, Dict, Generator, List, Set, Tuple
+
+PATTERN_NUMBER = re.compile(r"^\s*([A-Z]\d+)\s*", re.I)
+
+DUPLICATES: Dict[Tuple[str, str], Set] = {
+    key: values  # type: ignore
+    for values in (
+        # multiple statements on one line
+        {("pycodestyle", "E701"), ("pylint", "C0321")},
+        # unused variable
+        {("pylint", "W0612"), ("pyflakes", "W0612")},
+        # undefined variable
+        {("pylint", "E0602"), ("pyflakes", "E0602")},
+        # unused import
+        {("pylint", "W0611"), ("pyflakes", "W0611")},
+        # whitespace before ')'
+        {("pylint", "C0326"), ("pycodestyle", "E202")},
+        # whitespace before '('
+        {("pylint", "C0326"), ("pycodestyle", "E211")},
+        # multiple spaces after operator
+        {("pylint", "C0326"), ("pycodestyle", "E222")},
+        # missing whitespace around operator
+        {("pylint", "C0326"), ("pycodestyle", "E225")},
+        # unexpected spaces
+        {("pylint", "C0326"), ("pycodestyle", "E251")},
+        # long lines
+        {("pylint", "C0301"), ("pycodestyle", "E501")},
+        # statement ends with a semicolon
+        {("pylint", "W0301"), ("pycodestyle", "E703")},
+        # multiple statements on one line
+        {('pylint", "C0321'), ("pycodestyle", "E702")},
+        # bad indentation
+        {("pylint", "W0311"), ("pycodestyle", "E111")},
+        # wildcart import
+        {("pylint", "W00401"), ("pyflakes", "W0401")},
+        # module docstring
+        {("pydocstyle", "D100"), ("pylint", "C0111")},
+    )
+    for key in values  # type: ignore
+}
+
+
+class Error:
+    """Store an error's information."""
+
+    __slots__ = "source", "col", "lnum", "etype", "message", "filename", "number"
+
+    def __init__(
+        self,
+        source="pylama",
+        col=1,
+        lnum=1,
+        type=None,  # pylint: disable=R0913
+        text="unknown error",
+        filename="",
+        number="",
+        **_,
+    ):
+        """Init error information with default values."""
+        text = str(text).strip().replace("\n", " ")
+        if number:
+            self.number = number
+        else:
+            number = PATTERN_NUMBER.match(text)
+            self.number = number.group(1).upper() if number else ""
+
+        self.etype = type[:1] if type else (number[0] if number else "E")
+        self.col = max(col, 1)
+        self.filename = filename
+        self.source = source
+        self.lnum = int(lnum)
+        self.message = text
+
+    def __repr__(self):
+        return f"<Error:{self.lnum}:{self.col}: {self.number} {self.message}>"
+
+    def format(self, pattern: str) -> str:
+        """Format the error with the given pattern."""
+        return pattern.format(
+            filename=self.filename,
+            lnum=self.lnum,
+            col=self.col,
+            message=self.message,
+            etype=self.etype,
+            source=self.source,
+            number=self.number,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the error as a dict."""
+        return {
+            "source": self.source,
+            "col": self.col,
+            "lnum": self.lnum,
+            "etype": self.etype,
+            "message": self.message,
+            "filename": self.filename,
+            "number": self.number,
+        }
+
+
+def remove_duplicates(errors: List[Error]) -> Generator[Error, None, None]:
+    """Filter duplicates from given error's list."""
+    passed: DefaultDict[int, Set] = defaultdict(set)
+    for error in errors:
+        key = error.source, error.number
+        if key in DUPLICATES:
+            if key in passed[error.lnum]:
+                continue
+            passed[error.lnum] = DUPLICATES[key]
+        yield error
+
+
+def default_sorter(err: Error) -> Any:
+    """Sort by line number."""
+    return err.lnum
+
+
+# pylama:ignore=W0622,D,R0924
+########## pylama/hook.py ##########
+"""SCM hooks. Integration with git and mercurial."""
+
+from __future__ import absolute_import
+
+import sys
+from configparser import ConfigParser  # noqa
+from os import chmod, getcwd
+from os import path as op
+from subprocess import PIPE, Popen
+from typing import List, Tuple
+
+from pylama.config import parse_options, setup_logger
+from pylama.main import LOGGER, check_paths, display_errors
+
+
+def run(command: str) -> Tuple[int, List[bytes], List[bytes]]:
+    """Run a shell command."""
+    with Popen(command.split(), stdout=PIPE, stderr=PIPE) as pipe:
+        (stdout, stderr) = pipe.communicate()
+        return (
+            pipe.returncode,
+            [line.strip() for line in stdout.splitlines()],
+            [line.strip() for line in stderr.splitlines()],
+        )
+
+
+def git_hook(error=True):
+    """Run pylama after git commit."""
+    _, files_modified, _ = run("git diff-index --cached --name-only HEAD")
+
+    options = parse_options()
+    setup_logger(options)
+    candidates = [f.decode("utf-8") for f in files_modified]
+    if candidates:
+        errors = check_paths(candidates, options, rootdir=getcwd())
+        display_errors(errors, options)
+        sys.exit(int(error and bool(errors)))
+
+
+def hg_hook(_, repo, node=None, **kwargs):  # noqa
+    """Run pylama after mercurial commit."""
+    seen = set()
+    candidates = []
+    if len(repo):
+        for rev in range(repo[node], len(repo)):
+            for file_ in repo[rev].files():
+                file_ = op.join(repo.root, file_)
+                if file_ in seen or not op.exists(file_):
+                    continue
+                seen.add(file_)
+                candidates.append(file_)
+
+    options = parse_options()
+    setup_logger(options)
+    if candidates:
+        errors = check_paths(candidates, options)
+        display_errors(errors, options)
+        sys.exit(int(bool(errors)))
+
+
+def install_git(path):
+    """Install hook in Git repository."""
+    hook = op.join(path, "pre-commit")
+    with open(hook, "w", encoding="utf-8") as target:
+        target.write(
+            """#!/usr/bin/env python
+import sys
+from pylama.hook import git_hook
+
+if __name__ == '__main__':
+    sys.exit(git_hook())
+"""
+        )
+    chmod(hook, 484)
+
+
+def install_hg(path):
+    """Install hook in Mercurial repository."""
+    hook = op.join(path, "hgrc")
+    if not op.isfile(hook):
+        open(hook, "w+", encoding="utf-8").close()
+
+    cfgp = ConfigParser()
+    with open(hook, "r", encoding="utf-8") as source:
+        cfgp.read_file(source)
+
+    if not cfgp.has_section("hooks"):
+        cfgp.add_section("hooks")
+
+    if not cfgp.has_option("hooks", "commit"):
+        cfgp.set("hooks", "commit", "python:pylama.hooks.hg_hook")
+
+    if not cfgp.has_option("hooks", "qrefresh"):
+        cfgp.set("hooks", "qrefresh", "python:pylama.hooks.hg_hook")
+
+    with open(hook, "w+", encoding="utf-8") as target:
+        cfgp.write(target)
+
+
+def install_hook(path):
+    """Auto definition of SCM and hook installation."""
+    is_git = op.join(path, ".git", "hooks")
+    is_hg = op.join(path, ".hg")
+    if op.exists(is_git):
+        install_git(is_git)
+        LOGGER.warning("Git hook has been installed.")
+
+    elif op.exists(is_hg):
+        install_hg(is_hg)
+        LOGGER.warning("Mercurial hook has been installed.")
+
+    else:
+        LOGGER.error("VCS has not found. Check your path.")
+        sys.exit(1)
+
+
+# pylama:ignore=F0401,E1103,D210,F0001
+########## pylama/main.py ##########
+"""Pylama's shell support."""
+
+import sys
+import warnings
+from json import dumps
+from os import path as op
+from os import walk
+from pathlib import Path
+from typing import List, Optional
+
+from pylama.check_async import check_async
+from pylama.config import CURDIR, Namespace, parse_options, setup_logger
+from pylama.core import LOGGER, run
+from pylama.errors import Error
+from pylama.utils import read_stdin
+
+DEFAULT_FORMAT = "{filename}:{lnum}:{col} [{etype}] {number} {message} [{source}]"
+MESSAGE_FORMATS = {
+    "pylint": "{filename}:{lnum}: [{etype}] {number} {message} [{source}]",
+    "pycodestyle": "{filename}:{lnum}:{col} {number} {message} [{source}]",
+    "parsable": DEFAULT_FORMAT,
+}
+
+
+def check_paths(
+    paths: Optional[List[str]],
+    options: Namespace,
+    code: str = None,
+    rootdir: Path = None,
+) -> List[Error]:
+    """Check the given paths.
+
+    :param rootdir: Root directory (for making relative file paths)
+    :param options: Parsed pylama options (from pylama.config.parse_options)
+    """
+    paths = paths or options.paths
+    if not paths:
+        return []
+
+    if code is None:
+        candidates = []
+        for path in paths or options.paths:
+            if not op.exists(path):
+                continue
+
+            if not op.isdir(path):
+                candidates.append(op.abspath(path))
+
+            for root, _, files in walk(path):
+                candidates += [op.relpath(op.join(root, f), CURDIR) for f in files]
+    else:
+        candidates = [paths[0]]
+
+    if not candidates:
+        return []
+
+    if rootdir is None:
+        path = candidates[0]
+        rootdir = Path(path if op.isdir(path) else op.dirname(path))
+
+    candidates = [path for path in candidates if path.endswith(".py")]
+
+    if options.concurrent:
+        return check_async(candidates, code=code, options=options, rootdir=rootdir)
+
+    errors = []
+    for path in candidates:
+        errors += run(path=path, code=code, rootdir=rootdir, options=options)
+
+    return errors
+
+
+def check_path(
+    options: Namespace,
+    rootdir: str = None,
+    candidates: List[str] = None,
+    code: str = None,  # noqa
+) -> List[Error]:
+    """Support legacy code."""
+    warnings.warn(
+        "pylama.main.check_path is depricated and will be removed in pylama 9",
+        DeprecationWarning,
+    )
+    return check_paths(
+        candidates,
+        code=code,
+        options=options,
+        rootdir=rootdir and Path(rootdir) or None,
+    )
+
+
+def shell(args: List[str] = None, error: bool = True):
+    """Endpoint for console.
+
+    Parse a command arguments, configuration files and run a checkers.
+    """
+    if args is None:
+        args = sys.argv[1:]
+
+    options = parse_options(args)
+    setup_logger(options)
+    LOGGER.info(options)
+
+    # Install VSC hook
+    if options.hook:
+        from .hook import install_hook  # noqa
+
+        for path in options.paths:
+            return install_hook(path)
+
+    if options.from_stdin and not options.paths:
+        LOGGER.error("--from-stdin requires a filename")
+        return sys.exit(1)
+
+    errors = check_paths(
+        options.paths,
+        code=read_stdin() if options.from_stdin else None,
+        options=options,
+        rootdir=CURDIR,
+    )
+    display_errors(errors, options)
+
+    if error:
+        sys.exit(int(bool(errors)))
+
+    return errors
+
+
+def display_errors(errors: List[Error], options: Namespace):
+    """Format and display the given errors."""
+    if options.format == "json":
+        LOGGER.warning(dumps([err.to_dict() for err in errors]))
+
+    else:
+        pattern = MESSAGE_FORMATS.get(options.format, DEFAULT_FORMAT)
+        for err in errors:
+            LOGGER.warning(err.format(pattern))
+
+
+if __name__ == "__main__":
+    shell()
+
+# pylama:ignore=F0001
+########## pylama/pytest.py ##########
+""" py.test plugin for checking files with pylama. """
+from __future__ import absolute_import
+
+import pathlib
+from os import path as op
+
+import pytest
+
+from pylama.config import CURDIR
+from pylama.main import DEFAULT_FORMAT, check_paths, parse_options
+
+HISTKEY = "pylama/mtimes"
+
+
+def pytest_load_initial_conftests(early_config, *_):
+    # Marks have to be registered before usage
+    # to not fail with --strict command line argument
+    early_config.addinivalue_line(
+        "markers", "pycodestyle: Mark test as using pylama code audit tool."
+    )
+
+
+def pytest_addoption(parser):
+    group = parser.getgroup("general")
+    group.addoption(
+        "--pylama",
+        action="store_true",
+        help="perform some pylama code checks on .py files",
+    )
+
+
+def pytest_sessionstart(session):
+    config = session.config
+    if config.option.pylama and getattr(config, "cache", None):
+        config._pylamamtimes = config.cache.get(HISTKEY, {})
+
+
+def pytest_sessionfinish(session):
+    config = session.config
+    if hasattr(config, "_pylamamtimes"):
+        config.cache.set(HISTKEY, config._pylamamtimes)
+
+
+def pytest_collect_file(path, parent):
+    config = parent.config
+    if config.option.pylama and path.ext == ".py":
+        return PylamaFile.from_parent(parent, path=pathlib.Path(path))
+    return None
+
+
+class PylamaError(Exception):
+    """indicates an error during pylama checks."""
+
+
+class PylamaFile(pytest.File):
+    def collect(self):
+        return [PylamaItem.from_parent(self, name="pylama")]
+
+
+class PylamaItem(pytest.Item):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.add_marker("pycodestyle")
+        self.cache = None
+        self._pylamamtimes = None
+
+    def setup(self):
+        if not getattr(self.config, "cache", None):
+            return False
+
+        self.cache = True
+        self._pylamamtimes = self.fspath.mtime()
+        pylamamtimes = self.config._pylamamtimes
+        old = pylamamtimes.get(str(self.fspath), 0)
+        if old == self._pylamamtimes:
+            pytest.skip("file(s) previously passed Pylama checks")
+
+        return True
+
+    def runtest(self):
+        errors = check_file(self.fspath)
+        if errors:
+            out = "\n".join(err.format(DEFAULT_FORMAT) for err in errors)
+            raise PylamaError(out)
+
+        # update mtime only if test passed
+        # otherwise failures would not be re-run next time
+        if self.cache:
+            self.config._pylamamtimes[str(self.fspath)] = self._pylamamtimes
+
+    def repr_failure(self, excinfo, style=None):
+        if excinfo.errisinstance(PylamaError):
+            return excinfo.value.args[0]
+        return super().repr_failure(excinfo, style)
+
+
+def check_file(path):
+    options = parse_options()
+    path = op.relpath(str(path), CURDIR)
+    return check_paths([path], options, rootdir=CURDIR)
+
+
+# pylama:ignore=D,E1002,W0212,F0001,C0115,C0116
+########## pylama/utils.py ##########
+"""Pylama utils."""
+
+from io import StringIO
+from sys import stdin
+from typing import List
+
+
+def get_lines(value: str) -> List[str]:
+    """Return lines from the given string."""
+    return StringIO(value).readlines()
+
+
+def read(filename: str) -> str:
+    """Read the given filename."""
+    with open(filename, encoding="utf-8") as file:
+        return file.read()
+
+
+def read_stdin() -> str:
+    """Get value from stdin."""
+    value = stdin.buffer.read()
+    return value.decode("utf-8")
+########## pylama/lint/__init__.py ##########
+"""Custom module loader."""
+from __future__ import annotations
+
+from argparse import ArgumentParser
+from importlib import import_module
+from pathlib import Path
+from pkgutil import walk_packages
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+
+from pkg_resources import iter_entry_points
+
+LINTERS: Dict[str, Type[LinterV2]] = {}
+
+if TYPE_CHECKING:
+    from pylama.context import RunContext
+
+
+class LinterMeta(type):
+    """Register linters."""
+
+    def __new__(mcs, name, bases, params):
+        """Register linters."""
+        cls: Type[LinterV2] = super().__new__(mcs, name, bases, params)
+        if cls.name is not None:
+            LINTERS[cls.name] = cls
+        return cls
+
+
+class Linter(metaclass=LinterMeta):
+    """Abstract class for linter plugin."""
+
+    name: Optional[str] = None
+
+    @classmethod
+    def add_args(cls, _: ArgumentParser):
+        """Add options from linters.
+
+        The method has to be a classmethod.
+        """
+
+    def run(self, _path: str, **_meta) -> List[Dict[str, Any]]:  # noqa
+        """Legacy method (support old extenstions)."""
+        return []
+
+
+class LinterV2(Linter):
+    """A new linter class."""
+
+    def run_check(self, ctx: RunContext):
+        """Check code."""
+
+
+# Import default linters
+for _, pname, _ in walk_packages([str(Path(__file__).parent)]):  # type: ignore
+    try:
+        import_module(f"{__name__}.{pname}")
+    except ImportError:
+        pass
+
+# Import installed linters
+for entry in iter_entry_points("pylama.linter"):
+    if entry.name not in LINTERS:
+        try:
+            LINTERS[entry.name] = entry.load()
+        except ImportError:
+            pass

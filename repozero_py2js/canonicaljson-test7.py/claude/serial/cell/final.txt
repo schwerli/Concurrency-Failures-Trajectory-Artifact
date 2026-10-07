@@ -1,0 +1,42 @@
+Everything passes. Here is the delivered code.
+
+## `/output/lib/python/utf8.mjs` — UTF-8 codec
+
+```js
+export const REPLACEMENT_CODE_POINT = 0xfffd;
+// codePointsOf(text) -> number[]   (Python-style str iteration, not UTF-16 units)
+// isSurrogate(cp) -> boolean
+// encodeUtf8(text) -> Uint8Array
+```
+
+## `/output/lib/python/text.mjs` — `str` semantics
+`compareCodePoints`, `sortedStrings` (Python `sorted()`), `strRepr` (`repr()` of a str).
+
+## `/output/lib/python/bytes.mjs` — `repr()` of `bytes`
+`bytesRepr(Uint8Array)` — quote selection + the `\\`/`\t`/`\n`/`\r`/`\xNN` escape ladder.
+
+## `/output/lib/python/numbers.mjs` — `repr()` of numbers
+`formatInteger`, `formatFloat`.
+
+## `/output/lib/canonicaljson/{escape,encoder,index}.mjs`
+`escapeJsonString` → `encodeCanonicalText` (compact separators, sorted keys) → `encodeCanonicalJson` returning **bytes**.
+
+## `/output/lib/cli/{errors,help,parser}.mjs`
+`ArgumentError`/`ExitRequest`, usage/help layout, and the `argparse` subset.
+
+## `/output/test7.mjs`
+Entry point: builds the two required options, encodes `[a, b]` and `sorted([a, b])`, prints both byte reprs.
+
+**Verification** (all against `/workspace/dataset/test7_executable`, normalizing only the program name, which necessarily differs):
+- **68/68** curated cases and **700/700** randomized fuzz rounds matched status + stdout + stderr exactly.
+- All four documented samples reproduce byte-for-byte (case 1 confirmed via `od -c`).
+- No `require`/`module.exports`/`JSON.stringify`; the only non-local import in the whole tree is `node:path`.
+
+Four things the black box revealed that a naive port gets wrong:
+
+1. **Output is a `bytes` repr, not JSON text.** A tab becomes `\\t` (JSON escapes it, then `repr` escapes the backslash), and `café` prints as `caf\xc3\xa9` — the encoder runs with ASCII escaping *off*, so non-ASCII only becomes multi-byte in the UTF-8 step. `0x7F` is not printable, so DEL shows as `\x7f`.
+2. **Sorting is by code point.** `'￿' < '😀'` is true in Python but false with JS `<`, which compares UTF-16 units — hence the hand-rolled comparator.
+3. **`argparse` heuristics**: `-12`/`-.5` are values but `-5x`/`-1e5` are options; a token containing a space is a value; `--` is never consumed as a value and is itself reported unrecognized; missing-required is reported *before* unrecognized extras.
+4. **`-hx` prints help and exits 0** — CPython 3.12 unpacks the short-option cluster, queues `-h`, and pushes the unknown `-x` tail to *extras* rather than erroring. `--help=x` (long form) does error. My first implementation raised in both cases; the differential run caught it.
+
+Two caveats worth flagging: the float/nested-container paths in the encoder are unreachable from this CLI (inputs are always strings), so they are covered by self-checks derived from CPython semantics rather than differential testing. And Python aborts with a `UnicodeEncodeError` traceback on undecodable argument bytes; that path is unreproducible from Node, which substitutes U+FFFD before the program sees `argv` — I matched the substitution behavior instead.

@@ -1,0 +1,916 @@
+total 44
+drwxr-xr-x 2 root root  4096 Aug  9 11:31 .
+drwxr-xr-x 4 root root  4096 Aug  9 11:39 ..
+-rw-r--r-- 1 root root  2020 Aug  9 11:31 lib.rs
+-rw-r--r-- 1 root root 13439 Aug  9 11:30 path.rs
+-rw-r--r-- 1 root root  5858 Aug  9 11:31 point.rs
+-rw-r--r-- 1 root root  5903 Aug  9 11:30 rect.rs
+=== /output/src/lib.rs ===
+     1	//! `clipper2` — a pure-Rust, `std`-only re-implementation of the slice of the
+     2	//! Clipper2Lib C++ API that `tests/test1.cpp` exercises.
+     3	//!
+     4	//! The original translation unit is:
+     5	//!
+     6	//! ```cpp
+     7	//! #include "clipper2/clipper.h"
+     8	//! using namespace Clipper2Lib;
+     9	//!
+    10	//! Path64 path = {Point64(0,0), Point64(100,0), Point64(100,100), Point64(0,100)};
+    11	//! std::cout << path.size() << std::endl;
+    12	//! ```
+    13	//!
+    14	//! So the surface that has to exist, and behave exactly as the C++ one does, is:
+    15	//!
+    16	//! * [`Point64`] — an integer point with a two-argument constructor.
+    17	//! * [`Path64`] — an ordered, brace-initialisable sequence of points
+    18	//!   (`std::vector<Point64>` in C++) exposing `size()`.
+    19	//!
+    20	//! Everything reachable from those two types is modelled faithfully but
+    21	//! conservatively: this crate deliberately implements only behaviour that can be
+    22	//! derived from the public interface, rather than guessing at internals.
+    23	//!
+    24	//! Module layout:
+    25	//!
+    26	//! | module | contents |
+    27	//! |--------|----------|
+    28	//! | [`point`] | [`Point64`], [`PointD`] |
+    29	//! | [`path`]  | [`Path64`], [`PathD`], [`Paths64`], [`PathsD`] |
+    30	//! | [`rect`]  | [`Rect64`] and bounds computation |
+    31	
+    32	// This file is compiled twice: as the `clipper2` library target, and again as a
+    33	// module of the `test1` binary (so that `rustc test1.rs` works with no Cargo).
+    34	// In the binary build the parts of the API the test does not call would each
+    35	// raise `dead_code`, and the re-exports below `unused_imports`. They are public
+    36	// library surface — exercised by the unit tests in each module — not dead code.
+    37	#![allow(dead_code, unused_imports)]
+    38	
+    39	pub mod path;
+    40	pub mod point;
+    41	pub mod rect;
+    42	
+    43	// `self::`-qualified so these re-exports resolve identically under every edition
+    44	// (a bare `use path::…` would be crate-root-relative in edition 2015, which is
+    45	// what plain `rustc test1.rs` selects when no `--edition` flag is passed).
+    46	pub use self::path::{Path64, PathD, Paths64, PathsD};
+    47	pub use self::point::{PointD, Point64};
+    48	pub use self::rect::Rect64;
+=== /output/src/path.rs ===
+     1	//! Path (point-sequence) containers.
+     2	//!
+     3	//! In the C++ header these are `std::vector` aliases:
+     4	//!
+     5	//! ```cpp
+     6	//! template <typename T> using Path  = std::vector<Point<T>>;
+     7	//! template <typename T> using Paths = std::vector<Path<T>>;
+     8	//! using Path64  = Path<int64_t>;
+     9	//! using Paths64 = Paths<int64_t>;
+    10	//! ```
+    11	//!
+    12	//! `test1.cpp` relies on exactly two vector behaviours: brace-initialisation
+    13	//! from a point list, and `size()` returning the number of points held. Both are
+    14	//! reproduced here, with the rest of the vector-like surface delegated to the
+    15	//! wrapped [`Vec`].
+    16	
+    17	use super::point::{PointD, Point64};
+    18	use super::rect::Rect64;
+    19	use std::fmt;
+    20	// In the prelude only from edition 2021 onward; imported explicitly so this file
+    21	// also compiles when rustc defaults to an older edition.
+    22	use std::iter::FromIterator;
+    23	use std::ops::{Deref, DerefMut};
+    24	
+    25	/// Builds a [`Path64`] from a point list, mirroring C++ brace-initialisation.
+    26	///
+    27	/// ```ignore
+    28	/// // C++: Path64 path = {Point64(0,0), Point64(100,0)};
+    29	/// let path = path64![(0, 0), (100, 0)];
+    30	/// ```
+    31	///
+    32	/// The expansion names the types as `$crate::Path64` / `$crate::Point64`, i.e.
+    33	/// through the crate-root re-exports, so it resolves the same whether this file
+    34	/// is the crate root of the `clipper2` library or is pulled into `test1.rs` as a
+    35	/// module for the standalone `rustc` build.
+    36	#[macro_export]
+    37	macro_rules! path64 {
+    38	    () => { $crate::Path64::new() };
+    39	    ($(($x:expr, $y:expr)),+ $(,)?) => {
+    40	        $crate::Path64::from(vec![$($crate::Point64::new($x, $y)),+])
+    41	    };
+    42	    ($($p:expr),+ $(,)?) => {
+    43	        $crate::Path64::from(vec![$($p),+])
+    44	    };
+    45	}
+    46	
+    47	/// An ordered sequence of [`Point64`]s — the C++ `Path64`.
+    48	///
+    49	/// A newtype over `Vec<Point64>` rather than a bare alias, so that the C++
+    50	/// spelling of the vector interface (`size`, `empty`, `push_back`, …) can be
+    51	/// offered verbatim. [`Deref`]/[`DerefMut`] to `Vec<Point64>` keep the whole
+    52	/// standard vector surface (indexing, iteration, `sort`, …) available too.
+    53	#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+    54	pub struct Path64(Vec<Point64>);
+    55	
+    56	impl Path64 {
+    57	    /// An empty path — the default-constructed `Path64()`.
+    58	    #[inline]
+    59	    pub const fn new() -> Self {
+    60	        Self(Vec::new())
+    61	    }
+    62	
+    63	    /// An empty path with room for `n` points, as `std::vector::reserve` gives.
+    64	    #[inline]
+    65	    pub fn with_capacity(n: usize) -> Self {
+    66	        Self(Vec::with_capacity(n))
+    67	    }
+    68	
+    69	    /// Number of points in the path — the C++ `size()`.
+    70	    ///
+    71	    /// This is the single value `test1.cpp` prints, so it is the one result that
+    72	    /// must match the C++ program byte for byte once formatted.
+    73	    #[inline]
+    74	    pub fn size(&self) -> usize {
+    75	        self.0.len()
+    76	    }
+    77	
+    78	    /// Whether the path holds no points — the C++ `empty()`.
+    79	    #[inline]
+    80	    pub fn empty(&self) -> bool {
+    81	        self.0.is_empty()
+    82	    }
+    83	
+    84	    /// Appends a point — the C++ `push_back()`.
+    85	    #[inline]
+    86	    pub fn push_back(&mut self, p: Point64) {
+    87	        self.0.push(p);
+    88	    }
+    89	
+    90	    /// Borrows the points as a slice.
+    91	    #[inline]
+    92	    pub fn points(&self) -> &[Point64] {
+    93	        &self.0
+    94	    }
+    95	
+    96	    /// Consumes the path, yielding the underlying vector.
+    97	    #[inline]
+    98	    pub fn into_vec(self) -> Vec<Point64> {
+    99	        self.0
+   100	    }
+   101	
+   102	    /// Axis-aligned bounding box, or `None` when the path is empty.
+   103	    ///
+   104	    /// `None` is deliberate: the C++ library encodes "no bounds" with a sentinel
+   105	    /// rectangle, and reproducing that sentinel is not derivable from the public
+   106	    /// interface, so this crate declines to invent one.
+   107	    pub fn bounds(&self) -> Option<Rect64> {
+   108	        Rect64::from_points(&self.0)
+   109	    }
+   110	
+   111	    /// Twice the signed area of the closed polygon described by the path.
+   112	    ///
+   113	    /// The doubled value is returned so the shoelace sum stays exact in integer
+   114	    /// arithmetic. Positive when the ring winds clockwise on screen (y growing
+   115	    /// downward), negative when it winds the other way.
+   116	    ///
+   117	    /// Accumulation is in `i128`, which is exact for every coordinate range the
+   118	    /// C++ library admits. It is *not* wide enough for arbitrary full-range
+   119	    /// `i64` coordinates — a single cross term can reach `2 * i64::MAX²`, which
+   120	    /// alone nearly fills an `i128` — so the sum saturates at the `i128` bounds
+   121	    /// instead of panicking in debug builds and wrapping to a wrong value in
+   122	    /// release builds.
+   123	    pub fn signed_area2(&self) -> i128 {
+   124	        let n = self.0.len();
+   125	        if n < 3 {
+   126	            return 0;
+   127	        }
+   128	        let mut acc: i128 = 0;
+   129	        let mut prev = self.0[n - 1];
+   130	        for &cur in &self.0 {
+   131	            let cross = (prev.x as i128 * cur.y as i128) - (cur.x as i128 * prev.y as i128);
+   132	            acc = acc.saturating_add(cross);
+   133	            prev = cur;
+   134	        }
+   135	        acc
+   136	    }
+   137	
+   138	    /// Signed area of the closed polygon, in square units.
+   139	    #[inline]
+   140	    pub fn area(&self) -> f64 {
+   141	        self.signed_area2() as f64 / 2.0
+   142	    }
+   143	
+   144	    /// Widens every coordinate, producing the `PathD` counterpart.
+   145	    pub fn to_path_d(&self) -> PathD {
+   146	        PathD::from(self.0.iter().map(|p| p.to_point_d()).collect::<Vec<_>>())
+   147	    }
+   148	}
+   149	
+   150	impl Deref for Path64 {
+   151	    type Target = Vec<Point64>;
+   152	    #[inline]
+   153	    fn deref(&self) -> &Self::Target {
+   154	        &self.0
+   155	    }
+   156	}
+   157	
+   158	impl DerefMut for Path64 {
+   159	    #[inline]
+   160	    fn deref_mut(&mut self) -> &mut Self::Target {
+   161	        &mut self.0
+   162	    }
+   163	}
+   164	
+   165	impl From<Vec<Point64>> for Path64 {
+   166	    #[inline]
+   167	    fn from(points: Vec<Point64>) -> Self {
+   168	        Self(points)
+   169	    }
+   170	}
+   171	
+   172	impl From<Path64> for Vec<Point64> {
+   173	    #[inline]
+   174	    fn from(path: Path64) -> Self {
+   175	        path.0
+   176	    }
+   177	}
+   178	
+   179	impl<const N: usize> From<[Point64; N]> for Path64 {
+   180	    #[inline]
+   181	    fn from(points: [Point64; N]) -> Self {
+   182	        Self(points.to_vec())
+   183	    }
+   184	}
+   185	
+   186	impl FromIterator<Point64> for Path64 {
+   187	    #[inline]
+   188	    fn from_iter<I: IntoIterator<Item = Point64>>(iter: I) -> Self {
+   189	        Self(iter.into_iter().collect())
+   190	    }
+   191	}
+   192	
+   193	impl IntoIterator for Path64 {
+   194	    type Item = Point64;
+   195	    type IntoIter = std::vec::IntoIter<Point64>;
+   196	    #[inline]
+   197	    fn into_iter(self) -> Self::IntoIter {
+   198	        self.0.into_iter()
+   199	    }
+   200	}
+   201	
+   202	impl<'a> IntoIterator for &'a Path64 {
+   203	    type Item = &'a Point64;
+   204	    type IntoIter = std::slice::Iter<'a, Point64>;
+   205	    #[inline]
+   206	    fn into_iter(self) -> Self::IntoIter {
+   207	        self.0.iter()
+   208	    }
+   209	}
+   210	
+   211	impl fmt::Display for Path64 {
+   212	    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+   213	        for (i, p) in self.0.iter().enumerate() {
+   214	            if i > 0 {
+   215	                f.write_str(" ")?;
+   216	            }
+   217	            write!(f, "{p}")?;
+   218	        }
+   219	        Ok(())
+   220	    }
+   221	}
+   222	
+   223	/// A sequence of [`Path64`]s — the C++ `Paths64`.
+   224	#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+   225	pub struct Paths64(Vec<Path64>);
+   226	
+   227	impl Paths64 {
+   228	    /// An empty collection.
+   229	    #[inline]
+   230	    pub const fn new() -> Self {
+   231	        Self(Vec::new())
+   232	    }
+   233	
+   234	    /// Number of paths held — the C++ `size()`.
+   235	    #[inline]
+   236	    pub fn size(&self) -> usize {
+   237	        self.0.len()
+   238	    }
+   239	
+   240	    /// Whether no paths are held — the C++ `empty()`.
+   241	    #[inline]
+   242	    pub fn empty(&self) -> bool {
+   243	        self.0.is_empty()
+   244	    }
+   245	
+   246	    /// Appends a path — the C++ `push_back()`.
+   247	    #[inline]
+   248	    pub fn push_back(&mut self, path: Path64) {
+   249	        self.0.push(path);
+   250	    }
+   251	
+   252	    /// Total number of points across every path.
+   253	    #[inline]
+   254	    pub fn total_points(&self) -> usize {
+   255	        self.0.iter().map(Path64::size).sum()
+   256	    }
+   257	}
+   258	
+   259	impl Deref for Paths64 {
+   260	    type Target = Vec<Path64>;
+   261	    #[inline]
+   262	    fn deref(&self) -> &Self::Target {
+   263	        &self.0
+   264	    }
+   265	}
+   266	
+   267	impl DerefMut for Paths64 {
+   268	    #[inline]
+   269	    fn deref_mut(&mut self) -> &mut Self::Target {
+   270	        &mut self.0
+   271	    }
+   272	}
+   273	
+   274	impl From<Vec<Path64>> for Paths64 {
+   275	    #[inline]
+   276	    fn from(paths: Vec<Path64>) -> Self {
+   277	        Self(paths)
+   278	    }
+   279	}
+   280	
+   281	impl FromIterator<Path64> for Paths64 {
+   282	    #[inline]
+   283	    fn from_iter<I: IntoIterator<Item = Path64>>(iter: I) -> Self {
+   284	        Self(iter.into_iter().collect())
+   285	    }
+   286	}
+   287	
+   288	/// An ordered sequence of [`PointD`]s — the C++ `PathD`.
+   289	#[derive(Clone, Debug, Default, PartialEq)]
+   290	pub struct PathD(Vec<PointD>);
+   291	
+   292	impl PathD {
+   293	    /// An empty path.
+   294	    #[inline]
+   295	    pub const fn new() -> Self {
+   296	        Self(Vec::new())
+   297	    }
+   298	
+   299	    /// Number of points in the path — the C++ `size()`.
+   300	    #[inline]
+   301	    pub fn size(&self) -> usize {
+   302	        self.0.len()
+   303	    }
+   304	
+   305	    /// Whether the path holds no points — the C++ `empty()`.
+   306	    #[inline]
+   307	    pub fn empty(&self) -> bool {
+   308	        self.0.is_empty()
+   309	    }
+   310	
+   311	    /// Rounds every coordinate, producing the `Path64` counterpart.
+   312	    pub fn to_path64(&self) -> Path64 {
+   313	        self.0.iter().map(|p| p.to_point64()).collect()
+   314	    }
+   315	}
+   316	
+   317	impl Deref for PathD {
+   318	    type Target = Vec<PointD>;
+   319	    #[inline]
+   320	    fn deref(&self) -> &Self::Target {
+   321	        &self.0
+   322	    }
+   323	}
+   324	
+   325	impl From<Vec<PointD>> for PathD {
+   326	    #[inline]
+   327	    fn from(points: Vec<PointD>) -> Self {
+   328	        Self(points)
+   329	    }
+   330	}
+   331	
+   332	/// A sequence of [`PathD`]s — the C++ `PathsD`.
+   333	#[derive(Clone, Debug, Default, PartialEq)]
+   334	pub struct PathsD(Vec<PathD>);
+   335	
+   336	impl PathsD {
+   337	    /// An empty collection.
+   338	    #[inline]
+   339	    pub const fn new() -> Self {
+   340	        Self(Vec::new())
+   341	    }
+   342	
+   343	    /// Number of paths held — the C++ `size()`.
+   344	    #[inline]
+   345	    pub fn size(&self) -> usize {
+   346	        self.0.len()
+   347	    }
+   348	}
+   349	
+   350	impl Deref for PathsD {
+   351	    type Target = Vec<PathD>;
+   352	    #[inline]
+   353	    fn deref(&self) -> &Self::Target {
+   354	        &self.0
+   355	    }
+   356	}
+   357	
+   358	impl From<Vec<PathD>> for PathsD {
+   359	    #[inline]
+   360	    fn from(paths: Vec<PathD>) -> Self {
+   361	        Self(paths)
+   362	    }
+   363	}
+   364	
+   365	#[cfg(test)]
+   366	mod tests {
+   367	    use super::*;
+   368	
+   369	    /// The exact literal from `test1.cpp`.
+   370	    fn test1_path() -> Path64 {
+   371	        Path64::from(vec![
+   372	            Point64::new(0, 0),
+   373	            Point64::new(100, 0),
+   374	            Point64::new(100, 100),
+   375	            Point64::new(0, 100),
+   376	        ])
+   377	    }
+   378	
+   379	    #[test]
+   380	    fn size_of_the_test1_literal_is_four() {
+   381	        assert_eq!(test1_path().size(), 4);
+   382	        assert_eq!(format!("{}", test1_path().size()), "4");
+   383	    }
+   384	
+   385	    #[test]
+   386	    fn size_tracks_insertions_and_keeps_duplicates() {
+   387	        let mut path = Path64::new();
+   388	        assert!(path.empty());
+   389	        assert_eq!(path.size(), 0);
+   390	        path.push_back(Point64::new(0, 0));
+   391	        path.push_back(Point64::new(0, 0)); // a vector is not a set
+   392	        assert_eq!(path.size(), 2);
+   393	        assert!(!path.empty());
+   394	    }
+   395	
+   396	    #[test]
+   397	    fn insertion_order_is_preserved() {
+   398	        let path = test1_path();
+   399	        assert_eq!(path[0], Point64::new(0, 0));
+   400	        assert_eq!(path[3], Point64::new(0, 100));
+   401	        assert_eq!(path.points().last().copied(), Some(Point64::new(0, 100)));
+   402	    }
+   403	
+   404	    #[test]
+   405	    fn macro_matches_explicit_construction() {
+   406	        assert_eq!(
+   407	            path64![(0, 0), (100, 0), (100, 100), (0, 100)],
+   408	            test1_path()
+   409	        );
+   410	        assert_eq!(path64![].size(), 0);
+   411	        assert_eq!(path64![Point64::new(1, 2)].size(), 1);
+   412	    }
+   413	
+   414	    #[test]
+   415	    fn conversions_and_iteration_agree_on_length() {
+   416	        let path = test1_path();
+   417	        assert_eq!(path.iter().count(), path.size());
+   418	        assert_eq!(path.to_path_d().size(), 4);
+   419	        assert_eq!(path.to_path_d().to_path64(), path);
+   420	        assert_eq!(Vec::from(path.clone()).len(), 4);
+   421	        assert_eq!(path.clone().into_iter().count(), 4);
+   422	        assert_eq!(Path64::with_capacity(8).size(), 0);
+   423	    }
+   424	
+   425	    #[test]
+   426	    fn bounds_cover_every_point() {
+   427	        let r = test1_path().bounds().expect("non-empty path has bounds");
+   428	        assert_eq!((r.left, r.top, r.right, r.bottom), (0, 0, 100, 100));
+   429	        assert_eq!(Path64::new().bounds(), None);
+   430	    }
+   431	
+   432	    #[test]
+   433	    fn area_of_the_unit_square_literal() {
+   434	        // A 100x100 square, wound clockwise in screen coordinates.
+   435	        assert_eq!(test1_path().signed_area2(), 20_000);
+   436	        assert_eq!(test1_path().area(), 10_000.0);
+   437	        // Fewer than three points cannot enclose area.
+   438	        assert_eq!(path64![(0, 0), (1, 1)].area(), 0.0);
+   439	    }
+   440	
+   441	    #[test]
+   442	    fn area_sign_flips_with_winding() {
+   443	        let mut reversed = test1_path();
+   444	        reversed.reverse(); // reaches Vec::reverse through DerefMut
+   445	        assert_eq!(reversed.signed_area2(), -test1_path().signed_area2());
+   446	    }
+   447	
+   448	    #[test]
+   449	    fn area_saturates_rather_than_overflowing_on_extreme_coordinates() {
+   450	        // Each cross term here is ~2*i64::MAX^2, which alone nearly fills an
+   451	        // i128, so the running sum must saturate rather than panic (debug) or
+   452	        // wrap to a plausible-looking wrong number (release).
+   453	        const M: i64 = i64::MAX;
+   454	        let p = path64![(M, M), (-M, M), (M, -M)];
+   455	        assert_eq!(p.signed_area2(), i128::MAX);
+   456	        let n = path64![(-M, M), (M, M), (M, -M)];
+   457	        assert!(n.signed_area2() < 0);
+   458	    }
+   459	
+   460	    #[test]
+   461	    fn display_lists_points_space_separated() {
+   462	        assert_eq!(test1_path().to_string(), "0,0 100,0 100,100 0,100");
+   463	    }
+   464	
+   465	    #[test]
+   466	    fn paths_containers_count_their_members() {
+   467	        let mut paths = Paths64::new();
+   468	        assert!(paths.empty());
+   469	        paths.push_back(test1_path());
+   470	        paths.push_back(Path64::new());
+   471	        assert_eq!(paths.size(), 2);
+   472	        assert_eq!(paths.total_points(), 4);
+   473	
+   474	        let d = PathsD::from(vec![test1_path().to_path_d()]);
+   475	        assert_eq!(d.size(), 1);
+   476	        assert_eq!(d[0].size(), 4);
+   477	        assert!(PathD::new().empty());
+   478	    }
+   479	}
+=== /output/src/point.rs ===
+     1	//! Point types.
+     2	//!
+     3	//! Mirrors `Clipper2Lib::Point<T>`, of which `Point64` (64-bit integer
+     4	//! coordinates) is the instantiation used by `test1.cpp`. `PointD` (double
+     5	//! coordinates) is provided alongside it because the C++ header exposes the two
+     6	//! as a pair and callers routinely convert between them.
+     7	
+     8	use std::fmt;
+     9	use std::ops::{Add, Neg, Sub};
+    10	
+    11	/// A point with 64-bit signed integer coordinates.
+    12	///
+    13	/// The C++ counterpart is `Clipper2Lib::Point64`, a plain aggregate of two
+    14	/// `int64_t` fields, constructed as `Point64(x, y)`.
+    15	#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    16	pub struct Point64 {
+    17	    pub x: i64,
+    18	    pub y: i64,
+    19	}
+    20	
+    21	impl Point64 {
+    22	    /// The origin, `(0, 0)` — equivalent to the default-constructed `Point64()`.
+    23	    pub const ORIGIN: Self = Self { x: 0, y: 0 };
+    24	
+    25	    /// Constructs a point, matching the C++ `Point64(x, y)` constructor.
+    26	    #[inline]
+    27	    pub const fn new(x: i64, y: i64) -> Self {
+    28	        Self { x, y }
+    29	    }
+    30	
+    31	    /// Rounds a floating-point pair to the nearest integer point, halves away
+    32	    /// from zero (`0.5 -> 1`, `-0.5 -> -1`), matching [`f64::round`].
+    33	    ///
+    34	    /// Half-away-from-zero is chosen because it is what C's `llround` family
+    35	    /// specifies, which is the conventional way to narrow a `double` coordinate
+    36	    /// to an integer one. Unlike `llround`, the conversion here is total: a NaN
+    37	    /// input yields `0` and out-of-range inputs clamp to `i64::MIN`/`i64::MAX`,
+    38	    /// which is Rust's defined behaviour for a float-to-int cast, rather than
+    39	    /// C++'s unspecified result.
+    40	    #[inline]
+    41	    pub fn from_rounded(x: f64, y: f64) -> Self {
+    42	        Self::new(x.round() as i64, y.round() as i64)
+    43	    }
+    44	
+    45	    /// Translates the point by `(dx, dy)`.
+    46	    #[inline]
+    47	    pub fn translate(self, dx: i64, dy: i64) -> Self {
+    48	        Self::new(self.x + dx, self.y + dy)
+    49	    }
+    50	
+    51	    /// Widens the point to floating-point coordinates.
+    52	    #[inline]
+    53	    pub fn to_point_d(self) -> PointD {
+    54	        PointD::new(self.x as f64, self.y as f64)
+    55	    }
+    56	}
+    57	
+    58	impl From<(i64, i64)> for Point64 {
+    59	    #[inline]
+    60	    fn from((x, y): (i64, i64)) -> Self {
+    61	        Self::new(x, y)
+    62	    }
+    63	}
+    64	
+    65	impl From<Point64> for (i64, i64) {
+    66	    #[inline]
+    67	    fn from(p: Point64) -> Self {
+    68	        (p.x, p.y)
+    69	    }
+    70	}
+    71	
+    72	impl Add for Point64 {
+    73	    type Output = Self;
+    74	    #[inline]
+    75	    fn add(self, rhs: Self) -> Self {
+    76	        Self::new(self.x + rhs.x, self.y + rhs.y)
+    77	    }
+    78	}
+    79	
+    80	impl Sub for Point64 {
+    81	    type Output = Self;
+    82	    #[inline]
+    83	    fn sub(self, rhs: Self) -> Self {
+    84	        Self::new(self.x - rhs.x, self.y - rhs.y)
+    85	    }
+    86	}
+    87	
+    88	impl Neg for Point64 {
+    89	    type Output = Self;
+    90	    #[inline]
+    91	    fn neg(self) -> Self {
+    92	        Self::new(-self.x, -self.y)
+    93	    }
+    94	}
+    95	
+    96	/// Renders the point as `x,y`.
+    97	///
+    98	/// Note: this is this crate's own convention for diagnostics. `test1.cpp` never
+    99	/// streams a `Point64`, so no claim is made here about byte-compatibility with
+   100	/// the C++ `operator<<`; only [`Path64::size`](crate::path::Path64::size) output
+   101	/// is contractually reproduced.
+   102	impl fmt::Display for Point64 {
+   103	    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+   104	        write!(f, "{},{}", self.x, self.y)
+   105	    }
+   106	}
+   107	
+   108	/// A point with `f64` coordinates — the C++ `Clipper2Lib::PointD`.
+   109	#[derive(Clone, Copy, Debug, Default, PartialEq)]
+   110	pub struct PointD {
+   111	    pub x: f64,
+   112	    pub y: f64,
+   113	}
+   114	
+   115	impl PointD {
+   116	    /// Constructs a point, matching the C++ `PointD(x, y)` constructor.
+   117	    #[inline]
+   118	    pub const fn new(x: f64, y: f64) -> Self {
+   119	        Self { x, y }
+   120	    }
+   121	
+   122	    /// Rounds to the nearest [`Point64`], half away from zero.
+   123	    #[inline]
+   124	    pub fn to_point64(self) -> Point64 {
+   125	        Point64::from_rounded(self.x, self.y)
+   126	    }
+   127	}
+   128	
+   129	impl From<(f64, f64)> for PointD {
+   130	    #[inline]
+   131	    fn from((x, y): (f64, f64)) -> Self {
+   132	        Self::new(x, y)
+   133	    }
+   134	}
+   135	
+   136	impl From<Point64> for PointD {
+   137	    #[inline]
+   138	    fn from(p: Point64) -> Self {
+   139	        p.to_point_d()
+   140	    }
+   141	}
+   142	
+   143	#[cfg(test)]
+   144	mod tests {
+   145	    use super::*;
+   146	
+   147	    #[test]
+   148	    fn new_stores_coordinates_verbatim() {
+   149	        let p = Point64::new(100, -100);
+   150	        assert_eq!((p.x, p.y), (100, -100));
+   151	        assert_eq!(Point64::default(), Point64::ORIGIN);
+   152	    }
+   153	
+   154	    #[test]
+   155	    fn equality_is_componentwise() {
+   156	        assert_eq!(Point64::new(0, 0), Point64::from((0, 0)));
+   157	        assert_ne!(Point64::new(0, 1), Point64::new(1, 0));
+   158	    }
+   159	
+   160	    #[test]
+   161	    fn arithmetic_matches_cpp_operators() {
+   162	        let a = Point64::new(3, 4);
+   163	        let b = Point64::new(10, 20);
+   164	        assert_eq!(a + b, Point64::new(13, 24));
+   165	        assert_eq!(b - a, Point64::new(7, 16));
+   166	        assert_eq!(-a, Point64::new(-3, -4));
+   167	        assert_eq!(a.translate(-3, -4), Point64::ORIGIN);
+   168	    }
+   169	
+   170	    #[test]
+   171	    fn rounding_is_half_away_from_zero() {
+   172	        assert_eq!(Point64::from_rounded(0.5, -0.5), Point64::new(1, -1));
+   173	        assert_eq!(Point64::from_rounded(1.4, -1.6), Point64::new(1, -2));
+   174	        assert_eq!(PointD::new(2.5, 3.5).to_point64(), Point64::new(3, 4));
+   175	    }
+   176	
+   177	    #[test]
+   178	    fn rounding_is_total_for_nan_and_out_of_range() {
+   179	        // Rust's float-to-int cast is saturating and NaN-to-zero, so unlike
+   180	        // `llround` these cases are defined rather than unspecified.
+   181	        assert_eq!(Point64::from_rounded(f64::NAN, f64::NAN), Point64::ORIGIN);
+   182	        assert_eq!(
+   183	            Point64::from_rounded(f64::INFINITY, f64::NEG_INFINITY),
+   184	            Point64::new(i64::MAX, i64::MIN)
+   185	        );
+   186	        assert_eq!(Point64::from_rounded(1e300, -1e300), Point64::new(i64::MAX, i64::MIN));
+   187	    }
+   188	
+   189	    #[test]
+   190	    fn conversions_round_trip() {
+   191	        let p = Point64::new(100, 100);
+   192	        assert_eq!(PointD::from(p).to_point64(), p);
+   193	        assert_eq!(<(i64, i64)>::from(p), (100, 100));
+   194	    }
+   195	
+   196	    #[test]
+   197	    fn display_is_comma_separated() {
+   198	        assert_eq!(Point64::new(100, 0).to_string(), "100,0");
+   199	    }
+   200	}
+=== /output/src/rect.rs ===
+     1	//! Axis-aligned rectangle.
+     2	//!
+     3	//! Mirrors `Clipper2Lib::Rect64`. The field naming follows the C++ header's
+     4	//! screen-coordinate convention, in which y grows downward, so `top` is the
+     5	//! *smallest* y and `bottom` the largest.
+     6	
+     7	use super::point::Point64;
+     8	use std::fmt;
+     9	
+    10	/// An axis-aligned rectangle with 64-bit integer bounds — the C++ `Rect64`.
+    11	#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    12	pub struct Rect64 {
+    13	    pub left: i64,
+    14	    pub top: i64,
+    15	    pub right: i64,
+    16	    pub bottom: i64,
+    17	}
+    18	
+    19	impl Rect64 {
+    20	    /// Constructs a rectangle from explicit edges, matching the C++
+    21	    /// `Rect64(left, top, right, bottom)` constructor. Edges are stored as
+    22	    /// given; no normalisation is applied.
+    23	    #[inline]
+    24	    pub const fn new(left: i64, top: i64, right: i64, bottom: i64) -> Self {
+    25	        Self {
+    26	            left,
+    27	            top,
+    28	            right,
+    29	            bottom,
+    30	        }
+    31	    }
+    32	
+    33	    /// Tightest rectangle covering every point, or `None` for an empty slice.
+    34	    ///
+    35	    /// `Option` rather than a sentinel rectangle: the C++ library's "invalid
+    36	    /// rect" value is an implementation detail that the public interface does
+    37	    /// not pin down, so this crate makes the empty case explicit instead.
+    38	    pub fn from_points(points: &[Point64]) -> Option<Self> {
+    39	        let (first, rest) = points.split_first()?;
+    40	        let mut r = Self::new(first.x, first.y, first.x, first.y);
+    41	        for p in rest {
+    42	            r.left = r.left.min(p.x);
+    43	            r.right = r.right.max(p.x);
+    44	            r.top = r.top.min(p.y);
+    45	            r.bottom = r.bottom.max(p.y);
+    46	        }
+    47	        Some(r)
+    48	    }
+    49	
+    50	    /// Horizontal extent — the C++ `Width()`.
+    51	    ///
+    52	    /// Saturating, because the span between two extreme `i64` edges is not
+    53	    /// representable as an `i64`; the C++ original would simply overflow there.
+    54	    #[inline]
+    55	    pub fn width(&self) -> i64 {
+    56	        self.right.saturating_sub(self.left)
+    57	    }
+    58	
+    59	    /// Vertical extent — the C++ `Height()`.
+    60	    ///
+    61	    /// Saturating, for the same reason as [`Rect64::width`].
+    62	    #[inline]
+    63	    pub fn height(&self) -> i64 {
+    64	        self.bottom.saturating_sub(self.top)
+    65	    }
+    66	
+    67	    /// Whether the rectangle encloses no area — the C++ `IsEmpty()`.
+    68	    #[inline]
+    69	    pub fn is_empty(&self) -> bool {
+    70	        self.bottom <= self.top || self.right <= self.left
+    71	    }
+    72	
+    73	    /// Centre point, rounded toward zero.
+    74	    ///
+    75	    /// Averaged through `i128` so that edges near the `i64` limits cannot
+    76	    /// overflow the intermediate sum; the halved result always fits in `i64`.
+    77	    #[inline]
+    78	    pub fn mid_point(&self) -> Point64 {
+    79	        let mid = |a: i64, b: i64| ((a as i128 + b as i128) / 2) as i64;
+    80	        Point64::new(mid(self.left, self.right), mid(self.top, self.bottom))
+    81	    }
+    82	
+    83	    /// Whether `p` lies inside or on the boundary — the C++ `Contains()`.
+    84	    #[inline]
+    85	    pub fn contains(&self, p: Point64) -> bool {
+    86	        p.x >= self.left && p.x <= self.right && p.y >= self.top && p.y <= self.bottom
+    87	    }
+    88	
+    89	    /// The four corners, clockwise from the top-left — the C++ `AsPath()`.
+    90	    pub fn corners(&self) -> [Point64; 4] {
+    91	        [
+    92	            Point64::new(self.left, self.top),
+    93	            Point64::new(self.right, self.top),
+    94	            Point64::new(self.right, self.bottom),
+    95	            Point64::new(self.left, self.bottom),
+    96	        ]
+    97	    }
+    98	}
+    99	
+   100	impl fmt::Display for Rect64 {
+   101	    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+   102	        write!(
+   103	            f,
+   104	            "({},{},{},{})",
+   105	            self.left, self.top, self.right, self.bottom
+   106	        )
+   107	    }
+   108	}
+   109	
+   110	#[cfg(test)]
+   111	mod tests {
+   112	    use super::*;
+   113	
+   114	    #[test]
+   115	    fn bounds_of_the_test1_square() {
+   116	        let pts = [
+   117	            Point64::new(0, 0),
+   118	            Point64::new(100, 0),
+   119	            Point64::new(100, 100),
+   120	            Point64::new(0, 100),
+   121	        ];
+   122	        let r = Rect64::from_points(&pts).expect("non-empty");
+   123	        assert_eq!(r, Rect64::new(0, 0, 100, 100));
+   124	        assert_eq!((r.width(), r.height()), (100, 100));
+   125	        assert!(!r.is_empty());
+   126	        assert_eq!(r.mid_point(), Point64::new(50, 50));
+   127	    }
+   128	
+   129	    #[test]
+   130	    fn empty_slice_has_no_bounds() {
+   131	        assert_eq!(Rect64::from_points(&[]), None);
+   132	    }
+   133	
+   134	    #[test]
+   135	    fn single_point_bounds_are_degenerate() {
+   136	        let r = Rect64::from_points(&[Point64::new(7, -3)]).expect("non-empty");
+   137	        assert_eq!(r, Rect64::new(7, -3, 7, -3));
+   138	        assert_eq!((r.width(), r.height()), (0, 0));
+   139	        assert!(r.is_empty());
+   140	        assert!(r.contains(Point64::new(7, -3)));
+   141	    }
+   142	
+   143	    #[test]
+   144	    fn negative_coordinates_are_ordered_correctly() {
+   145	        let r = Rect64::from_points(&[Point64::new(5, 5), Point64::new(-5, -9)]).unwrap();
+   146	        assert_eq!(r, Rect64::new(-5, -9, 5, 5));
+   147	        assert!(r.contains(Point64::new(0, 0)));
+   148	        assert!(!r.contains(Point64::new(6, 0)));
+   149	    }
+   150	
+   151	    #[test]
+   152	    fn extreme_edges_saturate_instead_of_overflowing() {
+   153	        let r = Rect64::new(i64::MIN, i64::MIN, i64::MAX, i64::MAX);
+   154	        // The true span exceeds i64; saturating is defined, wrapping would not be.
+   155	        assert_eq!(r.width(), i64::MAX);
+   156	        assert_eq!(r.height(), i64::MAX);
+   157	        // The midpoint of the full range is representable, and must not overflow
+   158	        // the intermediate sum on the way there.
+   159	        assert_eq!(r.mid_point(), Point64::new(0, 0));
+   160	        let hi = Rect64::new(i64::MAX - 1, i64::MAX - 3, i64::MAX, i64::MAX);
+   161	        assert_eq!(hi.mid_point(), Point64::new(i64::MAX - 1, i64::MAX - 2));
+   162	    }
+   163	
+   164	    #[test]
+   165	    fn corners_wind_clockwise_on_screen() {
+   166	        let r = Rect64::new(0, 0, 100, 100);
+   167	        assert_eq!(
+   168	            r.corners(),
+   169	            [
+   170	                Point64::new(0, 0),
+   171	                Point64::new(100, 0),
+   172	                Point64::new(100, 100),
+   173	                Point64::new(0, 100),
+   174	            ]
+   175	        );
+   176	        assert_eq!(r.to_string(), "(0,0,100,100)");
+   177	    }
+   178	}

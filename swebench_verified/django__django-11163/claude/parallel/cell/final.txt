@@ -1,0 +1,21 @@
+Fixed. `django/forms/models.py:86` now uses an explicit `None` check, so `fields=[]` means "no fields requested" rather than falling through to "all fields":
+
+```python
+        if fields is not None and f.name not in fields:
+            continue
+```
+
+This matches the sibling checks already in the same module — `construct_instance()` (line 45) and `fields_for_model()` (line 151) both already use `fields is not None`, so `model_to_dict()` was the outlier.
+
+Added a regression test to the existing `ModelToDictTests` class in `tests/model_forms/tests.py`. Verified it reproduces the bug: on the unpatched tree it fails with `{'id': 1, 'name': '', 'colours': []} != {}`, and passes with the fix.
+
+**Behavior ripple checked:** the only in-tree caller is `BaseModelForm.__init__` (`models.py:290`), which passes `opts.fields`. That's `None` for `fields = '__all__'` (the metaclass normalizes it at line 244), so unbound-form initial data is unaffected. For a `ModelForm` with `fields = []` the form has no fields anyway, so the now-empty `object_data` is inert.
+
+**Tests:**
+- `model_forms model_formsets model_formsets_regress forms_tests generic_views` → 1097 tests, OK
+- Broad ModelForm-consumer sweep (`admin_views`, `admin_inlines`, `admin_widgets`, `admin_changelist`, `modeladmin`, `generic_inline_admin`, `inline_formsets`, `auth_tests`, `model_fields`, `serializers`, `contenttypes_tests`, …) → 2884 tests, OK
+- Full suite → 12779 tests, 8 failures — all 8 are pre-existing environment artifacts (running as root, pytz/yaml versions, inspectdb, subquery limit). I confirmed the identical 8 fail on a stashed clean tree, so no regressions.
+
+One thing I deliberately left alone: `BaseModelForm._save_m2m` (line 434) still uses `if fields and ...`. It's reachable only in the narrow case of a *declared* form field shadowing an m2m name under `fields = []`, it's outside this ticket's scope, and the upstream PR doesn't touch it — worth a separate ticket if you want the module fully consistent.
+
+Note the suite needs `/opt/miniconda3/envs/testbed/bin/python` plus a UTF-8 locale; the system `python` lacks `pytz`, and under the default ASCII locale one unrelated file-storage test raises `UnicodeEncodeError`.

@@ -1,0 +1,3085 @@
+diff --git a/agent_tests/test_moa.py b/agent_tests/test_moa.py
+new file mode 100644
+index 0000000..744761d
+--- /dev/null
++++ b/agent_tests/test_moa.py
+@@ -0,0 +1,291 @@
++"""Tests for the MOA framework: OzaBagging and the evaluation task."""
++
++import os
++import random
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from classifiers import AbstractClassifier
++from hoeffding_tree import HoeffdingTree
++from moa_framework import (EvaluateInterleavedTestThenTrain, OzaBagging,
++                           PerformanceStats, poisson, run_moa_experiments)
++from streams import Instance, RandomTreeGenerator, WaveformGenerator
++
++
++# -- Poisson sampling -------------------------------------------------------
++
++def test_poisson_matches_the_distribution():
++    rng = random.Random(42)
++    draws = [poisson(1.0, rng) for _ in range(100000)]
++    mean = sum(draws) / len(draws)
++    variance = sum(d * d for d in draws) / len(draws) - mean * mean
++    # Poisson(1) has mean 1 and variance 1
++    assert abs(mean - 1.0) < 0.02
++    assert abs(variance - 1.0) < 0.05
++    assert min(draws) == 0
++    # P(k = 0) = P(k = 1) = e^-1 = 0.3679
++    assert abs(draws.count(0) / len(draws) - 0.3679) < 0.01
++    assert abs(draws.count(1) / len(draws) - 0.3679) < 0.01
++
++
++def test_poisson_is_reproducible_from_the_seed():
++    assert ([poisson(1.0, random.Random(7)) for _ in range(5)]
++            == [poisson(1.0, random.Random(7)) for _ in range(5)])
++    first = random.Random(1)
++    second = random.Random(1)
++    assert [poisson(1.0, first) for _ in range(50)] == \
++           [poisson(1.0, second) for _ in range(50)]
++
++
++def test_poisson_of_zero_rate_is_zero():
++    assert poisson(0.0, random.Random(1)) == 0
++
++
++# -- OzaBagging -------------------------------------------------------------
++
++def test_ozabagging_is_a_classifier_with_the_spec_defaults():
++    ensemble = OzaBagging()
++    assert isinstance(ensemble, AbstractClassifier)
++    assert ensemble.num_learners == 10
++    assert ensemble.seed == 42
++    assert ensemble.get_ensemble_size() == 10
++    assert all(isinstance(learner, HoeffdingTree) for learner in ensemble.learners)
++    base = ensemble.learners[0]
++    assert base.grace_period == 200
++    assert base.split_confidence == 1e-7
++    assert base.tie_threshold == 0.05
++
++
++def test_base_learners_receive_different_resamples():
++    stream = RandomTreeGenerator(seed=1, num_attributes=5, num_classes=2,
++                                 max_depth=3)
++    ensemble = OzaBagging(num_learners=10, seed=42, num_classes=2,
++                          num_attributes=5)
++    for _ in range(2000):
++        ensemble.train(stream.next_instance())
++    assert ensemble.instances_seen == 2000
++    # Poisson(1) resampling gives each learner a different multiset
++    assert len(set(ensemble.learner_weights)) > 1
++    for weight in ensemble.learner_weights:
++        assert 1500 < weight < 2500          # concentrated around 2000
++
++
++def test_training_is_reproducible_for_a_fixed_seed():
++    def accuracy():
++        stream = RandomTreeGenerator(seed=3, num_attributes=6, num_classes=2,
++                                     max_depth=4)
++        ensemble = OzaBagging(num_learners=5, seed=42, num_classes=2,
++                              num_attributes=6)
++        correct = 0
++        for _ in range(1500):
++            instance = stream.next_instance()
++            correct += ensemble.predict(instance) == instance.label
++            ensemble.train(instance)
++        return correct, ensemble.learner_weights
++
++    assert accuracy() == accuracy()
++
++
++def test_prediction_is_a_majority_vote_over_the_learners():
++    ensemble = OzaBagging(num_learners=3, seed=1, num_classes=2,
++                          num_attributes=2)
++
++    class Constant:
++        def __init__(self, label):
++            self.label = label
++
++        def train(self, instance):
++            pass
++
++        def get_votes(self, instance):
++            return {self.label: 1.0}
++
++    ensemble.learners = [Constant(1), Constant(1), Constant(0)]
++    instance = Instance([0.1, 0.2], 1)
++    assert ensemble.get_votes(instance) == {1: 2.0, 0: 1.0}
++    assert ensemble.predict(instance) == 1
++    assert ensemble.predict_proba(instance)[1] == 2.0 / 3.0
++
++
++def test_untrained_ensemble_predicts_without_raising():
++    ensemble = OzaBagging(num_learners=3, seed=1)
++    assert ensemble.predict(Instance([0.1, 0.2], 0)) == 0
++    assert ensemble.get_votes(Instance([0.1, 0.2], 0)) == {}
++
++
++def test_ensemble_learns_a_learnable_stream():
++    stream = RandomTreeGenerator(seed=42, num_attributes=10, num_classes=2,
++                                 max_depth=5)
++    ensemble = OzaBagging(num_learners=5, seed=42, num_classes=2,
++                          num_attributes=10)
++    correct = 0
++    for _ in range(20000):
++        instance = stream.next_instance()
++        correct += ensemble.predict(instance) == instance.label
++        ensemble.train(instance)
++    assert correct / 20000 > 0.7
++    assert ensemble.get_total_nodes() > 5
++
++
++def test_reset_restores_a_fresh_ensemble():
++    stream = RandomTreeGenerator(seed=5, num_attributes=5, num_classes=2,
++                                 max_depth=3)
++    ensemble = OzaBagging(num_learners=3, seed=42, num_classes=2,
++                          num_attributes=5)
++    for _ in range(1000):
++        ensemble.train(stream.next_instance())
++    ensemble.reset()
++    assert ensemble.instances_seen == 0
++    assert ensemble.learner_weights == [0.0, 0.0, 0.0]
++    assert ensemble.get_total_nodes() == 3
++
++
++# -- EvaluateInterleavedTestThenTrain ---------------------------------------
++
++class _RecordingClassifier(AbstractClassifier):
++    """Records the order in which test and train calls happen."""
++
++    def __init__(self):
++        super().__init__()
++        self.calls = []
++
++    def train(self, instance):
++        self.calls.append(("train", instance.label))
++
++    def predict(self, instance):
++        self.calls.append(("predict", instance.label))
++        return 0
++
++    def get_votes(self, instance):
++        return {0: 1.0}
++
++
++def test_task_tests_each_instance_before_training_on_it():
++    stream = RandomTreeGenerator(seed=1, num_attributes=3, num_classes=2,
++                                 max_depth=2)
++    classifier = _RecordingClassifier()
++    task = EvaluateInterleavedTestThenTrain(classifier, stream,
++                                            num_instances=5, window_size=10,
++                                            sample_frequency=10)
++    task.run()
++    assert [kind for kind, _ in classifier.calls] == \
++           ["predict", "train"] * 5
++
++
++def test_task_reports_accuracies_snapshots_and_metadata():
++    stream = RandomTreeGenerator(seed=42, num_attributes=8, num_classes=2,
++                                 max_depth=4)
++    tree = HoeffdingTree(num_attributes=8, num_classes=2)
++    task = EvaluateInterleavedTestThenTrain(tree, stream, num_instances=5000,
++                                            window_size=1000,
++                                            sample_frequency=1000)
++    result = task.run()
++
++    assert 0.0 <= result["cumulative_accuracy"] <= 1.0
++    assert 0.0 <= result["window_accuracy"] <= 1.0
++    assert len(result["snapshots"]) == 5
++    assert [s["instances"] for s in result["snapshots"]] == \
++           [1000.0, 2000.0, 3000.0, 4000.0, 5000.0]
++    assert len(result["learning_curve"]) == 5
++
++    metadata = result["metadata"]
++    assert metadata["classifier"] == "HoeffdingTree"
++    assert metadata["stream"] == "RandomTreeGenerator"
++    assert metadata["num_instances"] == 5000
++    assert metadata["instances_processed"] == 5000
++    assert metadata["window_size"] == 1000
++    assert metadata["evaluation_time_seconds"] >= 0.0
++    assert "total_nodes" in metadata
++
++
++def test_task_cumulative_accuracy_matches_a_manual_count():
++    stream = RandomTreeGenerator(seed=9, num_attributes=5, num_classes=2,
++                                 max_depth=3)
++    tree = HoeffdingTree(num_attributes=5, num_classes=2)
++    task = EvaluateInterleavedTestThenTrain(tree, stream, num_instances=800,
++                                            window_size=100,
++                                            sample_frequency=100)
++    result = task.run()
++    metadata = result["metadata"]
++    assert abs(result["cumulative_accuracy"]
++               - metadata["correct"] / metadata["instances_processed"]) < 1e-12
++
++
++def test_task_can_be_run_twice_without_leaking_state():
++    stream = RandomTreeGenerator(seed=2, num_attributes=4, num_classes=2,
++                                 max_depth=3)
++    tree = HoeffdingTree(num_attributes=4, num_classes=2)
++    task = EvaluateInterleavedTestThenTrain(tree, stream, num_instances=500,
++                                            window_size=100,
++                                            sample_frequency=100)
++    first = task.run()
++    second = task.run()
++    assert len(first["snapshots"]) == len(second["snapshots"]) == 5
++    assert task.evaluator.total_seen == 500
++
++
++# -- PerformanceStats -------------------------------------------------------
++
++def test_performance_stats_collects_and_formats_metrics():
++    stats = PerformanceStats(precision=4)
++    stats.add("A_ACCURACY", 0.123456)
++    stats.add("B_NODES", 42)
++    assert stats.names() == ["A_ACCURACY", "B_NODES"]
++    assert stats.get("A_ACCURACY") == 0.123456
++    assert stats.get("MISSING", 0.0) == 0.0
++    assert "A_ACCURACY" in stats
++    assert len(stats) == 2
++    assert stats.to_lines() == ["A_ACCURACY: 0.1235", "B_NODES: 42"]
++    assert stats.report() == "A_ACCURACY: 0.1235\nB_NODES: 42"
++
++
++def test_performance_stats_preserves_order_and_overwrites_values():
++    stats = PerformanceStats()
++    stats.add("X", 1.0).add("Y", 2.0).add("X", 3.0)
++    assert stats.names() == ["X", "Y"]
++    assert stats.get("X") == 3.0
++    assert stats.as_dict() == {"X": 3.0, "Y": 2.0}
++
++
++def test_performance_stats_records_evaluation_results():
++    stats = PerformanceStats()
++    result = {"cumulative_accuracy": 0.8, "window_accuracy": 0.9,
++              "metadata": {"classifier": "X"}}
++    stats.add_result("MOA_ENSEMBLE", result)
++    assert stats.get("MOA_ENSEMBLE_CUMULATIVE_ACCURACY") == 0.8
++    assert stats.get("MOA_ENSEMBLE_WINDOW_ACCURACY") == 0.9
++    assert stats.metadata["MOA_ENSEMBLE_CUMULATIVE_ACCURACY"]["classifier"] == "X"
++
++
++def test_performance_stats_add_all():
++    stats = PerformanceStats()
++    stats.add_all({"A": 1.0})
++    assert stats.to_lines() == ["A: 1.0000"]
++
++
++# -- reported experiment ----------------------------------------------------
++
++def test_reported_metrics_are_sane():
++    results = run_moa_experiments(num_instances=20000, sample_frequency=5000)
++    assert results["MOA_ENSEMBLE_SIZE"] == 10
++    assert 0.3 < results["MOA_ENSEMBLE_ACCURACY"] <= 1.0
++    assert 0.3 < results["MOA_WINDOW_ACCURACY"] <= 1.0
++    assert results["MOA_ENSEMBLE_NODES"] >= 10
++
++
++def test_ensemble_beats_a_single_tree_on_the_waveform_stream():
++    def evaluate(classifier):
++        stream = WaveformGenerator(seed=42)
++        task = EvaluateInterleavedTestThenTrain(classifier, stream,
++                                                num_instances=30000,
++                                                window_size=1000,
++                                                sample_frequency=10000)
++        return task.run()["window_accuracy"]
++
++    single = evaluate(HoeffdingTree(num_attributes=21, num_classes=3,
++                                    grace_period=200, split_confidence=1e-7,
++                                    tie_threshold=0.05))
++    ensemble = evaluate(OzaBagging(num_learners=10, seed=42, num_classes=3,
++                                   num_attributes=21))
++    assert ensemble >= single
+diff --git a/moa_framework.py b/moa_framework.py
+new file mode 100644
+index 0000000..03ededf
+--- /dev/null
++++ b/moa_framework.py
+@@ -0,0 +1,477 @@
++"""MOA: Massive Online Analysis - ensembles and evaluation tasks.
++
++This module provides the parts of the MOA framework used to benchmark the
++online learners of this package:
++
++* :class:`OzaBagging` - online bagging with Poisson(1) resampling
++  (Oza & Russell, "Experimental comparisons of online and batch versions of
++  bagging and boosting", KDD 2001);
++* :class:`EvaluateInterleavedTestThenTrain` - the standard MOA evaluation
++  task: every example is first used to test the classifier and then to train
++  it, with accuracy snapshots taken at a fixed sampling frequency;
++* :class:`PerformanceStats` - a small collector that reports the metrics of
++  several experiments in the ``EXPERIMENT_NAME: VALUE`` format expected by
++  ``run.sh``.
++"""
++
++import math
++import random
++import time
++from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
++
++from classifiers import AbstractClassifier
++from evaluation import PrequentialEvaluator
++from hoeffding_tree import HoeffdingTree
++from streams import Instance, StreamGenerator
++
++__all__ = [
++    "poisson",
++    "OzaBagging",
++    "EvaluateInterleavedTestThenTrain",
++    "PerformanceStats",
++    "run_moa_experiments",
++]
++
++
++# ---------------------------------------------------------------------------
++# Poisson sampling
++# ---------------------------------------------------------------------------
++
++
++def poisson(lam: float = 1.0, rng: Optional[random.Random] = None) -> int:
++    """Draw ``k ~ Poisson(lam)`` with Knuth's product-of-uniforms method.
++
++    ``k`` is the number of times a base learner of an online bagging ensemble
++    trains on the current example.  ``lam = 1`` reproduces the multiplicity of
++    a bootstrap sample in the limit of an infinite training set.
++
++    Args:
++        lam: Rate of the Poisson distribution.
++        rng: Source of randomness; a module level ``random`` is used when None.
++
++    Returns:
++        A non negative integer drawn from ``Poisson(lam)``.
++    """
++    if lam <= 0.0:
++        return 0
++    source = rng.random if rng is not None else random.random
++    limit = math.exp(-lam)
++    k = 0
++    product = 1.0
++    while True:
++        k += 1
++        product *= source()
++        if product <= limit:
++            break
++    return k - 1
++
++
++# ---------------------------------------------------------------------------
++# online bagging
++# ---------------------------------------------------------------------------
++
++
++class OzaBagging(AbstractClassifier):
++    """Online bagging of Hoeffding Trees with Poisson(1) resampling.
++
++    Each of the ``num_learners`` base learners trains on every arriving example
++    ``k ~ Poisson(1)`` times, which simulates drawing a bootstrap replicate of
++    the stream.  Predictions are combined by a majority vote over the base
++    learners.
++
++    Args:
++        num_learners: Size ``N`` of the ensemble.
++        seed: Seed of the ``random.Random`` used for the Poisson draws.
++        num_classes: Number of classes (passed on to the base learners).
++        num_attributes: Number of attributes (passed on to the base learners).
++        grace_period: ``n_min`` of the base Hoeffding Trees.
++        split_confidence: ``delta`` of the base Hoeffding Trees.
++        tie_threshold: ``tau`` of the base Hoeffding Trees.
++        max_depth: Maximum depth of the base Hoeffding Trees.
++        num_bins: Bins of the numeric attribute observers.
++        lam: Rate of the Poisson resampling distribution (1.0 in Oza bagging).
++        base_learner_factory: Optional ``callable(index) -> classifier`` used
++            instead of the default Hoeffding Tree factory.
++    """
++
++    def __init__(self,
++                 num_learners: int = 10,
++                 seed: int = 42,
++                 num_classes: Optional[int] = None,
++                 num_attributes: Optional[int] = None,
++                 grace_period: int = 200,
++                 split_confidence: float = 1e-7,
++                 tie_threshold: float = 0.05,
++                 max_depth: int = 20,
++                 num_bins: int = 10,
++                 lam: float = 1.0,
++                 base_learner_factory: Optional[Callable[[int], object]] = None):
++        super().__init__()
++        self.num_learners = int(num_learners)
++        self.seed = int(seed)
++        self.num_classes = num_classes if num_classes else 0
++        self.num_attributes = num_attributes if num_attributes else 0
++        self.grace_period = int(grace_period)
++        self.split_confidence = float(split_confidence)
++        self.tie_threshold = float(tie_threshold)
++        self.max_depth = int(max_depth)
++        self.num_bins = int(num_bins)
++        self.lam = float(lam)
++        self.base_learner_factory = base_learner_factory
++
++        self.rng = random.Random(self.seed)
++        #: number of examples each base learner was trained on
++        self.learner_weights: List[float] = [0.0] * self.num_learners
++        self.learners: List[object] = [self._new_learner(index)
++                                       for index in range(self.num_learners)]
++
++    # -- construction ------------------------------------------------------
++    def _new_learner(self, index: int):
++        if self.base_learner_factory is not None:
++            return self.base_learner_factory(index)
++        return HoeffdingTree(num_attributes=self.num_attributes or None,
++                             num_classes=self.num_classes or None,
++                             grace_period=self.grace_period,
++                             split_confidence=self.split_confidence,
++                             tie_threshold=self.tie_threshold,
++                             max_depth=self.max_depth,
++                             num_bins=self.num_bins)
++
++    # -- training ----------------------------------------------------------
++    def train(self, instance: Instance):
++        """Train every base learner ``k ~ Poisson(lam)`` times on ``instance``."""
++        if instance.label is not None and instance.label + 1 > self.num_classes:
++            self.num_classes = instance.label + 1
++        if instance.num_attributes > self.num_attributes:
++            self.num_attributes = instance.num_attributes
++        self.instances_seen += 1
++        for index, learner in enumerate(self.learners):
++            k = poisson(self.lam, self.rng)
++            if k <= 0:
++                continue
++            self.learner_weights[index] += k
++            for _ in range(k):
++                learner.train(instance)
++
++    def partial_fit(self, instance: Instance):
++        """Alias for :meth:`train`."""
++        self.train(instance)
++
++    # -- prediction --------------------------------------------------------
++    def get_votes(self, instance: Instance) -> Dict[int, float]:
++        """Majority vote: one vote per base learner that has an opinion."""
++        votes: Dict[int, float] = {}
++        for learner in self.learners:
++            learner_votes = learner.get_votes(instance)
++            if not learner_votes:
++                continue
++            best_class = -1
++            best_weight = float("-inf")
++            for cls in sorted(learner_votes):
++                weight = learner_votes[cls]
++                if weight > best_weight:
++                    best_weight = weight
++                    best_class = cls
++            if best_class < 0:
++                continue
++            votes[best_class] = votes.get(best_class, 0.0) + 1.0
++        return votes
++
++    def get_soft_votes(self, instance: Instance) -> Dict[int, float]:
++        """Sum of the normalised class distributions of the base learners."""
++        votes: Dict[int, float] = {}
++        for learner in self.learners:
++            learner_votes = learner.get_votes(instance)
++            total = sum(learner_votes.values())
++            if total <= 0:
++                continue
++            for cls, weight in learner_votes.items():
++                votes[cls] = votes.get(cls, 0.0) + weight / total
++        return votes
++
++    def predict(self, instance: Instance) -> int:
++        votes = self.get_votes(instance)
++        if not votes:
++            return 0
++        best_class = -1
++        best_weight = float("-inf")
++        for cls in sorted(votes):
++            weight = votes[cls]
++            if weight > best_weight:
++                best_weight = weight
++                best_class = cls
++        return best_class if best_class >= 0 else 0
++
++    def predict_proba(self, instance: Instance) -> Dict[int, float]:
++        votes = self.get_votes(instance)
++        total = sum(votes.values())
++        if total <= 0:
++            return {}
++        return {cls: weight / total for cls, weight in votes.items()}
++
++    # -- introspection -----------------------------------------------------
++    def get_ensemble_size(self) -> int:
++        return len(self.learners)
++
++    def get_tree_sizes(self) -> List[Dict[str, int]]:
++        sizes = []
++        for learner in self.learners:
++            getter = getattr(learner, "get_tree_size", None)
++            sizes.append(getter() if getter is not None else {})
++        return sizes
++
++    def get_total_nodes(self) -> int:
++        return sum(size.get("total_nodes", 0) for size in self.get_tree_sizes())
++
++    def get_average_tree_nodes(self) -> float:
++        sizes = self.get_tree_sizes()
++        if not sizes:
++            return 0.0
++        return self.get_total_nodes() / len(sizes)
++
++    def reset(self):
++        self.instances_seen = 0
++        self.rng = random.Random(self.seed)
++        self.learner_weights = [0.0] * self.num_learners
++        self.learners = [self._new_learner(index)
++                         for index in range(self.num_learners)]
++
++    def __str__(self) -> str:  # pragma: no cover - debug helper
++        return ("OzaBagging(num_learners=%d, nodes=%d)"
++                % (len(self.learners), self.get_total_nodes()))
++
++
++# ---------------------------------------------------------------------------
++# evaluation task
++# ---------------------------------------------------------------------------
++
++
++class EvaluateInterleavedTestThenTrain:
++    """The MOA ``EvaluateInterleavedTestThenTrain`` task.
++
++    Every example of the stream is first classified (test) and then handed to
++    the learner (train), so no example is ever used for testing after it has
++    been learnt.  Accuracy is reported cumulatively and over a sliding window,
++    with a snapshot recorded every ``sample_frequency`` examples.
++
++    Args:
++        classifier: Learner implementing ``predict`` and ``train``.
++        stream: Stream generator to draw the examples from.
++        num_instances: Number of examples to process.
++        window_size: Length of the sliding accuracy window.
++        sample_frequency: Number of examples between two accuracy snapshots.
++        name: Optional label used in the returned metadata.
++    """
++
++    def __init__(self, classifier, stream: StreamGenerator,
++                 num_instances: int = 100000, window_size: int = 1000,
++                 sample_frequency: int = 10000, name: Optional[str] = None):
++        self.classifier = classifier
++        self.stream = stream
++        self.num_instances = int(num_instances)
++        self.window_size = int(window_size)
++        self.sample_frequency = max(1, int(sample_frequency))
++        self.name = name or type(classifier).__name__
++        self.evaluator = PrequentialEvaluator(window_size=self.window_size)
++        #: accuracy snapshots taken every ``sample_frequency`` examples
++        self.snapshots: List[Dict[str, float]] = []
++        self.result: Dict[str, object] = {}
++
++    # -- task --------------------------------------------------------------
++    def run(self) -> Dict[str, object]:
++        """Run the task and return the collected measurements."""
++        evaluator = self.evaluator
++        evaluator.reset()
++        self.snapshots = []
++        classifier = self.classifier
++        stream = self.stream
++        start = time.time()
++        for index in range(1, self.num_instances + 1):
++            instance = stream.next_instance()
++            prediction = classifier.predict(instance)
++            evaluator.add_result(prediction, instance.label)
++            classifier.train(instance)
++            if index % self.sample_frequency == 0:
++                self.snapshots.append({
++                    "instances": float(index),
++                    "cumulative_accuracy": evaluator.get_cumulative_accuracy(),
++                    "window_accuracy": evaluator.get_window_accuracy(),
++                })
++        elapsed = time.time() - start
++
++        self.result = {
++            "cumulative_accuracy": evaluator.get_cumulative_accuracy(),
++            "window_accuracy": evaluator.get_window_accuracy(),
++            "snapshots": self.snapshots,
++            "learning_curve": [(int(s["instances"]), s["window_accuracy"])
++                               for s in self.snapshots],
++            "metadata": self.get_metadata(elapsed),
++        }
++        return self.result
++
++    def get_metadata(self, elapsed: float = 0.0) -> Dict[str, object]:
++        """Describe the run: learner, stream, sizes and timing."""
++        metadata: Dict[str, object] = {
++            "task": type(self).__name__,
++            "name": self.name,
++            "classifier": type(self.classifier).__name__,
++            "stream": type(self.stream).__name__,
++            "num_instances": self.num_instances,
++            "instances_processed": self.evaluator.total_seen,
++            "correct": self.evaluator.total_correct,
++            "window_size": self.window_size,
++            "sample_frequency": self.sample_frequency,
++            "evaluation_time_seconds": elapsed,
++        }
++        if isinstance(self.classifier, OzaBagging):
++            metadata["ensemble_size"] = self.classifier.get_ensemble_size()
++            metadata["total_nodes"] = self.classifier.get_total_nodes()
++        else:
++            getter = getattr(self.classifier, "get_tree_size", None)
++            if getter is not None:
++                metadata["total_nodes"] = getter().get("total_nodes", 0)
++        return metadata
++
++    # -- convenience -------------------------------------------------------
++    def get_cumulative_accuracy(self) -> float:
++        return self.evaluator.get_cumulative_accuracy()
++
++    def get_window_accuracy(self) -> float:
++        return self.evaluator.get_window_accuracy()
++
++
++# ---------------------------------------------------------------------------
++# metric collection
++# ---------------------------------------------------------------------------
++
++
++class PerformanceStats:
++    """Collect the metrics of several experiments and report them uniformly.
++
++    Values are printed as ``EXPERIMENT_NAME: VALUE`` lines, integers without a
++    fractional part and floating point metrics with ``precision`` decimals.
++    """
++
++    def __init__(self, precision: int = 4):
++        self.precision = int(precision)
++        self.metrics: Dict[str, float] = {}
++        self.order: List[str] = []
++        self.metadata: Dict[str, Dict[str, object]] = {}
++
++    # -- collection --------------------------------------------------------
++    def add(self, name: str, value: float,
++            metadata: Optional[Dict[str, object]] = None):
++        """Record a single metric (overwriting a previous value)."""
++        if name not in self.metrics:
++            self.order.append(name)
++        self.metrics[name] = value
++        if metadata:
++            self.metadata[name] = dict(metadata)
++        return self
++
++    def add_all(self, metrics: Dict[str, float]):
++        for name in metrics:
++            self.add(name, metrics[name])
++        return self
++
++    def add_result(self, prefix: str, result: Dict[str, object],
++                   metrics: Sequence[str] = ("cumulative_accuracy",
++                                             "window_accuracy")):
++        """Record selected metrics of an evaluation task result.
++
++        ``prefix`` is combined with the upper cased metric name, e.g.
++        ``add_result("MOA_ENSEMBLE", result, ("cumulative_accuracy",))``
++        records ``MOA_ENSEMBLE_CUMULATIVE_ACCURACY``.
++        """
++        metadata = result.get("metadata") if isinstance(result, dict) else None
++        for metric in metrics:
++            if metric in result:
++                name = "%s_%s" % (prefix, metric.upper()) if prefix else metric.upper()
++                self.add(name, float(result[metric]),  # type: ignore[arg-type]
++                         metadata if isinstance(metadata, dict) else None)
++        return self
++
++    # -- access ------------------------------------------------------------
++    def get(self, name: str, default: Optional[float] = None) -> Optional[float]:
++        return self.metrics.get(name, default)
++
++    def names(self) -> List[str]:
++        return list(self.order)
++
++    def as_dict(self) -> Dict[str, float]:
++        return {name: self.metrics[name] for name in self.order}
++
++    def __contains__(self, name: str) -> bool:
++        return name in self.metrics
++
++    def __len__(self) -> int:
++        return len(self.metrics)
++
++    # -- reporting ---------------------------------------------------------
++    def format_value(self, value: float) -> str:
++        if isinstance(value, bool):
++            return str(int(value))
++        if isinstance(value, int):
++            return str(value)
++        if isinstance(value, float) and value == int(value) and abs(value) >= 1000:
++            # node counts and instance counts read better without decimals
++            return str(int(value))
++        return "%.*f" % (self.precision, value)
++
++    def to_lines(self) -> List[str]:
++        """Return the ``EXPERIMENT_NAME: VALUE`` lines of every metric."""
++        return ["%s: %s" % (name, self.format_value(self.metrics[name]))
++                for name in self.order]
++
++    def report(self) -> str:
++        return "\n".join(self.to_lines())
++
++    def print_report(self):
++        for line in self.to_lines():
++            print(line)
++
++    def __str__(self) -> str:  # pragma: no cover - debug helper
++        return self.report()
++
++
++# ---------------------------------------------------------------------------
++# experiments
++# ---------------------------------------------------------------------------
++
++
++def run_moa_experiments(num_instances: int = 100000, num_learners: int = 10,
++                        seed: int = 42, window_size: int = 1000,
++                        sample_frequency: int = 10000) -> Dict[str, float]:
++    """MOA_ENSEMBLE_ACCURACY / MOA_WINDOW_ACCURACY on the waveform stream."""
++    from streams import WaveformGenerator
++
++    stream = WaveformGenerator(seed=seed)
++    ensemble = OzaBagging(num_learners=num_learners, seed=seed,
++                          num_classes=stream.num_classes,
++                          num_attributes=stream.num_attributes,
++                          grace_period=200, split_confidence=1e-7,
++                          tie_threshold=0.05)
++    task = EvaluateInterleavedTestThenTrain(ensemble, stream,
++                                           num_instances=num_instances,
++                                           window_size=window_size,
++                                           sample_frequency=sample_frequency,
++                                           name="OzaBagging-Waveform")
++    result = task.run()
++    return {
++        "MOA_ENSEMBLE_ACCURACY": float(result["cumulative_accuracy"]),
++        "MOA_WINDOW_ACCURACY": float(result["window_accuracy"]),
++        "MOA_ENSEMBLE_NODES": float(ensemble.get_total_nodes()),
++        "MOA_ENSEMBLE_SIZE": float(ensemble.get_ensemble_size()),
++    }
++
++
++def main():  # pragma: no cover - script entry point
++    results = run_moa_experiments()
++    stats = PerformanceStats(precision=4)
++    stats.add("MOA_ENSEMBLE_ACCURACY", results["MOA_ENSEMBLE_ACCURACY"])
++    stats.add("MOA_WINDOW_ACCURACY", results["MOA_WINDOW_ACCURACY"])
++    stats.print_report()
++
++
++if __name__ == "__main__":  # pragma: no cover
++    main()
+diff --git a/requirement_patches/adwin.diff b/requirement_patches/adwin.diff
+new file mode 100644
+index 0000000..0dd8487
+--- /dev/null
++++ b/requirement_patches/adwin.diff
+@@ -0,0 +1,2262 @@
++diff --git a/agent_tests/test_adwin.py b/agent_tests/test_adwin.py
++new file mode 100644
++index 0000000..2a6a7a5
++--- /dev/null
+++++ b/agent_tests/test_adwin.py
++@@ -0,0 +1,252 @@
+++"""Tests for the ADWIN change detector."""
+++
+++import math
+++import os
+++import random
+++import sys
+++
+++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+++
+++from stream.adwin import ADWIN, Bucket, BucketRow
+++from stream.experiments.adwin_exp import ADWINExperiment, run_adwin_experiments
+++
+++
+++# -- Bucket -----------------------------------------------------------------
+++
+++def test_bucket_stores_summary_statistics():
+++    bucket = Bucket(total=4.0, variance=2.0, count=4)
+++    assert bucket.total == 4.0
+++    assert bucket.variance == 2.0
+++    assert bucket.count == 4
+++    assert bucket.mean == 1.0
+++
+++
+++def test_bucket_merge_matches_batch_statistics():
+++    left = [1.0, 2.0, 3.0, 4.0]
+++    right = [10.0, 12.0]
+++
+++    def summarise(values):
+++        mean = sum(values) / len(values)
+++        return Bucket(total=sum(values),
+++                      variance=sum((v - mean) ** 2 for v in values),
+++                      count=len(values))
+++
+++    merged = summarise(left).merge(summarise(right))
+++    combined = left + right
+++    mean = sum(combined) / len(combined)
+++    assert merged.count == len(combined)
+++    assert math.isclose(merged.total, sum(combined))
+++    assert math.isclose(merged.variance,
+++                        sum((v - mean) ** 2 for v in combined), rel_tol=1e-9)
+++
+++
+++def test_bucket_merge_with_empty_bucket():
+++    bucket = Bucket(total=3.0, variance=1.0, count=2)
+++    assert bucket.merge(Bucket()).count == 2
+++    assert Bucket().merge(bucket).count == 2
+++
+++
+++# -- BucketRow --------------------------------------------------------------
+++
+++def test_bucket_row_is_a_doubly_linked_list():
+++    row = BucketRow(level=2)
+++    assert row.size == 0 and row.head is None and row.tail is None
+++    assert row.bucket_size == 4
+++
+++    first = row.add_to_tail(Bucket(1.0, 0.0, 1))
+++    second = row.add_to_tail(Bucket(2.0, 0.0, 1))
+++    third = row.add_to_tail(Bucket(3.0, 0.0, 1))
+++
+++    assert row.size == 3
+++    assert row.head is first and row.tail is third
+++    assert first.next is second and second.previous is first
+++    assert second.next is third and third.previous is second
+++    assert [b.total for b in row.buckets()] == [1.0, 2.0, 3.0]
+++
+++
+++def test_bucket_row_remove_from_head_returns_oldest():
+++    row = BucketRow()
+++    row.add_to_tail(Bucket(1.0, 0.0, 1))
+++    row.add_to_tail(Bucket(2.0, 0.0, 1))
+++
+++    oldest = row.remove_from_head()
+++    assert oldest.total == 1.0
+++    assert row.size == 1
+++    assert row.head is row.tail
+++    assert row.head.previous is None
+++
+++    assert row.remove_from_head().total == 2.0
+++    assert row.size == 0
+++    assert row.head is None and row.tail is None
+++    assert row.remove_from_head() is None
+++
+++
+++# -- ADWIN ------------------------------------------------------------------
+++
+++def test_default_parameters_match_spec():
+++    detector = ADWIN()
+++    assert detector.delta == 0.002
+++    assert detector.max_buckets_per_row == 5
+++    assert detector.min_window_length == 10
+++
+++
+++def test_width_total_and_estimation_track_the_window():
+++    detector = ADWIN()
+++    values = [0.4, 0.5, 0.6]
+++    for value in values:
+++        detector.add_element(value)
+++    assert detector.width == 3
+++    assert math.isclose(detector.total, sum(values))
+++    assert math.isclose(detector.get_estimation(), sum(values) / 3)
+++    assert detector.variance >= 0.0
+++
+++
+++def test_estimation_of_empty_detector_is_zero():
+++    detector = ADWIN()
+++    assert detector.get_estimation() == 0.0
+++    assert detector.width == 0
+++
+++
+++def test_compress_bounds_the_number_of_buckets_per_row():
+++    detector = ADWIN(max_buckets_per_row=5)
+++    for _ in range(1000):
+++        detector.add_element(0.5)          # constant stream: never shrinks
+++    assert detector.width == 1000
+++    for row in detector.bucket_rows:
+++        assert row.size <= detector.max_buckets_per_row + 1
+++    # exponential histogram: O(M log n) buckets instead of n
+++    assert detector.bucket_count < 60
+++
+++
+++def test_compress_merges_two_oldest_buckets_into_next_row():
+++    detector = ADWIN(max_buckets_per_row=2)
+++    for _ in range(3):
+++        detector.add_element(1.0)
+++    detector.add_element(1.0)              # overflows row 0
+++    assert len(detector.bucket_rows) >= 2
+++    assert detector.bucket_rows[1].size >= 1
+++    assert detector.bucket_rows[1].head.count == 2
+++
+++
+++def test_no_change_detected_on_a_stationary_stream():
+++    detector = ADWIN(delta=0.002)
+++    rng = random.Random(7)
+++    detections = sum(1 for _ in range(3000)
+++                     if detector.add_element(rng.gauss(0.0, 1.0)))
+++    assert detections == 0
+++    assert not detector.detected_change()
+++    assert detector.width == 3000
+++
+++
+++def test_window_grows_while_the_distribution_is_stable():
+++    detector = ADWIN()
+++    rng = random.Random(11)
+++    for _ in range(2000):
+++        detector.add_element(rng.gauss(0.0, 0.1))
+++    assert detector.width == 2000
+++
+++
+++def test_abrupt_change_is_detected_and_shrinks_the_window():
+++    detector = ADWIN(delta=0.002)
+++    rng = random.Random(3)
+++    for _ in range(2000):
+++        detector.add_element(rng.gauss(0.0, 0.1))
+++    width_before = detector.width
+++
+++    detected_at = None
+++    for step in range(1000):
+++        if detector.add_element(rng.gauss(1.0, 0.1)):
+++            detected_at = step
+++            break
+++
+++    assert detected_at is not None and detected_at < 200
+++    assert detector.detected_change()
+++    assert detector.width < width_before
+++
+++
+++def test_estimation_follows_the_new_concept_after_a_change():
+++    detector = ADWIN(delta=0.002)
+++    rng = random.Random(5)
+++    for _ in range(2000):
+++        detector.add_element(rng.gauss(0.0, 0.1))
+++    for _ in range(2000):
+++        detector.add_element(rng.gauss(5.0, 0.1))
+++    assert abs(detector.get_estimation() - 5.0) < 0.5
+++
+++
+++def test_detected_change_flag_is_cleared_by_the_next_insertion():
+++    detector = ADWIN(delta=0.002)
+++    rng = random.Random(13)
+++    for _ in range(500):
+++        detector.add_element(rng.gauss(0.0, 0.05))
+++    while not detector.add_element(rng.gauss(3.0, 0.05)):
+++        pass
+++    assert detector.detected_change()
+++    for _ in range(50):
+++        detector.add_element(rng.gauss(3.0, 0.05))
+++    assert not detector.detected_change()
+++
+++
+++def test_reset_clears_all_state():
+++    detector = ADWIN()
+++    for value in range(100):
+++        detector.add_element(value / 100.0)
+++    detector.reset()
+++    assert detector.width == 0
+++    assert detector.total == 0.0
+++    assert detector.bucket_count == 0
+++    assert not detector.detected_change()
+++    assert detector.get_estimation() == 0.0
+++
+++
+++def test_add_element_returns_the_same_value_as_detected_change():
+++    detector = ADWIN(delta=0.002)
+++    rng = random.Random(17)
+++    for _ in range(1500):
+++        returned = detector.add_element(rng.gauss(0.0, 0.1))
+++        assert returned == detector.detected_change()
+++
+++
+++# -- experiments ------------------------------------------------------------
+++
+++def test_experiment_streams_have_the_requested_shape():
+++    experiment = ADWINExperiment(num_samples=400, change_point=200, sigma=0.1)
+++
+++    stationary = experiment.generate_stationary_stream(seed=1)
+++    assert len(stationary) == 400
+++
+++    abrupt = experiment.generate_abrupt_stream(seed=1)
+++    assert len(abrupt) == 400
+++    assert sum(abrupt[:200]) / 200 < sum(abrupt[200:]) / 200
+++
+++    gradual = experiment.generate_gradual_stream(seed=1, transition_length=100)
+++    assert len(gradual) == 400
+++
+++    recurring = experiment.generate_recurring_stream(seed=1, period=100)
+++    assert len(recurring) == 400
+++    assert experiment.recurring_change_points(period=100) == [100, 200, 300]
+++
+++
+++def test_run_detection_reports_delay_and_false_alarms():
+++    experiment = ADWINExperiment(num_samples=2000, change_point=1000, sigma=0.1)
+++    data = experiment.generate_abrupt_stream(seed=1)
+++    result = experiment.run_detection(data, change_points=(1000,))
+++    assert result["delays"][0] is not None
+++    assert result["delays"][0] >= 0
+++    assert result["false_alarms"] == 0
+++    # only the 1000 post-change samples survive (bucket granularity aside)
+++    assert 900 <= result["final_width"] < 1200
+++
+++
+++def test_reported_metrics_are_sane():
+++    results = run_adwin_experiments()
+++    expected = {"ADWIN_DETECTION_DELAY", "ADWIN_FALSE_POSITIVE_RATE",
+++                "ADWIN_WINDOW_SIZE_STABLE", "ADWIN_WINDOW_SIZE_DRIFT",
+++                "ADWIN_MEAN_ESTIMATION_ERROR"}
+++    assert set(results) == expected
+++    assert 0 <= results["ADWIN_DETECTION_DELAY"] < 1000
+++    assert 0.0 <= results["ADWIN_FALSE_POSITIVE_RATE"] < 0.01
+++    # the window keeps growing while nothing changes
+++    assert results["ADWIN_WINDOW_SIZE_STABLE"] > 1000
+++    assert results["ADWIN_WINDOW_SIZE_DRIFT"] > 0
+++    assert results["ADWIN_MEAN_ESTIMATION_ERROR"] < 0.5
++diff --git a/requirement_patches/cvfdt.diff b/requirement_patches/cvfdt.diff
++new file mode 100644
++index 0000000..d463604
++--- /dev/null
+++++ b/requirement_patches/cvfdt.diff
++@@ -0,0 +1,1092 @@
+++diff --git a/.gitignore b/.gitignore
+++new file mode 100644
+++index 0000000..a160f49
+++--- /dev/null
++++++ b/.gitignore
+++@@ -0,0 +1,3 @@
++++__pycache__/
++++*.py[cod]
++++.pytest_cache/
+++diff --git a/__pycache__/attribute_observers.cpython-312.pyc b/__pycache__/attribute_observers.cpython-312.pyc
+++deleted file mode 100644
+++index 6acfd25..0000000
+++Binary files a/__pycache__/attribute_observers.cpython-312.pyc and /dev/null differ
+++diff --git a/__pycache__/classifiers.cpython-312.pyc b/__pycache__/classifiers.cpython-312.pyc
+++deleted file mode 100644
+++index 54cc944..0000000
+++Binary files a/__pycache__/classifiers.cpython-312.pyc and /dev/null differ
+++diff --git a/__pycache__/evaluation.cpython-312.pyc b/__pycache__/evaluation.cpython-312.pyc
+++deleted file mode 100644
+++index 143073e..0000000
+++Binary files a/__pycache__/evaluation.cpython-312.pyc and /dev/null differ
+++diff --git a/__pycache__/hoeffding_tree.cpython-312.pyc b/__pycache__/hoeffding_tree.cpython-312.pyc
+++deleted file mode 100644
+++index 7c30d9e..0000000
+++Binary files a/__pycache__/hoeffding_tree.cpython-312.pyc and /dev/null differ
+++diff --git a/__pycache__/streams.cpython-312.pyc b/__pycache__/streams.cpython-312.pyc
+++deleted file mode 100644
+++index 4a9a15f..0000000
+++Binary files a/__pycache__/streams.cpython-312.pyc and /dev/null differ
+++diff --git a/agent_tests/__pycache__/test_vfdt.cpython-312-pytest-7.4.4.pyc b/agent_tests/__pycache__/test_vfdt.cpython-312-pytest-7.4.4.pyc
+++deleted file mode 100644
+++index 70b4352..0000000
+++Binary files a/agent_tests/__pycache__/test_vfdt.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+++diff --git a/agent_tests/test_cvfdt.py b/agent_tests/test_cvfdt.py
+++new file mode 100644
+++index 0000000..38d962f
+++--- /dev/null
++++++ b/agent_tests/test_cvfdt.py
+++@@ -0,0 +1,208 @@
++++"""Tests for CVFDT (concept-adapting VFDT)."""
++++
++++import os
++++import random
++++import sys
++++
++++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++++
++++from classifiers import AbstractClassifier
++++from cvfdt import CVFDT, CVFDTLeaf, CVFDTSplit, gain_of_existing_split
++++from hoeffding_tree import HoeffdingTree, HoeffdingTreeLeaf, HoeffdingTreeSplit
++++from streams import Instance, RandomTreeGenerator, RotatingHyperplaneGenerator
++++
++++
++++def test_class_hierarchy():
++++    assert issubclass(CVFDT, AbstractClassifier)
++++    assert issubclass(CVFDTLeaf, HoeffdingTreeLeaf)
++++    assert issubclass(CVFDTSplit, HoeffdingTreeSplit)
++++
++++
++++def test_default_parameters_match_spec():
++++    model = CVFDT()
++++    assert model.grace_period == 300
++++    assert model.split_confidence == 0.0001
++++    assert model.tie_threshold == 0.05
++++    assert model.window_size == 10000
++++    assert model.check_frequency == 2000
++++    assert model.max_depth == 20
++++    assert model.window.maxlen == 10000
++++
++++
++++def test_split_node_has_alternate_trees_attribute():
++++    node = CVFDTSplit(0, 0.5)
++++    assert node.alternate_trees == []
++++    leaf = CVFDTLeaf()
++++    node.add_alternate(leaf)
++++    assert node.alternate_trees == [leaf]
++++    assert node.alt_seen == [0.0] and node.alt_correct == [0.0]
++++    assert node.drop_alternate(0) is leaf
++++    assert node.alternate_trees == []
++++
++++
++++def test_leaf_forget_undoes_learning():
++++    leaf = CVFDTLeaf()
++++    inst = Instance([0.25, 0.75], 1)
++++    leaf.learn_from_instance(inst)
++++    leaf.learn_from_instance(Instance([0.3, 0.6], 0))
++++    assert leaf.class_counts == {1: 1.0, 0: 1.0}
++++    assert leaf.weight_seen == 2.0
++++    leaf.forget(inst)
++++    assert leaf.weight_seen == 1.0
++++    assert 1 not in leaf.class_counts
++++    observer = leaf.attribute_observers[0]
++++    assert abs(observer.total_count - 1.0) < 1e-9
++++
++++
++++def test_window_never_exceeds_window_size():
++++    model = CVFDT(num_attributes=5, num_classes=2, window_size=500,
++++                  grace_period=100, check_frequency=250)
++++    stream = RandomTreeGenerator(seed=5, num_attributes=5, num_classes=2)
++++    for _ in range(3000):
++++        model.train(stream.next_instance())
++++    assert model.get_window_size() == 500
++++    assert sum(model.window_class_counts.values()) == 500
++++
++++
++++def test_leaf_statistics_stay_consistent_with_window():
++++    """Total weight stored in the leaves must equal the window content."""
++++    model = CVFDT(num_attributes=5, num_classes=2, window_size=400,
++++                  grace_period=100, check_frequency=200, max_alternates=0)
++++    stream = RandomTreeGenerator(seed=9, num_attributes=5, num_classes=2)
++++    for _ in range(2500):
++++        model.train(stream.next_instance())
++++
++++    leaves = []
++++    stack = [model.root]
++++    while stack:
++++        node = stack.pop()
++++        if node.is_leaf():
++++            leaves.append(node)
++++        else:
++++            stack.extend(node.children_nodes())
++++    total = sum(leaf.weight_seen for leaf in leaves)
++++    assert abs(total - model.get_window_size()) <= 1e-6
++++    for leaf in leaves:
++++        assert all(count >= 0 for count in leaf.class_counts.values())
++++
++++
++++def test_tree_keeps_growing_after_the_window_is_full():
++++    model = CVFDT(num_attributes=10, num_classes=2, window_size=2000,
++++                  grace_period=100, split_confidence=0.01, check_frequency=500)
++++    stream = RandomTreeGenerator(seed=3, num_attributes=10, num_classes=2,
++++                                 max_depth=5)
++++    for _ in range(2000):
++++        model.train(stream.next_instance())
++++    size_at_window_full = model.get_tree_size()["total_nodes"]
++++    for _ in range(8000):
++++        model.train(stream.next_instance())
++++    assert model.get_tree_size()["total_nodes"] >= size_at_window_full
++++    assert model.num_splits_performed > 0
++++
++++
++++def test_learns_a_stationary_stream():
++++    stream = RandomTreeGenerator(seed=42, num_attributes=10, num_classes=2,
++++                                 max_depth=5)
++++    model = CVFDT(num_attributes=10, num_classes=2)
++++    correct = total = 0
++++    for i in range(20000):
++++        inst = stream.next_instance()
++++        if i >= 10000:
++++            correct += int(model.predict(inst) == inst.label)
++++            total += 1
++++        model.train(inst)
++++    assert correct / total > 0.75
++++
++++
++++def test_tracks_abrupt_drift_better_than_a_static_tree():
++++    """After an abrupt concept swap CVFDT must recover on the new concept."""
++++    rng = random.Random(1)
++++    model = CVFDT(num_attributes=4, num_classes=2, window_size=1000,
++++                  grace_period=100, split_confidence=0.01, check_frequency=250,
++++                  min_alt_examples=200, max_alt_examples=1000)
++++
++++    def make(flip):
++++        features = [rng.random() for _ in range(4)]
++++        label = 1 if features[0] > 0.5 else 0
++++        if flip:
++++            label = 1 - label
++++        return Instance(features, label)
++++
++++    for _ in range(6000):
++++        model.train(make(False))
++++    for _ in range(6000):
++++        model.train(make(True))
++++    correct = 0
++++    for _ in range(2000):
++++        inst = make(True)
++++        correct += int(model.predict(inst) == inst.label)
++++        model.train(inst)
++++    assert correct / 2000 > 0.8, "CVFDT failed to adapt to the new concept"
++++
++++
++++def test_predict_and_votes_api():
++++    stream = RotatingHyperplaneGenerator(seed=42)
++++    model = CVFDT(num_attributes=10, num_classes=2)
++++    for _ in range(3000):
++++        model.train(stream.next_instance())
++++    inst = stream.next_instance()
++++    assert isinstance(model.predict(inst), int)
++++    assert model.predict(inst) in (0, 1)
++++    votes = model.get_votes(inst)
++++    assert votes and all(v >= 0 for v in votes.values())
++++    probs = model.predict_proba(inst)
++++    assert abs(sum(probs.values()) - 1.0) < 1e-9
++++
++++
++++def test_tree_size_keys():
++++    model = CVFDT(num_attributes=4, num_classes=2)
++++    assert set(model.get_tree_size()) == {"num_leaves", "num_splits",
++++                                         "total_nodes"}
++++
++++
++++def test_alternates_are_created_on_drift():
++++    rng = random.Random(7)
++++    model = CVFDT(num_attributes=4, num_classes=2, window_size=1000,
++++                  grace_period=100, split_confidence=0.01, check_frequency=250,
++++                  min_alt_examples=200, max_alt_examples=1000)
++++
++++    def make(flip):
++++        features = [rng.random() for _ in range(4)]
++++        label = 1 if features[0] > 0.5 else 0
++++        if flip:
++++            # a completely different attribute now decides the label
++++            label = 1 if features[1] > 0.5 else 0
++++        return Instance(features, label)
++++
++++    for _ in range(5000):
++++        model.train(make(False))
++++    started_before = model.num_alternates_started
++++    for _ in range(8000):
++++        model.train(make(True))
++++    assert model.num_alternates_started > started_before
++++
++++
++++def test_gain_of_existing_split_matches_best_for_optimal_threshold():
++++    leaf = CVFDTLeaf()
++++    rng = random.Random(0)
++++    for _ in range(2000):
++++        x0 = rng.random()
++++        leaf.learn_from_instance(Instance([x0], 1 if x0 > 0.5 else 0))
++++    observer = leaf.attribute_observers[0]
++++    best_gain, best_value, _dists = observer.get_best_split_suggestion(2)
++++    assert abs(gain_of_existing_split(observer, 2, best_value) - best_gain) < 1e-9
++++    # a clearly worse threshold must yield a lower gain
++++    assert gain_of_existing_split(observer, 2, 0.05) < best_gain
++++
++++
++++def test_reset_clears_window_and_tree():
++++    model = CVFDT(num_attributes=5, num_classes=2, window_size=200,
++++                  grace_period=50, check_frequency=100)
++++    stream = RandomTreeGenerator(seed=2, num_attributes=5, num_classes=2)
++++    for _ in range(1000):
++++        model.train(stream.next_instance())
++++    model.reset()
++++    assert model.get_window_size() == 0
++++    assert model.get_tree_size() == {"num_leaves": 1, "num_splits": 0,
++++                                     "total_nodes": 1}
++++    assert model.instances_seen == 0
+++diff --git a/cvfdt.py b/cvfdt.py
+++new file mode 100644
+++index 0000000..38f35e5
+++--- /dev/null
++++++ b/cvfdt.py
+++@@ -0,0 +1,828 @@
++++"""CVFDT: Concept-adapting Very Fast Decision Tree.
++++
++++Implementation of the time-changing stream learner of Hulten, Spencer &
++++Domingos, "Mining Time-Changing Data Streams", KDD 2001.
++++
++++CVFDT keeps the VFDT growth procedure but adds the machinery needed to track
++++a moving concept:
++++
++++* a FIFO window ``W`` of the ``w`` most recent examples.  When an example
++++  leaves the window its contribution is *forgotten*, i.e. subtracted from the
++++  sufficient statistics of every node it updated when it arrived;
++++* internal (split) nodes keep sufficient statistics as well, so the tree can
++++  periodically ask whether the attribute it split on is still the best one
++++  (``CheckSplitValidity``);
++++* whenever the current split is no longer the best choice an *alternate*
++++  subtree is grown in the background.  Alternates learn from the same stream
++++  and are periodically compared against the subtree they shadow; a more
++++  accurate alternate replaces it, a hopeless one is pruned.
++++"""
++++
++++from collections import deque
++++import math
++++from typing import Deque, Dict, List, Optional, Sequence, Tuple
++++
++++from attribute_observers import (AttributeObserver, NominalAttributeObserver,
++++                                 NumericAttributeObserver)
++++from classifiers import AbstractClassifier, compute_hoeffding_bound
++++from hoeffding_tree import (HoeffdingTree, HoeffdingTreeLeaf, HoeffdingTreeNode,
++++                            HoeffdingTreeSplit, SplitSuggestion,
++++                            compute_split_suggestions, select_split_suggestion)
++++from streams import Instance
++++
++++__all__ = [
++++    "CVFDTLeaf",
++++    "CVFDTSplit",
++++    "CVFDT",
++++    "gain_of_existing_split",
++++    "run_cvfdt_experiments",
++++]
++++
++++
++++# ---------------------------------------------------------------------------
++++# statistics helpers shared by leaves and internal nodes
++++# ---------------------------------------------------------------------------
++++
++++
++++def _learn_stats(node, instance: Instance, tree: Optional["CVFDT"],
++++                 weight: float = 1.0):
++++    """Add ``instance`` to the sufficient statistics held by ``node``."""
++++    label = instance.label
++++    node.class_counts[label] = node.class_counts.get(label, 0.0) + weight
++++    node.weight_seen += weight
++++    observers = node.attribute_observers
++++    for attr_index, value in enumerate(instance.features):
++++        observer = observers.get(attr_index)
++++        if observer is None:
++++            if tree is not None:
++++                observer = tree.new_attribute_observer(attr_index)
++++            else:
++++                observer = NumericAttributeObserver()
++++            observers[attr_index] = observer
++++        observer.observe(value, label, weight)
++++
++++
++++def _forget_stats(node, instance: Instance, weight: float = 1.0):
++++    """Subtract ``instance`` from the sufficient statistics held by ``node``."""
++++    label = instance.label
++++    remaining = node.class_counts.get(label, 0.0) - weight
++++    if remaining > 0.0:
++++        node.class_counts[label] = remaining
++++    else:
++++        node.class_counts.pop(label, None)
++++    node.weight_seen = max(0.0, node.weight_seen - weight)
++++    observers = node.attribute_observers
++++    if not observers:
++++        return
++++    for attr_index, value in enumerate(instance.features):
++++        observer = observers.get(attr_index)
++++        if observer is not None:
++++            # negative weight decrements the stored counts
++++            observer.observe(value, label, -weight)
++++
++++
++++def gain_of_existing_split(observer: AttributeObserver, num_classes: int,
++++                           split_value: float) -> float:
++++    """Information gain the *current* split of a node would have today.
++++
++++    The candidate cut points of a :class:`NumericAttributeObserver` are the
++++    ``num_bins - 1`` bin boundaries; the gain of the existing split is the gain
++++    of the cut point closest to ``split_value``, recomputed from the statistics
++++    of the examples that are currently inside the sliding window.
++++    """
++++    from classifiers import compute_info_gain
++++
++++    if isinstance(observer, NominalAttributeObserver):
++++        gain, _value, _dists = observer.get_best_split_suggestion(num_classes)
++++        return gain
++++    if not isinstance(observer, NumericAttributeObserver):
++++        return 0.0
++++    if observer.total_count <= 0 or observer.max_val <= observer.min_val:
++++        return 0.0
++++
++++    n_classes = max(2, num_classes)
++++    pre_counts = [0.0] * n_classes
++++    for cls, count in observer.total_per_class.items():
++++        if cls < n_classes:
++++            pre_counts[cls] = count
++++
++++    span = observer.max_val - observer.min_val
++++    left_counts = [0.0] * n_classes
++++    best_distance = float("inf")
++++    gain_at_split = 0.0
++++    for i in range(observer.num_bins - 1):
++++        for cls, count in observer.bin_counts[i].items():
++++            if cls < n_classes:
++++                left_counts[cls] += count
++++        cut_point = observer.min_val + (i + 1) * span / observer.num_bins
++++        distance = abs(cut_point - split_value)
++++        if distance > best_distance:
++++            break
++++        right_counts = [pre_counts[c] - left_counts[c] for c in range(n_classes)]
++++        if sum(left_counts) > 0 and sum(right_counts) > 0:
++++            best_distance = distance
++++            gain_at_split = compute_info_gain(pre_counts,
++++                                              [left_counts[:], right_counts])
++++        else:
++++            best_distance = distance
++++            gain_at_split = 0.0
++++    return gain_at_split
++++
++++
++++# ---------------------------------------------------------------------------
++++# nodes
++++# ---------------------------------------------------------------------------
++++
++++
++++class CVFDTLeaf(HoeffdingTreeLeaf):
++++    """A learning leaf that can also *forget* examples leaving the window."""
++++
++++    def __init__(self, depth: int = 0,
++++                 class_counts: Optional[Dict[int, float]] = None,
++++                 tree: Optional["CVFDT"] = None):
++++        super().__init__(depth=depth, class_counts=class_counts, tree=tree)
++++        # Examples seen since the last split attempt.  This counter only ever
++++        # grows (forgetting does not cancel split attempts), which is what the
++++        # CVFDT pseudo code means by "the number of examples seen at l".
++++        self.examples_since_split_attempt: float = 0.0
++++
++++    def learn_from_instance(self, instance: Instance, tree=None,
++++                            weight: float = 1.0):
++++        if tree is not None:
++++            self._tree = tree
++++        _learn_stats(self, instance, self._tree, weight)
++++        self.examples_since_split_attempt += weight
++++
++++    def forget(self, instance: Instance, weight: float = 1.0):
++++        """Undo the effect of ``instance`` on this leaf."""
++++        _forget_stats(self, instance, weight)
++++        if self.weight_seen_at_last_split_attempt > self.weight_seen:
++++            self.weight_seen_at_last_split_attempt = self.weight_seen
++++
++++    def reset_split_attempt_counter(self):
++++        self.weight_seen_at_last_split_attempt = self.weight_seen
++++        self.examples_since_split_attempt = 0.0
++++
++++    def should_attempt_split(self, grace_period: float) -> bool:
++++        return self.examples_since_split_attempt >= grace_period
++++
++++
++++class CVFDTSplit(HoeffdingTreeSplit):
++++    """Internal node that keeps statistics and can host alternate subtrees."""
++++
++++    def __init__(self, split_attribute: int, split_value: float, depth: int = 0,
++++                 class_counts: Optional[Dict[int, float]] = None,
++++                 num_branches: int = 2, is_nominal: bool = False,
++++                 branch_values: Optional[Sequence[int]] = None,
++++                 tree: Optional["CVFDT"] = None):
++++        super().__init__(split_attribute, split_value, depth=depth,
++++                         class_counts=class_counts, num_branches=num_branches,
++++                         is_nominal=is_nominal, branch_values=branch_values)
++++        #: alternate subtrees grown in the background for this node
++++        self.alternate_trees: List[HoeffdingTreeNode] = []
++++        self.attribute_observers: Dict[int, AttributeObserver] = {}
++++        self.weight_seen: float = float(sum(self.class_counts.values()))
++++        self.weight_seen_at_last_split_check: float = 0.0
++++        self._tree = tree
++++        # accuracy bookkeeping used when comparing against the alternates
++++        self.main_correct: float = 0.0
++++        self.main_seen: float = 0.0
++++        self.alt_correct: List[float] = []
++++        self.alt_seen: List[float] = []
++++
++++    # -- statistics --------------------------------------------------------
++++    def learn_from_instance(self, instance: Instance, tree=None,
++++                            weight: float = 1.0):
++++        if tree is not None:
++++            self._tree = tree
++++        _learn_stats(self, instance, self._tree, weight)
++++
++++    def forget(self, instance: Instance, weight: float = 1.0):
++++        _forget_stats(self, instance, weight)
++++
++++    # -- alternates --------------------------------------------------------
++++    def add_alternate(self, root: HoeffdingTreeNode):
++++        self.alternate_trees.append(root)
++++        self.alt_correct.append(0.0)
++++        self.alt_seen.append(0.0)
++++
++++    def drop_alternate(self, index: int) -> Optional[HoeffdingTreeNode]:
++++        if 0 <= index < len(self.alternate_trees):
++++            root = self.alternate_trees.pop(index)
++++            self.alt_correct.pop(index)
++++            self.alt_seen.pop(index)
++++            return root
++++        return None
++++
++++    def reset_accuracy_counters(self):
++++        self.main_correct = 0.0
++++        self.main_seen = 0.0
++++        self.alt_correct = [0.0] * len(self.alternate_trees)
++++        self.alt_seen = [0.0] * len(self.alternate_trees)
++++
++++    def num_alternate_nodes(self) -> int:
++++        return sum(root.num_nodes() for root in self.alternate_trees)
++++
++++
++++# ---------------------------------------------------------------------------
++++# the learner
++++# ---------------------------------------------------------------------------
++++
++++
++++class CVFDT(AbstractClassifier):
++++    """Concept-adapting Very Fast Decision Tree.
++++
++++    Args:
++++        num_attributes: Number of attributes (optional, inferred otherwise).
++++        num_classes: Number of classes (optional, inferred otherwise).
++++        grace_period: Examples between split attempts at a leaf (``n_min``).
++++        split_confidence: Hoeffding bound confidence ``delta``.
++++        tie_threshold: Forced split threshold ``tau``.
++++        window_size: Size ``w`` of the sliding window of recent examples.
++++        check_frequency: Run ``CheckSplitValidity`` every ``f`` examples.
++++        max_depth: Maximum depth of the tree.
++++        num_bins: Bins used by numeric attribute observers.
++++        max_alternates: Maximum number of alternate subtrees per node.
++++        min_alt_examples: Examples an alternate must see before it can win.
++++        stale_margin: Gain improvement required to declare a split stale.
++++        max_alt_examples: Examples after which a losing alternate is pruned.
++++    """
++++
++++    def __init__(self,
++++                 num_attributes: Optional[int] = None,
++++                 num_classes: Optional[int] = None,
++++                 grace_period: int = 300,
++++                 split_confidence: float = 0.0001,
++++                 tie_threshold: float = 0.05,
++++                 window_size: int = 10000,
++++                 check_frequency: int = 2000,
++++                 max_depth: int = 20,
++++                 num_bins: int = 10,
++++                 max_alternates: int = 1,
++++                 min_alt_examples: int = 1000,
++++                 max_alt_examples: int = 5000,
++++                 stale_margin: float = 0.001,
++++                 nominal_attributes: Optional[Sequence[int]] = None,
++++                 stop_on_pure_leaf: bool = True):
++++        super().__init__()
++++        self.num_attributes = num_attributes if num_attributes else 0
++++        self.num_classes = num_classes if num_classes else 0
++++        self.grace_period = int(grace_period)
++++        self.split_confidence = float(split_confidence)
++++        self.tie_threshold = float(tie_threshold)
++++        self.window_size = int(window_size)
++++        self.check_frequency = int(check_frequency)
++++        self.max_depth = int(max_depth)
++++        self.num_bins = int(num_bins)
++++        self.max_alternates = int(max_alternates)
++++        self.min_alt_examples = int(min_alt_examples)
++++        self.max_alt_examples = int(max_alt_examples)
++++        self.stale_margin = float(stale_margin)
++++        self.nominal_attributes = set(nominal_attributes or ())
++++        self.stop_on_pure_leaf = bool(stop_on_pure_leaf)
++++
++++        #: FIFO window of ``(instance, touched_nodes)`` pairs
++++        self.window: Deque[Tuple[Instance, List[HoeffdingTreeNode]]] = deque(
++++            maxlen=self.window_size)
++++        #: class distribution of the examples currently inside the window
++++        self.window_class_counts: Dict[int, float] = {}
++++
++++        self.num_splits_performed = 0
++++        self.num_alternates_started = 0
++++        self.num_alternates_promoted = 0
++++        self.num_alternates_pruned = 0
++++        self.num_split_checks = 0
++++
++++        self.root: HoeffdingTreeNode = self._new_leaf(depth=0)
++++
++++    # -- factories ---------------------------------------------------------
++++    def new_attribute_observer(self, attr_index: int) -> AttributeObserver:
++++        if attr_index in self.nominal_attributes:
++++            return NominalAttributeObserver()
++++        return NumericAttributeObserver(num_bins=self.num_bins)
++++
++++    def _new_leaf(self, depth: int = 0,
++++                  class_counts: Optional[Dict[int, float]] = None) -> CVFDTLeaf:
++++        return CVFDTLeaf(depth=depth, class_counts=class_counts, tree=self)
++++
++++    def _new_split_node(self, suggestion: SplitSuggestion,
++++                        depth: int) -> CVFDTSplit:
++++        # Statistics start empty so that every count stored in the tree always
++++        # corresponds to an example that is still inside the sliding window.
++++        return CVFDTSplit(suggestion.attribute_index, suggestion.split_value,
++++                          depth=depth, num_branches=suggestion.num_branches,
++++                          is_nominal=suggestion.is_nominal,
++++                          branch_values=suggestion.branch_values, tree=self)
++++
++++    # -- bookkeeping -------------------------------------------------------
++++    def _observe_instance_meta(self, instance: Instance):
++++        if instance.num_attributes > self.num_attributes:
++++            self.num_attributes = instance.num_attributes
++++        if instance.label is not None and instance.label + 1 > self.num_classes:
++++            self.num_classes = instance.label + 1
++++
++++    # -- training ----------------------------------------------------------
++++    def train(self, instance: Instance):
++++        """Train on one example: window maintenance, growth, periodic checks."""
++++        self._observe_instance_meta(instance)
++++        self.instances_seen += 1
++++
++++        # 1. make room in the window, forgetting the oldest example
++++        if len(self.window) >= self.window_size:
++++            old_instance, old_nodes = self.window.popleft()
++++            self._forget_instance(old_instance, old_nodes)
++++
++++        # 2. register the example first: the list of touched nodes is shared
++++        #    with the window so that a split happening while this very example
++++        #    is being learnt also updates its path.
++++        touched: List[HoeffdingTreeNode] = []
++++        self.window.append((instance, touched))
++++        label = instance.label
++++        self.window_class_counts[label] = self.window_class_counts.get(label, 0.0) + 1.0
++++
++++        # 3. grow the main tree (and every alternate on the path)
++++        self._learn_instance(instance, touched)
++++
++++        # 4. every ``check_frequency`` examples revisit the split decisions
++++        if self.check_frequency > 0 and self.instances_seen % self.check_frequency == 0:
++++            self.check_split_validity()
++++
++++    def partial_fit(self, instance: Instance):
++++        """Alias for :meth:`train`."""
++++        self.train(instance)
++++
++++    # -- forgetting --------------------------------------------------------
++++    def _forget_instance(self, instance: Instance,
++++                         nodes: Sequence[HoeffdingTreeNode]):
++++        label = instance.label
++++        remaining = self.window_class_counts.get(label, 0.0) - 1.0
++++        if remaining > 0.0:
++++            self.window_class_counts[label] = remaining
++++        else:
++++            self.window_class_counts.pop(label, None)
++++        for node in nodes:
++++            if node.alive:
++++                node.forget(instance)
++++
++++    # -- growth ------------------------------------------------------------
++++    def _learn_instance(self, instance: Instance,
++++                        touched: Optional[List[HoeffdingTreeNode]] = None
++++                        ) -> List[HoeffdingTreeNode]:
++++        """Update the main tree and all reachable alternates.
++++
++++        Returns the list of nodes whose statistics were updated so that the
++++        example can be forgotten later on.
++++        """
++++        if touched is None:
++++            touched = []
++++        self._learn_subtree(self.root, instance, touched, owner=None,
++++                            owner_branch=-1, alt_owner=None, alt_index=-1,
++++                            allow_alternates=True)
++++        return touched
++++
++++    def _learn_subtree(self, root: HoeffdingTreeNode, instance: Instance,
++++                       touched: List[HoeffdingTreeNode],
++++                       owner: Optional[CVFDTSplit], owner_branch: int,
++++                       alt_owner: Optional[CVFDTSplit], alt_index: int,
++++                       allow_alternates: bool):
++++        """Route ``instance`` through one (sub)tree, learning on the way.
++++
++++        ``owner``/``owner_branch`` identify where ``root`` hangs in the main
++++        tree, ``alt_owner``/``alt_index`` identify it as an alternate subtree.
++++        Exactly one of the two is used to re-attach a new root after a split.
++++        """
++++        node = root
++++        parent: Optional[HoeffdingTreeSplit] = None
++++        parent_branch = -1
++++        while True:
++++            touched.append(node)
++++            if node.is_leaf():
++++                leaf = node  # type: CVFDTLeaf
++++                leaf.learn_from_instance(instance, self)
++++                if leaf.should_attempt_split(self.grace_period):
++++                    leaf.reset_split_attempt_counter()
++++                    if not (self.stop_on_pure_leaf
++++                            and leaf.observed_class_distribution_is_pure()):
++++                        new_node = self.attempt_to_split(leaf, parent, parent_branch)
++++                        if new_node is not None and parent is None:
++++                            self._reattach_root(new_node, owner, owner_branch,
++++                                                alt_owner, alt_index)
++++                return
++++
++++            split = node  # type: CVFDTSplit
++++            split.learn_from_instance(instance, self)
++++            if allow_alternates and split.alternate_trees:
++++                self._train_alternates(split, instance, touched)
++++
++++            branch = split.branch_for_instance(instance)
++++            child = split.get_child(branch)
++++            if child is None:
++++                child = self._new_leaf(depth=split.depth + 1)
++++                split.set_child(branch, child)
++++            parent = split
++++            parent_branch = branch
++++            node = child
++++
++++    def _reattach_root(self, new_root: HoeffdingTreeNode,
++++                       owner: Optional[CVFDTSplit], owner_branch: int,
++++                       alt_owner: Optional[CVFDTSplit], alt_index: int):
++++        """Install ``new_root`` where the previous subtree root was hanging."""
++++        if alt_owner is not None and 0 <= alt_index < len(alt_owner.alternate_trees):
++++            alt_owner.alternate_trees[alt_index] = new_root
++++        elif owner is not None:
++++            owner.set_child(owner_branch, new_root)
++++        else:
++++            self.root = new_root
++++
++++    def _train_alternates(self, split: CVFDTSplit, instance: Instance,
++++                          touched: List[HoeffdingTreeNode]):
++++        """Grow every alternate of ``split`` and score it against the main."""
++++        label = instance.label
++++        main_pred = self._subtree_predict(split, instance)
++++        split.main_seen += 1.0
++++        if main_pred == label:
++++            split.main_correct += 1.0
++++        for index in range(len(split.alternate_trees)):
++++            alt_root = split.alternate_trees[index]
++++            alt_pred = self._subtree_predict(alt_root, instance)
++++            split.alt_seen[index] += 1.0
++++            if alt_pred == label:
++++                split.alt_correct[index] += 1.0
++++            # alternates never spawn alternates of their own
++++            self._learn_subtree(alt_root, instance, touched, owner=None,
++++                                owner_branch=-1, alt_owner=split,
++++                                alt_index=index, allow_alternates=False)
++++
++++    def attempt_to_split(self, leaf: CVFDTLeaf,
++++                         parent: Optional[HoeffdingTreeSplit],
++++                         parent_branch: int) -> Optional[HoeffdingTreeSplit]:
++++        """Try to turn ``leaf`` into a split node; return the new node or None."""
++++        if leaf.depth >= self.max_depth:
++++            return None
++++        suggestions = compute_split_suggestions(leaf, self.num_classes)
++++        chosen, _epsilon = select_split_suggestion(
++++            suggestions, self.num_classes, leaf.weight_seen,
++++            self.split_confidence, self.tie_threshold)
++++        if chosen is None:
++++            return None
++++
++++        split_node = self._new_split_node(chosen, depth=leaf.depth)
++++        num_branches = max(2, len(chosen.post_split_dists))
++++        for branch in range(num_branches):
++++            split_node.set_child(branch, self._new_leaf(depth=leaf.depth + 1))
++++        leaf.alive = False
++++        if parent is not None:
++++            parent.set_child(parent_branch, split_node)
++++        self.num_splits_performed += 1
++++        # Re-play the window examples that belonged to ``leaf`` so that the new
++++        # subtree carries exactly the statistics of the current window.
++++        self._reseed_after_split(leaf, split_node)
++++        return split_node
++++
++++    def _reseed_after_split(self, leaf: CVFDTLeaf, split_node: CVFDTSplit):
++++        """Move ``leaf``'s window examples into the freshly created subtree."""
++++        for _instance, nodes in self.window:
++++            for position, node in enumerate(nodes):
++++                if node is leaf:
++++                    branch = split_node.branch_for_instance(_instance)
++++                    child = split_node.get_child(branch)
++++                    if child is None:
++++                        child = self._new_leaf(depth=split_node.depth + 1)
++++                        split_node.set_child(branch, child)
++++                    split_node.learn_from_instance(_instance, self)
++++                    child.learn_from_instance(_instance, self)
++++                    nodes[position] = split_node
++++                    nodes.append(child)
++++                    break
++++        # the replayed examples must not immediately trigger another split
++++        for child in split_node.children_nodes():
++++            if child.is_leaf():
++++                child.reset_split_attempt_counter()  # type: ignore[attr-defined]
++++
++++    def _seed_alternate(self, split: CVFDTSplit, alternate: CVFDTLeaf):
++++        """Give a new alternate the window statistics of the node it shadows."""
++++        for _instance, nodes in self.window:
++++            for node in nodes:
++++                if node is split:
++++                    alternate.learn_from_instance(_instance, self)
++++                    nodes.append(alternate)
++++                    break
++++        alternate.reset_split_attempt_counter()
++++
++++    # -- CheckSplitValidity ------------------------------------------------
++++    def check_split_validity(self):
++++        """Re-examine every split, start alternates and promote/prune them."""
++++        self.num_split_checks += 1
++++        stack: List[Tuple[HoeffdingTreeNode, Optional[CVFDTSplit], int]] = [
++++            (self.root, None, -1)]
++++        while stack:
++++            node, parent, branch = stack.pop()
++++            if node.is_leaf():
++++                continue
++++            split = node  # type: CVFDTSplit
++++            replaced = self._test_alternates(split, parent, branch)
++++            if replaced is not None:
++++                # the alternate took over: revisit the promoted subtree later
++++                stack.append((replaced, parent, branch))
++++                continue
++++            self._check_node_split(split)
++++            for child_branch, child in enumerate(split.children):
++++                if child is not None:
++++                    stack.append((child, split, child_branch))
++++
++++    def _check_node_split(self, split: CVFDTSplit):
++++        """Start an alternate when the current split decision is stale.
++++
++++        The split of a node is stale when some other candidate split of the
++++        window statistics is better than the split currently installed, by more
++++        than the Hoeffding bound (capped by the tie threshold).  This covers
++++        both a change of the best *attribute* (the case discussed in the CVFDT
++++        paper for nominal attributes) and a drifting *threshold* on the very
++++        same numeric attribute.
++++        """
++++        if len(split.alternate_trees) >= self.max_alternates:
++++            return
++++        if split.weight_seen < self.grace_period:
++++            return
++++        suggestions = compute_split_suggestions(split, self.num_classes)
++++        if not suggestions:
++++            return
++++        best = suggestions[-1]
++++        if best.merit <= 0.0:
++++            return
++++
++++        observer = split.attribute_observers.get(split.split_attribute)
++++        if observer is None:
++++            return
++++        current_gain = gain_of_existing_split(observer, self.num_classes,
++++                                              split.split_value)
++++        range_val = math.log2(max(2, self.num_classes))
++++        epsilon = compute_hoeffding_bound(range_val, self.split_confidence,
++++                                          split.weight_seen)
++++        # Mirror the VFDT tie rule: while the bound is loose the improvement has
++++        # to beat it, once enough examples support the estimate (epsilon below
++++        # the tie threshold) any material improvement is trusted.
++++        required = epsilon if epsilon >= self.tie_threshold else self.stale_margin
++++        if (best.merit - current_gain) <= required:
++++            return
++++
++++        # the installed split is no longer the best one -> grow an alternate
++++        alternate = self._new_leaf(depth=split.depth)
++++        split.add_alternate(alternate)
++++        self._seed_alternate(split, alternate)
++++        split.main_correct = 0.0
++++        split.main_seen = 0.0
++++        self.num_alternates_started += 1
++++
++++    def _test_alternates(self, split: CVFDTSplit,
++++                         parent: Optional[CVFDTSplit],
++++                         parent_branch: int) -> Optional[HoeffdingTreeNode]:
++++        """Promote a winning alternate, prune hopeless ones.
++++
++++        Returns the promoted subtree root when a replacement happened.
++++        """
++++        if not split.alternate_trees:
++++            return None
++++        main_seen = split.main_seen
++++        main_acc = (split.main_correct / main_seen) if main_seen > 0 else 0.0
++++        best_index = -1
++++        best_acc = main_acc
++++        for index in range(len(split.alternate_trees)):
++++            seen = split.alt_seen[index]
++++            if seen < self.min_alt_examples:
++++                continue
++++            acc = split.alt_correct[index] / seen
++++            if acc > best_acc:
++++                best_acc = acc
++++                best_index = index
++++        if best_index >= 0:
++++            return self._promote_alternate(split, best_index, parent,
++++                                           parent_branch)
++++        # prune alternates that had enough time and still lose
++++        for index in range(len(split.alternate_trees) - 1, -1, -1):
++++            if split.alt_seen[index] >= self.max_alt_examples:
++++                dropped = split.drop_alternate(index)
++++                if dropped is not None:
++++                    self._mark_dead(dropped)
++++                    self.num_alternates_pruned += 1
++++        return None
++++
++++    def _promote_alternate(self, split: CVFDTSplit, index: int,
++++                           parent: Optional[CVFDTSplit],
++++                           parent_branch: int) -> HoeffdingTreeNode:
++++        """Replace ``split``'s subtree by its ``index``-th alternate."""
++++        alternate = split.drop_alternate(index)
++++        assert alternate is not None
++++        self._mark_dead(split)          # kills the old subtree + other alternates
++++        alternate.alive = True
++++        self._refresh_depths(alternate, split.depth)
++++        if parent is None:
++++            self.root = alternate
++++        else:
++++            parent.set_child(parent_branch, alternate)
++++        self.num_alternates_promoted += 1
++++        return alternate
++++
++++    def _mark_dead(self, node: HoeffdingTreeNode):
++++        stack = [node]
++++        while stack:
++++            current = stack.pop()
++++            current.alive = False
++++            for child in current.children_nodes():
++++                stack.append(child)
++++            for alt in getattr(current, "alternate_trees", ()):  # type: ignore[arg-type]
++++                stack.append(alt)
++++
++++    def _refresh_depths(self, node: HoeffdingTreeNode, depth: int):
++++        stack = [(node, depth)]
++++        while stack:
++++            current, current_depth = stack.pop()
++++            current.depth = current_depth
++++            current.alive = True
++++            for child in current.children_nodes():
++++                stack.append((child, current_depth + 1))
++++            for alt in getattr(current, "alternate_trees", ()):  # type: ignore[arg-type]
++++                stack.append((alt, current_depth))
++++
++++    # -- prediction --------------------------------------------------------
++++    def _subtree_predict(self, root: HoeffdingTreeNode,
++++                         instance: Instance) -> int:
++++        votes = self._subtree_votes(root, instance)
++++        if not votes:
++++            return self._prior_class()
++++        best_class = -1
++++        best_weight = float("-inf")
++++        for cls in sorted(votes):
++++            weight = votes[cls]
++++            if weight > best_weight:
++++                best_weight = weight
++++                best_class = cls
++++        return best_class if best_class >= 0 else 0
++++
++++    def _subtree_votes(self, root: HoeffdingTreeNode,
++++                       instance: Instance) -> Dict[int, float]:
++++        node = root
++++        while not node.is_leaf():
++++            branch = node.branch_for_instance(instance)  # type: ignore[attr-defined]
++++            child = node.get_child(branch)  # type: ignore[attr-defined]
++++            if child is None:
++++                break
++++            node = child
++++        return node.get_class_votes(instance)
++++
++++    def _prior_class(self) -> int:
++++        if not self.window_class_counts:
++++            return 0
++++        best_class = -1
++++        best_weight = float("-inf")
++++        for cls in sorted(self.window_class_counts):
++++            weight = self.window_class_counts[cls]
++++            if weight > best_weight:
++++                best_weight = weight
++++                best_class = cls
++++        return best_class if best_class >= 0 else 0
++++
++++    def get_votes(self, instance: Instance) -> Dict[int, float]:
++++        votes = self._subtree_votes(self.root, instance)
++++        if votes:
++++            return votes
++++        # a freshly created leaf has no statistics yet: fall back to the
++++        # class distribution of the current window
++++        return dict(self.window_class_counts)
++++
++++    def predict(self, instance: Instance) -> int:
++++        votes = self.get_votes(instance)
++++        if not votes:
++++            return 0
++++        best_class = -1
++++        best_weight = float("-inf")
++++        for cls in sorted(votes):
++++            weight = votes[cls]
++++            if weight > best_weight:
++++                best_weight = weight
++++                best_class = cls
++++        return best_class if best_class >= 0 else 0
++++
++++    def predict_proba(self, instance: Instance) -> Dict[int, float]:
++++        votes = self.get_votes(instance)
++++        total = sum(votes.values())
++++        if total <= 0:
++++            return {}
++++        return {cls: w / total for cls, w in votes.items()}
++++
++++    # -- introspection -----------------------------------------------------
++++    def get_tree_size(self) -> Dict[str, int]:
++++        """Return ``{'num_leaves', 'num_splits', 'total_nodes'}`` (main tree)."""
++++        num_leaves = 0
++++        num_splits = 0
++++        total = 0
++++        stack: List[HoeffdingTreeNode] = [self.root] if self.root is not None else []
++++        while stack:
++++            node = stack.pop()
++++            total += 1
++++            if node.is_leaf():
++++                num_leaves += 1
++++            else:
++++                num_splits += 1
++++                stack.extend(node.children_nodes())
++++        return {"num_leaves": num_leaves, "num_splits": num_splits,
++++                "total_nodes": total}
++++
++++    def count_alternates(self) -> int:
++++        """Number of alternate subtrees currently being grown."""
++++        count = 0
++++        stack: List[HoeffdingTreeNode] = [self.root]
++++        while stack:
++++            node = stack.pop()
++++            alternates = getattr(node, "alternate_trees", ())
++++            count += len(alternates)
++++            for alt in alternates:
++++                stack.append(alt)
++++            stack.extend(node.children_nodes())
++++        return count
++++
++++    def get_window_size(self) -> int:
++++        return len(self.window)
++++
++++    def get_depth(self) -> int:
++++        return self.root.subtree_depth() if self.root is not None else 0
++++
++++    def reset(self):
++++        self.instances_seen = 0
++++        self.window.clear()
++++        self.window_class_counts = {}
++++        self.num_splits_performed = 0
++++        self.num_alternates_started = 0
++++        self.num_alternates_promoted = 0
++++        self.num_alternates_pruned = 0
++++        self.num_split_checks = 0
++++        self.root = self._new_leaf(depth=0)
++++
++++    def __str__(self) -> str:  # pragma: no cover - debug helper
++++        size = self.get_tree_size()
++++        return ("CVFDT(leaves=%d, splits=%d, nodes=%d, alternates=%d, window=%d)"
++++                % (size["num_leaves"], size["num_splits"], size["total_nodes"],
++++                   self.count_alternates(), len(self.window)))
++++
++++
++++# ---------------------------------------------------------------------------
++++# experiments
++++# ---------------------------------------------------------------------------
++++
++++
++++def run_cvfdt_experiments(num_instances: int = 100000,
++++                          window_size: int = 1000) -> Dict[str, float]:
++++    """CVFDT_DRIFT_ACCURACY / VFDT_DRIFT_ACCURACY on a rotating hyperplane."""
++++    from evaluation import PrequentialEvaluator
++++    from streams import RotatingHyperplaneGenerator
++++
++++    results: Dict[str, float] = {}
++++
++++    def make_stream():
++++        return RotatingHyperplaneGenerator(seed=42, num_attributes=10,
++++                                           num_drift_attributes=5,
++++                                           drift_magnitude=0.01,
++++                                           noise_percentage=0.05)
++++
++++    # --- CVFDT ---
++++    stream = make_stream()
++++    cvfdt = CVFDT(num_attributes=stream.num_attributes,
++++                  num_classes=stream.num_classes,
++++                  grace_period=300, split_confidence=0.0001,
++++                  tie_threshold=0.05, window_size=10000,
++++                  check_frequency=2000, max_depth=20)
++++    evaluator = PrequentialEvaluator(window_size=window_size)
++++    for _ in range(num_instances):
++++        instance = stream.next_instance()
++++        evaluator.add_result(cvfdt.predict(instance), instance.label)
++++        cvfdt.train(instance)
++++    results["CVFDT_DRIFT_ACCURACY"] = evaluator.get_cumulative_accuracy()
++++    results["CVFDT_DRIFT_WINDOW_ACCURACY"] = evaluator.get_window_accuracy()
++++    results["CVFDT_TREE_NODES"] = float(cvfdt.get_tree_size()["total_nodes"])
++++    results["CVFDT_ALTERNATES_STARTED"] = float(cvfdt.num_alternates_started)
++++    results["CVFDT_ALTERNATES_PROMOTED"] = float(cvfdt.num_alternates_promoted)
++++
++++    # --- VFDT baseline on the very same stream ---
++++    stream = make_stream()
++++    vfdt = HoeffdingTree(num_attributes=stream.num_attributes,
++++                         num_classes=stream.num_classes,
++++                         grace_period=200, split_confidence=1e-7,
++++                         tie_threshold=0.05, max_depth=20)
++++    evaluator = PrequentialEvaluator(window_size=window_size)
++++    for _ in range(num_instances):
++++        instance = stream.next_instance()
++++        evaluator.add_result(vfdt.predict(instance), instance.label)
++++        vfdt.train(instance)
++++    results["VFDT_DRIFT_ACCURACY"] = evaluator.get_cumulative_accuracy()
++++    results["VFDT_DRIFT_WINDOW_ACCURACY"] = evaluator.get_window_accuracy()
++++    return results
++++
++++
++++def main():  # pragma: no cover - script entry point
++++    results = run_cvfdt_experiments()
++++    print("CVFDT_DRIFT_ACCURACY: %.4f" % results["CVFDT_DRIFT_ACCURACY"])
++++    print("VFDT_DRIFT_ACCURACY: %.4f" % results["VFDT_DRIFT_ACCURACY"])
++++
++++
++++if __name__ == "__main__":  # pragma: no cover
++++    main()
+++diff --git a/run.sh b/run.sh
+++index a2faf5b..b7e2fb8 100755
+++--- a/run.sh
++++++ b/run.sh
+++@@ -9,3 +9,6 @@ PY=${PYTHON:-python3}
+++ 
+++ # --- VFDT (Hoeffding Tree) -------------------------------------------------
+++ $PY hoeffding_tree.py
++++
++++# --- CVFDT (concept-adapting VFDT) -----------------------------------------
++++$PY cvfdt.py
++diff --git a/run.sh b/run.sh
++index b7e2fb8..eff1104 100755
++--- a/run.sh
+++++ b/run.sh
++@@ -12,3 +12,6 @@ $PY hoeffding_tree.py
++ 
++ # --- CVFDT (concept-adapting VFDT) -----------------------------------------
++ $PY cvfdt.py
+++
+++# --- ADWIN (adaptive windowing drift detector) -----------------------------
+++$PY stream/experiments/adwin_exp.py
++diff --git a/stream/__init__.py b/stream/__init__.py
++new file mode 100644
++index 0000000..27ec142
++--- /dev/null
+++++ b/stream/__init__.py
++@@ -0,0 +1,12 @@
+++"""Stream mining package: adaptive windowing and instance based learners."""
+++
+++import os as _os
+++import sys as _sys
+++
+++# Allow ``stream.*`` modules to import the top level framework modules
+++# (streams.py, classifiers.py, ...) no matter what the current directory is.
+++_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+++if _ROOT not in _sys.path:
+++    _sys.path.insert(0, _ROOT)
+++
+++__all__ = ["adwin", "sam_knn", "experiments"]
++diff --git a/stream/adwin.py b/stream/adwin.py
++new file mode 100644
++index 0000000..bba69cf
++--- /dev/null
+++++ b/stream/adwin.py
++@@ -0,0 +1,515 @@
+++"""ADWIN: ADaptive WINdowing for concept drift detection.
+++
+++Implementation of the change detector of Bifet & Gavalda, "Learning from
+++Time-Changing Data with Adaptive Windowing", SDM 2007.
+++
+++ADWIN keeps a variable length window of the most recent observations, stored in
+++compressed form as an *exponential histogram*: a list of
+++:class:`BucketRow` objects where row ``i`` holds buckets summarising ``2^i``
+++observations each.  At most ``max_buckets_per_row`` buckets live in a row; when
+++a row overflows its two oldest buckets are merged into a single bucket of the
+++next row, so a window of ``n`` items needs only ``O(M log n)`` memory.
+++
+++After every insertion the window is scanned for a split point ``W = W0 . W1``
+++such that the means of the two sub-windows differ by more than the statistical
+++bound
+++
+++    epsilon = sqrt(2 * m * v * ln(2 ln n / delta')) + (2/3) * m * ln(2 ln n / delta')
+++
+++(the variance-sensitive bound of ADWIN2, with ``1/m = 1/n0 + 1/n1`` the
+++harmonic mean of the sub-window lengths and ``v`` the observed variance) or,
+++when ``use_variance_bound`` is disabled, the plain Hoeffding cut
+++
+++    epsilon = sqrt((1 / (2 m)) * ln(4 / delta'))     with delta' = delta / n.
+++
+++Whenever such a split exists the distribution has changed: the oldest bucket is
+++dropped and the test is repeated, so the window shrinks to the portion of the
+++stream that is consistent with the new concept.
+++"""
+++
+++import math
+++import os
+++import sys
+++from typing import Iterator, List, Optional
+++
+++_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+++if _ROOT not in sys.path:
+++    sys.path.insert(0, _ROOT)
+++
+++__all__ = ["Bucket", "BucketRow", "ADWIN"]
+++
+++
+++class Bucket:
+++    """Summary statistics of one segment of the window.
+++
+++    Attributes:
+++        total: Sum of the observations contained in the bucket.
+++        variance: Sum of squared deviations from the bucket mean.
+++        count: Number of observations summarised by the bucket.
+++    """
+++
+++    __slots__ = ("total", "variance", "count", "previous", "next")
+++
+++    def __init__(self, total: float = 0.0, variance: float = 0.0,
+++                 count: int = 0):
+++        self.total = float(total)
+++        self.variance = float(variance)
+++        self.count = int(count)
+++        self.previous: Optional["Bucket"] = None
+++        self.next: Optional["Bucket"] = None
+++
+++    # -- statistics --------------------------------------------------------
+++    @property
+++    def mean(self) -> float:
+++        if self.count <= 0:
+++            return 0.0
+++        return self.total / self.count
+++
+++    def clear(self):
+++        self.total = 0.0
+++        self.variance = 0.0
+++        self.count = 0
+++        self.previous = None
+++        self.next = None
+++
+++    def copy(self) -> "Bucket":
+++        return Bucket(self.total, self.variance, self.count)
+++
+++    # -- merging -----------------------------------------------------------
+++    def merge(self, other: "Bucket") -> "Bucket":
+++        """Merge the adjacent bucket ``other`` into this one.
+++
+++        The variance of the union of two samples follows from
+++
+++            V = V_a + V_b + n_a n_b (mean_a - mean_b)^2 / (n_a + n_b)
+++
+++        Returns ``self`` so that merges can be chained.
+++        """
+++        if other is None or other.count == 0:
+++            return self
+++        if self.count == 0:
+++            self.total = other.total
+++            self.variance = other.variance
+++            self.count = other.count
+++            return self
+++        n_a = self.count
+++        n_b = other.count
+++        mean_diff = self.total / n_a - other.total / n_b
+++        self.variance = (self.variance + other.variance
+++                         + n_a * n_b * mean_diff * mean_diff / (n_a + n_b))
+++        self.total += other.total
+++        self.count = n_a + n_b
+++        return self
+++
+++    @staticmethod
+++    def merged(first: "Bucket", second: "Bucket") -> "Bucket":
+++        """Return a new bucket holding the union of ``first`` and ``second``."""
+++        return first.copy().merge(second)
+++
+++    def __repr__(self) -> str:  # pragma: no cover - debug helper
+++        return ("Bucket(total=%.4f, variance=%.4f, count=%d)"
+++                % (self.total, self.variance, self.count))
+++
+++
+++class BucketRow:
+++    """Doubly linked list of :class:`Bucket` objects of the same granularity.
+++
+++    ``head`` is the *oldest* bucket of the row and ``tail`` the most recent one.
+++    Row ``level`` stores buckets summarising ``2 ** level`` observations.
+++    """
+++
+++    def __init__(self, level: int = 0):
+++        self.level = int(level)
+++        self.head: Optional[Bucket] = None
+++        self.tail: Optional[Bucket] = None
+++        self._size = 0
+++
+++    # -- properties --------------------------------------------------------
+++    @property
+++    def size(self) -> int:
+++        """Number of buckets currently stored in the row."""
+++        return self._size
+++
+++    @property
+++    def bucket_size(self) -> int:
+++        """Number of observations each bucket of this row summarises."""
+++        return 2 ** self.level
+++
+++    def is_empty(self) -> bool:
+++        return self._size == 0
+++
+++    # -- list operations ---------------------------------------------------
+++    def add_to_tail(self, bucket: Bucket) -> Bucket:
+++        """Append ``bucket`` as the most recent bucket of the row."""
+++        bucket.previous = self.tail
+++        bucket.next = None
+++        if self.tail is not None:
+++            self.tail.next = bucket
+++        else:
+++            self.head = bucket
+++        self.tail = bucket
+++        self._size += 1
+++        return bucket
+++
+++    def add_to_head(self, bucket: Bucket) -> Bucket:
+++        """Insert ``bucket`` as the oldest bucket of the row."""
+++        bucket.previous = None
+++        bucket.next = self.head
+++        if self.head is not None:
+++            self.head.previous = bucket
+++        else:
+++            self.tail = bucket
+++        self.head = bucket
+++        self._size += 1
+++        return bucket
+++
+++    def remove_from_head(self) -> Optional[Bucket]:
+++        """Remove and return the oldest bucket of the row."""
+++        bucket = self.head
+++        if bucket is None:
+++            return None
+++        self.head = bucket.next
+++        if self.head is not None:
+++            self.head.previous = None
+++        else:
+++            self.tail = None
+++        self._size -= 1
+++        bucket.previous = None
+++        bucket.next = None
+++        return bucket
+++
+++    def remove_from_tail(self) -> Optional[Bucket]:
+++        """Remove and return the most recent bucket of the row."""
+++        bucket = self.tail
+++        if bucket is None:
+++            return None
+++        self.tail = bucket.previous
+++        if self.tail is not None:
+++            self.tail.next = None
+++        else:
+++            self.head = None
+++        self._size -= 1
+++        bucket.previous = None
+++        bucket.next = None
+++        return bucket
+++
+++    def clear(self):
+++        self.head = None
+++        self.tail = None
+++        self._size = 0
+++
+++    # -- iteration ---------------------------------------------------------
+++    def buckets(self) -> Iterator[Bucket]:
+++        """Iterate over the buckets from the oldest to the most recent one."""
+++        bucket = self.head
+++        while bucket is not None:
+++            yield bucket
+++            bucket = bucket.next
+++
+++    def __iter__(self) -> Iterator[Bucket]:
+++        return self.buckets()
+++
+++    def __len__(self) -> int:
+++        return self._size
+++
+++    def total(self) -> float:
+++        return sum(bucket.total for bucket in self.buckets())
+++
+++    def count(self) -> int:
+++        return sum(bucket.count for bucket in self.buckets())
+++
+++    def __repr__(self) -> str:  # pragma: no cover - debug helper
+++        return "BucketRow(level=%d, size=%d)" % (self.level, self._size)
+++
+++
+++class ADWIN:
+++    """ADaptive WINdowing drift detector.
+++
+++    Args:
+++        delta: Confidence parameter of the change test.
+++        max_buckets_per_row: ``M``, buckets kept per granularity level.
+++        min_window_length: Minimum length of each sub-window when testing.
+++        min_clock: Run the change test every ``min_clock`` insertions.
+++        use_variance_bound: Use the variance sensitive ADWIN2 cut (default) or
+++            the plain Hoeffding cut of the original paper.
+++    """
+++
+++    def __init__(self, delta: float = 0.002, max_buckets_per_row: int = 5,
+++                 min_window_length: int = 10, min_clock: int = 1,
+++                 use_variance_bound: bool = True):
+++        self.delta = float(delta)
+++        self.max_buckets_per_row = int(max_buckets_per_row)
+++        self.min_window_length = int(min_window_length)
+++        self.min_clock = max(1, int(min_clock))
+++        self.use_variance_bound = bool(use_variance_bound)
+++        self.reset()
+++
+++    # -- state -------------------------------------------------------------
+++    def reset(self):
+++        """Clear all state (window, buckets and detection flags)."""
+++        self.bucket_rows: List[BucketRow] = [BucketRow(0)]
+++        self._width = 0
+++        self._total = 0.0
+++        self._variance_sum = 0.0
+++        self.bucket_count = 0
+++        self.time = 0
+++        self._detected_change = False
+++        self._detected_warning = False
+++        self.num_detections = 0
+++        self.num_elements = 0
+++        self.width_at_last_detection = 0
+++        self.detection_points: List[int] = []
+++
+++    # -- properties --------------------------------------------------------
+++    @property
+++    def width(self) -> int:
+++        """Current total window length."""
+++        return self._width
+++
+++    @property
+++    def total(self) -> float:
+++        """Running sum of the elements inside the window."""
+++        return self._total
+++
+++    @property
+++    def variance_sum(self) -> float:
+++        """Sum of squared deviations of the elements inside the window."""
+++        return self._variance_sum
+++
+++    @property
+++    def variance(self) -> float:
+++        """Running variance estimate of the elements inside the window."""
+++        if self._width <= 0:
+++            return 0.0
+++        return self._variance_sum / self._width
+++
+++    @property
+++    def last_bucket_row(self) -> int:
+++        return len(self.bucket_rows) - 1
+++
+++    def get_estimation(self) -> float:
+++        """Current mean estimate ``total / width``."""
+++        if self._width <= 0:
+++            return 0.0
+++        return self._total / self._width
+++
+++    # scikit-multiflow style aliases -------------------------------------
+++    @property
+++    def estimation(self) -> float:
+++        return self.get_estimation()
+++
+++    def get_width(self) -> int:
+++        return self._width
+++
+++    def get_total(self) -> float:
+++        return self._total
+++
+++    def get_variance(self) -> float:
+++        return self.variance
+++
+++    def get_num_buckets(self) -> int:
+++        return self.bucket_count
+++
+++    def detected_change(self) -> bool:
+++        """True when the most recent :meth:`add_element` detected a change."""
+++        return self._detected_change
+++
+++    def detected_warning_zone(self) -> bool:
+++        return self._detected_warning
+++
+++    # -- insertion ---------------------------------------------------------
+++    def add_element(self, value: float) -> bool:
+++        """Add an observation to the window and test for a distribution change.
+++
+++        Returns True when a change was detected (and the window shrunk).
+++        """
+++        value = float(value)
+++        self.time += 1
+++        self.num_elements += 1
+++        self._detected_change = False
+++
+++        self._insert_element(value)
+++        self._compress()
+++
+++        if self.time % self.min_clock == 0:
+++            changed = self._check_for_change()
+++        else:
+++            changed = False
+++        return changed
+++
+++    def add(self, value: float) -> bool:
+++        """Alias for :meth:`add_element`."""
+++        return self.add_element(value)
+++
+++    def update(self, value: float) -> bool:
+++        """Alias for :meth:`add_element` (scikit-multiflow naming)."""
+++        return self.add_element(value)
+++
+++    def _insert_element(self, value: float):
+++        """Insert ``value`` as a new bucket of size one at row 0."""
+++        self._width += 1
+++        self.bucket_rows[0].add_to_tail(Bucket(total=value, variance=0.0,
+++                                               count=1))
+++        self.bucket_count += 1
+++        if self._width > 1:
+++            previous_mean = self._total / (self._width - 1)
+++            deviation = value - previous_mean
+++            self._variance_sum += ((self._width - 1) * deviation * deviation
+++                                   / self._width)
+++        self._total += value
+++
+++    # -- compression -------------------------------------------------------
+++    def _compress(self):
+++        """Merge the two oldest buckets of every overflowing row."""
+++        row_index = 0
+++        while row_index < len(self.bucket_rows):
+++            row = self.bucket_rows[row_index]
+++            if row.size <= self.max_buckets_per_row:
+++                break
+++            first = row.remove_from_head()
+++            second = row.remove_from_head()
+++            if first is None or second is None:
+++                if first is not None:
+++                    row.add_to_head(first)
+++                break
+++            merged = first.merge(second)
+++            self.bucket_count -= 1
+++            if row_index + 1 >= len(self.bucket_rows):
+++                self.bucket_rows.append(BucketRow(row_index + 1))
+++            self.bucket_rows[row_index + 1].add_to_tail(merged)
+++            row_index += 1
+++
+++    # -- deletion ----------------------------------------------------------
+++    def _delete_element(self) -> int:
+++        """Drop the oldest bucket of the window; returns its element count."""
+++        row = self._oldest_row()
+++        if row is None:
+++            return 0
+++        bucket = row.remove_from_head()
+++        if bucket is None:
+++            return 0
+++        count = bucket.count
+++        self._width -= count
+++        self._total -= bucket.total
+++        self.bucket_count -= 1
+++        if self._width > 0 and count > 0:
+++            mean_removed = bucket.total / count
+++            mean_rest = self._total / self._width
+++            mean_diff = mean_removed - mean_rest
+++            self._variance_sum -= (bucket.variance
+++                                   + count * self._width * mean_diff * mean_diff
+++                                   / (count + self._width))
+++            if self._variance_sum < 0.0:
+++                self._variance_sum = 0.0
+++        elif self._width <= 0:
+++            self._variance_sum = 0.0
+++            self._total = 0.0
+++        # drop empty rows at the coarse end of the histogram
+++        while len(self.bucket_rows) > 1 and self.bucket_rows[-1].is_empty():
+++            self.bucket_rows.pop()
+++        return count
+++
+++    def _oldest_row(self) -> Optional[BucketRow]:
+++        for index in range(len(self.bucket_rows) - 1, -1, -1):
+++            if not self.bucket_rows[index].is_empty():
+++                return self.bucket_rows[index]
+++        return None
+++
+++    # -- change detection --------------------------------------------------
+++    def _iterate_buckets_oldest_first(self) -> Iterator[Bucket]:
+++        for index in range(len(self.bucket_rows) - 1, -1, -1):
+++            for bucket in self.bucket_rows[index].buckets():
+++                yield bucket
+++
+++    def cut_expression(self, n0: float, n1: float, u0: float, u1: float,
+++                       v0: float = 0.0, v1: float = 0.0) -> bool:
+++        """True when the means of the two sub-windows are significantly apart."""
+++        if n0 <= 0 or n1 <= 0:
+++            return False
+++        difference = u0 / n0 - u1 / n1
+++        return abs(difference) > self.epsilon_cut(n0, n1)
+++
+++    def epsilon_cut(self, n0: float, n1: float) -> float:
+++        """The statistical bound a mean difference has to exceed."""
+++        n = float(self._width)
+++        if n0 <= 0 or n1 <= 0 or n <= 1:
+++            return float("inf")
+++        if self.use_variance_bound:
+++            # ADWIN2: variance sensitive bound, delta' = delta / (2 ln n)
+++            log_n = math.log(n) if n > math.e else 1.0
+++            delta_prime = math.log(2.0 * log_n / self.delta)
+++            offset = self.min_window_length - 1
+++            inverse_m = (1.0 / max(1.0, n0 - offset)
+++                         + 1.0 / max(1.0, n1 - offset))
+++            variance = self.variance
+++            return (math.sqrt(2.0 * inverse_m * variance * delta_prime)
+++                    + 2.0 / 3.0 * delta_prime * inverse_m)
+++        # Original ADWIN cut: harmonic mean m and delta' = delta / n
+++        inverse_m = 1.0 / n0 + 1.0 / n1
+++        delta_prime = self.delta / n
+++        return math.sqrt(0.5 * inverse_m * math.log(4.0 / delta_prime))
+++
+++    def _check_for_change(self) -> bool:
+++        """Shrink the window while a significant split point exists."""
+++        changed = False
+++        keep_going = True
+++        while keep_going:
+++            keep_going = False
+++            if self._width < 2 * self.min_window_length:
+++                break
+++            n0 = 0.0
+++            u0 = 0.0
+++            v0 = 0.0
+++            n1 = float(self._width)
+++            u1 = self._total
+++            v1 = self._variance_sum
+++            for bucket in self._iterate_buckets_oldest_first():
+++                n2 = float(bucket.count)
+++                u2 = bucket.total
+++                if n2 <= 0:
+++                    continue
+++                rest = n1 - n2
+++                if rest <= 0:
+++                    break               # the newest bucket cannot be cut off
+++                # move the bucket from the newer sub-window to the older one
+++                if n0 > 0:
+++                    mean_diff = u0 / n0 - u2 / n2
+++                    v0 += (bucket.variance
+++                           + n0 * n2 * mean_diff * mean_diff / (n0 + n2))
+++                else:
+++                    v0 += bucket.variance
+++                mean_diff = u2 / n2 - (u1 - u2) / rest
+++                v1 -= bucket.variance + n2 * rest * mean_diff * mean_diff / n1
+++                if v1 < 0.0:
+++                    v1 = 0.0
+++                n0 += n2
+++                u0 += u2
+++                n1 = rest
+++                u1 -= u2
+++                if (n0 >= self.min_window_length
+++                        and n1 >= self.min_window_length
+++                        and self.cut_expression(n0, n1, u0, u1, v0, v1)):
+++                    changed = True
+++                    removed = self._delete_element()
+++                    if removed > 0:
+++                        keep_going = True
+++                    break
+++        if changed:
+++            self._detected_change = True
+++            self.num_detections += 1
+++            self.width_at_last_detection = self._width
+++            self.detection_points.append(self.num_elements)
+++        return changed
+++
+++    # -- helpers -----------------------------------------------------------
+++    def get_window_elements(self) -> List[Bucket]:
+++        """Buckets of the window from oldest to newest (debugging helper)."""
+++        return list(self._iterate_buckets_oldest_first())
+++
+++    def __len__(self) -> int:
+++        return self._width
+++
+++    def __str__(self) -> str:  # pragma: no cover - debug helper
+++        return ("ADWIN(width=%d, mean=%.4f, variance=%.4f, buckets=%d)"
+++                % (self._width, self.get_estimation(), self.variance,
+++                   self.bucket_count))
++diff --git a/stream/experiments/__init__.py b/stream/experiments/__init__.py
++new file mode 100644
++index 0000000..7c283da
++--- /dev/null
+++++ b/stream/experiments/__init__.py
++@@ -0,0 +1,10 @@
+++"""Experiment runners for the stream mining framework."""
+++
+++import os as _os
+++import sys as _sys
+++
+++_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+++if _ROOT not in _sys.path:
+++    _sys.path.insert(0, _ROOT)
+++
+++__all__ = ["adwin_exp", "sam_exp"]
++diff --git a/stream/experiments/adwin_exp.py b/stream/experiments/adwin_exp.py
++new file mode 100644
++index 0000000..8760986
++--- /dev/null
+++++ b/stream/experiments/adwin_exp.py
++@@ -0,0 +1,334 @@
+++"""Experiments for the ADWIN change detector.
+++
+++The experiments feed ADWIN with synthetic streams whose change points are known
+++by construction (abrupt, gradual and recurring drift) and report detection
+++delay, false positive rate, window behaviour and the quality of the running mean
+++estimate.
+++"""
+++
+++import math
+++import os
+++import random
+++import sys
+++from typing import Dict, List, Optional, Sequence, Tuple
+++
+++_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+++if _ROOT not in sys.path:
+++    sys.path.insert(0, _ROOT)
+++
+++from stream.adwin import ADWIN
+++
+++__all__ = ["ADWINExperiment", "run_adwin_experiments"]
+++
+++#: seeds used whenever an experiment is averaged over repetitions
+++DEFAULT_SEEDS: Tuple[int, ...] = (1, 2, 3, 4, 5)
+++
+++
+++class ADWINExperiment:
+++    """Drift detection experiments on synthetic streams.
+++
+++    Args:
+++        delta: ADWIN confidence parameter.
+++        num_samples: Length of the generated streams.
+++        change_point: Index of the abrupt change.
+++        sigma: Standard deviation of the Gaussian noise.
+++        max_buckets_per_row: ADWIN ``M`` parameter.
+++        min_window_length: ADWIN minimum sub-window length.
+++    """
+++
+++    def __init__(self, delta: float = 0.002, num_samples: int = 10000,
+++                 change_point: int = 5000, sigma: float = 1.0,
+++                 max_buckets_per_row: int = 5, min_window_length: int = 10):
+++        self.delta = float(delta)
+++        self.num_samples = int(num_samples)
+++        self.change_point = int(change_point)
+++        self.sigma = float(sigma)
+++        self.max_buckets_per_row = int(max_buckets_per_row)
+++        self.min_window_length = int(min_window_length)
+++
+++    # -- detector ----------------------------------------------------------
+++    def new_detector(self, delta: Optional[float] = None) -> ADWIN:
+++        return ADWIN(delta=self.delta if delta is None else delta,
+++                     max_buckets_per_row=self.max_buckets_per_row,
+++                     min_window_length=self.min_window_length)
+++
+++    # -- stream generators -------------------------------------------------
+++    def generate_stationary_stream(self, seed: int = 1,
+++                                   num_samples: Optional[int] = None,
+++                                   mean: float = 0.0,
+++                                   sigma: Optional[float] = None) -> List[float]:
+++        """A stream with no drift at all: ``N(mean, sigma)``."""
+++        rng = random.Random(seed)
+++        sigma = self.sigma if sigma is None else sigma
+++        n = self.num_samples if num_samples is None else num_samples
+++        return [rng.gauss(mean, sigma) for _ in range(n)]
+++
+++    def generate_abrupt_stream(self, seed: int = 1,
+++                               num_samples: Optional[int] = None,
+++                               change_point: Optional[int] = None,
+++                               mean_before: float = 0.0,
+++                               mean_after: float = 1.0,
+++                               sigma: Optional[float] = None) -> List[float]:
+++        """A stream whose mean jumps at ``change_point``."""
+++        rng = random.Random(seed)
+++        sigma = self.sigma if sigma is None else sigma
+++        n = self.num_samples if num_samples is None else num_samples
+++        cut = self.change_point if change_point is None else change_point
+++        return [rng.gauss(mean_before if i < cut else mean_after, sigma)
+++                for i in range(n)]
+++
+++    def generate_gradual_stream(self, seed: int = 1,
+++                                num_samples: Optional[int] = None,
+++                                change_start: Optional[int] = None,
+++                                transition_length: int = 1000,
+++                                mean_before: float = 0.0,
+++                                mean_after: float = 1.0,
+++                                sigma: Optional[float] = None) -> List[float]:
+++        """A stream whose mean ramps linearly from one level to the other."""
+++        rng = random.Random(seed)
+++        sigma = self.sigma if sigma is None else sigma
+++        n = self.num_samples if num_samples is None else num_samples
+++        start = self.change_point if change_start is None else change_start
+++        data: List[float] = []
+++        for i in range(n):
+++            if i < start:
+++                mean = mean_before
+++            elif i >= start + transition_length:
+++                mean = mean_after
+++            else:
+++                progress = (i - start) / float(transition_length)
+++                mean = mean_before + progress * (mean_after - mean_before)
+++            data.append(rng.gauss(mean, sigma))
+++        return data
+++
+++    def generate_recurring_stream(self, seed: int = 1,
+++                                  num_samples: Optional[int] = None,
+++                                  period: int = 2000,
+++                                  mean_low: float = 0.0,
+++                                  mean_high: float = 1.0,
+++                                  sigma: Optional[float] = None) -> List[float]:
+++        """A stream that alternates between two concepts every ``period``."""
+++        rng = random.Random(seed)
+++        sigma = self.sigma if sigma is None else sigma
+++        n = self.num_samples if num_samples is None else num_samples
+++        data: List[float] = []
+++        for i in range(n):
+++            high = (i // period) % 2 == 1
+++            data.append(rng.gauss(mean_high if high else mean_low, sigma))
+++        return data
+++
+++    def recurring_change_points(self, num_samples: Optional[int] = None,
+++                                period: int = 2000) -> List[int]:
+++        n = self.num_samples if num_samples is None else num_samples
+++        return list(range(period, n, period))
+++
+++    # -- single run --------------------------------------------------------
+++    def run_detection(self, data: Sequence[float],
+++                      change_points: Sequence[int] = (),
+++                      delta: Optional[float] = None,
+++                      true_means: Optional[Sequence[float]] = None
+++                      ) -> Dict[str, object]:
+++        """Feed ``data`` to ADWIN and collect detection statistics.
+++
+++        Args:
+++            data: The stream of observations.
+++            change_points: Indices at which the distribution really changes.
+++            delta: Optional confidence override.
+++            true_means: Optional per-sample true mean, used to score the
+++                running estimate.
+++
+++        Returns:
+++            A dict with the detection indices, the delay for each true change
+++            point, the number of false alarms, the window trajectory and the
+++            mean estimation error.
+++        """
+++        detector = self.new_detector(delta)
+++        detections: List[int] = []
+++        widths: List[int] = []
+++        width_after_detection: List[int] = []
+++        estimation_error = 0.0
+++        for index, value in enumerate(data):
+++            changed = detector.add_element(value)
+++            widths.append(detector.width)
+++            if changed:
+++                detections.append(index)
+++                width_after_detection.append(detector.width)
+++            if true_means is not None:
+++                estimation_error += abs(detector.get_estimation()
+++                                       - true_means[index])
+++
+++        delays: List[Optional[int]] = []
+++        matched = set()
+++        for position, change in enumerate(change_points):
+++            limit = (change_points[position + 1]
+++                     if position + 1 < len(change_points) else len(data))
+++            delay = None
+++            for detection in detections:
+++                if change <= detection < limit:
+++                    # ADWIN keeps signalling while it shrinks the window, so
+++                    # every alarm up to the next true change is attributed to
+++                    # this change; the delay is the first of them.
+++                    matched.add(detection)
+++                    if delay is None:
+++                        delay = detection - change
+++            delays.append(delay)
+++        false_alarms = [d for d in detections if d not in matched]
+++
+++        return {
+++            "detections": detections,
+++            "num_detections": len(detections),
+++            "delays": delays,
+++            "false_alarms": len(false_alarms),
+++            "false_positive_rate": len(false_alarms) / max(1, len(data)),
+++            "widths": widths,
+++            "average_width": sum(widths) / max(1, len(widths)),
+++            "final_width": detector.width,
+++            "width_after_first_detection": (width_after_detection[0]
+++                                            if width_after_detection else None),
+++            "width_after_detection": width_after_detection,
+++            "final_estimation": detector.get_estimation(),
+++            "mean_estimation_error": (estimation_error / max(1, len(data))
+++                                      if true_means is not None else None),
+++            "detector": detector,
+++        }
+++
+++    # -- experiment 1: detection delay -------------------------------------
+++    def detection_delay(self, seeds: Sequence[int] = DEFAULT_SEEDS,
+++                        mean_before: float = 0.0,
+++                        mean_after: float = 1.0) -> float:
+++        """Average number of samples between the drift and its detection."""
+++        delays: List[int] = []
+++        for seed in seeds:
+++            data = self.generate_abrupt_stream(seed=seed,
+++                                               mean_before=mean_before,
+++                                               mean_after=mean_after)
+++            result = self.run_detection(data, change_points=(self.change_point,))
+++            delay = result["delays"][0]  # type: ignore[index]
+++            if delay is None:
+++                # never detected: charge the whole remaining stream
+++                delay = len(data) - self.change_point
+++            delays.append(delay)
+++        return sum(delays) / max(1, len(delays))
+++
+++    # -- experiment 2: false positive rate ---------------------------------
+++    def false_positive_rate(self, seeds: Sequence[int] = DEFAULT_SEEDS) -> float:
+++        """Fraction of samples on a stationary stream that raise an alarm."""
+++        rates: List[float] = []
+++        for seed in seeds:
+++            data = self.generate_stationary_stream(seed=seed)
+++            result = self.run_detection(data)
+++            rates.append(result["num_detections"] / max(1, len(data)))  # type: ignore[operator]
+++        return sum(rates) / max(1, len(rates))
+++
+++    # -- experiment 3: window size, stationary stream ----------------------
+++    def window_size_stable(self, seeds: Sequence[int] = DEFAULT_SEEDS,
+++                           num_samples: int = 5000) -> float:
+++        """Average window length while the distribution does not change."""
+++        sizes: List[float] = []
+++        for seed in seeds:
+++            data = self.generate_stationary_stream(seed=seed,
+++                                                   num_samples=num_samples)
+++            result = self.run_detection(data)
+++            sizes.append(result["average_width"])  # type: ignore[arg-type]
+++        return sum(sizes) / max(1, len(sizes))
+++
+++    # -- experiment 4: window size right after a drift ---------------------
+++    def window_size_drift(self, seeds: Sequence[int] = DEFAULT_SEEDS,
+++                          mean_before: float = 0.0,
+++                          mean_after: float = 1.0) -> float:
+++        """Window length immediately after the drift has been detected."""
+++        sizes: List[float] = []
+++        for seed in seeds:
+++            data = self.generate_abrupt_stream(seed=seed,
+++                                               mean_before=mean_before,
+++                                               mean_after=mean_after)
+++            detector = self.new_detector()
+++            width = None
+++            for index, value in enumerate(data):
+++                if detector.add_element(value) and index >= self.change_point:
+++                    width = detector.width
+++                    break
+++            sizes.append(float(width if width is not None else detector.width))
+++        return sum(sizes) / max(1, len(sizes))
+++
+++    # -- experiment 5: mean estimation error -------------------------------
+++    def mean_estimation_error(self, seeds: Sequence[int] = DEFAULT_SEEDS,
+++                              mean_before: float = 0.0,
+++                              mean_after: float = 2.0,
+++                              measure_at: int = 7000) -> float:
+++        """Absolute error of the mean estimate ``measure_at`` samples in."""
+++        errors: List[float] = []
+++        for seed in seeds:
+++            data = self.generate_abrupt_stream(seed=seed,
+++                                               num_samples=measure_at,
+++                                               mean_before=mean_before,
+++                                               mean_after=mean_after)
+++            detector = self.new_detector()
+++            for value in data:
+++                detector.add_element(value)
+++            errors.append(abs(detector.get_estimation() - mean_after))
+++        return sum(errors) / max(1, len(errors))
+++
+++    # -- extra drift shapes ------------------------------------------------
+++    def gradual_drift_report(self, seeds: Sequence[int] = DEFAULT_SEEDS
+++                             ) -> Dict[str, float]:
+++        delays: List[int] = []
+++        for seed in seeds:
+++            data = self.generate_gradual_stream(seed=seed)
+++            result = self.run_detection(data, change_points=(self.change_point,))
+++            delay = result["delays"][0]  # type: ignore[index]
+++            delays.append(delay if delay is not None
+++                          else len(data) - self.change_point)
+++        return {"gradual_detection_delay": sum(delays) / max(1, len(delays))}
+++
+++    def recurring_drift_report(self, seeds: Sequence[int] = DEFAULT_SEEDS,
+++                               period: int = 2000) -> Dict[str, float]:
+++        detected = 0
+++        expected = 0
+++        delays: List[int] = []
+++        for seed in seeds:
+++            data = self.generate_recurring_stream(seed=seed, period=period)
+++            changes = self.recurring_change_points(period=period)
+++            result = self.run_detection(data, change_points=changes)
+++            expected += len(changes)
+++            for delay in result["delays"]:  # type: ignore[union-attr]
+++                if delay is not None:
+++                    detected += 1
+++                    delays.append(delay)
+++        return {
+++            "recurring_recall": detected / max(1, expected),
+++            "recurring_detection_delay": (sum(delays) / len(delays)
+++                                          if delays else float("nan")),
+++        }
+++
+++    # -- everything --------------------------------------------------------
+++    def run_all(self) -> Dict[str, float]:
+++        """Compute the five reported ADWIN metrics."""
+++        return {
+++            "ADWIN_DETECTION_DELAY": self.detection_delay(),
+++            "ADWIN_FALSE_POSITIVE_RATE": self.false_positive_rate(),
+++            "ADWIN_WINDOW_SIZE_STABLE": self.window_size_stable(),
+++            "ADWIN_WINDOW_SIZE_DRIFT": self.window_size_drift(),
+++            "ADWIN_MEAN_ESTIMATION_ERROR": self.mean_estimation_error(),
+++        }
+++
+++
+++def run_adwin_experiments() -> Dict[str, float]:
+++    """Run the reported ADWIN experiments with the parameters of the spec."""
+++    experiment = ADWINExperiment(delta=0.002, num_samples=10000,
+++                                 change_point=5000)
+++    return experiment.run_all()
+++
+++
+++def main():  # pragma: no cover - script entry point
+++    results = run_adwin_experiments()
+++    print("ADWIN_DETECTION_DELAY: %.2f" % results["ADWIN_DETECTION_DELAY"])
+++    print("ADWIN_FALSE_POSITIVE_RATE: %.6f" % results["ADWIN_FALSE_POSITIVE_RATE"])
+++    print("ADWIN_WINDOW_SIZE_STABLE: %.2f" % results["ADWIN_WINDOW_SIZE_STABLE"])
+++    print("ADWIN_WINDOW_SIZE_DRIFT: %.2f" % results["ADWIN_WINDOW_SIZE_DRIFT"])
+++    print("ADWIN_MEAN_ESTIMATION_ERROR: %.6f"
+++          % results["ADWIN_MEAN_ESTIMATION_ERROR"])
+++
+++
+++if __name__ == "__main__":  # pragma: no cover
+++    main()
+diff --git a/run.sh b/run.sh
+index eff1104..7e5023d 100755
+--- a/run.sh
++++ b/run.sh
+@@ -15,3 +15,6 @@ $PY cvfdt.py
+ 
+ # --- ADWIN (adaptive windowing drift detector) -----------------------------
+ $PY stream/experiments/adwin_exp.py
++
++# --- MOA (OzaBagging ensemble + interleaved test-then-train) ----------------
++$PY moa_framework.py
+=== ls patches ===
+total 316
+drwxr-xr-x 2 root root   4096 Aug 15 06:54 .
+drwxr-xr-x 1 root root   4096 Aug 15 06:53 ..
+-rw-r--r-- 1 root root  95304 Aug 15 06:44 adwin.diff
+-rw-r--r-- 1 root root  47600 Aug 15 06:40 cvfdt.diff
+-rw-r--r-- 1 root root 130289 Aug 15 06:54 moa.diff
+-rw-r--r-- 1 root root  35083 Aug 15 05:55 vfdt.diff
+=== agent_tests ===
+agent_tests:
+__pycache__
+test_adwin.py
+test_cvfdt.py
+test_moa.py
+test_vfdt.py
+
+agent_tests/__pycache__:
+test_adwin.cpython-312-pytest-7.4.4.pyc
+test_cvfdt.cpython-312-pytest-7.4.4.pyc
+test_moa.cpython-312-pytest-7.4.4.pyc
+test_vfdt.cpython-312-pytest-7.4.4.pyc
+=== agent_plans ===
+total 12
+drwxr-xr-x 2 root root 4096 Aug 15 05:49 .
+drwxr-xr-x 1 root root 4096 Aug 15 06:53 ..
+-rw-r--r-- 1 root root 1101 Aug 15 05:49 plan.json

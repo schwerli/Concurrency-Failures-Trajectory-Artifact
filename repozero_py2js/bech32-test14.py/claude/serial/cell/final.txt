@@ -1,0 +1,41 @@
+All four documented sample cases match byte-for-byte. Here is the delivered code.
+
+## Behaviour recovered from the executable (black-box probing)
+
+`convertbits` behaves as an MSB-first sliding-bit accumulator with `pad=True`:
+- accumulator is masked with `(1 << (frombits + tobits - 1)) - 1`, output values with `(1 << tobits) - 1`;
+- a negative or too-wide value makes the whole call return `None` → the chained second call then raises `TypeError: 'NoneType' object is not iterable` (frame `bech32/__init__.py`, line 90), exit 1;
+- shift widths are computed **before** the input is iterated, so `--c -5` fails at line 88 and `--b -8` at line 89 with `ValueError: negative shift count`, even when `data` is `None`;
+- `--c 0` makes the reference hang (infinite loop) — the port reproduces that rather than papering over it;
+- arbitrary precision is real: `--b 64 --c 40` prints `1095216660480`, so every value is a `BigInt`.
+
+## Library files
+
+**`/output/lib/pyerrors.mjs`** — `PythonError`/`PyValueError`/`PyTypeError`/`PyMemoryError`, each carrying the Python exception name and the library frames to print.
+
+**`/output/lib/pyrepr.mjs`** — `repr()`/`print()` for lists, ints and strings (`pyReprStr` reproduces CPython's quote choice and escaping, needed for the error messages).
+
+**`/output/lib/pyint.mjs`** — CPython's `int(str)`: whitespace stripping, ASCII sign, single underscores between digits, Unicode `Nd` digits, and the exact `invalid literal for int() with base 10: '…'` message.
+
+**`/output/lib/pytraceback.mjs`** — renders the CPython traceback plus PyInstaller's `[PYI-<pid>:ERROR] …` line and sets exit code 1.
+
+**`/output/lib/argparse.mjs`** — `ArgumentParser` with `--opt value` / `--opt=value`, unique-prefix abbreviation, `-h/--help`, and argparse's exact texts and error precedence (invalid type → missing required → unrecognized), exit 2.
+
+**`/output/lib/bech32/convertbits.mjs`** + **`/output/lib/bech32/index.mjs`** — the BigInt conversion core and the module's public surface.
+
+## Entry file `/output/test14.mjs`
+
+Mirrors the Python `main()` statement for statement, tagging each statement with its source frame so an escaping exception prints the same traceback.
+
+## Verification
+
+Two differential harnesses (`/output/difftest.sh`, `/output/fuzz.sh`) compare stdout, stderr and exit status against `/workspace/dataset/test14_executable`:
+
+- **345/345** curated cases pass — the 4 documented samples, a 10×7×4 bit-width matrix, 2^100-scale bignums, `None`-propagation, negative/zero bit widths, 14 `int()`-parsing quirks, and 27 argparse cases (`-h`, `--h` abbreviation, `--`, duplicate flags, `-x` extras, `--a=-1,2`).
+- **400/400** randomized cases pass (random data including deliberately out-of-range values, random `b`/`c`/`d`).
+
+Two notes on fidelity worth flagging:
+- stderr comparison required PID normalization, since the reference embeds its own PID in `[PYI-###:ERROR]`; the port uses `process.pid` there.
+- The reference's traceback shows source/caret lines only when `test14.py` is readable from the cwd (the frozen bundle has no copy). Initially 22 cases mismatched on exactly this; `pytraceback.mjs` now probes for the file, and the suite passes from both `/output` and `/workspace/dataset`.
+
+Constraints met: pure ESM with `.mjs` suffixes throughout, zero npm dependencies, `node:fs` as the only import that is not a local file, and no use of `Uint8Array`/`DataView`.

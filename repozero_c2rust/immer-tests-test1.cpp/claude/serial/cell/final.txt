@@ -1,0 +1,29 @@
+Done. Everything verified against the C++ binary.
+
+## What I built
+
+`/output` — Cargo project, zero dependencies (`Cargo.lock` contains only the package itself):
+
+```
+Cargo.toml            bin target "test1" → path = "test1.rs"
+test1.rs              entry point (attaches modules via #[path])
+src/immer/mod.rs      container namespace
+src/immer/node.rs     trie nodes, structural sharing via Rc
+src/immer/vector.rs   persistent Vector<T> + unit tests
+src/cpp_compat/mod.rs uncaught-exception terminate emulation
+src/cpp_compat/stoi.rs std::stoi semantics + unit tests
+```
+
+**`immer::vector` reimplementation** (black-box, from the interface): bitmapped radix-balanced trie, branching factor 32, with a tail buffer. `push_back` returns a new vector sharing all untouched subtrees, so `v = v.push_back(i)` in a loop is amortized O(1) rather than O(n) copying. Also implemented `get`/`Index`/`set`/`front`/`back`/`iter`/`FromIterator`/`PartialEq`/`Debug`.
+
+**`std::stoi` emulation** matters here — `str::parse::<i32>()` is stricter and would have diverged. The C++ version skips leading whitespace, takes an optional sign, reads leading digits, and *ignores trailing junk*: `./test1_executable "3abc"` prints `3`, and `" 42"` prints `42`. On no-digits/out-of-range it throws out of `main`, so I reproduce libstdc++'s terminate message on stderr and `SIGABRT` (exit 134).
+
+## Verification
+
+- **10 unit tests pass.** They caught a real bug: my `new_path` base case was `level == BITS` instead of `level == 0`, hanging a leaf one level too high — it only manifested above 1024 elements, past every provided test example.
+- **Differential vs. the C++ binary:** byte-exact stdout+stderr and matching exit codes for n = 0..200, no-args, trie boundaries (31/32/33, 1023/1024/1025, 1055/1056/1057, 32767/32769, 100k, 3M), negatives, and all malformed/overflow inputs (`abc`, `""`, `-`, `+-3`, `.5`, `0x10`, `1e5`, `2147483648`, `-2147483649`, `99999999999999999999`).
+- 3M pushes: 0.20s vs C++ 0.08s — same asymptotics.
+
+## One deviation to flag
+
+Requirement 7 asks for "an executable at `/output/test1.rs`" — writing a binary there would destroy the source file that requirement 5 asks for. I kept `test1.rs` as source and put the executables at **`/output/test1`** (from `rustc -O test1.rs`) and `/output/target/release/test1` (from `cargo build --release`). Both build paths work from the same source. Say the word if you actually want the binary at that exact path.

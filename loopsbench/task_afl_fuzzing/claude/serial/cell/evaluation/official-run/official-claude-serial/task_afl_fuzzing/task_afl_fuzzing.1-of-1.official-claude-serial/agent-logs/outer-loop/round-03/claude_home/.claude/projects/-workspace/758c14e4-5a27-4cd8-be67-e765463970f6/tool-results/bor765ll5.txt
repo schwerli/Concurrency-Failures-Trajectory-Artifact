@@ -1,0 +1,1493 @@
+     1	"""Core AFL (American Fuzzy Lop) coverage-guided greybox fuzzer.
+     2	
+     3	This module is a faithful, deterministic simulation of afl-fuzz.c's algorithm:
+     4	
+     5	* 64KB shared-memory edge bitmap with hit-count bucketing
+     6	  (1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+),
+     7	* edge identification via ``(prev_block >> 1) ^ cur_block`` (AFL's
+     8	  ``prev_loc``/``cur_loc`` trick, usually written ``(prev ^ cur) >> 1``),
+     9	* a fork-server model that amortises target start-up cost,
+    10	* test-case calibration with multi-run stability detection,
+    11	* input trimming with powers-of-two block removal preserving coverage,
+    12	* corpus culling via greedy set cover (smallest + fastest entry per edge),
+    13	* the complete deterministic stage pipeline (walking bit flips 1/2/4, byte
+    14	  flips 8/16/32, arithmetics +/- 1..35 for 8/16/32 bit widths in both
+    15	  endiannesses, interesting values 8/16/32, auto-dictionary extraction during
+    16	  the bit-flip stage and user/auto dictionary insertion),
+    17	* the havoc stage (2^1..2^7 stacked random mutations),
+    18	* the splice stage (midpoint recombination of two queue entries + havoc),
+    19	* performance scoring from execution speed / bitmap size / depth / handicap,
+    20	* crash de-duplication through coverage hashing,
+    21	* and queue scheduling with favoured-seed priority (the 75/25 skip split).
+    22	
+    23	Everything is driven from a single ``numpy.random.RandomState`` so that a given
+    24	seed always produces the same run.
+    25	"""
+    26	
+    27	from __future__ import annotations
+    28	
+    29	import hashlib
+    30	from dataclasses import dataclass, field
+    31	from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+    32	
+    33	import numpy as np
+    34	
+    35	from fuzzsim.bitmap import MAP_SIZE
+    36	from fuzzsim.mutation import (
+    37	    INTERESTING_8,
+    38	    INTERESTING_16,
+    39	    INTERESTING_32,
+    40	    clone_bytes,
+    41	    delete_bytes,
+    42	    insert_bytes,
+    43	)
+    44	from fuzzsim.seed import TestCase
+    45	
+    46	# ---------------------------------------------------------------------------
+    47	# AFL tuning constants (config.h)
+    48	# ---------------------------------------------------------------------------
+    49	
+    50	ARITH_MAX = 35            # maximum offset used by the arithmetic stages
+    51	HAVOC_STACK_POW2 = 7      # havoc stacks 2^1 .. 2^7 mutations
+    52	HAVOC_CYCLES = 256        # base havoc iterations (scaled by performance score)
+    53	HAVOC_CYCLES_INIT = 1024  # havoc iterations when deterministic stages are off
+    54	HAVOC_MIN = 16            # never do fewer than this many havoc execs
+    55	HAVOC_MAX_MULT = 16       # performance score cap multiplier (=> max 1600)
+    56	HAVOC_BLK_SMALL = 32
+    57	HAVOC_BLK_MEDIUM = 128
+    58	HAVOC_BLK_LARGE = 1500
+    59	SPLICE_CYCLES = 15        # splice attempts per queue entry
+    60	SPLICE_HAVOC = 32         # havoc iterations applied to a spliced input
+    61	
+    62	SKIP_TO_NEW_PROB = 75     # favoured/unseen entries: 75/25 split
+    63	SKIP_NFAV_OLD_PROB = 95   # skip probability for old non-favoured entries
+    64	SKIP_NFAV_NEW_PROB = 75   # skip probability for fresh non-favoured entries
+    65	
+    66	CAL_CYCLES = 3            # calibration executions for a fresh entry
+    67	TRIM_MIN_BYTES = 4
+    68	TRIM_START_STEPS = 16
+    69	TRIM_END_STEPS = 1024
+    70	
+    71	MIN_AUTO_EXTRA = 3
+    72	MAX_AUTO_EXTRA = 32
+    73	MAX_AUTO_EXTRAS = 50      # auto dictionary capacity
+    74	MAX_DET_EXTRAS = 200      # deterministic extras cut-off
+    75	
+    76	# Hit-count buckets used by AFL's classify_counts().
+    77	COUNT_CLASS_BUCKETS: Tuple[Tuple[int, int, int], ...] = (
+    78	    (0, 0, 0),        # never executed
+    79	    (1, 1, 1),        # exactly once
+    80	    (2, 2, 2),        # twice
+    81	    (3, 3, 4),        # three times
+    82	    (4, 7, 8),        # 4-7
+    83	    (8, 15, 16),      # 8-15
+    84	    (16, 31, 32),     # 16-31
+    85	    (32, 127, 64),    # 32-127
+    86	    (128, 1 << 30, 128),  # 128+
+    87	)
+    88	
+    89	
+    90	def classify_counts(count: int) -> int:
+    91	    """Map a raw hit count onto AFL's 8 hit-count buckets.
+    92	
+    93	    AFL folds hit counts into powers-of-two-ish buckets so that small changes
+    94	    in loop trip counts do not look like new coverage::
+    95	
+    96	        1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+
+    97	    """
+    98	    if count < 0:
+    99	        raise ValueError("hit count must be non-negative")
+   100	    for low, high, bucket in COUNT_CLASS_BUCKETS:
+   101	        if low <= count <= high:
+   102	            return bucket
+   103	    return 128
+   104	
+   105	
+   106	def bucket_index(count: int) -> int:
+   107	    """Return the index (0..8) of the bucket a hit count falls into."""
+   108	    for idx, (low, high, _bucket) in enumerate(COUNT_CLASS_BUCKETS):
+   109	        if low <= count <= high:
+   110	            return idx
+   111	    return len(COUNT_CLASS_BUCKETS) - 1
+   112	
+   113	
+   114	def edge_hash(prev_block: int, cur_block: int, map_size: int = MAP_SIZE) -> int:
+   115	    """Compute AFL's edge id for the transition ``prev_block -> cur_block``.
+   116	
+   117	    AFL's instrumentation keeps ``prev_loc`` already shifted right by one so
+   118	    that A->B and B->A hash differently; the transition is therefore
+   119	    ``(prev_block >> 1) ^ cur_block`` taken modulo the bitmap size.
+   120	    """
+   121	    return ((prev_block >> 1) ^ cur_block) % map_size
+   122	
+   123	
+   124	def coverage_hash(edges: Iterable[int]) -> str:
+   125	    """Stable hash of a coverage set, used for crash de-duplication."""
+   126	    payload = ",".join(str(e) for e in sorted(edges)).encode()
+   127	    return hashlib.sha1(payload).hexdigest()[:16]
+   128	
+   129	
+   130	def swap16(value: int) -> int:
+   131	    """Byte-swap a 16 bit value."""
+   132	    value &= 0xFFFF
+   133	    return ((value & 0xFF) << 8) | (value >> 8)
+   134	
+   135	
+   136	def swap32(value: int) -> int:
+   137	    """Byte-swap a 32 bit value."""
+   138	    value &= 0xFFFFFFFF
+   139	    return (
+   140	        ((value & 0x000000FF) << 24)
+   141	        | ((value & 0x0000FF00) << 8)
+   142	        | ((value & 0x00FF0000) >> 8)
+   143	        | ((value & 0xFF000000) >> 24)
+   144	    )
+   145	
+   146	
+   147	# ---------------------------------------------------------------------------
+   148	# "Could this value have been produced by a cheaper stage?" predicates
+   149	# ---------------------------------------------------------------------------
+   150	
+   151	def could_be_bitflip(xor_val: int) -> bool:
+   152	    """True if ``xor_val`` is reachable by the walking bit-flip stages.
+   153	
+   154	    Direct port of afl-fuzz.c's could_be_bitflip(): 1/2/4 bit patterns are
+   155	    reachable at any offset, 8/16/32 bit patterns only at byte-aligned ones.
+   156	    """
+   157	    xor_val &= 0xFFFFFFFF
+   158	    if xor_val == 0:
+   159	        return True
+   160	    sh = 0
+   161	    while (xor_val & 1) == 0:
+   162	        sh += 1
+   163	        xor_val >>= 1
+   164	    if xor_val in (1, 3, 15):
+   165	        return True
+   166	    if sh & 7:
+   167	        return False
+   168	    return xor_val in (0xFF, 0xFFFF, 0xFFFFFFFF)
+   169	
+   170	
+   171	def _within_arith(a: int, b: int, bits: int) -> bool:
+   172	    """True if ``a`` and ``b`` are within ARITH_MAX using wrapping arithmetic."""
+   173	    mask = (1 << bits) - 1
+   174	    return ((a - b) & mask) <= ARITH_MAX or ((b - a) & mask) <= ARITH_MAX
+   175	
+   176	
+   177	def could_be_arith(old_val: int, new_val: int, blen: int) -> bool:
+   178	    """True if ``old_val -> new_val`` is reachable by the arithmetic stages."""
+   179	    if old_val == new_val:
+   180	        return True
+   181	
+   182	    diffs = 0
+   183	    ov = nv = 0
+   184	    for i in range(blen):
+   185	        a = (old_val >> (8 * i)) & 0xFF
+   186	        b = (new_val >> (8 * i)) & 0xFF
+   187	        if a != b:
+   188	            diffs += 1
+   189	            ov, nv = a, b
+   190	
+   191	    # A single byte differs: an 8 bit arithmetic op would have found it.
+   192	    if diffs == 1 and _within_arith(ov, nv, 8):
+   193	        return True
+   194	
+   195	    if blen == 1:
+   196	        return False
+   197	
+   198	    # Try 16 bit arithmetics in both endiannesses.
+   199	    diffs = 0
+   200	    for i in range(blen // 2):
+   201	        a = (old_val >> (16 * i)) & 0xFFFF
+   202	        b = (new_val >> (16 * i)) & 0xFFFF
+   203	        if a != b:
+   204	            diffs += 1
+   205	            ov, nv = a, b
+   206	    if diffs == 1:
+   207	        if _within_arith(ov, nv, 16):
+   208	            return True
+   209	        if _within_arith(swap16(ov), swap16(nv), 16):
+   210	            return True
+   211	
+   212	    if blen == 4:
+   213	        if _within_arith(old_val, new_val, 32):
+   214	            return True
+   215	        if _within_arith(swap32(old_val), swap32(new_val), 32):
+   216	            return True
+   217	    return False
+   218	
+   219	
+   220	def could_be_interest(old_val: int, new_val: int, blen: int, check_le: bool) -> bool:
+   221	    """True if ``old_val -> new_val`` is reachable by the interesting-value stages."""
+   222	    if old_val == new_val:
+   223	        return True
+   224	
+   225	    # Single-byte interesting values applied at any offset.
+   226	    for i in range(blen):
+   227	        for interesting in INTERESTING_8:
+   228	            tval = (old_val & ~(0xFF << (8 * i))) | ((interesting & 0xFF) << (8 * i))
+   229	            if new_val == tval:
+   230	                return True
+   231	
+   232	    if blen == 2 and not check_le:
+   233	        return False
+   234	
+   235	    for i in range(blen - 1):
+   236	        for interesting in INTERESTING_16:
+   237	            iv = interesting & 0xFFFF
+   238	            tval = (old_val & ~(0xFFFF << (8 * i))) | (iv << (8 * i))
+   239	            if new_val == tval:
+   240	                return True
+   241	            if blen > 2:
+   242	                tval = (old_val & ~(0xFFFF << (8 * i))) | (swap16(iv) << (8 * i))
+   243	                if new_val == tval:
+   244	                    return True
+   245	    return False
+   246	
+   247	
+   248	# ---------------------------------------------------------------------------
+   249	# Fork server simulation
+   250	# ---------------------------------------------------------------------------
+   251	
+   252	class ForkServer:
+   253	    """Simulated AFL fork server.
+   254	
+   255	    The real fork server executes the target up to ``main()`` once and then
+   256	    clones the initialised process for every test case, which removes the
+   257	    (expensive) linking/initialisation cost from the per-exec budget.  We model
+   258	    that: ``STARTUP_COST`` is paid once at ``start()`` and every subsequent run
+   259	    only pays ``FORK_COST`` plus the target's own execution time.
+   260	    """
+   261	
+   262	    STARTUP_COST = 0.020  # 20ms one-off initialisation
+   263	    FORK_COST = 0.0002    # 0.2ms per fork
+   264	    EXECVE_COST = 0.010   # 10ms if we had to execve() every time
+   265	
+   266	    def __init__(self, program):
+   267	        self.program = program
+   268	        self.is_running = False
+   269	        self.total_execs = 0
+   270	        self.total_time = 0.0
+   271	        self.startup_time = 0.0
+   272	        self.timeouts = 0
+   273	        self.child_pid = 0
+   274	
+   275	    def start(self) -> None:
+   276	        """Spin up the fork server (paid once)."""
+   277	        if self.is_running:
+   278	            return
+   279	        self.is_running = True
+   280	        self.startup_time = self.STARTUP_COST
+   281	        self.total_time += self.STARTUP_COST
+   282	        self.child_pid = 1000
+   283	
+   284	    def run(self, data: bytes) -> Tuple[Set[int], bool, float]:
+   285	        """Execute one test case through the fork server."""
+   286	        if not self.is_running:
+   287	            self.start()
+   288	        self.child_pid += 1
+   289	        edges, is_crash, exec_time = self.program.execute(data)
+   290	        self.total_execs += 1
+   291	        self.total_time += self.FORK_COST + exec_time
+   292	        return set(edges), bool(is_crash), float(exec_time)
+   293	
+   294	    def stop(self) -> None:
+   295	        self.is_running = False
+   296	        self.child_pid = 0
+   297	
+   298	    @property
+   299	    def saved_time(self) -> float:
+   300	        """Time saved compared to a plain execve() based executor."""
+   301	        return self.total_execs * (self.EXECVE_COST - self.FORK_COST) - self.STARTUP_COST
+   302	
+   303	
+   304	# ---------------------------------------------------------------------------
+   305	# Bitmap with hit-count bucketing
+   306	# ---------------------------------------------------------------------------
+   307	
+   308	class AFLBitmap:
+   309	    """64KB coverage bitmap with hit-count bucketing and virgin-bit tracking."""
+   310	
+   311	    def __init__(self, map_size: int = MAP_SIZE):
+   312	        self.map_size = map_size
+   313	        # virgin_bits[edge] is the OR of every bucket value observed so far.
+   314	        self.virgin_bits: Dict[int, int] = {}
+   315	        self.global_coverage: Set[int] = set()
+   316	        self.hit_counts: Dict[int, int] = {}
+   317	        self.trace_bits: Dict[int, int] = {}
+   318	
+   319	    # -- current run ------------------------------------------------------
+   320	    def reset_trace(self) -> None:
+   321	        self.trace_bits = {}
+   322	
+   323	    def record_trace(self, edges: Dict[int, int]) -> None:
+   324	        """Store the raw hit counts of the current execution."""
+   325	        self.trace_bits = dict(edges)
+   326	
+   327	    def classified_trace(self) -> Dict[int, int]:
+   328	        """Return the current trace after classify_counts()."""
+   329	        return {e: classify_counts(c) for e, c in self.trace_bits.items()}
+   330	
+   331	    # -- global bitmap ----------------------------------------------------
+   332	    def has_new_bits(self, edges: Dict[int, int]) -> int:
+   333	        """AFL's has_new_bits(): 2 = new edge, 1 = new hit-count bucket, 0 = nothing."""
+   334	        result = 0
+   335	        for edge, count in edges.items():
+   336	            if count <= 0:
+   337	                continue
+   338	            bucket = classify_counts(count)
+   339	            seen = self.virgin_bits.get(edge, 0)
+   340	            if seen == 0:
+   341	                return 2
+   342	            if seen & bucket == 0:
+   343	                result = max(result, 1)
+   344	        return result
+   345	
+   346	    def update(self, edges: Dict[int, int]) -> Set[int]:
+   347	        """Fold an execution into the global bitmap, returning new edges."""
+   348	        new_edges = set()
+   349	        for edge, count in edges.items():
+   350	            if count <= 0:
+   351	                continue
+   352	            if edge not in self.virgin_bits:
+   353	                new_edges.add(edge)
+   354	                self.virgin_bits[edge] = 0
+   355	            self.virgin_bits[edge] |= classify_counts(count)
+   356	            self.global_coverage.add(edge)
+   357	            self.hit_counts[edge] = self.hit_counts.get(edge, 0) + count
+   358	        return new_edges
+   359	
+   360	    def count_bytes(self) -> int:
+   361	        """Number of non-zero bytes in the bitmap (AFL's count_bytes)."""
+   362	        return len(self.global_coverage)
+   363	
+   364	    def get_coverage_count(self) -> int:
+   365	        return len(self.global_coverage)
+   366	
+   367	    def get_coverage_percentage(self, total_edges: int) -> float:
+   368	        if total_edges == 0:
+   369	            return 0.0
+   370	        return len(self.global_coverage) / total_edges * 100.0
+   371	
+   372	    def map_density(self) -> float:
+   373	        """Fraction of the 64KB map that is in use (AFL's map density stat)."""
+   374	        return len(self.global_coverage) / self.map_size * 100.0
+   375	
+   376	
+   377	# ---------------------------------------------------------------------------
+   378	# Dictionary (user supplied extras + auto-extracted tokens)
+   379	# ---------------------------------------------------------------------------
+   380	
+   381	class Dictionary:
+   382	    """User (``-x``) and auto-extracted dictionary tokens."""
+   383	
+   384	    def __init__(self, extras: Optional[Sequence[bytes]] = None):
+   385	        self.extras: List[bytes] = sorted(set(extras or []), key=lambda t: (len(t), t))
+   386	        self.auto_extras: List[bytes] = []
+   387	        self.auto_hits: Dict[bytes, int] = {}
+   388	
+   389	    def maybe_add_auto(self, token: bytes) -> bool:
+   390	        """AFL's maybe_add_auto(): remember a token found during bit flipping."""
+   391	        if not (MIN_AUTO_EXTRA <= len(token) <= MAX_AUTO_EXTRA):
+   392	            return False
+   393	        if len(set(token)) <= 1:  # all-same bytes carry no information
+   394	            return False
+   395	        if token in self.extras:
+   396	            return False
+   397	        if token in self.auto_hits:
+   398	            self.auto_hits[token] += 1
+   399	            return False
+   400	        self.auto_hits[token] = 1
+   401	        if len(self.auto_extras) < MAX_AUTO_EXTRAS:
+   402	            self.auto_extras.append(token)
+   403	            self.auto_extras.sort(key=lambda t: (len(t), t))
+   404	            return True
+   405	        # Replace the least useful (largest) entry.
+   406	        self.auto_extras[-1] = token
+   407	        self.auto_extras.sort(key=lambda t: (len(t), t))
+   408	        return True
+   409	
+   410	    @property
+   411	    def all_tokens(self) -> List[bytes]:
+   412	        return list(self.extras) + list(self.auto_extras)
+   413	
+   414	    def __len__(self) -> int:
+   415	        return len(self.extras) + len(self.auto_extras)
+   416	
+   417	
+   418	# ---------------------------------------------------------------------------
+   419	# Power schedules
+   420	# ---------------------------------------------------------------------------
+   421	
+   422	class PowerSchedule:
+   423	    """Base class for energy assignment (how many havoc execs a seed gets)."""
+   424	
+   425	    name = "base"
+   426	
+   427	    def assign_energy(self, fuzzer: "AFLFuzzer", tc: TestCase) -> float:
+   428	        raise NotImplementedError
+   429	
+   430	
+   431	class ConstantPowerSchedule(PowerSchedule):
+   432	    """AFL's original constant schedule: energy == performance score."""
+   433	
+   434	    name = "CONST"
+   435	
+   436	    def assign_energy(self, fuzzer: "AFLFuzzer", tc: TestCase) -> float:
+   437	        return fuzzer.calculate_score(tc)
+   438	
+   439	
+   440	# ---------------------------------------------------------------------------
+   441	# Statistics
+   442	# ---------------------------------------------------------------------------
+   443	
+   444	@dataclass
+   445	class FuzzerStats:
+   446	    """Aggregate statistics of a fuzzing campaign."""
+   447	
+   448	    total_execs: int = 0
+   449	    paths_discovered: int = 0
+   450	    corpus_size: int = 0
+   451	    unique_crashes: int = 0
+   452	    total_crashes: int = 0
+   453	    edges_covered: int = 0
+   454	    edge_coverage: float = 0.0
+   455	    queue_cycles: int = 0
+   456	    first_crash_exec: Optional[int] = None
+   457	    favored_count: int = 0
+   458	    stability: float = 100.0
+   459	    trimmed_bytes: int = 0
+   460	    havoc_finds: int = 0
+   461	    det_finds: int = 0
+   462	    splice_finds: int = 0
+   463	    stage_finds: Dict[str, int] = field(default_factory=dict)
+   464	    stage_execs: Dict[str, int] = field(default_factory=dict)
+   465	    auto_extras: int = 0
+   466	    mean_energy: float = 0.0
+   467	    execs_per_sec: float = 0.0
+   468	
+   469	
+   470	# ---------------------------------------------------------------------------
+   471	# The fuzzer
+   472	# ---------------------------------------------------------------------------
+   473	
+   474	class AFLFuzzer:
+   475	    """AFL's main loop: calibrate, trim, deterministic stages, havoc, splice."""
+   476	
+   477	    def __init__(
+   478	        self,
+   479	        program,
+   480	        seeds: Optional[Sequence[bytes]] = None,
+   481	        seed: int = 42,
+   482	        max_execs: int = 20000,
+   483	        deterministic: bool = True,
+   484	        use_splice: bool = True,
+   485	        use_trim: bool = True,
+   486	        dictionary: Optional[Sequence[bytes]] = None,
+   487	        power_schedule: Optional[PowerSchedule] = None,
+   488	        total_edges: Optional[int] = None,
+   489	        stop_on_crash: bool = False,
+   490	        max_cycles: Optional[int] = None,
+   491	    ):
+   492	        self.program = program
+   493	        self.rng = np.random.RandomState(seed)
+   494	        self.seed_value = seed
+   495	        self.max_execs = max_execs
+   496	        self.deterministic = deterministic
+   497	        self.use_splice = use_splice
+   498	        self.use_trim = use_trim
+   499	        self.stop_on_crash = stop_on_crash
+   500	        self.max_cycles = max_cycles
+   501	
+   502	        self.fork_server = ForkServer(program)
+   503	        self.bitmap = AFLBitmap()
+   504	        self.crash_bitmap = AFLBitmap()  # AFL's virgin_crash map
+   505	        self.dictionary = Dictionary(dictionary)
+   506	        self.power_schedule = power_schedule or ConstantPowerSchedule()
+   507	
+   508	        self.queue: List[TestCase] = []
+   509	        self.crashes: List[TestCase] = []
+   510	        self.unique_crash_hashes: Dict[str, TestCase] = {}
+   511	        self.hangs: List[TestCase] = []
+   512	
+   513	        self.total_edges = total_edges or self._infer_total_edges()
+   514	
+   515	        self.total_execs = 0
+   516	        self.queue_cycle = 0
+   517	        self.current_index = 0
+   518	        self.pending_favored = 0
+   519	        self.pending_not_fuzzed = 0
+   520	        self.queued_discovered = 0
+   521	        self.first_crash_exec: Optional[int] = None
+   522	        self.first_unique_crash_exec: Optional[int] = None
+   523	        self.total_crashes = 0
+   524	        self.total_crash_execs = 0
+   525	        self.trimmed_bytes = 0
+   526	        self.energy_log: List[float] = []
+   527	        self.stage_finds: Dict[str, int] = {}
+   528	        self.stage_execs: Dict[str, int] = {}
+   529	        self.top_rated: Dict[int, TestCase] = {}
+   530	        self.cur_depth = 0
+   531	        self.max_depth = 0
+   532	        self.coverage_history: List[Tuple[int, int]] = []  # (execs, edges)
+   533	        self.queue_history: List[Tuple[int, int]] = []     # (execs, corpus size)
+   534	        self.current_stage = "init"
+   535	        self.current_target: Optional[TestCase] = None
+   536	        self.stability_samples: List[float] = []
+   537	
+   538	        self.fork_server.start()
+   539	        for data in seeds or [b"hello world"]:
+   540	            self.add_seed(bytes(data))
+   541	
+   542	    # ------------------------------------------------------------------
+   543	    # Setup helpers
+   544	    # ------------------------------------------------------------------
+   545	    def _infer_total_edges(self) -> int:
+   546	        for attr in ("get_total_edges", "total_edges"):
+   547	            value = getattr(self.program, attr, None)
+   548	            if callable(value):
+   549	                return int(value())
+   550	            if isinstance(value, int):
+   551	                return value
+   552	        return MAP_SIZE
+   553	
+   554	    def add_seed(self, data: bytes) -> TestCase:
+   555	        """Add an initial seed: execute, calibrate, trim and queue it."""
+   556	        edges, is_crash, exec_time = self.run_target(data)
+   557	        tc = TestCase(
+   558	            data=data,
+   559	            coverage=set(edges),
+   560	            exec_time=exec_time,
+   561	            is_crash=is_crash,
+   562	            depth=0,
+   563	            creation_time=self.total_execs,
+   564	        )
+   565	        if is_crash:
+   566	            # afl-fuzz refuses to start on a crashing seed; we simply file it as
+   567	            # a crash and keep it out of the queue/bitmap.
+   568	            self.save_if_interesting(data, edges, True, exec_time, None)
+   569	            return tc
+   570	        self.bitmap.update({e: 1 for e in edges})
+   571	        self.queue.append(tc)
+   572	        self.queued_discovered += 1
+   573	        self.calibrate_case(tc)
+   574	        if self.use_trim:
+   575	            self.trim_case(tc)
+   576	        self.update_bitmap_score(tc)
+   577	        self._record_history()
+   578	        return tc
+   579	
+   580	    # ------------------------------------------------------------------
+   581	    # Execution
+   582	    # ------------------------------------------------------------------
+   583	    def budget_left(self) -> int:
+   584	        return max(0, self.max_execs - self.total_execs)
+   585	
+   586	    def out_of_budget(self) -> bool:
+   587	        return self.total_execs >= self.max_execs
+   588	
+   589	    def run_target(self, data: bytes) -> Tuple[Set[int], bool, float]:
+   590	        """Run the target once through the fork server and account for it."""
+   591	        edges, is_crash, exec_time = self.fork_server.run(data)
+   592	        self.total_execs += 1
+   593	        self.stage_execs[self.current_stage] = self.stage_execs.get(self.current_stage, 0) + 1
+   594	        self.bitmap.record_trace({e: 1 for e in edges})
+   595	        if is_crash:
+   596	            self.total_crashes += 1
+   597	            if self.first_crash_exec is None:
+   598	                self.first_crash_exec = self.total_execs
+   599	        return edges, is_crash, exec_time
+   600	
+   601	    def common_fuzz_stuff(self, data: bytes, parent: Optional[TestCase] = None) -> bool:
+   602	        """Execute a mutated buffer and queue it when it is interesting."""
+   603	        if self.out_of_budget():
+   604	            return False
+   605	        edges, is_crash, exec_time = self.run_target(data)
+   606	        return self.save_if_interesting(data, edges, is_crash, exec_time, parent)
+   607	
+   608	    # ------------------------------------------------------------------
+   609	    # Queue management
+   610	    # ------------------------------------------------------------------
+   611	    def save_if_interesting(
+   612	        self,
+   613	        data: bytes,
+   614	        edges: Set[int],
+   615	        is_crash: bool,
+   616	        exec_time: float,
+   617	        parent: Optional[TestCase] = None,
+   618	    ) -> bool:
+   619	        """AFL's save_if_interesting(): queue new coverage, de-duplicate crashes.
+   620	
+   621	        Like afl-fuzz.c, a crashing input never enters the queue: it is checked
+   622	        against the *crash* bitmap (``virgin_crash``) and, when its bucketed
+   623	        coverage hash is new, filed as a unique crash.  Only inputs that finish
+   624	        normally can extend ``virgin_bits`` and become queue entries.
+   625	        """
+   626	        trace = {e: 1 for e in edges}
+   627	        is_new = False
+   628	
+   629	        if is_crash:
+   630	            self.total_crash_execs += 1
+   631	            if self.crash_bitmap.has_new_bits(trace) > 0:
+   632	                self.crash_bitmap.update(trace)
+   633	            chash = coverage_hash(edges)
+   634	            if chash not in self.unique_crash_hashes:
+   635	                crash_tc = TestCase(
+   636	                    data=data,
+   637	                    coverage=set(edges),
+   638	                    exec_time=exec_time,
+   639	                    is_crash=True,
+   640	                    depth=(parent.depth + 1) if parent else 0,
+   641	                    creation_time=self.total_execs,
+   642	                )
+   643	                self.unique_crash_hashes[chash] = crash_tc
+   644	                self.crashes.append(crash_tc)
+   645	                if self.first_unique_crash_exec is None:
+   646	                    self.first_unique_crash_exec = self.total_execs
+   647	            self._record_history()
+   648	            return False
+   649	
+   650	        new_level = self.bitmap.has_new_bits(trace)
+   651	        if new_level > 0:
+   652	            self.bitmap.update(trace)
+   653	            tc = TestCase(
+   654	                data=data,
+   655	                coverage=set(edges),
+   656	                exec_time=exec_time,
+   657	                is_crash=is_crash,
+   658	                depth=(parent.depth + 1) if parent else 0,
+   659	                creation_time=self.total_execs,
+   660	            )
+   661	            self.queue.append(tc)
+   662	            self.queued_discovered += 1
+   663	            self.max_depth = max(self.max_depth, tc.depth)
+   664	            self.calibrate_case(tc)
+   665	            if self.use_trim:
+   666	                self.trim_case(tc)
+   667	            self.update_bitmap_score(tc)
+   668	            self.stage_finds[self.current_stage] = self.stage_finds.get(self.current_stage, 0) + 1
+   669	            is_new = True
+   670	        self._record_history()
+   671	        return is_new
+   672	
+   673	    def _record_history(self) -> None:
+   674	        self.coverage_history.append((self.total_execs, self.bitmap.get_coverage_count()))
+   675	        self.queue_history.append((self.total_execs, len(self.queue)))
+   676	
+   677	    def calibrate_case(self, tc: TestCase, cycles: int = CAL_CYCLES) -> float:
+   678	        """Run a fresh entry several times: stability detection + timing.
+   679	
+   680	        Stability is the Jaccard similarity of the coverage observed across
+   681	        runs; anything below 100% means the target has non-deterministic edges
+   682	        (AFL calls those "variable" and marks the entry).
+   683	        """
+   684	        traces: List[Set[int]] = []
+   685	        total_time = 0.0
+   686	        for _ in range(max(1, cycles)):
+   687	            if self.out_of_budget():
+   688	                break
+   689	            edges, _crash, exec_time = self.run_target(tc.data)
+   690	            traces.append(set(edges))
+   691	            total_time += exec_time
+   692	        if not traces:
+   693	            return 100.0
+   694	
+   695	        union: Set[int] = set()
+   696	        intersection: Optional[Set[int]] = None
+   697	        for t in traces:
+   698	            union |= t
+   699	            intersection = set(t) if intersection is None else (intersection & t)
+   700	        intersection = intersection or set()
+   701	        stability = 100.0 if not union else len(intersection) / len(union) * 100.0
+   702	
+   703	        tc.exec_time = total_time / len(traces)
+   704	        tc.coverage = set(union)
+   705	        tc.is_variable = stability < 100.0  # type: ignore[attr-defined]
+   706	        tc.stability = stability            # type: ignore[attr-defined]
+   707	        self.stability_samples.append(stability)
+   708	        return stability
+   709	
+   710	    def trim_case(self, tc: TestCase) -> int:
+   711	        """Powers-of-two block removal that preserves the entry's coverage."""
+   712	        if len(tc.data) < TRIM_MIN_BYTES:
+   713	            return 0
+   714	
+   715	        original_len = len(tc.data)
+   716	        reference = set(tc.coverage)
+   717	        data = bytearray(tc.data)
+   718	
+   719	        len_p2 = 1 << max(0, (len(data) - 1).bit_length())
+   720	        remove_len = max(len_p2 // TRIM_START_STEPS, TRIM_MIN_BYTES)
+   721	
+   722	        while remove_len >= max(len_p2 // TRIM_END_STEPS, 1) and remove_len > 0:
+   723	            pos = 0
+   724	            while pos + remove_len <= len(data):
+   725	                if self.out_of_budget():
+   726	                    break
+   727	                candidate = bytes(data[:pos]) + bytes(data[pos + remove_len:])
+   728	                if not candidate:
+   729	                    pos += remove_len
+   730	                    continue
+   731	                edges, _crash, exec_time = self.run_target(candidate)
+   732	                if set(edges) == reference:
+   733	                    data = bytearray(candidate)
+   734	                    tc.exec_time = exec_time
+   735	                    # Do not advance: retry the same offset on the shorter buffer.
+   736	                else:
+   737	                    pos += remove_len
+   738	            if self.out_of_budget():
+   739	                break
+   740	            remove_len //= 2
+   741	
+   742	        removed = original_len - len(data)
+   743	        if removed > 0:
+   744	            tc.data = bytes(data)
+   745	            self.trimmed_bytes += removed
+   746	        return removed
+   747	
+   748	    def fav_factor(self, tc: TestCase) -> float:
+   749	        """AFL's favourite factor: execution time multiplied by size."""
+   750	        return max(tc.exec_time, 1e-6) * max(len(tc.data), 1)
+   751	
+   752	    def update_bitmap_score(self, tc: TestCase) -> None:
+   753	        """Keep, per edge, the smallest + fastest entry covering it."""
+   754	        factor = self.fav_factor(tc)
+   755	        for edge in tc.coverage:
+   756	            current = self.top_rated.get(edge)
+   757	            if current is not None and self.fav_factor(current) <= factor:
+   758	                continue
+   759	            self.top_rated[edge] = tc
+   760	
+   761	    def cull_queue(self) -> List[TestCase]:
+   762	        """Greedy set cover over the queue: mark a minimal favoured subset.
+   763	
+   764	        Walks the edges in id order, always picking the cheapest entry that
+   765	        covers a still-uncovered edge (AFL's cull_queue()).
+   766	        """
+   767	        for tc in self.queue:
+   768	            tc.is_favored = False
+   769	            tc.unique_edges = set()
+   770	
+   771	        temp_v: Set[int] = set(self.bitmap.global_coverage)
+   772	        favored: List[TestCase] = []
+   773	        for edge in sorted(self.bitmap.global_coverage):
+   774	            if edge not in temp_v:
+   775	                continue
+   776	            best = self.top_rated.get(edge)
+   777	            if best is None:
+   778	                candidates = [tc for tc in self.queue if edge in tc.coverage]
+   779	                if not candidates:
+   780	                    continue
+   781	                best = min(candidates, key=lambda t: (self.fav_factor(t), t.creation_time))
+   782	            newly = temp_v & best.coverage
+   783	            temp_v -= best.coverage
+   784	            if not best.is_favored:
+   785	                best.is_favored = True
+   786	                best.unique_edges = set(newly)
+   787	                favored.append(best)
+   788	            else:
+   789	                best.unique_edges |= newly
+   790	
+   791	        self.pending_favored = sum(1 for tc in self.queue if tc.is_favored and not tc.was_fuzzed)
+   792	        self.pending_not_fuzzed = sum(1 for tc in self.queue if not tc.was_fuzzed)
+   793	        return favored
+   794	
+   795	    @property
+   796	    def favored_count(self) -> int:
+   797	        return sum(1 for tc in self.queue if tc.is_favored)
+   798	
+   799	    # ------------------------------------------------------------------
+   800	    # Scheduling
+   801	    # ------------------------------------------------------------------
+   802	    def select_next_seed(self) -> Optional[TestCase]:
+   803	        """Walk the queue honouring AFL's favoured-first skip probabilities."""
+   804	        if not self.queue:
+   805	            return None
+   806	        attempts = 0
+   807	        limit = max(4 * len(self.queue), 8)
+   808	        while attempts <= limit:
+   809	            attempts += 1
+   810	            if self.current_index >= len(self.queue):
+   811	                self.current_index = 0
+   812	                self.queue_cycle += 1
+   813	                self.cull_queue()
+   814	                if self.max_cycles is not None and self.queue_cycle > self.max_cycles:
+   815	                    return None
+   816	            tc = self.queue[self.current_index]
+   817	            self.current_index += 1
+   818	            if self.should_skip(tc):
+   819	                continue
+   820	            return tc
+   821	        return self.queue[0]
+   822	
+   823	    def should_skip(self, tc: TestCase) -> bool:
+   824	        """AFL's skip logic: favoured entries first, 75/25 for the rest."""
+   825	        if self.pending_favored > 0:
+   826	            if (tc.was_fuzzed or not tc.is_favored) and self.rng.randint(0, 100) < SKIP_TO_NEW_PROB:
+   827	                return True
+   828	        elif not tc.is_favored and len(self.queue) > 10:
+   829	            if self.queue_cycle > 1 and not tc.was_fuzzed:
+   830	                if self.rng.randint(0, 100) < SKIP_NFAV_NEW_PROB:
+   831	                    return True
+   832	            else:
+   833	                if self.rng.randint(0, 100) < SKIP_NFAV_OLD_PROB:
+   834	                    return True
+   835	        return False
+   836	
+   837	    def calculate_score(self, tc: TestCase) -> float:
+   838	        """AFL's calculate_score(): exec speed, bitmap size, handicap, depth."""
+   839	        perf_score = 100.0
+   840	        avg_exec_time = (
+   841	            sum(q.exec_time for q in self.queue) / len(self.queue) if self.queue else tc.exec_time
+   842	        )
+   843	        avg_bitmap_size = (
+   844	            sum(len(q.coverage) for q in self.queue) / len(self.queue) if self.queue else 1.0
+   845	        )
+   846	        avg_exec_time = max(avg_exec_time, 1e-9)
+   847	        avg_bitmap_size = max(avg_bitmap_size, 1e-9)
+   848	
+   849	        t = tc.exec_time
+   850	        if t * 0.1 > avg_exec_time:
+   851	            perf_score = 10.0
+   852	        elif t * 0.25 > avg_exec_time:
+   853	            perf_score = 25.0
+   854	        elif t * 0.5 > avg_exec_time:
+   855	            perf_score = 50.0
+   856	        elif t * 0.75 > avg_exec_time:
+   857	            perf_score = 75.0
+   858	        elif t * 4 < avg_exec_time:
+   859	            perf_score = 300.0
+   860	        elif t * 3 < avg_exec_time:
+   861	            perf_score = 200.0
+   862	        elif t * 2 < avg_exec_time:
+   863	            perf_score = 150.0
+   864	
+   865	        bsize = len(tc.coverage)
+   866	        if bsize * 0.3 > avg_bitmap_size:
+   867	            perf_score *= 3.0
+   868	        elif bsize * 0.5 > avg_bitmap_size:
+   869	            perf_score *= 2.0
+   870	        elif bsize * 0.75 > avg_bitmap_size:
+   871	            perf_score *= 1.5
+   872	        elif bsize * 3 < avg_bitmap_size:
+   873	            perf_score *= 0.25
+   874	        elif bsize * 2 < avg_bitmap_size:
+   875	            perf_score *= 0.5
+   876	        elif bsize * 1.5 < avg_bitmap_size:
+   877	            perf_score *= 0.75
+   878	
+   879	        handicap = getattr(tc, "handicap", 0)
+   880	        if handicap >= 4:
+   881	            perf_score *= 4.0
+   882	            tc.handicap = handicap - 4  # type: ignore[attr-defined]
+   883	        elif handicap:
+   884	            perf_score *= 2.0
+   885	            tc.handicap = handicap - 1  # type: ignore[attr-defined]
+   886	
+   887	        depth = tc.depth
+   888	        if depth <= 3:
+   889	            pass
+   890	        elif depth <= 7:
+   891	            perf_score *= 2.0
+   892	        elif depth <= 13:
+   893	            perf_score *= 3.0
+   894	        elif depth <= 25:
+   895	            perf_score *= 4.0
+   896	        else:
+   897	            perf_score *= 5.0
+   898	
+   899	        stability = getattr(tc, "stability", 100.0)
+   900	        if stability < 100.0:
+   901	            perf_score *= max(0.25, stability / 100.0)
+   902	
+   903	        return min(perf_score, HAVOC_MAX_MULT * 100.0)
+   904	
+   905	    def assign_energy(self, tc: TestCase) -> float:
+   906	        """Energy (havoc iterations budget) from the active power schedule."""
+   907	        energy = self.power_schedule.assign_energy(self, tc)
+   908	        self.energy_log.append(energy)
+   909	        return energy
+   910	
+   911	    # ------------------------------------------------------------------
+   912	    # Deterministic stages
+   913	    # ------------------------------------------------------------------
+   914	    def _set_stage(self, name: str) -> None:
+   915	        self.current_stage = name
+   916	
+   917	    def stage_bitflip1(self, tc: TestCase) -> None:
+   918	        """Walking 1 bit flips, with auto-dictionary token extraction."""
+   919	        self._set_stage("bitflip 1/1")
+   920	        data = bytearray(tc.data)
+   921	        nbits = len(data) * 8
+   922	        base_hash = coverage_hash(tc.coverage)
+   923	        prev_hash = base_hash
+   924	        collected = bytearray()
+   925	
+   926	        for bit in range(nbits):
+   927	            if self.out_of_budget():
+   928	                return
+   929	            byte_idx, bit_idx = bit // 8, bit % 8
+   930	            data[byte_idx] ^= 1 << (7 - bit_idx)
+   931	            candidate = bytes(data)
+   932	            edges, is_crash, exec_time = self.run_target(candidate)
+   933	            self.save_if_interesting(candidate, edges, is_crash, exec_time, tc)
+   934	            data[byte_idx] ^= 1 << (7 - bit_idx)
+   935	
+   936	            # Auto dictionary extraction (AFL's a_collect trick): a run of
+   937	            # consecutive bytes whose flips all perturb coverage identically
+   938	            # looks like a syntax token.
+   939	            cur_hash = coverage_hash(edges)
+   940	            if bit_idx == 7:
+   941	                if bit == nbits - 1 and cur_hash == prev_hash:
+   942	                    collected.append(data[byte_idx])
+   943	                    self._flush_auto(collected)
+   944	                elif cur_hash != prev_hash:
+   945	                    self._flush_auto(collected)
+   946	                    prev_hash = cur_hash
+   947	                if cur_hash != base_hash:
+   948	                    if len(collected) < MAX_AUTO_EXTRA:
+   949	                        collected.append(data[byte_idx])
+   950	                    else:
+   951	                        self._flush_auto(collected)
+   952	                else:
+   953	                    self._flush_auto(collected)
+   954	        self._flush_auto(collected)
+   955	
+   956	    def _flush_auto(self, collected: bytearray) -> None:
+   957	        if MIN_AUTO_EXTRA <= len(collected) <= MAX_AUTO_EXTRA:
+   958	            self.dictionary.maybe_add_auto(bytes(collected))
+   959	        collected.clear()
+   960	
+   961	    def stage_bitflip2(self, tc: TestCase) -> None:
+   962	        """Walking 2 bit flips."""
+   963	        self._set_stage("bitflip 2/1")
+   964	        data = bytearray(tc.data)
+   965	        nbits = len(data) * 8
+   966	        for bit in range(max(0, nbits - 1)):
+   967	            if self.out_of_budget():
+   968	                return
+   969	            for off in (0, 1):
+   970	                idx = (bit + off) // 8
+   971	                data[idx] ^= 1 << (7 - (bit + off) % 8)
+   972	            candidate = bytes(data)
+   973	            self.common_fuzz_stuff(candidate, tc)
+   974	            for off in (0, 1):
+   975	                idx = (bit + off) // 8
+   976	                data[idx] ^= 1 << (7 - (bit + off) % 8)
+   977	
+   978	    def stage_bitflip4(self, tc: TestCase) -> None:
+   979	        """Walking 4 bit flips."""
+   980	        self._set_stage("bitflip 4/1")
+   981	        data = bytearray(tc.data)
+   982	        nbits = len(data) * 8
+   983	        for bit in range(max(0, nbits - 3)):
+   984	            if self.out_of_budget():
+   985	                return
+   986	            for off in range(4):
+   987	                idx = (bit + off) // 8
+   988	                data[idx] ^= 1 << (7 - (bit + off) % 8)
+   989	            candidate = bytes(data)
+   990	            self.common_fuzz_stuff(candidate, tc)
+   991	            for off in range(4):
+   992	                idx = (bit + off) // 8
+   993	                data[idx] ^= 1 << (7 - (bit + off) % 8)
+   994	
+   995	    def stage_byteflip8(self, tc: TestCase) -> List[int]:
+   996	        """Walking byte flips; builds the effector map used by later stages."""
+   997	        self._set_stage("bitflip 8/8")
+   998	        data = bytearray(tc.data)
+   999	        eff_map = [0] * max(1, len(data))
+  1000	        if len(data):
+  1001	            eff_map[0] = 1
+  1002	            eff_map[-1] = 1
+  1003	        base_hash = coverage_hash(tc.coverage)
+  1004	        for i in range(len(data)):
+  1005	            if self.out_of_budget():
+  1006	                break
+  1007	            data[i] ^= 0xFF
+  1008	            candidate = bytes(data)
+  1009	            edges, is_crash, exec_time = self.run_target(candidate)
+  1010	            self.save_if_interesting(candidate, edges, is_crash, exec_time, tc)
+  1011	            if coverage_hash(edges) != base_hash:
+  1012	                eff_map[i] = 1
+  1013	            data[i] ^= 0xFF
+  1014	        return eff_map
+  1015	
+  1016	    def stage_byteflip16(self, tc: TestCase, eff_map: List[int]) -> None:
+  1017	        self._set_stage("bitflip 16/8")
+  1018	        data = bytearray(tc.data)
+  1019	        for i in range(max(0, len(data) - 1)):
+  1020	            if self.out_of_budget():
+  1021	                return
+  1022	            if not eff_map[i] and not eff_map[i + 1]:
+  1023	                continue
+  1024	            data[i] ^= 0xFF
+  1025	            data[i + 1] ^= 0xFF
+  1026	            self.common_fuzz_stuff(bytes(data), tc)
+  1027	            data[i] ^= 0xFF
+  1028	            data[i + 1] ^= 0xFF
+  1029	
+  1030	    def stage_byteflip32(self, tc: TestCase, eff_map: List[int]) -> None:
+  1031	        self._set_stage("bitflip 32/8")
+  1032	        data = bytearray(tc.data)
+  1033	        for i in range(max(0, len(data) - 3)):
+  1034	            if self.out_of_budget():
+  1035	                return
+  1036	            if not any(eff_map[i:i + 4]):
+  1037	                continue
+  1038	            for off in range(4):
+  1039	                data[i + off] ^= 0xFF
+  1040	            self.common_fuzz_stuff(bytes(data), tc)
+  1041	            for off in range(4):
+  1042	                data[i + off] ^= 0xFF
+  1043	
+  1044	    def stage_arith8(self, tc: TestCase, eff_map: List[int]) -> None:
+  1045	        """8 bit arithmetics: +/- 1..ARITH_MAX on every effective byte."""
+  1046	        self._set_stage("arith 8/8")
+  1047	        data = bytearray(tc.data)
+  1048	        for i in range(len(data)):
+  1049	            if not eff_map[i]:
+  1050	                continue
+  1051	            orig = data[i]
+  1052	            for j in range(1, ARITH_MAX + 1):
+  1053	                if self.out_of_budget():
+  1054	                    return
+  1055	                for value in ((orig + j) & 0xFF, (orig - j) & 0xFF):
+  1056	                    if could_be_bitflip(orig ^ value):
+  1057	                        continue
+  1058	                    data[i] = value
+  1059	                    self.common_fuzz_stuff(bytes(data), tc)
+  1060	                    data[i] = orig
+  1061	
+  1062	    def _stage_arith_wide(self, tc: TestCase, eff_map: List[int], width: int, label: str) -> None:
+  1063	        """16/32 bit arithmetics in both endiannesses.
+  1064	
+  1065	        Like AFL we only try the wide operation when it carries over a byte
+  1066	        (16 bit) or word (32 bit) boundary - otherwise the 8 bit stage has
+  1067	        already covered the same value.
+  1068	        """
+  1069	        self._set_stage(label)
+  1070	        data = bytearray(tc.data)
+  1071	        bits = 8 * width
+  1072	        mask = (1 << bits) - 1
+  1073	        half_mask = (1 << (bits // 2)) - 1
+  1074	        swap = swap16 if width == 2 else swap32
+  1075	
+  1076	        for i in range(max(0, len(data) - width + 1)):
+  1077	            if not any(eff_map[i:i + width]):
+  1078	                continue
+  1079	            orig_bytes = bytes(data[i:i + width])
+  1080	            orig_le = int.from_bytes(orig_bytes, "little")
+  1081	            orig_be = swap(orig_le)
+  1082	            for j in range(1, ARITH_MAX + 1):
+  1083	                if self.out_of_budget():
+  1084	                    return
+  1085	                candidates = []
+  1086	                # Little endian add / sub (only if it crosses a boundary).
+  1087	                if (orig_le & half_mask) + j > half_mask:
+  1088	                    candidates.append((orig_le + j) & mask)
+  1089	                if (orig_le & half_mask) < j:
+  1090	                    candidates.append((orig_le - j) & mask)
+  1091	                # Big endian add / sub.
+  1092	                if (orig_be & half_mask) + j > half_mask:
+  1093	                    candidates.append(swap((orig_be + j) & mask))
+  1094	                if (orig_be & half_mask) < j:
+  1095	                    candidates.append(swap((orig_be - j) & mask))
+  1096	
+  1097	                for new_le in candidates:
+  1098	                    if could_be_bitflip(orig_le ^ new_le):
+  1099	                        continue
+  1100	                    data[i:i + width] = int(new_le).to_bytes(width, "little")
+  1101	                    self.common_fuzz_stuff(bytes(data), tc)
+  1102	                    data[i:i + width] = orig_bytes
+  1103	
+  1104	    def stage_arith16(self, tc: TestCase, eff_map: List[int]) -> None:
+  1105	        self._stage_arith_wide(tc, eff_map, 2, "arith 16/8")
+  1106	
+  1107	    def stage_arith32(self, tc: TestCase, eff_map: List[int]) -> None:
+  1108	        self._stage_arith_wide(tc, eff_map, 4, "arith 32/8")
+  1109	
+  1110	    def stage_interest8(self, tc: TestCase, eff_map: List[int]) -> None:
+  1111	        """Overwrite single bytes with AFL's interesting 8 bit values."""
+  1112	        self._set_stage("interest 8/8")
+  1113	        data = bytearray(tc.data)
+  1114	        for i in range(len(data)):
+  1115	            if not eff_map[i]:
+  1116	                continue
+  1117	            orig = data[i]
+  1118	            for interesting in INTERESTING_8:
+  1119	                if self.out_of_budget():
+  1120	                    return
+  1121	                value = interesting & 0xFF
+  1122	                if could_be_bitflip(orig ^ value) or could_be_arith(orig, value, 1):
+  1123	                    continue
+  1124	                data[i] = value
+  1125	                self.common_fuzz_stuff(bytes(data), tc)
+  1126	                data[i] = orig
+  1127	
+  1128	    def _stage_interest_wide(
+  1129	        self, tc: TestCase, eff_map: List[int], width: int, values: Sequence[int], label: str
+  1130	    ) -> None:
+  1131	        """16/32 bit interesting values, little endian then big endian."""
+  1132	        self._set_stage(label)
+  1133	        data = bytearray(tc.data)
+  1134	        bits = 8 * width
+  1135	        mask = (1 << bits) - 1
+  1136	        swap = swap16 if width == 2 else swap32
+  1137	
+  1138	        for i in range(max(0, len(data) - width + 1)):
+  1139	            if not any(eff_map[i:i + width]):
+  1140	                continue
+  1141	            orig_bytes = bytes(data[i:i + width])
+  1142	            orig_le = int.from_bytes(orig_bytes, "little")
+  1143	            for interesting in values:
+  1144	                if self.out_of_budget():
+  1145	                    return
+  1146	                value = interesting & mask
+  1147	                # Little endian variant.
+  1148	                if not (
+  1149	                    could_be_bitflip(orig_le ^ value)
+  1150	                    or could_be_arith(orig_le, value, width)
+  1151	                    or could_be_interest(orig_le, value, width, False)
+  1152	                ):
+  1153	                    data[i:i + width] = int(value).to_bytes(width, "little")
+  1154	                    self.common_fuzz_stuff(bytes(data), tc)
+  1155	                    data[i:i + width] = orig_bytes
+  1156	                # Big endian variant (skipped when byte order does not matter).
+  1157	                swapped = swap(value)
+  1158	                if swapped != value and not (
+  1159	                    could_be_bitflip(orig_le ^ swapped)
+  1160	                    or could_be_arith(orig_le, swapped, width)
+  1161	                    or could_be_interest(orig_le, swapped, width, True)
+  1162	                ):
+  1163	                    data[i:i + width] = int(swapped).to_bytes(width, "little")
+  1164	                    self.common_fuzz_stuff(bytes(data), tc)
+  1165	                    data[i:i + width] = orig_bytes
+  1166	
+  1167	    def stage_interest16(self, tc: TestCase, eff_map: List[int]) -> None:
+  1168	        self._stage_interest_wide(tc, eff_map, 2, INTERESTING_16, "interest 16/8")
+  1169	
+  1170	    def stage_interest32(self, tc: TestCase, eff_map: List[int]) -> None:
+  1171	        self._stage_interest_wide(tc, eff_map, 4, INTERESTING_32, "interest 32/8")
+  1172	
+  1173	    def stage_dictionary(self, tc: TestCase, use_auto: bool = False) -> None:
+  1174	        """Overwrite/insert user (``-x``) or auto-extracted dictionary tokens."""
+  1175	        tokens = self.dictionary.auto_extras if use_auto else self.dictionary.extras
+  1176	        if not tokens:
+  1177	            return
+  1178	        self._set_stage("auto extras (over)" if use_auto else "user extras (over)")
+  1179	        limit = MAX_AUTO_EXTRAS if use_auto else MAX_DET_EXTRAS
+  1180	        data = bytes(tc.data)
+  1181	        for i in range(len(data)):
+  1182	            for token in tokens[:limit]:
+  1183	                if self.out_of_budget():
+  1184	                    return
+  1185	                if i + len(token) > len(data):
+  1186	                    continue
+  1187	                candidate = data[:i] + token + data[i + len(token):]
+  1188	                if candidate == data:
+  1189	                    continue
+  1190	                self.common_fuzz_stuff(candidate, tc)
+  1191	        if use_auto:
+  1192	            return
+  1193	        # User extras are also inserted (growing the input).
+  1194	        self._set_stage("user extras (insert)")
+  1195	        for i in range(len(data) + 1):
+  1196	            for token in tokens[:limit]:
+  1197	                if self.out_of_budget():
+  1198	                    return
+  1199	                candidate = data[:i] + token + data[i:]
+  1200	                self.common_fuzz_stuff(candidate, tc)
+  1201	
+  1202	    def run_deterministic_stages(self, tc: TestCase) -> None:
+  1203	        """The full deterministic pipeline in AFL's order."""
+  1204	        self.stage_bitflip1(tc)
+  1205	        self.stage_bitflip2(tc)
+  1206	        self.stage_bitflip4(tc)
+  1207	        eff_map = self.stage_byteflip8(tc)
+  1208	        self.stage_byteflip16(tc, eff_map)
+  1209	        self.stage_byteflip32(tc, eff_map)
+  1210	        self.stage_arith8(tc, eff_map)
+  1211	        self.stage_arith16(tc, eff_map)
+  1212	        self.stage_arith32(tc, eff_map)
+  1213	        self.stage_interest8(tc, eff_map)
+  1214	        self.stage_interest16(tc, eff_map)
+  1215	        self.stage_interest32(tc, eff_map)
+  1216	        self.stage_dictionary(tc, use_auto=False)
+  1217	        self.stage_dictionary(tc, use_auto=True)
+  1218	
+  1219	    # ------------------------------------------------------------------
+  1220	    # Havoc / splice
+  1221	    # ------------------------------------------------------------------
+  1222	    def havoc_mutate(
+  1223	        self,
+  1224	        data: bytes,
+  1225	        num_ops: Optional[int] = None,
+  1226	        allowed_positions: Optional[Set[int]] = None,
+  1227	    ) -> bytes:
+  1228	        """Apply a stack of 2^1..2^7 random mutations (AFL's havoc).
+  1229	
+  1230	        ``allowed_positions`` restricts byte-modifying operators to a subset of
+  1231	        offsets; FairFuzz uses it to preserve influential bytes.
+  1232	        """
+  1233	        rng = self.rng
+  1234	        if num_ops is None:
+  1235	            num_ops = 1 << (1 + rng.randint(0, HAVOC_STACK_POW2))
+  1236	        out = bytearray(data if data else b"\x00")
+  1237	
+  1238	        def pick_pos(limit: int) -> int:
+  1239	            if limit <= 0:
+  1240	                return 0
+  1241	            if allowed_positions:
+  1242	                choices = sorted(p for p in allowed_positions if p < limit)
+  1243	                if choices:
+  1244	                    return int(choices[rng.randint(0, len(choices))])
+  1245	            return int(rng.randint(0, limit))
+  1246	
+  1247	        length_ops_allowed = allowed_positions is None
+  1248	        num_operators = 15 if length_ops_allowed else 11
+  1249	
+  1250	        for _ in range(num_ops):
+  1251	            if not out:
+  1252	                out = bytearray(b"\x00")
+  1253	            op = rng.randint(0, num_operators)
+  1254	            if op == 0:  # flip a single bit
+  1255	                pos = pick_pos(len(out))
+  1256	                out[pos] ^= 1 << rng.randint(0, 8)
+  1257	            elif op == 1:  # set an interesting 8 bit value
+  1258	                pos = pick_pos(len(out))
+  1259	                out[pos] = INTERESTING_8[rng.randint(0, len(INTERESTING_8))] & 0xFF
+  1260	            elif op == 2:  # set an interesting 16 bit value
+  1261	                if len(out) >= 2:
+  1262	                    pos = pick_pos(len(out) - 1)
+  1263	                    value = INTERESTING_16[rng.randint(0, len(INTERESTING_16))] & 0xFFFF
+  1264	                    order = "little" if rng.randint(0, 2) else "big"
+  1265	                    out[pos:pos + 2] = value.to_bytes(2, order)
+  1266	            elif op == 3:  # set an interesting 32 bit value
+  1267	                if len(out) >= 4:
+  1268	                    pos = pick_pos(len(out) - 3)
+  1269	                    value = INTERESTING_32[rng.randint(0, len(INTERESTING_32))] & 0xFFFFFFFF
+  1270	                    order = "little" if rng.randint(0, 2) else "big"
+  1271	                    out[pos:pos + 4] = value.to_bytes(4, order)
+  1272	            elif op == 4:  # subtract from a byte
+  1273	                pos = pick_pos(len(out))
+  1274	                out[pos] = (out[pos] - (1 + rng.randint(0, ARITH_MAX))) & 0xFF
+  1275	            elif op == 5:  # add to a byte
+  1276	                pos = pick_pos(len(out))
+  1277	                out[pos] = (out[pos] + (1 + rng.randint(0, ARITH_MAX))) & 0xFF
+  1278	            elif op == 6:  # 16 bit arithmetics
+  1279	                if len(out) >= 2:
+  1280	                    pos = pick_pos(len(out) - 1)
+  1281	                    order = "little" if rng.randint(0, 2) else "big"
+  1282	                    value = int.from_bytes(bytes(out[pos:pos + 2]), order)
+  1283	                    delta = 1 + rng.randint(0, ARITH_MAX)
+  1284	                    if rng.randint(0, 2):
+  1285	                        value = (value + delta) & 0xFFFF
+  1286	                    else:
+  1287	                        value = (value - delta) & 0xFFFF
+  1288	                    out[pos:pos + 2] = value.to_bytes(2, order)
+  1289	            elif op == 7:  # 32 bit arithmetics
+  1290	                if len(out) >= 4:
+  1291	                    pos = pick_pos(len(out) - 3)
+  1292	                    order = "little" if rng.randint(0, 2) else "big"
+  1293	                    value = int.from_bytes(bytes(out[pos:pos + 4]), order)
+  1294	                    delta = 1 + rng.randint(0, ARITH_MAX)
+  1295	                    if rng.randint(0, 2):
+  1296	                        value = (value + delta) & 0xFFFFFFFF
+  1297	                    else:
+  1298	                        value = (value - delta) & 0xFFFFFFFF
+  1299	                    out[pos:pos + 4] = value.to_bytes(4, order)
+  1300	            elif op == 8:  # random byte (XOR with 1..255)
+  1301	                pos = pick_pos(len(out))
+  1302	                out[pos] ^= 1 + rng.randint(0, 255)
+  1303	            elif op == 9:  # overwrite with a repeated byte / copied chunk
+  1304	                if len(out) > 1:
+  1305	                    size = min(len(out), 1 + rng.randint(0, HAVOC_BLK_SMALL))
+  1306	                    dst = pick_pos(max(1, len(out) - size + 1))
+  1307	                    if rng.randint(0, 4):
+  1308	                        src = pick_pos(max(1, len(out) - size + 1))
+  1309	                        out = bytearray(clone_bytes(bytes(out), src, dst, size))
+  1310	                    else:
+  1311	                        value = rng.randint(0, 256)
+  1312	                        for k in range(size):
+  1313	                            if dst + k < len(out):
+  1314	                                out[dst + k] = value
+  1315	            elif op == 10:  # dictionary token overwrite
+  1316	                tokens = self.dictionary.all_tokens
+  1317	                if tokens:
+  1318	                    token = tokens[rng.randint(0, len(tokens))]
+  1319	                    if len(token) <= len(out):
+  1320	                        pos = pick_pos(len(out) - len(token) + 1)
+  1321	                        out[pos:pos + len(token)] = token
+  1322	            elif op == 11:  # delete bytes
+  1323	                if len(out) > TRIM_MIN_BYTES:
+  1324	                    size = 1 + rng.randint(0, min(HAVOC_BLK_SMALL, len(out) - 1))
+  1325	                    pos = int(rng.randint(0, max(1, len(out) - size + 1)))
+  1326	                    out = bytearray(delete_bytes(bytes(out), pos, size))
+  1327	            elif op == 12:  # clone / insert a block
+  1328	                size = 1 + rng.randint(0, min(HAVOC_BLK_SMALL, max(1, len(out))))
+  1329	                pos = int(rng.randint(0, len(out) + 1))
+  1330	                if rng.randint(0, 4):
+  1331	                    src = int(rng.randint(0, max(1, len(out))))
+  1332	                    chunk = bytes(out[src:src + size]) or b"\x00"
+  1333	                else:
+  1334	                    chunk = bytes([rng.randint(0, 256)]) * size
+  1335	                out = bytearray(insert_bytes(bytes(out), pos, chunk))
+  1336	            elif op == 13:  # dictionary token insert
+  1337	                tokens = self.dictionary.all_tokens
+  1338	                if tokens:
+  1339	                    token = tokens[rng.randint(0, len(tokens))]
+  1340	                    pos = int(rng.randint(0, len(out) + 1))
+  1341	                    out = bytearray(insert_bytes(bytes(out), pos, token))
+  1342	            else:  # op == 14: swap two bytes
+  1343	                if len(out) >= 2:
+  1344	                    a = pick_pos(len(out))
+  1345	                    b = pick_pos(len(out))
+  1346	                    out[a], out[b] = out[b], out[a]
+  1347	
+  1348	        return bytes(out)
+  1349	
+  1350	    def stage_havoc(self, tc: TestCase, energy: float) -> int:
+  1351	        """Random stacked mutations; the number of execs scales with energy."""
+  1352	        self._set_stage("havoc")
+  1353	        iterations = int(max(HAVOC_MIN, HAVOC_CYCLES * energy / 100.0))
+  1354	        iterations = min(iterations, self.budget_left())
+  1355	        finds = 0
+  1356	        for _ in range(iterations):
+  1357	            if self.out_of_budget():
+  1358	                break
+  1359	            candidate = self.havoc_mutate(tc.data)
+  1360	            if self.common_fuzz_stuff(candidate, tc):
+  1361	                finds += 1
+  1362	        return finds
+  1363	
+  1364	    def stage_splice(self, tc: TestCase, energy: float = 100.0) -> int:
+  1365	        """Splice the entry with another queue entry, then havoc the result."""
+  1366	        if len(self.queue) < 2:
+  1367	            return 0
+  1368	        self._set_stage("splice")
+  1369	        finds = 0
+  1370	        for _ in range(SPLICE_CYCLES):
+  1371	            if self.out_of_budget():
+  1372	                break
+  1373	            other = self.queue[self.rng.randint(0, len(self.queue))]
+  1374	            if other is tc or len(other.data) < 2 or len(tc.data) < 2:
+  1375	                continue
+  1376	            spliced = self.splice_inputs(tc.data, other.data)
+  1377	            if spliced is None:
+  1378	                continue
+  1379	            rounds = int(max(1, min(SPLICE_HAVOC * energy / 100.0, self.budget_left())))
+  1380	            for _ in range(min(rounds, SPLICE_HAVOC)):
+  1381	                if self.out_of_budget():
+  1382	                    break
+  1383	                candidate = self.havoc_mutate(spliced)
+  1384	                if self.common_fuzz_stuff(candidate, tc):
+  1385	                    finds += 1
+  1386	        return finds
+  1387	
+  1388	    def splice_inputs(self, a: bytes, b: bytes) -> Optional[bytes]:
+  1389	        """Combine two inputs at a random midpoint (AFL's splice stage)."""
+  1390	        if len(a) < 2 or len(b) < 2:
+  1391	            return None
+  1392	        # AFL looks for the first and last differing byte and splices in between.
+  1393	        limit = min(len(a), len(b))
+  1394	        first_diff = last_diff = -1
+  1395	        for i in range(limit):
+  1396	            if a[i] != b[i]:
+  1397	                if first_diff < 0:
+  1398	                    first_diff = i
+  1399	                last_diff = i
+  1400	        if first_diff < 0 or last_diff < first_diff + 1:
+  1401	            split = int(self.rng.randint(1, limit))
+  1402	        else:
+  1403	            split = int(first_diff + self.rng.randint(0, last_diff - first_diff))
+  1404	            split = max(1, min(split, limit - 1)) if limit > 1 else 1
+  1405	        return a[:split] + b[split:]
+  1406	
+  1407	    # ------------------------------------------------------------------
+  1408	    # Main loop
+  1409	    # ------------------------------------------------------------------
+  1410	    def fuzz_one(self, tc: Optional[TestCase] = None) -> int:
+  1411	        """Fuzz a single queue entry through every enabled stage."""
+  1412	        if tc is None:
+  1413	            tc = self.select_next_seed()
+  1414	        if tc is None:
+  1415	            return 0
+  1416	        self.current_target = tc
+  1417	        tc.times_chosen += 1
+  1418	        tc.fuzz_count += 1
+  1419	        before = len(self.queue)
+  1420	
+  1421	        energy = self.assign_energy(tc)
+  1422	        if energy <= 0:
+  1423	            tc.was_fuzzed = True
+  1424	            return 0
+  1425	
+  1426	        if self.deterministic and not tc.was_fuzzed:
+  1427	            self.run_deterministic_stages(tc)
+  1428	        self.stage_havoc(tc, energy)
+  1429	        if self.use_splice:
+  1430	            self.stage_splice(tc, energy)
+  1431	
+  1432	        tc.was_fuzzed = True
+  1433	        self.pending_favored = sum(1 for q in self.queue if q.is_favored and not q.was_fuzzed)
+  1434	        return len(self.queue) - before
+  1435	
+  1436	    def run(self, max_execs: Optional[int] = None) -> FuzzerStats:
+  1437	        """Run the campaign until the exec budget (or cycle cap) is exhausted."""
+  1438	        if max_execs is not None:
+  1439	            self.max_execs = max_execs
+  1440	        self.cull_queue()
+  1441	        while not self.out_of_budget():
+  1442	            tc = self.select_next_seed()
+  1443	            if tc is None:
+  1444	                break
+  1445	            self.fuzz_one(tc)
+  1446	            if self.stop_on_crash and self.first_crash_exec is not None:
+  1447	                break
+  1448	            if self.max_cycles is not None and self.queue_cycle > self.max_cycles:
+  1449	                break
+  1450	        return self.get_stats()
+  1451	
+  1452	    # ------------------------------------------------------------------
+  1453	    # Reporting
+  1454	    # ------------------------------------------------------------------
+  1455	    def get_stats(self) -> FuzzerStats:
+  1456	        stability = (
+  1457	            sum(self.stability_samples) / len(self.stability_samples)
+  1458	            if self.stability_samples
+  1459	            else 100.0
+  1460	        )
+  1461	        elapsed = max(self.fork_server.total_time, 1e-9)
+  1462	        return FuzzerStats(
+  1463	            total_execs=self.total_execs,
+  1464	            paths_discovered=len(self.queue),
+  1465	            corpus_size=len(self.queue),
+  1466	            unique_crashes=len(self.unique_crash_hashes),
+  1467	            total_crashes=self.total_crashes,
+  1468	            edges_covered=self.bitmap.get_coverage_count(),
+  1469	            edge_coverage=self.bitmap.get_coverage_percentage(self.total_edges),
+  1470	            queue_cycles=self.queue_cycle,
+  1471	            first_crash_exec=self.first_crash_exec,
+  1472	            favored_count=self.favored_count,
+  1473	            stability=stability,
+  1474	            trimmed_bytes=self.trimmed_bytes,
+  1475	            havoc_finds=self.stage_finds.get("havoc", 0),
+  1476	            splice_finds=self.stage_finds.get("splice", 0),
+  1477	            det_finds=sum(
+  1478	                count
+  1479	                for name, count in self.stage_finds.items()
+  1480	                if name not in ("havoc", "splice", "init")
+  1481	            ),
+  1482	            stage_finds=dict(self.stage_finds),
+  1483	            stage_execs=dict(self.stage_execs),
+  1484	            auto_extras=len(self.dictionary.auto_extras),
+  1485	            mean_energy=(sum(self.energy_log) / len(self.energy_log)) if self.energy_log else 0.0,
+  1486	            execs_per_sec=self.total_execs / elapsed,
+  1487	        )
+  1488	
+  1489	    def get_coverage(self) -> Set[int]:
+  1490	        return set(self.bitmap.global_coverage)
+  1491	
+  1492	    def corpus_data(self) -> List[bytes]:
+  1493	        return [tc.data for tc in self.queue]

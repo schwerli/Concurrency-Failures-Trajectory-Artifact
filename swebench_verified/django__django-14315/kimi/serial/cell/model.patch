@@ -1,0 +1,40 @@
+diff --git a/django/db/backends/base/client.py b/django/db/backends/base/client.py
+index 339f1e863c..7a758318c2 100644
+--- a/django/db/backends/base/client.py
++++ b/django/db/backends/base/client.py
+@@ -20,7 +20,8 @@ class BaseDatabaseClient:
+         )
+ 
+     def runshell(self, parameters):
+-        args, env = self.settings_to_cmd_args_env(self.connection.settings_dict, parameters)
+-        if env:
+-            env = {**os.environ, **env}
++        args, env = self.settings_to_cmd_args_env(
++            self.connection.settings_dict, parameters
++        )
++        env = {**os.environ, **env} if env else None
+         subprocess.run(args, env=env, check=True)
+diff --git a/tests/backends/base/test_client.py b/tests/backends/base/test_client.py
+index 4573bbe97b..21940f3865 100644
+--- a/tests/backends/base/test_client.py
++++ b/tests/backends/base/test_client.py
+@@ -1,3 +1,5 @@
++from unittest import mock
++
+ from django.db import connection
+ from django.db.backends.base.client import BaseDatabaseClient
+ from django.test import SimpleTestCase
+@@ -14,3 +16,13 @@ class SimpleDatabaseClientTests(SimpleTestCase):
+         )
+         with self.assertRaisesMessage(NotImplementedError, msg):
+             self.client.settings_to_cmd_args_env(None, None)
++
++    def test_runshell_use_environ(self):
++        for env in [None, {}]:
++            with self.subTest(env=env):
++                with mock.patch.object(
++                    BaseDatabaseClient, 'settings_to_cmd_args_env',
++                    return_value=([], env),
++                ), mock.patch('subprocess.run') as run:
++                    self.client.runshell(None)
++                    run.assert_called_once_with([], env=None, check=True)

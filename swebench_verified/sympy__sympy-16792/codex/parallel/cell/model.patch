@@ -1,0 +1,248 @@
+diff --git a/sympy/utilities/codegen.py b/sympy/utilities/codegen.py
+index f0befb2bd..f76363d1c 100644
+--- a/sympy/utilities/codegen.py
++++ b/sympy/utilities/codegen.py
+@@ -574,6 +574,34 @@ def __init__(self, project="project", cse=False):
+         self.project = project
+         self.cse = cse
+ 
++    def _get_argument_dimensions(self, arg):
++        if isinstance(arg, (Indexed, IndexedBase, MatrixSymbol)):
++            shape = arg.shape
++            if shape is None or any(dim is None for dim in shape):
++                return None
++            return tuple((S.Zero, dim - 1) for dim in shape)
++        return None
++
++    def _make_input_argument(self, symbol, arg=None):
++        metadata = {}
++        dimensions = self._get_argument_dimensions(
++            symbol if arg is None else arg)
++        if dimensions is not None:
++            metadata['dimensions'] = dimensions
++        return InputArgument(symbol, **metadata)
++
++    def _normalize_argument_sequence(self, argument_sequence):
++        normalized = []
++        original_args = {}
++        for arg in argument_sequence:
++            if isinstance(arg, IndexedBase):
++                symbol = arg.label
++            else:
++                symbol = arg
++            normalized.append(symbol)
++            original_args[symbol] = arg
++        return normalized, original_args
++
+     def routine(self, name, expr, argument_sequence=None, global_vars=None):
+         """Creates an Routine object that is appropriate for this language.
+ 
+@@ -702,29 +730,15 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+             array_symbols[array] = array
+ 
+         for symbol in sorted(symbols, key=str):
+-            if symbol in array_symbols:
+-                dims = []
+-                array = array_symbols[symbol]
+-                for dim in array.shape:
+-                    dims.append((S.Zero, dim - 1))
+-                metadata = {'dimensions': dims}
+-            else:
+-                metadata = {}
+-
+-            arg_list.append(InputArgument(symbol, **metadata))
++            arg_list.append(
++                self._make_input_argument(symbol, array_symbols.get(symbol)))
+ 
+         output_args.sort(key=lambda x: str(x.name))
+         arg_list.extend(output_args)
+ 
+         if argument_sequence is not None:
+-            # if the user has supplied IndexedBase instances, we'll accept that
+-            new_sequence = []
+-            for arg in argument_sequence:
+-                if isinstance(arg, IndexedBase):
+-                    new_sequence.append(arg.label)
+-                else:
+-                    new_sequence.append(arg)
+-            argument_sequence = new_sequence
++            argument_sequence, original_args = self._normalize_argument_sequence(
++                argument_sequence)
+ 
+             missing = [x for x in arg_list if x.name not in argument_sequence]
+             if missing:
+@@ -739,7 +753,8 @@ def routine(self, name, expr, argument_sequence=None, global_vars=None):
+                 try:
+                     new_args.append(name_arg_dict[symbol])
+                 except KeyError:
+-                    new_args.append(InputArgument(symbol))
++                    new_args.append(
++                        self._make_input_argument(symbol, original_args.get(symbol)))
+             arg_list = new_args
+ 
+         return Routine(name, arg_list, return_val, local_vars, global_vars)
+@@ -1377,17 +1392,12 @@ def routine(self, name, expr, argument_sequence, global_vars):
+             array_symbols[array] = array
+ 
+         for symbol in sorted(symbols, key=str):
+-            arg_list.append(InputArgument(symbol))
++            arg_list.append(
++                self._make_input_argument(symbol, array_symbols.get(symbol)))
+ 
+         if argument_sequence is not None:
+-            # if the user has supplied IndexedBase instances, we'll accept that
+-            new_sequence = []
+-            for arg in argument_sequence:
+-                if isinstance(arg, IndexedBase):
+-                    new_sequence.append(arg.label)
+-                else:
+-                    new_sequence.append(arg)
+-            argument_sequence = new_sequence
++            argument_sequence, original_args = self._normalize_argument_sequence(
++                argument_sequence)
+ 
+             missing = [x for x in arg_list if x.name not in argument_sequence]
+             if missing:
+@@ -1402,7 +1412,8 @@ def routine(self, name, expr, argument_sequence, global_vars):
+                 try:
+                     new_args.append(name_arg_dict[symbol])
+                 except KeyError:
+-                    new_args.append(InputArgument(symbol))
++                    new_args.append(
++                        self._make_input_argument(symbol, original_args.get(symbol)))
+             arg_list = new_args
+ 
+         return Routine(name, arg_list, return_vals, local_vars, global_vars)
+@@ -1585,17 +1596,12 @@ def routine(self, name, expr, argument_sequence, global_vars):
+             array_symbols[array] = array
+ 
+         for symbol in sorted(symbols, key=str):
+-            arg_list.append(InputArgument(symbol))
++            arg_list.append(
++                self._make_input_argument(symbol, array_symbols.get(symbol)))
+ 
+         if argument_sequence is not None:
+-            # if the user has supplied IndexedBase instances, we'll accept that
+-            new_sequence = []
+-            for arg in argument_sequence:
+-                if isinstance(arg, IndexedBase):
+-                    new_sequence.append(arg.label)
+-                else:
+-                    new_sequence.append(arg)
+-            argument_sequence = new_sequence
++            argument_sequence, original_args = self._normalize_argument_sequence(
++                argument_sequence)
+ 
+             missing = [x for x in arg_list if x.name not in argument_sequence]
+             if missing:
+@@ -1610,7 +1616,8 @@ def routine(self, name, expr, argument_sequence, global_vars):
+                 try:
+                     new_args.append(name_arg_dict[symbol])
+                 except KeyError:
+-                    new_args.append(InputArgument(symbol))
++                    new_args.append(
++                        self._make_input_argument(symbol, original_args.get(symbol)))
+             arg_list = new_args
+ 
+         return Routine(name, arg_list, return_vals, local_vars, global_vars)
+@@ -1816,17 +1823,12 @@ def routine(self, name, expr, argument_sequence, global_vars):
+             array_symbols[array] = array
+ 
+         for symbol in sorted(symbols, key=str):
+-            arg_list.append(InputArgument(symbol))
++            arg_list.append(
++                self._make_input_argument(symbol, array_symbols.get(symbol)))
+ 
+         if argument_sequence is not None:
+-            # if the user has supplied IndexedBase instances, we'll accept that
+-            new_sequence = []
+-            for arg in argument_sequence:
+-                if isinstance(arg, IndexedBase):
+-                    new_sequence.append(arg.label)
+-                else:
+-                    new_sequence.append(arg)
+-            argument_sequence = new_sequence
++            argument_sequence, original_args = self._normalize_argument_sequence(
++                argument_sequence)
+ 
+             missing = [x for x in arg_list if x.name not in argument_sequence]
+             if missing:
+@@ -1841,7 +1843,8 @@ def routine(self, name, expr, argument_sequence, global_vars):
+                 try:
+                     new_args.append(name_arg_dict[symbol])
+                 except KeyError:
+-                    new_args.append(InputArgument(symbol))
++                    new_args.append(
++                        self._make_input_argument(symbol, original_args.get(symbol)))
+             arg_list = new_args
+ 
+         return Routine(name, arg_list, return_vals, local_vars, global_vars)
+diff --git a/sympy/utilities/tests/test_autowrap.py b/sympy/utilities/tests/test_autowrap.py
+index 47fe933dc..f291b1873 100644
+--- a/sympy/utilities/tests/test_autowrap.py
++++ b/sympy/utilities/tests/test_autowrap.py
+@@ -5,8 +5,9 @@
+ import tempfile
+ import shutil
+ 
+-from sympy.core import symbols, Eq
++from sympy.core import symbols, Eq, Float
+ from sympy.core.compatibility import StringIO
++from sympy.matrices import MatrixSymbol
+ from sympy.utilities.autowrap import (autowrap, binary_function,
+             CythonCodeWrapper, UfuncifyCodeWrapper, CodeWrapper)
+ from sympy.utilities.codegen import (
+@@ -205,6 +206,25 @@ def test_cython_wrapper_unique_dummyvars():
+     expected = expected_template.format(x_id=x_id, y_id=y_id, z_id=z_id)
+     assert source == expected
+ 
++
++def test_cython_wrapper_unused_matrix_input():
++    x = MatrixSymbol('x', 2, 1)
++    routine = make_routine("test", Float(1.0), argument_sequence=[x], language="C")
++    code_gen = CythonCodeWrapper(CCodeGen())
++    source = get_string(code_gen.dump_pyx, [routine])
++
++    expected = (
++        "import numpy as np\n"
++        "cimport numpy as np\n\n"
++        "cdef extern from 'file.h':\n"
++        "    double test(double *x)\n"
++        "\n"
++        "def test_c(np.ndarray[np.double_t, ndim=2] x):\n"
++        "\n"
++        "    return test(<double*> x.data)")
++    assert source == expected
++
++
+ def test_autowrap_dummy():
+     x, y, z = symbols('x y z')
+ 
+diff --git a/sympy/utilities/tests/test_codegen.py b/sympy/utilities/tests/test_codegen.py
+index 1cd56e12d..7f4dc231d 100644
+--- a/sympy/utilities/tests/test_codegen.py
++++ b/sympy/utilities/tests/test_codegen.py
+@@ -1,4 +1,4 @@
+-from sympy.core import symbols, Eq, pi, Catalan, Lambda, Dummy
++from sympy.core import symbols, Eq, pi, Catalan, Lambda, Dummy, Float, S
+ from sympy.core.compatibility import StringIO
+ from sympy import erf, Integral, Symbol
+ from sympy import Equality
+@@ -56,6 +56,17 @@ def test_Routine_argument_order():
+     assert [ arg.name for arg in r.arguments ] == [z, x, a, y]
+ 
+ 
++def test_Routine_unused_matrix_argument_preserves_dimensions():
++    x = MatrixSymbol('x', 2, 1)
++    r = make_routine('test', Float(1.0), argument_sequence=[x], language="C")
++    assert [arg.name for arg in r.arguments] == [x]
++    assert [type(arg) for arg in r.arguments] == [InputArgument]
++    assert r.arguments[0].dimensions == (
++        (S.Zero, S.One),
++        (S.Zero, S.Zero),
++    )
++
++
+ def test_empty_c_code():
+     code_gen = C89CodeGen()
+     source = get_string(code_gen.dump_c, [])

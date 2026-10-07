@@ -1,0 +1,233 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index d913658291..ecf590e3a4 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -150,6 +150,59 @@ class Combinable:
+         )
+ 
+ 
++def _resolve_combined_type(connector, lhs_type=None, rhs_type=None):
++    """
++    Return the resulting field type used in combined expressions.
++    """
++    if rhs_type is None:
++        return lhs_type
++    if lhs_type == rhs_type:
++        # Valid connectors for same types.
++        for combinable_type, connectors in _combinable_types.items():
++            if issubclass(lhs_type, combinable_type) and connector in connectors:
++                return lhs_type
++        return None
++    # Other combinations.
++    combination = _connector_combinations.get(connector, {})
++    return combination.get((lhs_type, rhs_type)) or combination.get((rhs_type, lhs_type))
++
++
++_connector_combinations = {
++    # Date and DurationField.
++    Combinable.ADD: {
++        (fields.DateField, fields.DurationField): fields.DateTimeField,
++        (fields.DateTimeField, fields.DurationField): fields.DateTimeField,
++        (fields.TimeField, fields.DurationField): fields.TimeField,
++    },
++    Combinable.SUB: {
++        (fields.DateField, fields.DurationField): fields.DateTimeField,
++        (fields.DateTimeField, fields.DurationField): fields.DateTimeField,
++        (fields.TimeField, fields.DurationField): fields.TimeField,
++    },
++}
++
++_combinable_types = {
++    fields.DateField: (Combinable.ADD, Combinable.SUB),
++    fields.DateTimeField: (Combinable.ADD, Combinable.SUB),
++    fields.DurationField: (Combinable.ADD, Combinable.SUB),
++    fields.TimeField: (Combinable.ADD, Combinable.SUB),
++    fields.DecimalField: (
++        Combinable.ADD, Combinable.SUB, Combinable.MUL, Combinable.DIV,
++        Combinable.MOD, Combinable.POW,
++    ),
++    fields.FloatField: (
++        Combinable.ADD, Combinable.SUB, Combinable.MUL, Combinable.DIV,
++        Combinable.MOD, Combinable.POW,
++    ),
++    fields.IntegerField: (
++        Combinable.ADD, Combinable.SUB, Combinable.MUL, Combinable.DIV,
++        Combinable.MOD, Combinable.POW,
++        Combinable.BITAND, Combinable.BITOR, Combinable.BITLEFTSHIFT,
++        Combinable.BITRIGHTSHIFT, Combinable.BITXOR,
++    ),
++}
++
++
+ @deconstructible
+ class BaseExpression:
+     """Base class for all query expressions."""
+@@ -286,18 +339,18 @@ class BaseExpression:
+ 
+     def _resolve_output_field(self):
+         """
+-        Attempt to infer the output type of the expression. If the output
+-        fields of all source fields match then, simply infer the same type
+-        here. This isn't always correct, but it makes sense most of the time.
++        Attempt to infer the output type of the expression.
+ 
+-        Consider the difference between `2 + 2` and `2 / 3`. Inferring
+-        the type here is a convenience for the common case. The user should
+-        supply their own output_field with more complex computations.
++        As a guess, if the output fields of all source fields match then simply
++        infer the same type here.
+ 
+         If a source's output field resolves to None, exclude it from this check.
+         If all sources are None, then an error is raised higher up the stack in
+         the output_field property.
+         """
++        # This guess is mostly a bad idea, but there is quite a lot of code
++        # (especially 3rd party Func subclasses) that depend on it, we'd need a
++        # deprecation path to fix it.
+         sources_iter = (source for source in self.get_source_fields() if source is not None)
+         for output_field in sources_iter:
+             for source in sources_iter:
+@@ -480,6 +533,24 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
+         c.rhs = c.rhs.resolve_expression(query, allow_joins, reuse, summarize, for_save)
+         return c
+ 
++    def _resolve_output_field(self):
++        # We avoid using super() here for reasons given in
++        # Expression._resolve_output_field()
++        sources = [type(field) for field in self.get_source_fields() if field is not None]
++        if not sources:
++            return None
++        combined_type = _resolve_combined_type(self.connector, *sources)
++        if combined_type is None:
++            raise FieldError(
++                'Cannot infer type of %r expression involving these types: '
++                '%s, %s. You must set output_field.' % (
++                    self.connector,
++                    self.lhs.output_field.__class__.__name__,
++                    self.rhs.output_field.__class__.__name__,
++                )
++            )
++        return combined_type()
++
+ 
+ class DurationExpression(CombinedExpression):
+     def compile(self, side, compiler, connection):
+diff --git a/tests/aggregation/tests.py b/tests/aggregation/tests.py
+index a8377c9a26..dd1185104c 100644
+--- a/tests/aggregation/tests.py
++++ b/tests/aggregation/tests.py
+@@ -893,8 +893,8 @@ class AggregateTestCase(TestCase):
+ 
+     def test_combine_different_types(self):
+         msg = (
+-            'Expression contains mixed types: FloatField, IntegerField. '
+-            'You must set output_field.'
++            "Cannot infer type of '+' expression involving these types: "
++            'FloatField, IntegerField. You must set output_field.'
+         )
+         qs = Book.objects.annotate(sums=Sum('rating') + Sum('pages') + Sum('price'))
+         with self.assertRaisesMessage(FieldError, msg):
+diff --git a/tests/expressions/tests.py b/tests/expressions/tests.py
+index 72f95f0194..e8aade7ebe 100644
+--- a/tests/expressions/tests.py
++++ b/tests/expressions/tests.py
+@@ -9,11 +9,14 @@ from django.core.exceptions import FieldError
+ from django.db import DatabaseError, NotSupportedError, connection
+ from django.db.models import (
+     Avg, BooleanField, Case, CharField, Count, DateField, DateTimeField,
+-    DurationField, Exists, Expression, ExpressionList, ExpressionWrapper, F,
+-    Func, IntegerField, Max, Min, Model, OrderBy, OuterRef, Q, StdDev,
+-    Subquery, Sum, TimeField, UUIDField, Value, Variance, When,
++    DecimalField, DurationField, Exists, Expression, ExpressionList,
++    ExpressionWrapper, F, FloatField, Func, IntegerField, Max, Min, Model,
++    OrderBy, OuterRef, PositiveIntegerField, Q, StdDev, Subquery, Sum,
++    TimeField, UUIDField, Value, Variance, When,
++)
++from django.db.models.expressions import (
++    Col, Combinable, CombinedExpression, Random, RawSQL, Ref,
+ )
+-from django.db.models.expressions import Col, Combinable, Random, RawSQL, Ref
+ from django.db.models.functions import (
+     Coalesce, Concat, Left, Length, Lower, Substr, Upper,
+ )
+@@ -969,6 +972,80 @@ class FTests(SimpleTestCase):
+         self.assertNotEqual(value, f)
+ 
+ 
++class CombinedExpressionTests(SimpleTestCase):
++    def test_resolve_output_field(self):
++        tests = [
++            # Valid connectors for same types.
++            (Combinable.ADD, DateTimeField, DateTimeField, DateTimeField),
++            (Combinable.SUB, DateTimeField, DateTimeField, DateTimeField),
++            (Combinable.ADD, DurationField, DurationField, DurationField),
++            (Combinable.ADD, IntegerField, IntegerField, IntegerField),
++            (Combinable.MUL, DecimalField, DecimalField, DecimalField),
++            (Combinable.DIV, FloatField, FloatField, FloatField),
++            # Subclasses of combinable types.
++            (
++                Combinable.ADD,
++                PositiveIntegerField, PositiveIntegerField,
++                PositiveIntegerField,
++            ),
++            # Date/DateTime/TimeField combined with DurationField.
++            (Combinable.ADD, DateField, DurationField, DateTimeField),
++            (Combinable.SUB, DateField, DurationField, DateTimeField),
++            (Combinable.ADD, DurationField, DateField, DateTimeField),
++            (Combinable.SUB, DurationField, DateField, DateTimeField),
++            (Combinable.ADD, DateTimeField, DurationField, DateTimeField),
++            (Combinable.SUB, DateTimeField, DurationField, DateTimeField),
++            (Combinable.ADD, DurationField, DateTimeField, DateTimeField),
++            (Combinable.SUB, DurationField, DateTimeField, DateTimeField),
++            (Combinable.ADD, TimeField, DurationField, TimeField),
++            (Combinable.SUB, TimeField, DurationField, TimeField),
++            (Combinable.ADD, DurationField, TimeField, TimeField),
++            (Combinable.SUB, DurationField, TimeField, TimeField),
++        ]
++        for connector, lhs_type, rhs_type, combined_type in tests:
++            with self.subTest(connector=connector, lhs_type=lhs_type, rhs_type=rhs_type):
++                expr = CombinedExpression(
++                    Value(1, output_field=lhs_type()),
++                    connector,
++                    Value(1, output_field=rhs_type()),
++                )
++                self.assertIsInstance(expr._resolve_output_field(), combined_type)
++
++    def test_resolve_output_field_with_invalid_connector(self):
++        tests = [
++            (Combinable.MUL, DateTimeField, DateTimeField),
++            (Combinable.DIV, DateField, DateField),
++            (Combinable.MOD, DurationField, DurationField),
++        ]
++        for connector, lhs_type, rhs_type in tests:
++            with self.subTest(connector=connector, lhs_type=lhs_type, rhs_type=rhs_type):
++                expr = CombinedExpression(
++                    Value(1, output_field=lhs_type()),
++                    connector,
++                    Value(1, output_field=rhs_type()),
++                )
++                msg = 'Cannot infer type of'
++                with self.assertRaisesMessage(FieldError, msg):
++                    expr._resolve_output_field()
++
++    def test_resolve_output_field_mixed_types(self):
++        tests = [
++            (Combinable.ADD, DateField, DateTimeField),
++            (Combinable.SUB, DateTimeField, TimeField),
++            (Combinable.ADD, IntegerField, FloatField),
++        ]
++        for connector, lhs_type, rhs_type in tests:
++            with self.subTest(connector=connector, lhs_type=lhs_type, rhs_type=rhs_type):
++                expr = CombinedExpression(
++                    Value(1, output_field=lhs_type()),
++                    connector,
++                    Value(1, output_field=rhs_type()),
++                )
++                msg = 'Cannot infer type of'
++                with self.assertRaisesMessage(FieldError, msg):
++                    expr._resolve_output_field()
++
++
+ class ExpressionsTests(TestCase):
+ 
+     def test_F_reuse(self):

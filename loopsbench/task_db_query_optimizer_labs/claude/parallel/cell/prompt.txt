@@ -1,0 +1,178 @@
+This project implements two undergraduate database-lab components: (1) an external-memory relational query processing system and (2) a query-tree optimisation engine. Both are C++ applications built with CMake.
+
+The query processing system operates on two simulated relations R(A,B) (112 tuples, 16 blocks) and S(C,D) (224 tuples, 32 blocks) stored as fixed-size 64-byte block files in `/workspace/lab/QueryProcessing/data/`. A fixed-size buffer (520 bytes, holding up to 8 blocks) provides block-level I/O primitives; all operators must respect this constraint. The compiled binary at `/workspace/lab/QueryProcessing/build/QueryProcessing` accepts interactive commands: `select`, `project`, `nlj`, `hj`, `smj`.
+
+The query optimiser parses textual query representations into tree structures and applies heuristic transformations (predicate pushdown). Its binary is at `/workspace/lab/QueryOptimize/build/QueryOptimize`.
+
+Your working directory is `/workspace`. The project code is already present. You need to implement all the modules and features listed below so that all tests pass.
+
+Implement the following hollowed units:
+
+Buffer Initialization (`lab/QueryProcessing/extmem.cpp`): implement `initBuffer`, allocating the buffer memory region and setting the core metadata fields.
+
+Buffer Block Allocation (`lab/QueryProcessing/extmem.cpp`): implement `getNewBlockInBuffer`, selecting a free slot and returning its payload pointer.
+
+Buffer Block Release (`lab/QueryProcessing/extmem.cpp`): implement `freeBlockInBuffer`, returning a consumed slot to the free list.
+
+Buffer Block Read (`lab/QueryProcessing/extmem.cpp`): implement `readBlockFromDisk`, loading a numbered block file into an available buffer slot.
+
+Buffer Block Write (`lab/QueryProcessing/extmem.cpp`): implement `writeBlockToDisk`, flushing a buffer slot back to disk and releasing it.
+
+Buffered Tuple Writer (`lab/QueryProcessing/blkio.cpp`): implement `pushToWrite`, batching result tuples into output blocks with reset/push controls.
+
+Tuple Block Decoder (`lab/QueryProcessing/blkio.cpp`): implement `readTuplesFromBlock`, deserialising raw relation blocks into `Relation` tuples.
+
+Join Output Emitter (`lab/QueryProcessing/blkio.cpp`): implement `output`, printing 3-attribute join tuples and forwarding them to disk output.
+
+Hash Partition Writer (`lab/QueryProcessing/blkio.cpp`): implement `pushHashToWrite`, routing tuples into hash buckets on disk.
+
+Hash Partition Reader (`lab/QueryProcessing/blkio.cpp`): implement `readHashFromBlock`, decoding bucket records back into relation tuples.
+
+Query Tree Node Output (`lab/QueryOptimize/tree.cpp`): implement the node-formatting portion of `TreeNode::preOrder` with 4-space indentation.
+
+Query Tree Traversal (`lab/QueryOptimize/tree.cpp`): complete `TreeNode::preOrder` by recursively traversing left and right subtrees.
+
+Query Parser (`lab/QueryOptimize/main.cpp`): implement `parseQuery`, tokenising the relational-algebra string into SELECT/PROJECTION/JOIN/LEAF nodes.
+
+Query Optimizer (`lab/QueryOptimize/main.cpp`): implement `optimizeQuery`, splitting compound predicates and pushing SELECT nodes below JOIN/PROJECTION nodes.
+
+External Sort Run Generation (`lab/QueryProcessing/mergeSort.cpp`): implement pass 1 of `mergeSort`, reading M-block segments, sorting them in memory, and writing sorted runs.
+
+External Merge Sort Final Merge (`lab/QueryProcessing/mergeSort.cpp`): implement pass 2 of `mergeSort`, merging run heads into the final globally sorted output.
+
+Selection Scan for R (`lab/QueryProcessing/select.cpp`): implement the R-side branch of `select`, filtering tuples where `A = 40`.
+
+Selection Scan for S and Final Flush (`lab/QueryProcessing/select.cpp`): complete `select` by filtering S tuples where `C = 60`, then flushing the buffered output.
+
+Projection Preparation (`lab/QueryProcessing/project.cpp`): implement the setup phase of `project`, invoking `mergeSort(buf, SORT_R)` and initialising projection output.
+
+Projection Deduplication Scan (`lab/QueryProcessing/project.cpp`): complete `project` by scanning sorted R output and emitting distinct A values.
+
+Hash Join Partitioning Phase (`lab/QueryProcessing/hashJoin.cpp`): implement phase 1 of `hashJoin`, partitioning both relations into disk buckets.
+
+Hash Join Probe Phase (`lab/QueryProcessing/hashJoin.cpp`): complete `hashJoin` by building/probing buckets and emitting joined tuples.
+
+Nested-Loop Outer Block Scan (`lab/QueryProcessing/nestedLoopJoin.cpp`): implement the outer buffering phase of `nestedLoopJoin`, loading M-1 blocks of R.
+
+Nested-Loop Join Inner Probe (`lab/QueryProcessing/nestedLoopJoin.cpp`): complete `nestedLoopJoin` by scanning S for each buffered R batch and flushing results.
+
+Sort-Merge Join Preparation (`lab/QueryProcessing/sortMergeJoin.cpp`): implement the setup phase of `sortMergeJoin`, sorting both relations and loading the first sorted blocks.
+
+Sort-Merge Join Scan (`lab/QueryProcessing/sortMergeJoin.cpp`): complete `sortMergeJoin` with the two-pointer merge scan that handles duplicate-key groups.
+
+The tests also depend on these signatures and entry points:
+
+The following functions are called directly by the test suite through the compiled binaries. You must implement them with these exact signatures:
+
+`Buffer *initBuffer(size_t bufSize, size_t blkSize, Buffer *buf)` — initialises a buffer with the specified total size and block size, allocating memory and setting metadata fields
+`unsigned char *getNewBlockInBuffer(Buffer *buf)` — allocates and returns a pointer to a free block within the buffer
+`unsigned char *readBlockFromDisk(unsigned int addr, Buffer *buf)` — reads the disk file for the given block address into a buffer slot and returns a pointer to it
+`int writeBlockToDisk(unsigned char *blkPtr, unsigned int addr, Buffer *buf)` — writes a buffer block to disk at the given address
+`void pushToWrite(Buffer *buf, unsigned char *source, size_t size, unsigned int addr, bool reset, bool push)` — buffered tuple writer: accumulates tuples in a block and flushes to disk when full; supports reset and force-push modes
+`void output(Buffer *buf, unsigned int addr, int attr1, int attr2, int attr3)` — outputs a 3-attribute join result tuple to stdout and writes it to disk
+`void pushHashToWrite(Buffer *buf, Relation *R, unsigned int addr, bool reset, bool push)` — hash-partitions a tuple into one of BUCKET_NUM buckets and writes partitions to disk
+`int readHashFromBlock(unsigned char *blk, Relation *R)` — reads hash-partitioned tuples from a block into a Relation array, returns count
+`int select(Buffer *buf)` — performs selection on R and S with target attribute values
+`int project(Buffer *buf)` — performs projection with duplicate elimination on R
+`int mergeSort(Buffer *buf, bool choice)` — two-pass multi-way external merge sort for relation R or S
+`int nestedLoopJoin(Buffer *buf)` — block nested-loop join of R and S on R.A = S.C
+`int hashJoin(Buffer *buf)` — hash join of R and S on R.A = S.C
+`int sortMergeJoin(Buffer *buf)` — sort-merge join of R and S on R.A = S.C
+`void parseQuery(TreeNode *root, string query)` — parses a textual relational-algebra query into a tree of TreeNode objects
+`TreeNode *optimizeQuery(TreeNode *root, vector<string> info)` — applies heuristic optimisation (predicate pushdown) to a query tree
+`void TreeNode::preOrder(int level)` — prints the query tree in pre-order traversal with indentation
+
+The tests also exercise these helper signatures:
+
+The binaries exercise these helpers transitively, so they must also be implemented correctly:
+
+`void freeBlockInBuffer(unsigned char *blk, Buffer *buf)` — marks a consumed buffer slot available again
+`void readTuplesFromBlock(unsigned char *blk, Relation *R)` — decodes a block into `TUPLE_PER_BLK` `Relation` tuples
+
+Refer to `extmem.h`, `blkio.h`, `join.h`, `file.h`, and `tree.h` for data structure definitions and constants (`BUF_SIZE`, `BLK_SIZE`, `TUPLE_PER_BLK`, `BUCKET_NUM`, `R_BLK_NUM`, `S_BLK_NUM`, address constants, `Relation`, `Relation3`, `Hash`, `TreeNode`, etc.).
+
+
+
+You are running as a long-horizon autonomous engineering agent at
+`/workspace`. This task spans many files and requirements, and is expected
+to take many iterations.
+
+Read every requirement under `/workspace/requirements/` (and any other
+explicit requirement list referenced by the task) and only finish once
+every single one is addressed. Cherry-picking or partial fixes will lead
+to failure.
+
+
+
+## Optional planning artifact
+
+If you believe the task is complex enough to benefit from a plan, you may
+write `/workspace/agent_plans/plan.json` before making changes. This is
+optional. If you create it, it must be a JSON object with `nodes` and
+`edges`. Each node must have string `id` equal to a requirement slug from
+`/workspace/requirements/`, may include `label` and `layer`, and each edge
+must use string `from` and `to` that reference those ids.
+
+
+
+## Git workflow (required)
+
+`/workspace` is initialized as a git repo. After finishing the
+implementation for ONE requirement:
+
+  1. `cd /workspace`
+  2. `git add -A`
+  3. `git diff --cached > requirement_patches/<slug>.diff`
+  4. `git commit -m "impl: <slug>"`
+
+Where `<slug>` is the requirement filename without the `.yaml` extension.
+The patch file MUST be non-empty for the requirement to count as complete.
+Never write or `touch` an empty `.diff` file.
+
+You may run `git log`, `git diff`, `git show` at any time to inspect what
+prior work has done — only your own commits will be there; no reference
+solution is accessible.
+
+## Recommended workflow
+
+1. Read the task carefully and survey `/workspace` so you understand the
+   code you are changing.
+2. As a development agent, when implementing a requirement you may write
+   tests under `/workspace/agent_tests/` to safeguard correctness and
+   future stability — write them if you think they help, otherwise skip.
+3. Keep iterating until every requirement is implemented. Do not stop at a
+   partial fix, a first passing check, or one successful edit.
+4. Do not narrow the scope on your own. Missing a requirement is a task
+   failure even if the changed tests pass.
+5. You may revise the same files and rerun focused checks as many times as
+   needed before finishing.
+6. Your final summary must report requirement coverage counts, including at
+   least the total number of requirements reviewed and how many were
+   implemented and blocked.
+
+Harness progress update:
+- Requirement coverage: 0/26 (0.0%)
+- Completed requirement slugs: none
+- Remaining requirement slugs: blkio_buffered_write, blkio_hash_partition_read, blkio_hash_partition_write, blkio_join_output, blkio_tuple_decode, buffer_block_allocation, buffer_block_read, buffer_block_release, buffer_block_write, buffer_initialization, external_merge_sort, external_sort_runs, hash_join, hash_partitioning, nested_loop_join, nested_loop_outer_scan, projection_operator, projection_prepare, query_optimizer, query_parser, query_tree, query_tree_node_output, selection_operator, selection_scan_r, sort_merge_join, sort_merge_preparation
+- Your previous run ended naturally. Continue from the current workspace state.
+- You may estimate progress yourself by comparing `/workspace/requirement_patches/*.diff` against `/workspace/requirements/*.yaml`.
+- You are only allowed to end when the whole task is complete, not when one part is complete.
+- The full task prompt is repeated above; keep working until every remaining requirement is implemented or you are truly blocked.
+
+## Git workflow (required)
+
+`/workspace` is initialized as a git repo at the start of round 1. After
+finishing the implementation for ONE requirement:
+
+  1. `cd /workspace`
+  2. `git add -A`
+  3. `git diff --cached > requirement_patches/<slug>.diff`
+  4. `git commit -m "impl: <slug>"`
+
+Where `<slug>` is the requirement filename without the `.yaml` extension.
+The patch file MUST be non-empty for the requirement to count as complete.
+Never write or `touch` an empty `.diff` file.
+
+You may run `git log`, `git diff`, `git show` at any time to inspect what
+prior rounds have done — only your own commits will be there; no reference
+solution is accessible.

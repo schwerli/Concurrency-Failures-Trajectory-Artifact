@@ -1,0 +1,513 @@
+diff --git a/doc/users/next_whats_new/text_antialiasing.rst b/doc/users/next_whats_new/text_antialiasing.rst
+new file mode 100644
+index 0000000000..0ba964c785
+--- /dev/null
++++ b/doc/users/next_whats_new/text_antialiasing.rst
+@@ -0,0 +1,18 @@
++Configurable antialiasing for Text and Annotation
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++The *antialiased* parameter of `.Text` and `.Annotation` can now be used to
++enable or disable antialiased rendering on a per-artist basis, instead of
++relying on the global :rc:`text.antialiased`, which is still used as the
++default.  The value can also be queried and changed after creation with
++``Text.get_antialiased`` and ``Text.set_antialiased``::
++
++    mpl.text.Text(.5, .5, "foo\nbar", antialiased=True)
++
++or::
++
++    text = mpl.text.Text(.5, .5, "foo\nbar")
++    text.set_antialiased(True)
++    print(text.get_antialiased())
++
++Note that antialiasing only affects raster output; it is ignored by vector
++backends, where antialiasing is a property of the viewer.
+diff --git a/lib/matplotlib/_mathtext.py b/lib/matplotlib/_mathtext.py
+index 09f5c61879..0ca6b71c45 100644
+--- a/lib/matplotlib/_mathtext.py
++++ b/lib/matplotlib/_mathtext.py
+@@ -99,7 +99,7 @@ class Output:
+               for x1, y1, x2, y2 in self.rects]
+         return VectorParse(w, h + d, d, gs, rs)
+ 
+-    def to_raster(self):
++    def to_raster(self, *, antialiased):
+         # Metrics y's and mathtext y's are oriented in opposite directions,
+         # hence the switch between ymin and ymax.
+         xmin = min([*[ox + info.metrics.xmin for ox, oy, info in self.glyphs],
+@@ -124,7 +124,7 @@ class Output:
+         for ox, oy, info in shifted.glyphs:
+             info.font.draw_glyph_to_bitmap(
+                 image, ox, oy - info.metrics.iceberg, info.glyph,
+-                antialiased=mpl.rcParams['text.antialiased'])
++                antialiased=antialiased)
+         for x1, y1, x2, y2 in shifted.rects:
+             height = max(int(y2 - y1) - 1, 0)
+             if height == 0:
+diff --git a/lib/matplotlib/backends/backend_agg.py b/lib/matplotlib/backends/backend_agg.py
+index 7d038a998f..5518487fd2 100644
+--- a/lib/matplotlib/backends/backend_agg.py
++++ b/lib/matplotlib/backends/backend_agg.py
+@@ -189,7 +189,8 @@ class RendererAgg(RendererBase):
+     def draw_mathtext(self, gc, x, y, s, prop, angle):
+         """Draw mathtext using :mod:`matplotlib.mathtext`."""
+         ox, oy, width, height, descent, font_image = \
+-            self.mathtext_parser.parse(s, self.dpi, prop)
++            self.mathtext_parser.parse(s, self.dpi, prop,
++                                       antialiased=gc.get_antialiased())
+ 
+         xd = descent * sin(radians(angle))
+         yd = descent * cos(radians(angle))
+@@ -205,8 +206,7 @@ class RendererAgg(RendererBase):
+         # We pass '0' for angle here, since it will be rotated (in raster
+         # space) in the following call to draw_text_image).
+         font.set_text(s, 0, flags=get_hinting_flag())
+-        font.draw_glyphs_to_bitmap(
+-            antialiased=mpl.rcParams['text.antialiased'])
++        font.draw_glyphs_to_bitmap(antialiased=gc.get_antialiased())
+         d = font.get_descent() / 64.0
+         # The descent needs to be adjusted for the angle.
+         xo, yo = font.get_bitmap_offset()
+diff --git a/lib/matplotlib/backends/backend_cairo.py b/lib/matplotlib/backends/backend_cairo.py
+index 9ccadcdf1c..c733f3f9d3 100644
+--- a/lib/matplotlib/backends/backend_cairo.py
++++ b/lib/matplotlib/backends/backend_cairo.py
+@@ -25,7 +25,6 @@ except ImportError:
+             "cairo backend requires that pycairo>=1.14.0 or cairocffi "
+             "is installed") from err
+ 
+-import matplotlib as mpl
+ from .. import _api, cbook, font_manager
+ from matplotlib.backend_bases import (
+     _Backend, FigureCanvasBase, FigureManagerBase, GraphicsContextBase,
+@@ -204,9 +203,7 @@ class RendererCairo(RendererBase):
+             ctx.select_font_face(*_cairo_font_args_from_font_prop(prop))
+             ctx.set_font_size(self.points_to_pixels(prop.get_size_in_points()))
+             opts = cairo.FontOptions()
+-            opts.set_antialias(
+-                cairo.ANTIALIAS_DEFAULT if mpl.rcParams["text.antialiased"]
+-                else cairo.ANTIALIAS_NONE)
++            opts.set_antialias(gc.get_antialiased())
+             ctx.set_font_options(opts)
+             if angle:
+                 ctx.rotate(np.deg2rad(-angle))
+@@ -312,6 +309,9 @@ class GraphicsContextCairo(GraphicsContextBase):
+         self.ctx.set_antialias(
+             cairo.ANTIALIAS_DEFAULT if b else cairo.ANTIALIAS_NONE)
+ 
++    def get_antialiased(self):
++        return self.ctx.get_antialias()
++
+     def set_capstyle(self, cs):
+         self.ctx.set_line_cap(_api.check_getitem(self._capd, capstyle=cs))
+         self._capstyle = cs
+diff --git a/lib/matplotlib/mathtext.py b/lib/matplotlib/mathtext.py
+index e538d451f8..968ef2d8ca 100644
+--- a/lib/matplotlib/mathtext.py
++++ b/lib/matplotlib/mathtext.py
+@@ -18,6 +18,7 @@ metrics for those fonts.
+ import functools
+ import logging
+ 
++import matplotlib as mpl
+ from matplotlib import _api, _mathtext
+ from matplotlib.ft2font import LOAD_NO_HINTING
+ from matplotlib.font_manager import FontProperties
+@@ -58,7 +59,7 @@ class MathTextParser:
+             {"path": "vector", "agg": "raster", "macosx": "raster"},
+             output=output.lower())
+ 
+-    def parse(self, s, dpi=72, prop=None):
++    def parse(self, s, dpi=72, prop=None, *, antialiased=None):
+         """
+         Parse the given math expression *s* at the given *dpi*.  If *prop* is
+         provided, it is a `.FontProperties` object specifying the "default"
+@@ -74,10 +75,12 @@ class MathTextParser:
+         # is mutable; key the cache using an internal copy (see
+         # text._get_text_metrics_with_cache for a similar case).
+         prop = prop.copy() if prop is not None else None
+-        return self._parse_cached(s, dpi, prop)
++        antialiased = (mpl.rcParams['text.antialiased']
++                       if antialiased is None else antialiased)
++        return self._parse_cached(s, dpi, prop, antialiased)
+ 
+     @functools.lru_cache(50)
+-    def _parse_cached(self, s, dpi, prop):
++    def _parse_cached(self, s, dpi, prop, antialiased):
+         from matplotlib.backends import backend_agg
+ 
+         if prop is None:
+@@ -100,7 +103,7 @@ class MathTextParser:
+         if self._output_type == "vector":
+             return output.to_vector()
+         elif self._output_type == "raster":
+-            return output.to_raster()
++            return output.to_raster(antialiased=antialiased)
+ 
+ 
+ def math_to_image(s, filename_or_obj, prop=None, dpi=None, format=None,
+diff --git a/lib/matplotlib/mathtext.pyi b/lib/matplotlib/mathtext.pyi
+index a2e6e0e056..b55880dffa 100644
+--- a/lib/matplotlib/mathtext.pyi
++++ b/lib/matplotlib/mathtext.pyi
+@@ -13,7 +13,10 @@ from matplotlib.typing import ColorType
+ 
+ class MathTextParser:
+     def __init__(self, output: Literal["path", "raster", "macosx"]) -> None: ...
+-    def parse(self, s: str, dpi: float = ..., prop: FontProperties | None = ...): ...
++    def parse(
++        self, s: str, dpi: float = ..., prop: FontProperties | None = ...,
++        *, antialiased: bool | None = ...
++    ): ...
+ 
+ def math_to_image(
+     s: str,
+diff --git a/lib/matplotlib/mpl-data/matplotlibrc b/lib/matplotlib/mpl-data/matplotlibrc
+index 86f70a23da..a4b6152ccd 100644
+--- a/lib/matplotlib/mpl-data/matplotlibrc
++++ b/lib/matplotlib/mpl-data/matplotlibrc
+@@ -301,6 +301,7 @@
+                          # Values  other than 0 or 6 have no defined meaning.
+ #text.antialiased: True  # If True (default), the text will be antialiased.
+                          # This only affects raster outputs.
++                         # Can be overridden per-artist via Text.set_antialiased.
+ #text.parse_math: True  # Use mathtext if there is an even number of unescaped
+                         # dollar signs.
+ 
+diff --git a/lib/matplotlib/tests/baseline_images/test_text/antialiased.png b/lib/matplotlib/tests/baseline_images/test_text/antialiased.png
+index 11ba1b082df94b965371f44699a556afdb09b6a6..fa076a3026bd4994fbe8bd31a7d7b040d21bdcb3 100644
+GIT binary patch
+literal 3617
+zcmbVPXH-+$w%$k)kRl>QIyrEtQWKCMMG3tKNEZZ5AR&a%aw$>-QHr66$l=gLMFc@W
+z=^g{pq_@xo=>k$h4?$^fGu|EV=NseRF?LyNtTxxTzB%W&5-cqY*;xfx0RUh(HbPhf
+zz&UoXY|6|8es^Q5dcdDOLEnLJ+t-s2>>l6&n7b4FaJ~eb*FCWykAOfgU%aZqH3cOF
+zlt+-VvIa~JjZ$*IcJCStrmn7lQc+S-Q@W<CDldj15c~q+ii$q}H(bFt0Ig`$etQgD
+zg2m6sF%SSa-OpaSBAr4n&>lZy#0{H}9LiLf*$DOY{MPcELh!lgla2b(Zo4m)Ua=(H
+zgQxKl1^z0vgS(iXVtV;YPkvTl6f&7hdKKRA_sJmX#79um*4)x&nQV}ui-~jrN!@cf
+zW1A^$%k9zh;ZcFt8fm}A$B#(;YrBzObk1w!N#*T^ib5d}F$e^b^)RVgN*94ZT%gyZ
+z=i=ge*F11mD^`MD<l;(|Wn%{`Z&?4|Ci8CU+SuH}LX7BxBmap*5uHdOZEbCgmzUMV
+zv$V9-tSoGwOqRK!;ra0J@U0PhSI00}!~zB?06vuz&7p>+W?XW55AjvBnTfG+(`f0P
+z_UbhPysEYqiNRndA~@LCUe?zO-><*xwYI*Fu(uz3zl4=xilL)WC_gthYxiwBOqN<Y
+zyCxR6lRVKBmVu+;$w^{#bhJN3Sy_2th47)e8rFSnxj%222qClmeb~>m-G4DvfQ_Bl
+zN|~(nKRF8h{yCU4IXT(L$VeB5dv9g#?JZa4@;Ua=BL+fnaDGt{b4yE0$b5p-MQ-l=
+zVV62TIv*b&aAN7JR~do2fBu0eD|5NHxYUJgLq^M7hy|t@vWLT?qw_n9-E|L6wZBhI
+zZU0ES1yNB6=n6gE=~g^5D9hX4p0DqP7E$N)h&v`GCO$C{5fGrVPN5|2kE~Ip<>d5S
+zT!i=TYn`K~|LESr#K6dSWu&^Q>Sa~c<*Qe(GPAKEOiWlw_4Vz&1q}@%l9G}GYt(U4
+z=x$vk#(xk4<<)SvD0DULY08NxrgRG+2Zgwuww@4)j8O*%2k~|#>7bRYz_)7e3@aC7
+z;{@O-r_Pb3v$L~=gaqRH_3MayvJoC%W}Wf;xde#J{Oqh4i0CDLe(ANbaz3uqt}YWg
+zF>q0n2s^vKfQvdhI%I71{K|@qK$3y>$pJEd`^&-n1v;?@r^mH}HTWsGv5ARw&3PuK
+z*6HcHXUnLlSl`ss)6XY&bfwD`l$M&mTU%L4g?W$0mzI_y^!1GigsPDH_f0}V>d1eG
+zhKA1n_#uJE<9Ei9DG8O8l_8;_onMK3Nvk`%yI;X6L6aq9Wle;Hg%|5-)7$_^Jk{P!
+zX2<RhQvo2qJOL|JqDnomQOv~BGK(yFh1#^$vbWo7diM^{fjz1b_zw7iivz>z>gt=~
+zVv}#9Yt(?*MmjpN#l=OFLnF-A?rz%ZDwd0DWpgvbJX<XxE-r3wZ%?|~*x0xNKlP74
+zGLw}(Jw4sp)wLYQ$-&Vj=t~k;Q&TgbU~k4)6s9#d-z2XPOeWLi>|1+#&G$E^N~$7G
+zel6bviKdSKZaEPf7q<xF(6wLfJ=QupY8SNeUFP)UuslAVKp+@}hm#l>7&;moqvGSC
+zFj(g^NmJC&Tl2xOF)0Xyot^#C<;$%D9~#YqATayvf+eV9=|m)2wIRzN{aeU9h=g6^
+z7g#z!&HRb^QC!>~aJbXAnvWlwPL2=fHaAmtc6R)!D=RAwm7eTCV`nGJ;XXwVq$UW3
+zCp6N`j7=nB&&p%6sfjKxe1`>rnkbQ9Utix^uk3H`+c=%kAQFi!`;^I~<bvvI9t#T#
+zW)>E!37n4)7aw0CP83dHo}QjQ0DFHxbzTCZGBWr$M6Sm#EqQw285tQt_cgSz;K<3%
+zr2|r~?=Y*VsJw**XNjVEBq<*!Z;xaiiex9W<;kfE&kRRm^SW1tw_dz`{Fnxnza(Xm
+zqkH29-O0fMCmS1^E@EJGH1?3TnNlLm!uE&3^k>of%K>l@R{tLzT$g!x<~F82^9u>t
+zh^WF&Y$A`T_Cng>{4f~o=f*~ClbbFYT}Un_`b^f$#c*otqEHfpgM&|>KYx@YsNPH_
+zTfO^qpDGKwacX*c0m&^PzCz$N=yQPO?c4OezP|4rJ~m@SSXfwwUTF3{_)FW^@lXP@
+zu|2Y<ZjDTiLQ$UTry(&83@WOs+kKjwZtcm!A-lcmb1N$>f`Wo1>gXLXlq{?oMrMn+
+zBX?&Q3&~Q8E8~@D&SYWDSgo-A*~ff$qq4IFp#tnd>*MYLN1Zmdw&L2_B2J~e<)j_f
+zqvK<DG&=6#!*kEm(`EieCX)|-E$5}?<|g?z{9-!KDPnW3xi43f4w#yn`cPZj{wZ*|
+zEveF@n-}C10Q~;_dv<XVR@P=CNJjk$5ACyks<eENPrEWTGv0tecx7YqGW(*JL}O$1
+z#iXRp_iNFFl0|j!!wq3HJTYZzXecJ%Fy-Fq$#F+dkIjT89PYX2$YGc)6kS=V3a(m6
+zDgc15U%xJ3kw~PKr6my46jfX-i$bB?Xd6>TW@ZQsMmjtqVs38EedlTx87!LL_3*;u
+zU+f=wod`xetF$>CbxUY`z3*U_q!C1=FBg;NAQifEfd^;c=JwKR@>?Z(d$uX&3T@@b
+zk4Fs+4Ki!smYy#r=jX!zg*8|R3JzX)6(^#?%BH2ImG<Jm2Z#F*L~$Y=ZhThaXT#ud
+z3;=GLbY)~@q^Ptsm(X)?5VA+5&K2fGs$do6<#Wi&1I?ZrX@U=0PEsb8qx;8>+6F!_
+zx3;xGbaX^{cz7_rzJ^|2GIt}WwsoIA_14`gwId3u<Hgj~`OtkiO<<HY8~yd`m$-xk
+zLma25fvqi%)15p1>*LBK(7z4TRV|hs1Ox>^Vm+>@Q5zl}p3OwRxI$BFHx!L{M1P)R
+zmNxUi5RH~vU0d`2IUs&bQ}Yj5Syo_cf6}*QXo$PBvr}4L9uXL*il1pns;E%G%`^x<
+zIHvLevmgiB!36ZtdrZN`#%4C}!AVnwYh(h6MDps-<K-}oNZk1uDNkNTm_5$@mR!E1
+zk=4h4o8p^*6jRNP;SoT&*W#z1#m6&yI6lkH&JI7Oj=dhiO2S~a?*ttK9336Ks!n~s
+z9RCTtDJnAZ^7i!wGsR{9;9x$WYgzPfr-0D8W=0lfX3I9$8eHblRtx9+{5%AVGbXuN
+zk{MvWdzO_|yyt;L{!w1PpY^7&keHvJZ%tb%%zFaHR<gjxz<{Mj;8G&_BX}~Mzo~0U
+zt6<ncEwm*W<Q@9$E}64%a@u3hojdpA^Jc@svu;Mu*BQ{;l>F0MiQ(o|n>Mi9RE?l7
+z3BR+7BleJQv1ie68B@{Vx#L`{#RTiu>Sa%2p20Y=fe99bpFB1e$0KLQ?=qctK~GN)
+zlpRrEP(UDB6U$T*M+XNVhS4_Mf9))8ZEq_(=8vuUFZT(9`lMxSjIXJwsmnYUSzS{z
+z57OPw-~Wc6pOUkSOZ!MXGuGSNU5WqVl`9%+NHK^Lj$a@?KHi9Ddgwn@SpS_a`|n5H
+zJCjkT97zVMCCB=$W~$;&bq9fn(N;Njs1y?u)6?{HMy||lKJqF2tV^Ewi4Ym53?0Zh
+z0BN~BPgHaY6F?xK7ueWQ{_tE5VPRnhkOb9*H>=!|oIS)U{)}a+s7sT&1-W{)cVb8k
+z^4jqpMvSNex+4~Q)6Z|Ku3hAMNYqf_t^ArAUf}GsFZ1!8iNUf$V`#Z~Q2LF0ve|(?
+z3NJ86Rj7Cgc0`U8+cICcpo;ay;aWS>q_#nowLl$nZC@QJ;o{|uy;F;S_3j;uVTwrg
+zU}D1iZX4adrJ;#<Q5F`+y**z@;Cwoh3Nbd82{&284$s9qAC5Ny0O+<I9UZ!smKW_x
+zogP1V!b;j3H2q1T=sP=qcQ(()OlPmlwv6wm`jkBvGo4$8K6O0Pf>7w?LW^8$JLB-v
+zV_L}SyF#<k!h!;sFYLDV_6s1tnE(_T-QW8tVd-6}9OLzsp>PmZ6z|E&$@u4B#el%T
+z^cqlN>6MIRy-$gc2exLqo|tARh$}1mE4($XdZ~1MAiM<}pyuxGzO}Wb>)|1JKP(JX
+zh_N!Xvn&OO!QldcA8o^hjgxa>E>5)Or*pzmC7C8^<|$#5Sn4qj+6wNrB;s&iTvJmp
+zL(#QuAw>sY@s>n7lkH%VL>L>hG&eW9p=qv>z1`h<y1I?d7MYl7>%e)@FjWb9ddEw8
+z^qC`|P`7e%(OT(E3<?TzsJ{=h$hj6>R3r_8@cP4ti<z03;}sqka&mH({Mrz^X<6K-
+zKLtg8S&^Z9bw8f<lz~SpXJ3|6^|rJWgq#E1|Nq8ggpm=mkdV+4<}Z*!F8{uN%)B_e
+wtJwbAfnu4!iuL1H(V#ooxMTjKro~eLH>*<@sm-$sUdRAreG5d{O}B^t10aLQW&i*H
+
+delta 2875
+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
+JEd9eh_W#}Aopk^J
+
+diff --git a/lib/matplotlib/tests/test_text.py b/lib/matplotlib/tests/test_text.py
+index f86b9f111b..af29694ae7 100644
+--- a/lib/matplotlib/tests/test_text.py
++++ b/lib/matplotlib/tests/test_text.py
+@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
+ import matplotlib.transforms as mtransforms
+ from matplotlib.testing.decorators import check_figures_equal, image_comparison
+ from matplotlib.testing._markers import needs_usetex
+-from matplotlib.text import Text
++from matplotlib.text import Text, Annotation
+ 
+ 
+ @image_comparison(['font_styles'])
+@@ -184,17 +184,21 @@ def test_multiline2():
+ 
+ @image_comparison(['antialiased.png'])
+ def test_antialiasing():
+-    mpl.rcParams['text.antialiased'] = True
++    mpl.rcParams['text.antialiased'] = False  # Passed arguments should override.
+ 
+     fig = plt.figure(figsize=(5.25, 0.75))
+-    fig.text(0.5, 0.75, "antialiased", horizontalalignment='center',
+-             verticalalignment='center')
+-    fig.text(0.5, 0.25, r"$\sqrt{x}$", horizontalalignment='center',
+-             verticalalignment='center')
+-    # NOTE: We don't need to restore the rcParams here, because the
+-    # test cleanup will do it for us.  In fact, if we do it here, it
+-    # will turn antialiasing back off before the images are actually
+-    # rendered.
++    fig.text(0.3, 0.75, "antialiased", horizontalalignment='center',
++             verticalalignment='center', antialiased=True)
++    fig.text(0.3, 0.25, r"$\sqrt{x}$", horizontalalignment='center',
++             verticalalignment='center', antialiased=True)
++
++    mpl.rcParams['text.antialiased'] = True  # Passed arguments should override.
++    fig.text(0.7, 0.75, "not antialiased", horizontalalignment='center',
++             verticalalignment='center', antialiased=False)
++    fig.text(0.7, 0.25, r"$\sqrt{x}$", horizontalalignment='center',
++             verticalalignment='center', antialiased=False)
++
++    mpl.rcParams['text.antialiased'] = False  # Should not affect existing text.
+ 
+ 
+ def test_afm_kerning():
+@@ -902,3 +906,62 @@ def test_annotate_offset_fontsize():
+     points_coords, fontsize_coords = [ann.get_window_extent() for ann in anns]
+     fig.canvas.draw()
+     assert str(points_coords) == str(fontsize_coords)
++
++
++def test_set_antialiased():
++    txt = Text(.5, .5, "foo\nbar")
++    assert txt._antialiased == mpl.rcParams['text.antialiased']
++
++    txt.set_antialiased(True)
++    assert txt._antialiased is True
++
++    txt.set_antialiased(False)
++    assert txt._antialiased is False
++
++
++def test_get_antialiased():
++    txt2 = Text(.5, .5, "foo\nbar", antialiased=True)
++    assert txt2._antialiased is True
++    assert txt2.get_antialiased() == txt2._antialiased
++
++    txt3 = Text(.5, .5, "foo\nbar", antialiased=False)
++    assert txt3._antialiased is False
++    assert txt3.get_antialiased() == txt3._antialiased
++
++    txt4 = Text(.5, .5, "foo\nbar")
++    assert txt4.get_antialiased() == mpl.rcParams['text.antialiased']
++
++
++def test_annotation_antialiased():
++    annot = Annotation("foo\nbar", (.5, .5), antialiased=True)
++    assert annot._antialiased is True
++    assert annot.get_antialiased() == annot._antialiased
++
++    annot2 = Annotation("foo\nbar", (.5, .5), antialiased=False)
++    assert annot2._antialiased is False
++    assert annot2.get_antialiased() == annot2._antialiased
++
++    annot3 = Annotation("foo\nbar", (.5, .5), antialiased=False)
++    annot3.set_antialiased(True)
++    assert annot3.get_antialiased() is True
++    assert annot3._antialiased is True
++
++    annot4 = Annotation("foo\nbar", (.5, .5))
++    assert annot4._antialiased == mpl.rcParams['text.antialiased']
++
++
++@check_figures_equal()
++def test_text_antialiased_off_default_vs_manual(fig_test, fig_ref):
++    fig_test.text(.5, .5, '6 inches x 2 inches',
++                  antialiased=False)
++
++    mpl.rcParams['text.antialiased'] = False
++    fig_ref.text(.5, .5, '6 inches x 2 inches')
++
++
++@check_figures_equal()
++def test_text_antialiased_on_default_vs_manual(fig_test, fig_ref):
++    fig_test.text(.5, .5, '6 inches x 2 inches', antialiased=True)
++
++    mpl.rcParams['text.antialiased'] = True
++    fig_ref.text(.5, .5, '6 inches x 2 inches')
+diff --git a/lib/matplotlib/text.py b/lib/matplotlib/text.py
+index 4591316cf9..934c65ffb7 100644
+--- a/lib/matplotlib/text.py
++++ b/lib/matplotlib/text.py
+@@ -115,6 +115,7 @@ class Text(Artist):
+                  wrap=False,
+                  transform_rotates_text=False,
+                  parse_math=None,    # defaults to rcParams['text.parse_math']
++                 antialiased=None,  # defaults to rcParams['text.antialiased']
+                  **kwargs
+                  ):
+         """
+@@ -149,6 +150,7 @@ class Text(Artist):
+             transform_rotates_text=transform_rotates_text,
+             linespacing=linespacing,
+             rotation_mode=rotation_mode,
++            antialiased=antialiased
+         )
+         self.update(kwargs)
+ 
+@@ -167,6 +169,7 @@ class Text(Artist):
+         transform_rotates_text=False,
+         linespacing=None,
+         rotation_mode=None,
++        antialiased=None
+     ):
+         self.set_text(text)
+         self.set_color(
+@@ -187,6 +190,8 @@ class Text(Artist):
+             linespacing = 1.2  # Maybe use rcParam later.
+         self.set_linespacing(linespacing)
+         self.set_rotation_mode(rotation_mode)
++        self.set_antialiased(antialiased if antialiased is not None else
++                             mpl.rcParams['text.antialiased'])
+ 
+     def update(self, kwargs):
+         # docstring inherited
+@@ -309,6 +314,27 @@ class Text(Artist):
+         """Return the text rotation mode."""
+         return self._rotation_mode
+ 
++    def set_antialiased(self, antialiased):
++        """
++        Set whether to use antialiased rendering.
++
++        Parameters
++        ----------
++        antialiased : bool
++
++        Notes
++        -----
++        Antialiasing will be determined by :rc:`text.antialiased`
++        and the parameter *antialiased* will have no effect if the text contains
++        math expressions.
++        """
++        self._antialiased = antialiased
++        self.stale = True
++
++    def get_antialiased(self):
++        """Return whether antialiased rendering is used."""
++        return self._antialiased
++
+     def update_from(self, other):
+         # docstring inherited
+         super().update_from(other)
+@@ -322,6 +348,7 @@ class Text(Artist):
+         self._transform_rotates_text = other._transform_rotates_text
+         self._picker = other._picker
+         self._linespacing = other._linespacing
++        self._antialiased = other._antialiased
+         self.stale = True
+ 
+     def _get_layout(self, renderer):
+@@ -737,6 +764,7 @@ class Text(Artist):
+             gc.set_foreground(self.get_color())
+             gc.set_alpha(self.get_alpha())
+             gc.set_url(self._url)
++            gc.set_antialiased(self._antialiased)
+             self._set_gc_clip(gc)
+ 
+             angle = self.get_rotation()
+diff --git a/lib/matplotlib/text.pyi b/lib/matplotlib/text.pyi
+index bb2f529920..b14955cb43 100644
+--- a/lib/matplotlib/text.pyi
++++ b/lib/matplotlib/text.pyi
+@@ -36,6 +36,7 @@ class Text(Artist):
+         wrap: bool = ...,
+         transform_rotates_text: bool = ...,
+         parse_math: bool | None = ...,
++        antialiased: bool | None = ...,
+         **kwargs
+     ) -> None: ...
+     def update(self, kwargs: dict[str, Any]) -> None: ...
+@@ -43,6 +44,8 @@ class Text(Artist):
+     def get_transform_rotates_text(self) -> bool: ...
+     def set_rotation_mode(self, m: None | Literal["default", "anchor"]) -> None: ...
+     def get_rotation_mode(self) -> None | Literal["default", "anchor"]: ...
++    def set_antialiased(self, antialiased: bool) -> None: ...
++    def get_antialiased(self) -> bool: ...
+     def set_bbox(self, rectprops: dict[str, Any]) -> None: ...
+     def get_bbox_patch(self) -> None | FancyBboxPatch: ...
+     def update_bbox_position_size(self, renderer: RendererBase) -> None: ...

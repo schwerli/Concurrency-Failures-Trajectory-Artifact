@@ -1,0 +1,148 @@
+{
+  "schema_version": 2,
+  "phase": "fixed",
+  "pair_id": "swebench_verified/django__django-14792/claude",
+  "task": {
+    "plain_summary_zh": "修复 Django 的 Trunc()/Extract() 数据库函数在使用 Etc/GMT-10 等带符号时区名时发生反向时区转换的问题。",
+    "acceptance_target_zh": "最终补丁需要让 TimezoneMixin 传入数据库后端的时区表示恢复正确方向，并加入能覆盖 Etc/GMT-10 行为的回归测试，官方 SWE-bench 评估应通过。"
+  },
+  "modes": {
+    "parallel": {
+      "solution_passed": true,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 1951.412
+    },
+    "serial": {
+      "solution_passed": false,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 1825.062
+    }
+  },
+  "reconstruction": {
+    "parallel_strategy_zh": "并行运行先由父上下文本地阅读 _get_timezone_name、各数据库后端的 _prepare_tzname_delta、SQLite 解析逻辑和既有测试，然后启动 tz-reverse-conversion-analysis 工作流，把 PostgreSQL、MySQL、Oracle、SQLite、timezone 工具函数和测试影响拆给多个子上下文。父上下文读取这些结果，停止并丢弃过宽的子代理实现，转而提交一个窄补丁：让 _get_timezone_name 返回 timezone.tzname(None) 或回退到 str(timezone)，并添加工具函数测试和发布说明。",
+    "serial_strategy_zh": "串行运行在工作流和代理工具被禁用的单一路径下 grep 并阅读同一批 Django 时区代码、后端实现、SQLite 解析和 dateparse 辅助函数，但没有写入代码、没有运行测试，最终交付空补丁并在官方评估中失败。",
+    "realized_parallelism_zh": "首个工作流 wf_df7c2521-bef 的六个调查子代理在 1786701361180 到 1786701361186 毫秒之间启动，分别处理不同后端、timezone 根因和测试覆盖；父上下文随后继续本地验证、读取工作流报告并作出最终实现选择。该重叠是有用的模型上下文工作，不只是工具并发或名义上的多代理配置。",
+    "parallel_workers": 13,
+    "peak_overlapping_useful_workers": 7
+  },
+  "baseline_audit": {
+    "same_task_and_prompt": true,
+    "serial_run_valid": true,
+    "parallel_run_valid": true,
+    "external_or_harness_issues_zh": []
+  },
+  "decision": "retain",
+  "exclusion_code": null,
+  "decision_reason_zh": "保留为真实并发优势：两边是同一任务和同一 prompt，串行控制无并发污染且官方评估正常完成。并行的重叠子上下文提供了互补的根因、后端和测试信息，父上下文据此在超时前提交通过评估的窄补丁；串行单路探索没有形成补丁。并行墙钟更长，所以优势只编码为质量优势。",
+  "advantage": {
+    "proposed_dimension_zh": "互补工作并行化",
+    "secondary_mechanism_zh": null,
+    "benefit_kind": "quality",
+    "measured_benefit_zh": "并行官方评估 solution_passed 为 true，报告中 resolved_instances 为 1；串行官方评估 solution_passed 为 false，报告中 empty_patch_instances 为 1。并行耗时 1951.412 秒，串行耗时 1825.062 秒，因此没有时间收益，只有质量收益。",
+    "parallel_action_zh": "并行把不同必要部分并发拆开：多个子代理分别确认后端符号处理、SQLite 崩溃路径、timezone.tzname(None) 对 Etc/GMT-10 的返回值和测试落点，父上下文同时继续本地验证，随后选择窄的 _get_timezone_name 修复并添加回归测试。",
+    "serial_contrast_zh": "串行被设计成单路径控制，状态文件显示无 delegation、无 workflow、无子日志；轨迹只停留在阅读后端和 dateparse 代码，没有并发地补齐后端/根因/测试证据，也没有把调查转化为补丁。",
+    "mechanism_link_zh": "质量差异与并发链条相连：并行的互补调查在同一时间覆盖了父上下文无法串行快速完成的多个风险面，帮助确认根因修复足以覆盖评估目标并给出测试。宽泛子代理实现被父上下文停止并重置，未被选中或采用，所以不是多路尝试与优选；后续 adversarial verifier 未返回并导致代码修正，所以也不是独立校验与纠错。"
+  },
+  "new_pattern_candidate": {
+    "is_candidate": false,
+    "name_zh": null,
+    "mechanism_zh": null,
+    "why_existing_dimensions_fail_zh": null
+  },
+  "evidence": {
+    "parallel": [
+      {
+        "path": "parallel/cell/prompt.txt",
+        "line": 4,
+        "summary_zh": "任务说明把问题定位到 Etc/GMT-10 在 Trunc/Extract 中经 _get_timezone_name 进入后端后符号方向错误。"
+      },
+      {
+        "path": "parallel/agent/claude/.claude/projects/-testbed/8be28068-d101-4ef7-9951-e61036a491f4/workflows/scripts/tz-reverse-conversion-analysis-wf_df7c2521-bef.js",
+        "line": 11,
+        "summary_zh": "首个并行工作流定义 PostgreSQL、MySQL、Oracle、SQLite、tzutil、tests 六个互补调查 lane。"
+      },
+      {
+        "path": "parallel/agent/claude/.claude/projects/-testbed/8be28068-d101-4ef7-9951-e61036a491f4/workflows/wf_df7c2521-bef.json",
+        "line": 1,
+        "summary_zh": "工作流记录显示六个调查代理几乎同时启动，并返回后端、根因和测试报告，证明实际重叠工作。"
+      },
+      {
+        "path": "parallel/agent/claude/.claude/projects/-testbed/8be28068-d101-4ef7-9951-e61036a491f4.jsonl",
+        "line": 147,
+        "summary_zh": "父上下文说明子代理写入的实现过宽，随后停止工作流，保留参考但不直接采用该实现。"
+      },
+      {
+        "path": "parallel/agent/claude/.claude/projects/-testbed/8be28068-d101-4ef7-9951-e61036a491f4.jsonl",
+        "line": 159,
+        "summary_zh": "父上下文最终编辑 django/utils/timezone.py，将 _get_timezone_name 改为 tzname(None) 或 str() 回退。"
+      },
+      {
+        "path": "parallel/cell/model.patch",
+        "line": 8,
+        "summary_zh": "最终补丁在 _get_timezone_name 中实现窄修复，返回 timezone.tzname(None) or str(timezone)。"
+      }
+    ],
+    "serial": [
+      {
+        "path": "serial/cell/prompt.txt",
+        "line": 4,
+        "summary_zh": "串行模式收到同一 Django 时区回归任务，prompt 内容与并行一致。"
+      },
+      {
+        "path": "serial/agent/claude/.claude/projects/-testbed/a136bf63-0ca0-41b0-857e-87fdf12ffe64.jsonl",
+        "line": 6,
+        "summary_zh": "串行父上下文从 grep _get_timezone_name 用法开始单路探索。"
+      },
+      {
+        "path": "serial/agent/claude/.claude/projects/-testbed/a136bf63-0ca0-41b0-857e-87fdf12ffe64.jsonl",
+        "line": 13,
+        "summary_zh": "串行继续搜索测试和后端相关符号，但对应命令没有产出可用测试线索。"
+      },
+      {
+        "path": "serial/cell/status.json",
+        "line": 114,
+        "summary_zh": "串行协议校验显示 any_delegation 为 false，没有并发代理污染。"
+      },
+      {
+        "path": "serial/cell/status.json",
+        "line": 225,
+        "summary_zh": "串行尝试的 patch_bytes 为 0，说明最终交付为空补丁。"
+      },
+      {
+        "path": "serial/cell/status.json",
+        "line": 271,
+        "summary_zh": "串行官方评估记录 patch_exists 为 false，后续 solution_passed 为 false。"
+      }
+    ],
+    "evaluator": [
+      {
+        "path": "parallel/cell/evaluation/official-run/reports/uiuc-claude-parallel.formal-claude-parallel-django__django-14792.json",
+        "line": 5,
+        "summary_zh": "并行官方报告显示 resolved_instances 为 1。"
+      },
+      {
+        "path": "parallel/cell/evaluation/official-run/logs/run_evaluation/formal-claude-parallel-django__django-14792/uiuc-claude-parallel/django__django-14792/report.json",
+        "line": 6,
+        "summary_zh": "并行实例级报告显示补丁存在、成功应用并 resolved 为 true。"
+      },
+      {
+        "path": "serial/cell/evaluation/official-run/reports/uiuc-claude-serial.formal-claude-serial-django__django-14792.json",
+        "line": 7,
+        "summary_zh": "串行官方报告显示 empty_patch_instances 为 1。"
+      },
+      {
+        "path": "serial/cell/evaluation/official-run/harness.stdout.log",
+        "line": 8,
+        "summary_zh": "串行 harness stdout 也确认 empty patches 为 1。"
+      }
+    ]
+  },
+  "case_narrative_zh": "本任务要求修复 Django 3.2 后 Trunc()/Extract() 在 Etc/GMT-10 等时区上的反向转换。并行运行先自行定位相关函数，然后把 PostgreSQL、MySQL、Oracle、SQLite、timezone 工具函数和测试影响拆给多个子上下文并发调查；这些上下文重叠启动并返回互补证据，父上下文同时验证行为，丢弃过宽的子代理实现，最终提交 _get_timezone_name 的窄修复和回归测试。串行运行在无 workflow、无子代理的控制设置下只完成单路阅读和搜索，没有编辑和测试，官方评估为空补丁失败。并行耗时更长，不能认定时间优势；但官方质量从串行失败变为并行通过，且差异可由互补调查并行化帮助父上下文在时限内形成正确补丁来解释，因此保留为互补工作并行化的质量优势。",
+  "confidence": "high"
+}

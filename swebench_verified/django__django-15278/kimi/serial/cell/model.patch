@@ -1,0 +1,45 @@
+diff --git a/django/db/backends/sqlite3/schema.py b/django/db/backends/sqlite3/schema.py
+index 6752a8e3c0..140dac4c88 100644
+--- a/django/db/backends/sqlite3/schema.py
++++ b/django/db/backends/sqlite3/schema.py
+@@ -324,10 +324,14 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
+ 
+     def add_field(self, model, field):
+         """Create a field on a model."""
+-        # Fields with default values cannot by handled by ALTER TABLE ADD
+-        # COLUMN statement because DROP DEFAULT is not supported in
+-        # ALTER TABLE.
+-        if not field.null or self.effective_default(field) is not None:
++        # Fields with default values or unique constraints cannot be handled
++        # by ALTER TABLE ADD COLUMN statement because DROP DEFAULT and ADD
++        # UNIQUE are not supported in ALTER TABLE.
++        if (
++            not field.null or
++            self.effective_default(field) is not None or
++            field.unique
++        ):
+             self._remake_table(model, create_field=field)
+         else:
+             super().add_field(model, field)
+diff --git a/tests/schema/tests.py b/tests/schema/tests.py
+index cd6a52f6af..18c6252750 100644
+--- a/tests/schema/tests.py
++++ b/tests/schema/tests.py
+@@ -531,6 +531,17 @@ class SchemaTests(TransactionTestCase):
+         self.assertEqual(columns['age'][0], connection.features.introspected_field_types['IntegerField'])
+         self.assertTrue(columns['age'][1][6])
+ 
++    @isolate_apps('schema')
++    def test_add_field_o2o_nullable(self):
++        with connection.schema_editor() as editor:
++            editor.create_model(Author)
++            editor.create_model(Note)
++        new_field = OneToOneField(Note, null=True, on_delete=CASCADE)
++        new_field.set_attributes_from_name('note')
++        new_field.model = Author
++        with connection.schema_editor() as editor:
++            editor.add_field(Author, new_field)
++
+     def test_add_field_remove_field(self):
+         """
+         Adding a field and removing it removes all deferred sql referring to it.

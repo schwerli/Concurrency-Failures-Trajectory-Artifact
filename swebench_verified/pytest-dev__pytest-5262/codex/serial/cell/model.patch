@@ -1,0 +1,65 @@
+diff --git a/src/_pytest/capture.py b/src/_pytest/capture.py
+index 25eab7fd..71e1f5fe 100644
+--- a/src/_pytest/capture.py
++++ b/src/_pytest/capture.py
+@@ -407,6 +407,7 @@ def safe_text_dupfile(f, mode, default_encoding="UTF8"):
+     """ return an open text file object that's a duplicate of f on the
+         FD-level if possible.
+     """
++    text_mode = mode.replace("b", "")
+     encoding = getattr(f, "encoding", None)
+     try:
+         fd = f.fileno()
+@@ -419,15 +420,16 @@ def safe_text_dupfile(f, mode, default_encoding="UTF8"):
+         if "b" not in mode:
+             mode += "b"
+         f = os.fdopen(newfd, mode, 0)  # no buffering
+-    return EncodedFile(f, encoding or default_encoding)
++    return EncodedFile(f, encoding or default_encoding, mode=text_mode)
+ 
+ 
+ class EncodedFile(object):
+     errors = "strict"  # possibly needed by py3 code (issue555)
+ 
+-    def __init__(self, buffer, encoding):
++    def __init__(self, buffer, encoding, mode=None):
+         self.buffer = buffer
+         self.encoding = encoding
++        self._mode = mode
+ 
+     def write(self, obj):
+         if isinstance(obj, six.text_type):
+@@ -442,6 +444,12 @@ class EncodedFile(object):
+         data = "".join(linelist)
+         self.write(data)
+ 
++    @property
++    def mode(self):
++        if self._mode is not None:
++            return self._mode
++        return self.buffer.mode.replace("b", "")
++
+     @property
+     def name(self):
+         """Ensure that file.name is a string."""
+diff --git a/testing/test_capture.py b/testing/test_capture.py
+index 5d80eb63..83062aed 100644
+--- a/testing/test_capture.py
++++ b/testing/test_capture.py
+@@ -936,6 +936,16 @@ def test_dupfile(tmpfile):
+     assert fname_closed == repr(flist[0].buffer)
+ 
+ 
++@needsosdup
++def test_dupfile_mode_is_text(tmpfile):
++    f = capture.safe_text_dupfile(tmpfile, "wb+")
++    assert "b" not in f.mode
++    f.write(b"hello" if "b" in f.mode else "hello")
++    f.flush()
++    tmpfile.seek(0)
++    assert "hello" in repr(tmpfile.read())
++
++
+ def test_dupfile_on_bytesio():
+     bio = io.BytesIO()
+     f = capture.safe_text_dupfile(bio, "wb")

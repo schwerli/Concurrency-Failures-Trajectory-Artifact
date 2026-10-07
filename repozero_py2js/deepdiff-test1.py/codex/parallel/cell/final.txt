@@ -1,0 +1,582 @@
+Files written to `/output` and spot-verified against `/workspace/dataset/test1_executable` for help/error handling, repeated args, `--help` abbreviations, quote escaping, NBSP escaping, negative-number-like values, and multiline diffs.
+
+**Hierarchy**
+- [python_repr.mjs](/workspace/output/lib/python_repr.mjs)
+- [unified_diff.mjs](/workspace/output/lib/unified_diff.mjs)
+- [deepdiff_strings.mjs](/workspace/output/lib/deepdiff_strings.mjs)
+- [argparse_compat.mjs](/workspace/output/lib/argparse_compat.mjs)
+- [test1.mjs](/workspace/output/test1.mjs)
+
+**Library Files**
+
+[python_repr.mjs](/workspace/output/lib/python_repr.mjs)
+```js
+const ASCII_CONTROL_ESCAPES = {
+  "\b": "\\x08",
+  "\t": "\\t",
+  "\n": "\\n",
+  "\v": "\\x0b",
+  "\f": "\\x0c",
+  "\r": "\\r",
+};
+
+const NON_PRINTABLE_UNICODE = /[\p{C}\p{Z}]/u;
+
+function isPrintableCharacter(character, codePoint) {
+  if (codePoint === 0x20) {
+    return true;
+  }
+
+  if (codePoint >= 0x21 && codePoint <= 0x7e) {
+    return true;
+  }
+
+  return !NON_PRINTABLE_UNICODE.test(character);
+}
+
+function escapeCodePoint(character, codePoint, quote) {
+  if (character === "\\") {
+    return "\\\\";
+  }
+
+  if (character === quote) {
+    return `\\${quote}`;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(ASCII_CONTROL_ESCAPES, character)) {
+    return ASCII_CONTROL_ESCAPES[character];
+  }
+
+  if (isPrintableCharacter(character, codePoint)) {
+    return character;
+  }
+
+  if (codePoint <= 0xff) {
+    return `\\x${codePoint.toString(16).padStart(2, "0")}`;
+  }
+
+  if (codePoint <= 0xffff) {
+    return `\\u${codePoint.toString(16).padStart(4, "0")}`;
+  }
+
+  return `\\U${codePoint.toString(16).padStart(8, "0")}`;
+}
+
+export function formatPythonString(value) {
+  const quote = value.includes("'") && !value.includes('"') ? '"' : "'";
+  let output = quote;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const codePoint = value.codePointAt(index);
+    const character = String.fromCodePoint(codePoint);
+    output += escapeCodePoint(character, codePoint, quote);
+
+    if (codePoint > 0xffff) {
+      index += 1;
+    }
+  }
+
+  return `${output}${quote}`;
+}
+
+export function formatPythonValue(value) {
+  if (typeof value === "string") {
+    return formatPythonString(value);
+  }
+
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const entries = Object.entries(value);
+
+    if (entries.length === 0) {
+      return "{}";
+    }
+
+    return `{${entries
+      .map(([key, entryValue]) => `${formatPythonString(key)}: ${formatPythonValue(entryValue)}`)
+      .join(", ")}}`;
+  }
+
+  if (typeof value === "boolean") {
+    return value ? "True" : "False";
+  }
+
+  if (value === null) {
+    return "None";
+  }
+
+  return String(value);
+}
+```
+
+[unified_diff.mjs](/workspace/output/lib/unified_diff.mjs)
+```js
+const LINE_SEPARATOR_CODE_POINTS = new Set([0x0a, 0x0b, 0x0c, 0x0d, 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029]);
+
+function isNegativeNumberLike(token) {
+  return /^-\d+$|^-\d*\.\d+$/.test(token);
+}
+
+export function splitPythonLines(text) {
+  if (text.length === 0) {
+    return [];
+  }
+
+  const lines = [];
+  let current = "";
+  let endedWithLineBreak = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const codePoint = text.codePointAt(index);
+    const character = String.fromCodePoint(codePoint);
+
+    if (codePoint > 0xffff) {
+      index += 1;
+    }
+
+    if (codePoint === 0x0d) {
+      lines.push(current);
+      current = "";
+      endedWithLineBreak = true;
+
+      if (text.codePointAt(index + 1) === 0x0a) {
+        index += 1;
+      }
+
+      continue;
+    }
+
+    if (LINE_SEPARATOR_CODE_POINTS.has(codePoint)) {
+      lines.push(current);
+      current = "";
+      endedWithLineBreak = true;
+      continue;
+    }
+
+    current += character;
+    endedWithLineBreak = false;
+  }
+
+  if (!endedWithLineBreak) {
+    lines.push(current);
+  }
+
+  return lines;
+}
+
+function buildLcsTable(oldLines, newLines) {
+  const table = Array.from({ length: oldLines.length + 1 }, () => new Uint32Array(newLines.length + 1));
+
+  for (let oldIndex = oldLines.length - 1; oldIndex >= 0; oldIndex -= 1) {
+    for (let newIndex = newLines.length - 1; newIndex >= 0; newIndex -= 1) {
+      if (oldLines[oldIndex] === newLines[newIndex]) {
+        table[oldIndex][newIndex] = table[oldIndex + 1][newIndex + 1] + 1;
+      } else if (table[oldIndex + 1][newIndex] >= table[oldIndex][newIndex + 1]) {
+        table[oldIndex][newIndex] = table[oldIndex + 1][newIndex];
+      } else {
+        table[oldIndex][newIndex] = table[oldIndex][newIndex + 1];
+      }
+    }
+  }
+
+  return table;
+}
+
+function collapseOpcodes(primitiveOpcodes) {
+  const opcodes = [];
+
+  for (const opcode of primitiveOpcodes) {
+    const previousOpcode = opcodes[opcodes.length - 1];
+
+    if (previousOpcode && previousOpcode.tag === opcode.tag) {
+      previousOpcode.i2 = opcode.i2;
+      previousOpcode.j2 = opcode.j2;
+      continue;
+    }
+
+    opcodes.push({ ...opcode });
+  }
+
+  return opcodes;
+}
+
+function buildOpcodes(oldLines, newLines) {
+  const table = buildLcsTable(oldLines, newLines);
+  const primitiveOpcodes = [];
+  let oldIndex = 0;
+  let newIndex = 0;
+
+  while (oldIndex < oldLines.length && newIndex < newLines.length) {
+    if (oldLines[oldIndex] === newLines[newIndex]) {
+      primitiveOpcodes.push({ tag: "equal", i1: oldIndex, i2: oldIndex + 1, j1: newIndex, j2: newIndex + 1 });
+      oldIndex += 1;
+      newIndex += 1;
+      continue;
+    }
+
+    if (table[oldIndex + 1][newIndex] >= table[oldIndex][newIndex + 1]) {
+      primitiveOpcodes.push({ tag: "delete", i1: oldIndex, i2: oldIndex + 1, j1: newIndex, j2: newIndex });
+      oldIndex += 1;
+      continue;
+    }
+
+    primitiveOpcodes.push({ tag: "insert", i1: oldIndex, i2: oldIndex, j1: newIndex, j2: newIndex + 1 });
+    newIndex += 1;
+  }
+
+  while (oldIndex < oldLines.length) {
+    primitiveOpcodes.push({ tag: "delete", i1: oldIndex, i2: oldIndex + 1, j1: newIndex, j2: newIndex });
+    oldIndex += 1;
+  }
+
+  while (newIndex < newLines.length) {
+    primitiveOpcodes.push({ tag: "insert", i1: oldIndex, i2: oldIndex, j1: newIndex, j2: newIndex + 1 });
+    newIndex += 1;
+  }
+
+  return collapseOpcodes(primitiveOpcodes);
+}
+
+function formatUnifiedRange(start, stop) {
+  const beginning = start + 1;
+  const length = stop - start;
+
+  if (length === 1) {
+    return String(beginning);
+  }
+
+  if (length === 0) {
+    return `${beginning - 1},0`;
+  }
+
+  return `${beginning},${length}`;
+}
+
+function groupOpcodes(opcodes, contextSize) {
+  if (opcodes.length === 0) {
+    return [];
+  }
+
+  const grouped = opcodes.map((opcode) => ({ ...opcode }));
+
+  if (grouped[0].tag === "equal") {
+    grouped[0].i1 = Math.max(grouped[0].i1, grouped[0].i2 - contextSize);
+    grouped[0].j1 = Math.max(grouped[0].j1, grouped[0].j2 - contextSize);
+  }
+
+  if (grouped[grouped.length - 1].tag === "equal") {
+    grouped[grouped.length - 1].i2 = Math.min(grouped[grouped.length - 1].i2, grouped[grouped.length - 1].i1 + contextSize);
+    grouped[grouped.length - 1].j2 = Math.min(grouped[grouped.length - 1].j2, grouped[grouped.length - 1].j1 + contextSize);
+  }
+
+  const groups = [];
+  const largeEqualBlock = contextSize * 2;
+  let currentGroup = [];
+
+  for (const opcode of grouped) {
+    if (opcode.tag === "equal" && opcode.i2 - opcode.i1 > largeEqualBlock) {
+      currentGroup.push({
+        tag: "equal",
+        i1: opcode.i1,
+        i2: Math.min(opcode.i2, opcode.i1 + contextSize),
+        j1: opcode.j1,
+        j2: Math.min(opcode.j2, opcode.j1 + contextSize),
+      });
+      groups.push(currentGroup);
+      currentGroup = [];
+
+      currentGroup.push({
+        tag: "equal",
+        i1: Math.max(opcode.i1, opcode.i2 - contextSize),
+        i2: opcode.i2,
+        j1: Math.max(opcode.j1, opcode.j2 - contextSize),
+        j2: opcode.j2,
+      });
+      continue;
+    }
+
+    currentGroup.push(opcode);
+  }
+
+  if (!(currentGroup.length === 1 && currentGroup[0].tag === "equal")) {
+    groups.push(currentGroup);
+  }
+
+  return groups;
+}
+
+export function createUnifiedDiff(oldText, newText, contextSize = 3) {
+  const oldLines = splitPythonLines(oldText);
+  const newLines = splitPythonLines(newText);
+  const opcodes = buildOpcodes(oldLines, newLines);
+  const hasDifference = opcodes.some((opcode) => opcode.tag !== "equal");
+
+  if (!hasDifference) {
+    return "";
+  }
+
+  const groups = groupOpcodes(opcodes, contextSize);
+
+  if (groups.length === 0) {
+    return "";
+  }
+
+  const outputLines = ["--- ", "+++ "];
+
+  for (const group of groups) {
+    const firstOpcode = group[0];
+    const lastOpcode = group[group.length - 1];
+    outputLines.push(
+      `@@ -${formatUnifiedRange(firstOpcode.i1, lastOpcode.i2)} +${formatUnifiedRange(firstOpcode.j1, lastOpcode.j2)} @@`,
+    );
+
+    for (const opcode of group) {
+      if (opcode.tag === "equal" || opcode.tag === "delete") {
+        for (let index = opcode.i1; index < opcode.i2; index += 1) {
+          outputLines.push(`${opcode.tag === "equal" ? " " : "-"}${oldLines[index]}`);
+        }
+      }
+
+      if (opcode.tag === "insert") {
+        for (let index = opcode.j1; index < opcode.j2; index += 1) {
+          outputLines.push(`+${newLines[index]}`);
+        }
+      }
+    }
+  }
+
+  return outputLines.join("\n");
+}
+
+export { isNegativeNumberLike };
+```
+
+[deepdiff_strings.mjs](/workspace/output/lib/deepdiff_strings.mjs)
+```js
+import { createUnifiedDiff } from "./unified_diff.mjs";
+
+export function deepDiffStrings(oldValue, newValue) {
+  if (oldValue === newValue) {
+    return {};
+  }
+
+  const rootDifference = {
+    new_value: newValue,
+    old_value: oldValue,
+  };
+
+  if (oldValue.includes("\n") || newValue.includes("\n")) {
+    const diff = createUnifiedDiff(oldValue, newValue);
+
+    if (diff !== "") {
+      rootDifference.diff = diff;
+    }
+  }
+
+  return {
+    values_changed: {
+      root: rootDifference,
+    },
+  };
+}
+```
+
+[argparse_compat.mjs](/workspace/output/lib/argparse_compat.mjs)
+```js
+import { formatPythonString } from "./python_repr.mjs";
+import { isNegativeNumberLike } from "./unified_diff.mjs";
+
+const LONG_OPTIONS = ["--help", "--a", "--b"];
+
+function getProgramName(argv) {
+  const rawPath = argv[1] ?? "test1.mjs";
+  const parts = rawPath.split(/[\\/]/);
+  return parts[parts.length - 1] || "test1.mjs";
+}
+
+function formatUsage(programName) {
+  return `usage: ${programName} [-h] --a A --b B`;
+}
+
+export function formatHelp(programName) {
+  return `${formatUsage(programName)}
+
+options:
+  -h, --help  show this help message and exit
+  --a A
+  --b B
+`;
+}
+
+function formatError(programName, message) {
+  return `${formatUsage(programName)}
+${programName}: error: ${message}
+`;
+}
+
+function resolveLongOption(token) {
+  const equalsIndex = token.indexOf("=");
+  const optionPart = equalsIndex === -1 ? token : token.slice(0, equalsIndex);
+  const explicitValue = equalsIndex === -1 ? "" : token.slice(equalsIndex + 1);
+  const matches = LONG_OPTIONS.filter((candidate) => candidate.startsWith(optionPart));
+
+  if (matches.length !== 1) {
+    return null;
+  }
+
+  return {
+    option: matches[0],
+    hasExplicitValue: equalsIndex !== -1,
+    explicitValue,
+  };
+}
+
+function isShortHelpToken(token) {
+  return token.startsWith("-h") && !token.startsWith("--");
+}
+
+function isUnavailableAsOptionValue(token) {
+  if (token === "--") {
+    return true;
+  }
+
+  if (!token.startsWith("-") || token === "-") {
+    return false;
+  }
+
+  return !isNegativeNumberLike(token);
+}
+
+function createHelpResult(programName) {
+  return {
+    kind: "help",
+    exitCode: 0,
+    text: formatHelp(programName),
+  };
+}
+
+function createErrorResult(programName, message) {
+  return {
+    kind: "error",
+    exitCode: 2,
+    text: formatError(programName, message),
+  };
+}
+
+export function parseTest1Args(argv) {
+  const programName = getProgramName(argv);
+  const tokens = argv.slice(2);
+  const values = {
+    a: undefined,
+    b: undefined,
+  };
+  const unrecognized = [];
+  let parsePositionalsOnly = false;
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+
+    if (parsePositionalsOnly) {
+      unrecognized.push(token);
+      continue;
+    }
+
+    if (token === "--") {
+      parsePositionalsOnly = true;
+      continue;
+    }
+
+    if (isShortHelpToken(token)) {
+      return createHelpResult(programName);
+    }
+
+    if (token.startsWith("--")) {
+      const resolvedLongOption = resolveLongOption(token);
+
+      if (resolvedLongOption) {
+        if (resolvedLongOption.option === "--help") {
+          if (resolvedLongOption.hasExplicitValue) {
+            return createErrorResult(
+              programName,
+              `argument -h/--help: ignored explicit argument ${formatPythonString(resolvedLongOption.explicitValue)}`,
+            );
+          }
+
+          return createHelpResult(programName);
+        }
+
+        const optionName = resolvedLongOption.option.slice(2);
+
+        if (resolvedLongOption.hasExplicitValue) {
+          values[optionName] = resolvedLongOption.explicitValue;
+          continue;
+        }
+
+        const nextToken = tokens[index + 1];
+
+        if (nextToken === undefined || isUnavailableAsOptionValue(nextToken)) {
+          return createErrorResult(programName, `argument ${resolvedLongOption.option}: expected one argument`);
+        }
+
+        values[optionName] = nextToken;
+        index += 1;
+        continue;
+      }
+    }
+
+    unrecognized.push(token);
+  }
+
+  const missingArguments = [];
+
+  if (values.a === undefined) {
+    missingArguments.push("--a");
+  }
+
+  if (values.b === undefined) {
+    missingArguments.push("--b");
+  }
+
+  if (missingArguments.length > 0) {
+    return createErrorResult(programName, `the following arguments are required: ${missingArguments.join(", ")}`);
+  }
+
+  if (unrecognized.length > 0) {
+    return createErrorResult(programName, `unrecognized arguments: ${unrecognized.join(" ")}`);
+  }
+
+  return {
+    kind: "ok",
+    exitCode: 0,
+    values,
+  };
+}
+```
+
+**Entry File**
+
+[test1.mjs](/workspace/output/test1.mjs)
+```js
+import { parseTest1Args } from "./lib/argparse_compat.mjs";
+import { deepDiffStrings } from "./lib/deepdiff_strings.mjs";
+import { formatPythonValue } from "./lib/python_repr.mjs";
+
+export function main(argv = process.argv) {
+  const parsed = parseTest1Args(argv);
+
+  if (parsed.kind === "help") {
+    process.stdout.write(parsed.text);
+    return parsed.exitCode;
+  }
+
+  if (parsed.kind === "error") {
+    process.stderr.write(parsed.text);
+    return parsed.exitCode;
+  }
+
+  const result = deepDiffStrings(parsed.values.a, parsed.values.b);
+  process.stdout.write(`${formatPythonValue(result)}\n`);
+  return 0;
+}
+
+process.exitCode = main();
+```

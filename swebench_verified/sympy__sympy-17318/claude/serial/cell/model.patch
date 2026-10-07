@@ -1,0 +1,52 @@
+diff --git a/sympy/simplify/radsimp.py b/sympy/simplify/radsimp.py
+index 216ae26204..37da7129de 100644
+--- a/sympy/simplify/radsimp.py
++++ b/sympy/simplify/radsimp.py
+@@ -1113,6 +1113,8 @@ def _split_gcd(*a):
+     >>> _split_gcd(55, 35, 22, 14, 77, 10)
+     (5, [55, 35, 10], [22, 14, 77])
+     """
++    if not a:
++        return S.One, [], []
+     g = a[0]
+     b1 = [g]
+     b2 = []
+diff --git a/sympy/simplify/sqrtdenest.py b/sympy/simplify/sqrtdenest.py
+index f0b7653ea8..e437987d83 100644
+--- a/sympy/simplify/sqrtdenest.py
++++ b/sympy/simplify/sqrtdenest.py
+@@ -156,7 +156,8 @@ def _sqrt_match(p):
+         res = (p, S.Zero, S.Zero)
+     elif p.is_Add:
+         pargs = sorted(p.args, key=default_sort_key)
+-        if all((x**2).is_Rational for x in pargs):
++        sqargs = [x**2 for x in pargs]
++        if all(sq.is_Rational and sq.is_positive for sq in sqargs):
+             r, b, a = split_surds(p)
+             res = a, b, r
+             return list(res)
+diff --git a/sympy/simplify/tests/test_sqrtdenest.py b/sympy/simplify/tests/test_sqrtdenest.py
+index c30f7a3235..275dc94fe9 100644
+--- a/sympy/simplify/tests/test_sqrtdenest.py
++++ b/sympy/simplify/tests/test_sqrtdenest.py
+@@ -1,5 +1,5 @@
+ from sympy import sqrt, root, S, Symbol, sqrtdenest, Integral, cos
+-from sympy.simplify.sqrtdenest import _subsets as subsets
++from sympy.simplify.sqrtdenest import _subsets as subsets, _sqrt_match
+ from sympy.utilities.pytest import slow
+ 
+ r2, r3, r5, r6, r7, r10, r15, r29 = [sqrt(x) for x in [2, 3, 5, 6, 7, 10,
+@@ -183,3 +183,13 @@ def test_issue_5653():
+ 
+ def test_sqrt_ratcomb():
+     assert sqrtdenest(sqrt(1 + r3) + sqrt(3 + 3*r3) - sqrt(10 + 6*r3)) == 0
++
++
++def test_issue_12420():
++    I = S.ImaginaryUnit
++    # _sqrt_match must not use split_surds when the addends are not surds
++    # of positive rationals
++    assert _sqrt_match(4 + I) == []
++    assert sqrtdenest((3 - sqrt(2)*sqrt(4 + 3*I) + 3*I)/2) == I
++    # nothing to denest here: returned unchanged
++    assert sqrtdenest(sqrt(4 + I)) == sqrt(4 + I)

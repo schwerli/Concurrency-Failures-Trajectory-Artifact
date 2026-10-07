@@ -1,0 +1,186 @@
+Files are written under `/output` and verified. Library files first, then the entry file.
+
+**Library Files**
+[formatting.mjs](/output/lib/cli/formatting.mjs)
+```js
+export function formatUsage(programName) {
+  return `usage: ${programName} [-h] --a A\n`;
+}
+
+export function formatHelp(programName) {
+  return (
+    `${formatUsage(programName)}\n` +
+    'options:\n' +
+    '  -h, --help  show this help message and exit\n' +
+    '  --a A\n'
+  );
+}
+
+export function formatError(programName, message) {
+  return `${formatUsage(programName)}${programName}: error: ${message}\n`;
+}
+```
+
+[parser.mjs](/output/lib/cli/parser.mjs)
+```js
+import { formatError, formatHelp } from './formatting.mjs';
+
+export class CliExit extends Error {
+  constructor(code, stream, text) {
+    super(text);
+    this.code = code;
+    this.stream = stream;
+    this.text = text;
+  }
+}
+
+export function parseTest3Args(argv, programName) {
+  let aValue;
+  const unknown = [];
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (token === '-h' || token === '--help') {
+      throw new CliExit(0, 'stdout', formatHelp(programName));
+    }
+
+    if (token === '--a') {
+      const next = argv[index + 1];
+      if (next === undefined || looksLikeOption(next)) {
+        throw new CliExit(
+          2,
+          'stderr',
+          formatError(programName, 'argument --a: expected one argument'),
+        );
+      }
+
+      aValue = next;
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith('--a=')) {
+      aValue = token.slice(4);
+      continue;
+    }
+
+    if (token === '--') {
+      unknown.push(...argv.slice(index + 1));
+      break;
+    }
+
+    unknown.push(token);
+  }
+
+  if (aValue === undefined) {
+    throw new CliExit(
+      2,
+      'stderr',
+      formatError(programName, 'the following arguments are required: --a'),
+    );
+  }
+
+  if (unknown.length > 0) {
+    throw new CliExit(
+      2,
+      'stderr',
+      formatError(programName, `unrecognized arguments: ${unknown.join(' ')}`),
+    );
+  }
+
+  return { a: aValue };
+}
+
+export function writeCliExit(error) {
+  if (!(error instanceof CliExit)) {
+    throw error;
+  }
+
+  const stream = error.stream === 'stdout' ? process.stdout : process.stderr;
+  stream.write(error.text);
+  process.exitCode = error.code;
+}
+
+function looksLikeOption(token) {
+  return token.startsWith('-') && token !== '-';
+}
+```
+
+[analysis.mjs](/output/lib/whoosh/analysis.mjs)
+```js
+export class StemmingAnalyzer {}
+```
+
+[fields.mjs](/output/lib/whoosh/fields.mjs)
+```js
+export function TEXT(options = {}) {
+  return new TextField(options);
+}
+
+export class Schema {
+  constructor(fields = {}) {
+    this.fields = { ...fields };
+  }
+
+  toString() {
+    return `<Schema: ${formatPythonStringList(Object.keys(this.fields))}>`;
+  }
+}
+
+class TextField {
+  constructor({ analyzer = null } = {}) {
+    this.analyzer = analyzer;
+  }
+}
+
+function formatPythonStringList(values) {
+  return `[${values.map(formatPythonString).join(', ')}]`;
+}
+
+function formatPythonString(value) {
+  const escaped = String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'");
+
+  return `'${escaped}'`;
+}
+```
+
+**Entry File**
+[test3.mjs](/output/test3.mjs)
+```js
+import { parseTest3Args, writeCliExit } from './lib/cli/parser.mjs';
+import { StemmingAnalyzer } from './lib/whoosh/analysis.mjs';
+import { Schema, TEXT } from './lib/whoosh/fields.mjs';
+
+export function main(argv = process.argv.slice(2), programPath = process.argv[1]) {
+  const programName = getProgramName(programPath);
+
+  try {
+    parseTest3Args(argv, programName);
+  } catch (error) {
+    writeCliExit(error);
+    return;
+  }
+
+  const analyzer = new StemmingAnalyzer();
+  const schema = new Schema({ content: TEXT({ analyzer }) });
+  console.log(String(schema));
+}
+
+function getProgramName(programPath) {
+  if (!programPath) {
+    return 'test3.mjs';
+  }
+
+  const parts = programPath.split(/[\\/]/);
+  return parts[parts.length - 1] || 'test3.mjs';
+}
+
+if (process.argv[1] && import.meta.url.endsWith(process.argv[1])) {
+  main();
+}
+```
+
+Verified: `node /output/test3.mjs --a x` produces stdout bytes identical to `/workspace/dataset/test3_executable --a x`, and the manual parser matches the observed `argparse` behavior for `--help`, missing `--a`, missing `--a` value, `--a=value`, duplicate `--a`, and unknown arguments.

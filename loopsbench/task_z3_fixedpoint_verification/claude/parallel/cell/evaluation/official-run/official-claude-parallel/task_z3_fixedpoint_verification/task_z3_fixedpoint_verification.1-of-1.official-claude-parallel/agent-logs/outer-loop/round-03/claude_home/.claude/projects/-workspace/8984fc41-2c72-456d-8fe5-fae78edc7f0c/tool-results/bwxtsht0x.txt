@@ -1,0 +1,1125 @@
+"""Translation of a small imperative language into constrained Horn clauses.
+
+The module ships three layers that stack on top of each other:
+
+1. **SimpleAST** -- :class:`Variable`, :class:`Const`, :class:`BinOp`,
+   :class:`UnOp`, :class:`Assign`, :class:`If`, :class:`While`,
+   :class:`Assert` and :class:`Sequence`.  Expression nodes translate
+   themselves with ``to_z3(env)``, where ``env`` maps a program variable name
+   onto the z3 integer constant that stands for it.  Unary negation and
+   boolean negation are both spelled ``UnOp(op, operand)`` with ``op`` in
+   ``{"-", "not"}``.
+
+2. **Parser** -- :func:`parse_program` runs a hand written tokenizer and
+   recursive descent parser over this grammar::
+
+       program ::= statement*
+       block   ::= '{' statement* '}'
+       stmt    ::= 'var' IDENT '=' expr ';'
+                 | IDENT '=' expr ';'
+                 | 'if' '(' expr ')' block ('else' (block | if-stmt))?
+                 | 'while' '(' expr ')' ('bound' NUMBER)? block
+                 | 'assert' '(' expr ')' ';'
+       expr    ::= or_expr                     -- 'or' < 'and' < 'not'
+                                               -- < comparison < +,- < * < unary
+
+   ``//`` starts a line comment.  A comment of the shape ``// @bound 100``
+   placed directly in front of a loop is an alternative spelling of the
+   primary, inline ``while (cond) bound 100 { ... }`` annotation; when both
+   are present the inline one wins.  Malformed input raises :class:`ParseError`
+   carrying the offending line and column.
+
+3. **Horn encoding** -- :class:`HornEncoder` walks the AST and creates one
+   fresh relation per program point, each of them over the *whole* vector of
+   program variables, so that a solution of the clause system assigns an
+   invariant to every point.  Assignments relate a point to its successor, a
+   loop head becomes a recursive relation, and every assertion contributes a
+   clause into the nullary ``Error`` relation.  :func:`verify_program` loads
+   the clauses into a Spacer :class:`z3.Fixedpoint` and queries ``Error``:
+   ``unsat`` means the assertions hold on every execution, ``sat`` means a
+   concrete execution violates one of them.
+"""
+
+import operator
+import re
+import time
+
+import z3
+
+__all__ = [
+    "DEFAULT_TIMEOUT_MS",
+    "ParseError",
+    "EncodingError",
+    "Variable",
+    "Const",
+    "BinOp",
+    "UnOp",
+    "Assign",
+    "If",
+    "While",
+    "Assert",
+    "Sequence",
+    "tokenize",
+    "parse_program",
+    "HornClause",
+    "HornEncoder",
+    "HornVerifier",
+    "verify_program",
+]
+
+#: Wall clock budget handed to Spacer for a single query, in milliseconds.
+#: Every program below is discharged in a few milliseconds; the budget only
+#: guarantees that a pathological input degrades to "unknown" instead of
+#: hanging the experiment.
+DEFAULT_TIMEOUT_MS = 10000
+
+
+class ParseError(Exception):
+    """Raised when the program text does not conform to the grammar.
+
+    Besides the formatted message the exception carries the raw `message`,
+    `line` and `column` of the offending token so callers can point at it.
+    """
+
+    def __init__(self, message, line, column):
+        super().__init__("line %d, column %d: %s" % (line, column, message))
+        self.message = message
+        self.line = line
+        self.column = column
+
+
+class EncodingError(Exception):
+    """Raised when a syntactically valid program cannot be encoded.
+
+    The language is integer valued, so mixing an arithmetic expression into a
+    boolean position (or the other way around) is caught here rather than by
+    an opaque z3 type error.
+    """
+
+
+# --------------------------------------------------------------------------
+# SimpleAST
+# --------------------------------------------------------------------------
+
+
+class ASTNode(object):
+    """Base class of every AST node."""
+
+    def children(self):
+        """Return the direct child nodes, in source order."""
+        return []
+
+
+class Expr(ASTNode):
+    """Base class of the expression nodes, which translate to z3 terms."""
+
+    def to_z3(self, env):
+        """Translate this expression to a z3 term.
+
+        Args:
+            env: Mapping from program variable name to the z3 constant that
+                represents it at the current program point.
+
+        Returns:
+            A z3 ``ArithRef`` for arithmetic expressions, a ``BoolRef`` for
+            comparisons and boolean connectives.
+        """
+        raise NotImplementedError
+
+
+class Variable(Expr):
+    """A reference to the program variable `name`."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def to_z3(self, env):
+        """Look `name` up in `env`; unknown names are an encoding error."""
+        try:
+            return env[self.name]
+        except KeyError:
+            raise EncodingError("reference to undeclared variable %r" % self.name)
+
+    def __repr__(self):
+        return "Variable(%r)" % self.name
+
+
+class Const(Expr):
+    """An integer literal."""
+
+    def __init__(self, value):
+        self.value = int(value)
+
+    def to_z3(self, env):
+        """Return the literal as a z3 integer value."""
+        return z3.IntVal(self.value)
+
+    def __repr__(self):
+        return "Const(%d)" % self.value
+
+
+class BinOp(Expr):
+    """A binary operation ``left op right``.
+
+    Supported operators are the arithmetic ``+ - *``, the comparisons
+    ``< <= == != > >=`` and the boolean connectives ``and`` / ``or``.
+    """
+
+    #: Operator name -> builder taking the two translated operands.
+    BUILDERS = {
+        "+": operator.add,
+        "-": operator.sub,
+        "*": operator.mul,
+        "<": operator.lt,
+        "<=": operator.le,
+        ">": operator.gt,
+        ">=": operator.ge,
+        "==": lambda a, b: a == b,
+        "!=": lambda a, b: a != b,
+        "and": lambda a, b: z3.And(a, b),
+        "or": lambda a, b: z3.Or(a, b),
+    }
+
+    #: Operators whose operands and result are booleans.
+    LOGICAL = ("and", "or")
+
+    def __init__(self, op, left, right):
+        if op not in self.BUILDERS:
+            raise EncodingError("unsupported binary operator %r" % op)
+        self.op = op
+        self.left = left
+        self.right = right
+
+    def children(self):
+        return [self.left, self.right]
+
+    def to_z3(self, env):
+        """Translate both operands and combine them with `op`."""
+        left = self.left.to_z3(env)
+        right = self.right.to_z3(env)
+        expect_bool = self.op in self.LOGICAL
+        for operand in (left, right):
+            if z3.is_bool(operand) != expect_bool:
+                raise EncodingError(
+                    "operator %r expects %s operands" %
+                    (self.op, "boolean" if expect_bool else "integer"))
+        return self.BUILDERS[self.op](left, right)
+
+    def __repr__(self):
+        return "BinOp(%r, %r, %r)" % (self.op, self.left, self.right)
+
+
+class UnOp(Expr):
+    """A unary operation: boolean ``not`` or arithmetic negation ``-``."""
+
+    def __init__(self, op, operand):
+        if op not in ("not", "-"):
+            raise EncodingError("unsupported unary operator %r" % op)
+        self.op = op
+        self.operand = operand
+
+    def children(self):
+        return [self.operand]
+
+    def to_z3(self, env):
+        """Translate the operand and apply the unary operator."""
+        value = self.operand.to_z3(env)
+        if self.op == "not":
+            if not z3.is_bool(value):
+                raise EncodingError("operator 'not' expects a boolean operand")
+            return z3.Not(value)
+        if z3.is_bool(value):
+            raise EncodingError("unary '-' expects an integer operand")
+        return -value
+
+    def __repr__(self):
+        return "UnOp(%r, %r)" % (self.op, self.operand)
+
+
+class Assign(ASTNode):
+    """Assignment ``var_name = expr``.
+
+    `is_decl` records whether the source spelled this as a ``var`` declaration;
+    it does not change the semantics, since a declaration is simply the first
+    assignment to the variable.
+    """
+
+    def __init__(self, var_name, expr, is_decl=False):
+        self.var_name = var_name
+        self.expr = expr
+        self.is_decl = bool(is_decl)
+
+    def children(self):
+        return [self.expr]
+
+    def __repr__(self):
+        suffix = ", is_decl=True" if self.is_decl else ""
+        return "Assign(%r, %r%s)" % (self.var_name, self.expr, suffix)
+
+
+class If(ASTNode):
+    """Conditional ``if (cond) then_body else else_body``.
+
+    `then_body` is a :class:`Sequence`; `else_body` is a :class:`Sequence` or
+    ``None`` when the source omits the ``else`` branch.
+    """
+
+    def __init__(self, cond, then_body, else_body=None):
+        self.cond = cond
+        self.then_body = then_body
+        self.else_body = else_body
+
+    def children(self):
+        kids = [self.cond, self.then_body]
+        if self.else_body is not None:
+            kids.append(self.else_body)
+        return kids
+
+    def __repr__(self):
+        return "If(%r, %r, %r)" % (self.cond, self.then_body, self.else_body)
+
+
+class While(ASTNode):
+    """Loop ``while (cond) body`` with an optional iteration `bound`.
+
+    A `bound` of ``None`` means the loop runs an unbounded number of times.
+    When a bound is given the encoder threads an implicit iteration counter
+    through the loop relation and lets the loop leave once the counter reaches
+    the bound.
+    """
+
+    def __init__(self, cond, body, bound=None):
+        self.cond = cond
+        self.body = body
+        self.bound = None if bound is None else int(bound)
+
+    def children(self):
+        return [self.cond, self.body]
+
+    def __repr__(self):
+        suffix = "" if self.bound is None else ", bound=%d" % self.bound
+        return "While(%r, %r%s)" % (self.cond, self.body, suffix)
+
+
+class Assert(ASTNode):
+    """Assertion ``assert(cond)`` that must hold on every execution."""
+
+    def __init__(self, cond):
+        self.cond = cond
+
+    def children(self):
+        return [self.cond]
+
+    def __repr__(self):
+        return "Assert(%r)" % (self.cond,)
+
+
+class Sequence(ASTNode):
+    """Sequential composition of the statements in `stmts`."""
+
+    def __init__(self, stmts):
+        self.stmts = list(stmts)
+
+    def children(self):
+        return list(self.stmts)
+
+    def __repr__(self):
+        return "Sequence(%r)" % (self.stmts,)
+
+
+# --------------------------------------------------------------------------
+# Tokenizer and parser
+# --------------------------------------------------------------------------
+
+_KEYWORDS = frozenset(
+    ["var", "if", "else", "while", "bound", "assert", "and", "or", "not"])
+
+#: Multi character operators first, so that '<=' never lexes as '<' '='.
+_OPERATORS = ("<=", ">=", "==", "!=", "<", ">", "+", "-", "*", "=")
+
+_PUNCTUATION = "(){};"
+
+_COMPARISONS = frozenset(["<", "<=", "==", "!=", ">", ">="])
+
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+_NUMBER_RE = re.compile(r"[0-9]+")
+_BOUND_COMMENT_RE = re.compile(r"@bound\s+([0-9]+)")
+
+
+class Token(object):
+    """A lexical token with its source position (1 based line and column)."""
+
+    def __init__(self, kind, value, line, column):
+        self.kind = kind
+        self.value = value
+        self.line = line
+        self.column = column
+
+    def describe(self):
+        """Return a human readable rendering used in parse error messages."""
+        if self.kind == "EOF":
+            return "end of input"
+        if self.kind == "BOUND":
+            return "'// @bound %d'" % self.value
+        return "'%s'" % self.value
+
+    def __repr__(self):
+        return "Token(%r, %r, line=%d, column=%d)" % (
+            self.kind, self.value, self.line, self.column)
+
+
+def tokenize(text):
+    """Split program `text` into a list of :class:`Token` ending with ``EOF``.
+
+    Line comments are dropped, except that a ``// @bound N`` comment produces a
+    ``BOUND`` token so the parser can attach the annotation to the loop that
+    follows it.
+
+    Raises:
+        ParseError: on a character that starts no legal token.
+    """
+    tokens = []
+    pos, line, column = 0, 1, 1
+    length = len(text)
+    while pos < length:
+        char = text[pos]
+        if char == "\n":
+            pos, line, column = pos + 1, line + 1, 1
+            continue
+        if char in " \t\r\f\v":
+            pos, column = pos + 1, column + 1
+            continue
+        if text.startswith("//", pos):
+            end = text.find("\n", pos)
+            end = length if end < 0 else end
+            match = _BOUND_COMMENT_RE.search(text, pos, end)
+            if match:
+                tokens.append(Token("BOUND", int(match.group(1)), line, column))
+            column += end - pos
+            pos = end
+            continue
+        match = _NUMBER_RE.match(text, pos)
+        if match:
+            tokens.append(Token("NUMBER", int(match.group()), line, column))
+            column += len(match.group())
+            pos = match.end()
+            continue
+        match = _IDENT_RE.match(text, pos)
+        if match:
+            word = match.group()
+            kind = "KEYWORD" if word in _KEYWORDS else "IDENT"
+            tokens.append(Token(kind, word, line, column))
+            column += len(word)
+            pos = match.end()
+            continue
+        for op in _OPERATORS:
+            if text.startswith(op, pos):
+                tokens.append(Token("OP", op, line, column))
+                column += len(op)
+                pos += len(op)
+                break
+        else:
+            if char in _PUNCTUATION:
+                tokens.append(Token("PUNCT", char, line, column))
+                pos, column = pos + 1, column + 1
+                continue
+            raise ParseError("unexpected character %r" % char, line, column)
+    tokens.append(Token("EOF", None, line, column))
+    return tokens
+
+
+class _Parser(object):
+    """Recursive descent parser over the token list produced by :func:`tokenize`."""
+
+    def __init__(self, tokens):
+        self._tokens = tokens
+        self._pos = 0
+
+    # -- token plumbing ----------------------------------------------------
+
+    @property
+    def _current(self):
+        return self._tokens[self._pos]
+
+    def _check(self, kind, value=None):
+        token = self._current
+        return token.kind == kind and (value is None or token.value == value)
+
+    def _accept(self, kind, value=None):
+        """Consume and return the current token if it matches, else ``None``."""
+        if self._check(kind, value):
+            token = self._current
+            self._pos += 1
+            return token
+        return None
+
+    def _expect(self, kind, value=None, what=None):
+        """Consume the current token, raising :class:`ParseError` on a mismatch."""
+        token = self._accept(kind, value)
+        if token is None:
+            wanted = what or (repr(value) if value is not None else kind)
+            raise self._error("expected %s but found %s"
+                              % (wanted, self._current.describe()))
+        return token
+
+    def _error(self, message, token=None):
+        token = token or self._current
+        return ParseError(message, token.line, token.column)
+
+    # -- statements --------------------------------------------------------
+
+    def parse(self):
+        """Parse the whole token stream into a top level :class:`Sequence`."""
+        stmts = []
+        while not self._check("EOF"):
+            stmts.append(self._statement())
+        return Sequence(stmts)
+
+    def _statement(self):
+        token = self._current
+        if token.kind == "BOUND":
+            return self._annotated_loop()
+        if token.kind == "KEYWORD":
+            if token.value == "var":
+                return self._declaration()
+            if token.value == "if":
+                return self._if_statement()
+            if token.value == "while":
+                return self._while_statement()
+            if token.value == "assert":
+                return self._assert_statement()
+        if token.kind == "IDENT":
+            return self._assignment()
+        raise self._error("expected a statement but found %s" % token.describe())
+
+    def _annotated_loop(self):
+        """Parse a ``// @bound N`` comment together with the loop it annotates."""
+        annotation = self._expect("BOUND")
+        if not self._check("KEYWORD", "while"):
+            raise self._error("a '// @bound' annotation must precede a while loop")
+        loop = self._while_statement()
+        if loop.bound is None:  # an inline 'bound' clause takes precedence
+            loop.bound = annotation.value
+        return loop
+
+    def _declaration(self):
+        self._expect("KEYWORD", "var")
+        name = self._expect("IDENT", what="a variable name").value
+        self._expect("OP", "=", what="'=' in a variable declaration")
+        expr = self._expression()
+        self._expect("PUNCT", ";", what="';' after a variable declaration")
+        return Assign(name, expr, is_decl=True)
+
+    def _assignment(self):
+        name = self._expect("IDENT", what="a variable name").value
+        self._expect("OP", "=", what="'=' in an assignment")
+        expr = self._expression()
+        self._expect("PUNCT", ";", what="';' after an assignment")
+        return Assign(name, expr)
+
+    def _if_statement(self):
+        self._expect("KEYWORD", "if")
+        self._expect("PUNCT", "(", what="'(' after 'if'")
+        cond = self._expression()
+        self._expect("PUNCT", ")", what="')' after the if condition")
+        then_body = self._block()
+        else_body = None
+        if self._accept("KEYWORD", "else"):
+            if self._check("KEYWORD", "if"):  # 'else if' chain
+                else_body = Sequence([self._if_statement()])
+            else:
+                else_body = self._block()
+        return If(cond, then_body, else_body)
+
+    def _while_statement(self):
+        self._expect("KEYWORD", "while")
+        self._expect("PUNCT", "(", what="'(' after 'while'")
+        cond = self._expression()
+        self._expect("PUNCT", ")", what="')' after the loop condition")
+        bound = None
+        if self._accept("KEYWORD", "bound"):
+            bound = self._expect("NUMBER", what="an integer iteration bound").value
+        body = self._block()
+        return While(cond, body, bound)
+
+    def _assert_statement(self):
+        self._expect("KEYWORD", "assert")
+        self._expect("PUNCT", "(", what="'(' after 'assert'")
+        cond = self._expression()
+        self._expect("PUNCT", ")", what="')' after the assert condition")
+        self._expect("PUNCT", ";", what="';' after an assert statement")
+        return Assert(cond)
+
+    def _block(self):
+        """Parse ``{ statement* }`` and return the statements as a Sequence."""
+        self._expect("PUNCT", "{", what="'{' to open a block")
+        stmts = []
+        while not self._check("PUNCT", "}"):
+            if self._check("EOF"):
+                raise self._error("unterminated block, expected '}'")
+            stmts.append(self._statement())
+        self._expect("PUNCT", "}")
+        return Sequence(stmts)
+
+    # -- expressions, loosest binding operator first -----------------------
+
+    def _expression(self):
+        return self._or_expression()
+
+    def _or_expression(self):
+        node = self._and_expression()
+        while self._accept("KEYWORD", "or"):
+            node = BinOp("or", node, self._and_expression())
+        return node
+
+    def _and_expression(self):
+        node = self._not_expression()
+        while self._accept("KEYWORD", "and"):
+            node = BinOp("and", node, self._not_expression())
+        return node
+
+    def _not_expression(self):
+        if self._accept("KEYWORD", "not"):
+            return UnOp("not", self._not_expression())
+        return self._comparison()
+
+    def _comparison(self):
+        node = self._additive()
+        token = self._current
+        if token.kind == "OP" and token.value in _COMPARISONS:
+            self._pos += 1
+            node = BinOp(token.value, node, self._additive())
+        return node
+
+    def _additive(self):
+        node = self._multiplicative()
+        while True:
+            token = self._current
+            if token.kind == "OP" and token.value in ("+", "-"):
+                self._pos += 1
+                node = BinOp(token.value, node, self._multiplicative())
+            else:
+                return node
+
+    def _multiplicative(self):
+        node = self._unary()
+        while self._accept("OP", "*"):
+            node = BinOp("*", node, self._unary())
+        return node
+
+    def _unary(self):
+        if self._accept("OP", "-"):
+            return UnOp("-", self._unary())
+        return self._primary()
+
+    def _primary(self):
+        token = self._current
+        if token.kind == "NUMBER":
+            self._pos += 1
+            return Const(token.value)
+        if token.kind == "IDENT":
+            self._pos += 1
+            return Variable(token.value)
+        if self._accept("PUNCT", "("):
+            node = self._expression()
+            self._expect("PUNCT", ")", what="')' to close a parenthesised expression")
+            return node
+        raise self._error("expected an expression but found %s" % token.describe())
+
+
+def parse_program(text):
+    """Parse imperative program `text` into a :class:`Sequence` AST.
+
+    Args:
+        text: Source of the program; ``//`` line comments are ignored.
+
+    Returns:
+        The top level :class:`Sequence` of parsed statements.
+
+    Raises:
+        ParseError: on any lexical or syntactic problem, carrying the line and
+            column of the offending token.
+    """
+    return _Parser(tokenize(text)).parse()
+
+
+# --------------------------------------------------------------------------
+# Horn clause encoding
+# --------------------------------------------------------------------------
+
+
+def _one_line(expr):
+    """Render a z3 expression on a single line, collapsing its layout breaks."""
+    return " ".join(str(expr).split())
+
+
+class HornClause(object):
+    """A constrained Horn clause ``head :- body``.
+
+    Both `head` and `body` hold z3 expressions: the head is an application of a
+    program point relation (or of the nullary ``Error`` relation) and the body
+    is the list of relation applications and constraints that imply it.  An
+    empty body denotes a fact.
+    """
+
+    def __init__(self, head, body=None, name=None):
+        self.head = head
+        self.body = list(body) if body is not None else []
+        self.name = name
+
+    def __repr__(self):
+        body = ", ".join(_one_line(term) for term in self.body) or "true"
+        label = "" if self.name is None else "[%s] " % self.name
+        return "%s%s :- %s" % (label, _one_line(self.head), body)
+
+
+class HornEncoder(object):
+    """Encode a SimpleAST program as a system of constrained Horn clauses.
+
+    One fresh relation is created per program point, always over the complete
+    vector of program variables in :attr:`program_vars` order, so that a
+    solution of the system labels every point with an invariant.  Control flow
+    is threaded by passing the relation of the point before a statement in and
+    getting the relation of the point after it back.
+
+    Every ``encode_*`` method appends the clauses it builds to :attr:`clauses`
+    and returns exactly those clauses, so it can also be called on its own.
+
+    Attributes:
+        program_vars: Names of the program variables, in declaration order.
+        relations: Mapping from relation name to its z3 declaration.
+        loop_relations: Names of the relations that stand for a loop head, in
+            creation order; a solution assigns each of them a loop invariant.
+        clauses: The :class:`HornClause` objects built so far.
+        error: The nullary ``Error`` relation reached by a violated assertion.
+    """
+
+    def __init__(self, timeout_ms=DEFAULT_TIMEOUT_MS):
+        self.timeout_ms = timeout_ms
+        self._reset()
+
+    def _reset(self):
+        """Drop all state, so an encoder instance can be reused."""
+        self.program_vars = []
+        self.relations = {}
+        self.loop_relations = []
+        self.clauses = []
+        self.error = z3.Function("Error", z3.BoolSort())
+        self.entry_relation = None
+        self.exit_relation = None
+        self._consts = {}
+        self._extra_consts = []
+        self._loop_counters = {}
+        self._counters = {"point": 0, "loop": 0, "fresh": 0}
+
+    # -- helpers -----------------------------------------------------------
+
+    def _new_relation(self, is_loop=False):
+        """Declare a fresh relation over every program variable."""
+        kind = "loop" if is_loop else "point"
+        name = "%s%d" % ("L" if is_loop else "P", self._counters[kind])
+        self._counters[kind] += 1
+        sorts = [z3.IntSort()] * len(self.program_vars)
+        relation = z3.Function(name, *(sorts + [z3.BoolSort()]))
+        self.relations[name] = relation
+        if is_loop:
+            self.loop_relations.append(name)
+        return relation
+
+    def _fresh_const(self, name):
+        """Create a fresh z3 constant standing for the new value of `name`."""
+        self._counters["fresh"] += 1
+        const = z3.Int("%s!%d" % (name, self._counters["fresh"]))
+        self._extra_consts.append(const)
+        return const
+
+    def _apply(self, relation, updates=None):
+        """Apply `relation` to the state vector, overridden by `updates`."""
+        updates = updates or {}
+        args = [updates.get(name, self._consts[name]) for name in self.program_vars]
+        return relation(*args)
+
+    def _condition(self, expr):
+        """Translate `expr` in the current state and require it to be boolean."""
+        value = expr.to_z3(self._consts)
+        if not z3.is_bool(value):
+            raise EncodingError("condition %r is not a boolean expression" % expr)
+        return value
+
+    def _emit(self, head, body, name):
+        """Append a clause with a unique rule name and return it."""
+        clause = HornClause(head, body, "%s#%d" % (name, len(self.clauses)))
+        self.clauses.append(clause)
+        return clause
+
+    # -- variable discovery ------------------------------------------------
+
+    def _declare(self, name):
+        if name not in self.program_vars:
+            self.program_vars.append(name)
+
+    def _collect_variables(self, node):
+        """Record every variable the program mentions, in order of appearance.
+
+        Bounded loops additionally get an implicit iteration counter, named so
+        that it cannot collide with a name the tokenizer could ever produce.
+        """
+        if isinstance(node, Sequence):
+            for stmt in node.stmts:
+                self._collect_variables(stmt)
+        elif isinstance(node, Assign):
+            self._collect_variables(node.expr)
+            self._declare(node.var_name)
+        elif isinstance(node, While):
+            self._collect_variables(node.cond)
+            if node.bound is not None:
+                counter = "!iter%d" % len(self._loop_counters)
+                self._loop_counters[node] = counter
+                self._declare(counter)
+            self._collect_variables(node.body)
+        elif isinstance(node, Variable):
+            self._declare(node.name)
+        else:
+            for child in node.children():
+                self._collect_variables(child)
+
+    # -- encoding ----------------------------------------------------------
+
+    def encode_program(self, ast):
+        """Encode a whole program and return its Horn clauses.
+
+        The encoder state is reset first, so the same instance can translate
+        one program after another.  Execution starts at the entry relation,
+        which holds for arbitrary initial values: variables only become
+        constrained once the program assigns them.
+
+        Args:
+            ast: The :class:`Sequence` returned by :func:`parse_program` (any
+                single statement is accepted as well).
+
+        Returns:
+            The list of :class:`HornClause` objects, also available as
+            :attr:`clauses`.
+        """
+        self._reset()
+        self._collect_variables(ast)
+        self._consts = {name: z3.Int(name) for name in self.program_vars}
+        self.entry_relation = self._new_relation()
+        self._emit(self._apply(self.entry_relation), [], "entry")
+        self.exit_relation = self._encode_statement(ast, self.entry_relation)
+        return self.clauses
+
+    def _encode_statement(self, stmt, pre_rel):
+        """Encode one statement and return the relation of the point after it."""
+        if isinstance(stmt, Sequence):
+            relation = pre_rel
+            for inner in stmt.stmts:
+                relation = self._encode_statement(inner, relation)
+            return relation
+        post_rel = self._new_relation()
+        if isinstance(stmt, Assign):
+            self.encode_assignment(stmt, pre_rel, post_rel)
+        elif isinstance(stmt, If):
+            self.encode_branch(stmt, pre_rel, post_rel)
+        elif isinstance(stmt, Assert):
+            self.encode_assertion(stmt, pre_rel, post_rel)
+        elif isinstance(stmt, While):
+            loop_rel = self._new_relation(is_loop=True)
+            self.encode_loop(stmt, loop_rel, pre_rel, post_rel)
+        else:
+            raise EncodingError("cannot encode statement %r" % (stmt,))
+        return post_rel
+
+    def encode_assignment(self, assign, pre_rel, post_rel):
+        """Encode ``x = e`` as ``post_rel(x') :- pre_rel(x), x' = e(x)``.
+
+        The post state repeats the pre state variable for variable; only the
+        assigned variable is replaced by a fresh constant tied to the value of
+        the right hand side, so all other variables are unchanged by
+        construction.
+        """
+        mark = len(self.clauses)
+        value = assign.expr.to_z3(self._consts)
+        if z3.is_bool(value):
+            raise EncodingError("cannot assign the boolean %r to %r"
+                                % (assign.expr, assign.var_name))
+        updated = self._fresh_const(assign.var_name)
+        self._emit(self._apply(post_rel, {assign.var_name: updated}),
+                   [self._apply(pre_rel), updated == value],
+                   "assign:%s" % assign.var_name)
+        return self.clauses[mark:]
+
+    def encode_branch(self, if_node, pre_rel, post_rel):
+        """Encode ``if (c) A else B`` as the two guarded paths into `post_rel`.
+
+        The first two clauses returned are the guards -- ``c`` enters the then
+        path, ``Not(c)`` the else path -- and are followed by the clauses of
+        the two branch bodies plus the two clauses that join them back into
+        `post_rel`.  A missing ``else`` branch behaves like an empty one.
+        """
+        mark = len(self.clauses)
+        cond = self._condition(if_node.cond)
+        then_rel = self._new_relation()
+        else_rel = self._new_relation()
+        self._emit(self._apply(then_rel), [self._apply(pre_rel), cond], "if:then")
+        self._emit(self._apply(else_rel), [self._apply(pre_rel), z3.Not(cond)],
+                   "if:else")
+        for entry, body, label in ((then_rel, if_node.then_body, "then"),
+                                   (else_rel, if_node.else_body, "else")):
+            exit_rel = self._encode_statement(body or Sequence([]), entry)
+            self._emit(self._apply(post_rel), [self._apply(exit_rel)],
+                       "if:join-%s" % label)
+        return self.clauses[mark:]
+
+    def encode_loop(self, while_node, loop_rel, pre_rel=None, post_rel=None):
+        """Encode ``while (c) B`` as the recursive clause group around `loop_rel`.
+
+        Four kinds of clause are produced: the entry ``loop_rel(x) :-
+        pre_rel(x)``, the guarded step into the body ``body(x) :- loop_rel(x),
+        c(x)``, the back edge ``loop_rel(x') :- body_exit(x')`` closing the
+        recursion, and the exit ``post_rel(x) :- loop_rel(x), Not(c(x))``.  A
+        solution for `loop_rel` is exactly a loop invariant.
+
+        When the loop carries an iteration bound, the implicit counter of
+        :meth:`_collect_variables` is initialised at the entry, tested in the
+        guard and incremented on the back edge, and an extra exit clause lets
+        the loop leave once the bound is exhausted.
+
+        Args:
+            while_node: The :class:`While` node to encode.
+            loop_rel: Relation standing for the loop head.
+            pre_rel: Relation of the point before the loop; a fresh relation is
+                created when the caller does not supply one.
+            post_rel: Relation of the point after the loop; likewise optional.
+        """
+        mark = len(self.clauses)
+        pre_rel = pre_rel if pre_rel is not None else self._new_relation()
+        post_rel = post_rel if post_rel is not None else self._new_relation()
+        cond = self._condition(while_node.cond)
+        counter = self._loop_counters.get(while_node)
+
+        entry_updates = {counter: z3.IntVal(0)} if counter else None
+        self._emit(self._apply(loop_rel, entry_updates), [self._apply(pre_rel)],
+                   "while:entry")
+
+        guard = [self._apply(loop_rel), cond]
+        if counter:
+            guard.append(self._consts[counter] < z3.IntVal(while_node.bound))
+        body_rel = self._new_relation()
+        self._emit(self._apply(body_rel), guard, "while:iterate")
+
+        body_exit = self._encode_statement(while_node.body, body_rel)
+        if counter:
+            stepped = self._fresh_const(counter)
+            self._emit(self._apply(loop_rel, {counter: stepped}),
+                       [self._apply(body_exit),
+                        stepped == self._consts[counter] + 1], "while:back")
+        else:
+            self._emit(self._apply(loop_rel), [self._apply(body_exit)],
+                       "while:back")
+
+        self._emit(self._apply(post_rel), [self._apply(loop_rel), z3.Not(cond)],
+                   "while:exit")
+        if counter:
+            self._emit(self._apply(post_rel),
+                       [self._apply(loop_rel),
+                        self._consts[counter] >= z3.IntVal(while_node.bound)],
+                       "while:exhausted")
+        return self.clauses[mark:]
+
+    def encode_assertion(self, assert_node, pre_rel, post_rel=None):
+        """Encode ``assert(c)`` as ``Error :- pre_rel(x), Not(c(x))``.
+
+        When `post_rel` is given -- as :meth:`encode_program` always does -- a
+        second clause carries the surviving states, for which ``c`` holds, on
+        to the next program point.
+        """
+        mark = len(self.clauses)
+        cond = self._condition(assert_node.cond)
+        self._emit(self.error(), [self._apply(pre_rel), z3.Not(cond)],
+                   "assert:violated")
+        if post_rel is not None:
+            self._emit(self._apply(post_rel), [self._apply(pre_rel), cond],
+                       "assert:holds")
+        return self.clauses[mark:]
+
+    # -- handing the clauses to z3 ----------------------------------------
+
+    def to_z3(self, program_vars=None, timeout_ms=None):
+        """Build a Spacer :class:`z3.Fixedpoint` holding all encoded clauses.
+
+        Args:
+            program_vars: Variables to declare as universally quantified rule
+                variables, given as names or as z3 constants.  Defaults to the
+                discovered :attr:`program_vars`; the constants the encoder
+                introduced for updated states are always declared as well.
+            timeout_ms: Per query budget; defaults to :attr:`timeout_ms`.
+
+        Returns:
+            A configured ``Fixedpoint`` with every relation registered and
+            every clause added as a rule.  Query it with ``fp.query(enc.error())``.
+        """
+        fp = z3.Fixedpoint()
+        fp.set(engine="spacer")
+        fp.set(timeout=self.timeout_ms if timeout_ms is None else timeout_ms)
+
+        fp.register_relation(*(list(self.relations.values()) + [self.error]))
+
+        names = self.program_vars if program_vars is None else program_vars
+        declared = []
+        for var in list(names) + list(self._extra_consts):
+            const = z3.Int(var) if isinstance(var, str) else var
+            if not any(const.eq(seen) for seen in declared):
+                declared.append(const)
+        if declared:
+            fp.declare_var(*declared)
+
+        for clause in self.clauses:
+            fp.rule(clause.head, clause.body, clause.name)
+        return fp
+
+
+def _conjuncts(expr):
+    """Split a (possibly nested) conjunction into its top level conjuncts."""
+    return list(expr.children()) if z3.is_and(expr) else [expr]
+
+
+def extract_loop_invariants(fp, encoder):
+    """Read the loop invariants out of a solved Fixedpoint.
+
+    After an ``unsat`` query ``fp.get_answer()`` returns the solution of the
+    clause system as a conjunction of definitions ``ForAll(x, R(x) == phi(x))``.
+    This picks out the definitions of the loop head relations and substitutes
+    the program variable names back in for the bound de Bruijn variables.
+
+    Returns:
+        A dict mapping loop relation name to the invariant as a one line
+        string.  Never raises: relations whose definition cannot be recovered
+        are simply absent.
+    """
+    invariants = {}
+    try:
+        answer = fp.get_answer()
+    except Exception:
+        return invariants
+    wanted = set(encoder.loop_relations)
+    for conjunct in _conjuncts(answer):
+        try:
+            if z3.is_quantifier(conjunct) and conjunct.is_forall():
+                body, num_vars = conjunct.body(), conjunct.num_vars()
+            else:
+                body, num_vars = conjunct, 0
+            if not z3.is_eq(body):
+                continue
+            application, definition = body.arg(0), body.arg(1)
+            if not z3.is_app(application):
+                continue
+            name = application.decl().name()
+            if name not in wanted or name in invariants:
+                continue
+            invariants[name] = _one_line(
+                _name_bound_vars(application, definition, num_vars,
+                                 encoder.program_vars))
+        except Exception:
+            continue
+    return invariants
+
+
+def _name_bound_vars(application, definition, num_vars, program_vars):
+    """Replace the de Bruijn variables of `definition` by program variables.
+
+    `application` is the ``R(Var(i), ...)`` head of the definition, which tells
+    us which bound variable sits in which argument position of the relation.
+    """
+    if not num_vars:
+        return definition
+    replacements = [z3.Int("_v%d" % index) for index in range(num_vars)]
+    for position in range(application.num_args()):
+        argument = application.arg(position)
+        if z3.is_var(argument) and position < len(program_vars):
+            replacements[z3.get_var_index(argument)] = z3.Int(program_vars[position])
+    substituted = z3.substitute_vars(definition, *replacements)
+    try:
+        return z3.simplify(substituted)
+    except Exception:
+        return substituted
+
+
+def verify_program(text, timeout_ms=DEFAULT_TIMEOUT_MS):
+    """Parse, encode and verify an imperative program with Spacer.
+
+    Args:
+        text: Program source in the language of :func:`parse_program`.
+        timeout_ms: Wall clock budget for the Spacer query.
+
+    Returns:
+        A dict that always carries
+
+        * ``"safe"`` -- ``True`` only when Spacer proved every assertion,
+        * ``"num_clauses"`` -- number of Horn clauses generated,
+        * ``"num_relations"`` -- number of relations, ``Error`` included,
+        * ``"num_loops"`` -- number of loop head relations,
+        * ``"invariants"`` -- loop relation name -> invariant string, filled in
+          only for a safe program,
+        * ``"translation_time"`` -- seconds spent parsing and encoding, i.e.
+          everything up to but excluding the query,
+        * ``"status"`` -- ``"safe"``, ``"unsafe"``, ``"unknown"`` or ``"error"``,
+        * ``"reason"`` -- ``None`` unless something went wrong.
+
+        Never raises: a parse or encoding failure comes back as ``status
+        "error"`` with the message in ``"reason"``.
+    """
+    result = {"safe": False, "num_clauses": 0, "num_relations": 0,
+              "num_loops": 0, "invariants": {}, "translation_time": 0.0,
+              "status": "unknown", "reason": None}
+    started = time.time()
+    try:
+        encoder = HornEncoder(timeout_ms=timeout_ms)
+        clauses = encoder.encode_program(parse_program(text))
+        fp = encoder.to_z3(encoder.program_vars)
+        result["num_clauses"] = len(clauses)
+        result["num_relations"] = len(encoder.relations) + 1
+        result["num_loops"] = len(encoder.loop_relations)
+        result["translation_time"] = time.time() - started
+
+        answer = fp.query(encoder.error())
+        if answer == z3.unsat:
+            result["safe"] = True
+            result["status"] = "safe"
+            result["invariants"] = extract_loop_invariants(fp, encoder)
+        elif answer == z3.sat:
+            result["status"] = "unsafe"
+            result["reason"] = "an execution reaches a violated assertion"
+        else:
+            result["reason"] = "spacer returned unknown"
+    except Exception as exc:  # keeps the experiment alive on malformed input
+        result["translation_time"] = time.time() - started
+        result["status"] = "error"
+        result["reason"] = "%s: %s" % (type(exc).__name__, exc)
+    return result
+
+
+class HornVerifier(object):
+    """Front-end tying the parser, the encoder and Spacer together."""
+
+    def __init__(self, timeout_ms=DEFAULT_TIMEOUT_MS):
+        self.timeout_ms = timeout_ms
+
+    def translate(self, text):
+        """Translate program `text` without solving anything.
+
+        Returns:
+            The ``(ast, encoder, fixedpoint)`` triple, where the Fixedpoint is
+            loaded with every rule but has not been queried yet.
+
+        Raises:
+            ParseError, EncodingError: on malformed or untranslatable input.
+        """
+        ast = parse_program(text)
+        encoder = HornEncoder(timeout_ms=self.timeout_ms)
+        encoder.encode_program(ast)
+        return ast, encoder, encoder.to_z3(encoder.program_vars)
+
+    def verify(self, text):
+        """Verify program `text`, see :func:`verify_program` for the result dict."""
+        return verify_program(text, timeout_ms=self.timeout_ms)

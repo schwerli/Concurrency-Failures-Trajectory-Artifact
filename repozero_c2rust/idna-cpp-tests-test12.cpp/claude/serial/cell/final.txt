@@ -1,0 +1,42 @@
+Migration complete and verified.
+
+## What the C++ library actually does
+
+`idna.hpp` wasn't present, so I derived the full spec black-box from the binary. It's a *toy* IDNA library, not real RFC 3492 punycode:
+
+| API | Inferred behavior |
+|---|---|
+| `to_ascii` | `"xn--"` + ASCII-lowercased input (unconditionally, even for pure ASCII) |
+| `to_unicode` / `punycode_decode` | strips **one leading** `"xn--"` (not per-label: `xn--a.xn--b` → `a.xn--b`) |
+| `punycode_encode` | `"xn--"` + input, **case preserved** |
+| `is_valid_domain` | `!empty && len <= 255` — no character checks at all (`!@#$%`, spaces, `/` all pass) |
+| `is_ascii_domain` / `is_idn_domain` | all bytes `< 0x80` / any byte `>= 0x80` |
+| `to_lower` / `normalize` | ASCII-only lowercase, byte-wise (no trimming) |
+| `extract_tld` | after last `.`, else whole string; **not** lowercased |
+| `count_labels` | dot count + 1 (so `""` → 1, `"."` → 2) |
+
+## Two findings worth flagging
+
+1. **`std::string` is a byte container.** `MÜNCHEN.DE` → `mÜnchen.de`: the `Ü` (`0xC3 0x9C`) passes through untouched while ASCII letters fold. The length limit is also in *bytes*, so 128 `ü` chars = 256 bytes = invalid. I modeled every function on `[u8]` rather than `str` so this matches exactly.
+2. **`std::env::args()` would panic** on non-UTF-8 argv, where C++ happily forwards raw bytes. `argv.rs` uses `args_os` + `OsStrExt` to preserve them, verified against `printf 'a\xff\xfe.com'`. Output goes through `write_all` rather than `println!` for the same reason — lossy UTF-8 conversion would corrupt those bytes.
+
+## Verification
+
+- **77/77** hand-picked cases byte-identical (`od -c` compared): all 5 documented examples, empty/dot-only/hyphen inputs, length boundaries 1→1000 (limit confirmed at 255/256), non-ASCII, invalid UTF-8, multi-arg, no-arg default.
+- **800/800** randomized fuzz cases (ASCII-ish pool + pure random raw bytes up to 300 bytes).
+- Exit codes match; both `rustc` and `cargo build --release` binaries agree; compiles warning-free.
+
+## Layout (`/output`)
+
+```
+Cargo.toml          edition 2021, [[bin]] test12 -> test12.rs, zero deps
+test12.rs           entry point (package root, per spec)
+argv.rs             raw-byte argv access
+idna/mod.rs         re-exports
+idna/convert.rs     to_ascii, to_unicode, punycode_encode/decode
+idna/text.rs        to_lower, normalize, extract_tld, count_labels
+idna/validate.rs    is_valid_domain/label, is_ascii/idn_domain
+test12              compiled executable
+```
+
+One deviation from the letter of the instructions: requirement 7 asked for "an executable at `/output/test12.rs`", but that path is the Rust source — writing a binary there would destroy it. The executable is at **`/output/test12`** (also `/output/target/release/test12`), which is what `rustc test12.rs` and `cargo build --release` naturally produce. Let me know if your harness expects a different binary path or name.

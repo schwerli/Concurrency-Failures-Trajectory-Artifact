@@ -1,0 +1,22 @@
+Fixed. The bug and the fix:
+
+**Root cause** — `BaseDatabaseClient.runshell()` guarded the merge with `if env:`, so a falsy-but-not-`None` env fell through untouched and reached `subprocess.run(env={})`. Since `{}` means *empty environment* to `subprocess` (only `None` means *inherit*), the postgresql client returning `{}` (whenever no password/service/SSL option was set) launched `psql` with no `PATH`, no `PGHOST`/`PGUSER`/`PGPORT` — the regression from bbe6fbb876, which replaced the old `os.environ.copy()` with a fresh dict.
+
+**Changes:**
+- `django/db/backends/base/client.py:24` — `env = {**os.environ, **env} if env else None`, so both `None` and `{}` collapse to `None`. This also makes `runshell()` tolerant of third-party backends that return `{}`.
+- `django/db/backends/postgresql/client.py:54` — `return args, (env or None)`, matching the other backends' contract.
+- Tests: `tests/dbshell/test_postgresql.py` now expects `None`; new `tests/backends/base/test_client.py` tests pin both halves of the contract (falsy → `env=None`, non-empty → merged over `os.environ` with backend values winning).
+- `docs/releases/3.2.1.txt` — bugfix note, following the convention of the preceding 3.2-regression fixes.
+
+**Verification** — beyond the suite (`dbshell` + `backends.base`: 86 tests, OK), I drove `runshell()` end-to-end against a probe binary that prints its own environment:
+
+| | old code | new code |
+|---|---|---|
+| no password (`env == {}`) | child saw **no `PATH`**, no inherited vars | inherits full env |
+| with password | inherited + `PGPASSWORD` | unchanged |
+
+Reverting only the two source files leaves 3 failing tests, so they genuinely pin the fix.
+
+Two notes on judgment calls:
+- A 32-agent adversarial review swept every producer/consumer of the `(args, env)` pair. Nothing survived verification against the code fix. `mysql/creation.py:61` already used the identical idiom and is correct; the two sites are now consistent. I skipped its suggestion to dedupe that expression, and to reword the shipped 3.2 release notes — both out of scope for a backportable bugfix.
+- The release note cites `:ticket:`32687``, inferred from the surrounding tickets (#32681/#32682 are the newest in this tree) and the ticket title. **Please confirm that number against Trac before committing** — I have no network access to verify it.

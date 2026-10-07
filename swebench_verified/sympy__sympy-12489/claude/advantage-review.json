@@ -1,0 +1,127 @@
+{
+  "schema_version": 2,
+  "phase": "fixed",
+  "pair_id": "swebench_verified/sympy__sympy-12489/claude",
+  "task": {
+    "plain_summary_zh": "修复 SymPy 中 combinatorics.Permutation 的子类化问题，使内部构造路径不要把子类实例降级成基类 Permutation。",
+    "acceptance_target_zh": "补丁需要让 Permutation.__new__、_af_new 以及返回新置换的相关方法按实际调用类创建对象，同时不破坏既有组合数学回归测试。"
+  },
+  "modes": {
+    "parallel": {
+      "solution_passed": true,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 1848.344
+    },
+    "serial": {
+      "solution_passed": false,
+      "evaluation_completed": true,
+      "passed": null,
+      "total": null,
+      "rate": null,
+      "wall_seconds": 1890.028
+    }
+  },
+  "reconstruction": {
+    "parallel_strategy_zh": "并行主模型先自己搜索和阅读 permutations.py 的构造路径，同时启动 workflow 让子模型映射 permutations、perm_groups、tensor 等位置的 _af_new 和硬编码 Permutation 风险；随后主模型独立完成一批编辑并本地验证。",
+    "serial_strategy_zh": "串行模型只有一个上下文，先 grep/read 关键构造点，然后一次性把多处 _af_new 改成 cls._af_new 或 self._af_new，并把 _af_new 本身改为 classmethod，但没有形成同等细粒度的类方法边界修正。",
+    "realized_parallelism_zh": "并行确实发生：父上下文在 12:35:39 启动 workflow 后继续读代码和编辑，三个映射子上下文在同一时间段内审计构造位点并产出结果；另有测试与合成子任务因 429 失败或未合成有效结果。",
+    "parallel_workers": 6,
+    "peak_overlapping_useful_workers": 4
+  },
+  "baseline_audit": {
+    "same_task_and_prompt": true,
+    "serial_run_valid": true,
+    "parallel_run_valid": true,
+    "external_or_harness_issues_zh": [
+      "两端 agent 进程都有 1799 秒左右的超时标记，但 cell 均为 finished 且官方评测完成；串行曾有一次归档评测失败重试，当前 official-run returncode 为 0，因此不按外部或评测故障排除。"
+    ]
+  },
+  "decision": "exclude",
+  "exclusion_code": "ordinary_implementation_variance",
+  "decision_reason_zh": "并行得分更高且存在重叠子模型审计，但原始父轨迹没有显示主模型读取、选择或采纳这些审计结果；主模型在 workflow 给出可用内容前已经按自己的分析开始并继续完成关键修正。因此质量差异更像并行主路径自身实现更完整，而不是已证明的并发机制收益。",
+  "advantage": null,
+  "new_pattern_candidate": {
+    "is_candidate": false,
+    "name_zh": null,
+    "mechanism_zh": null,
+    "why_existing_dimensions_fail_zh": null
+  },
+  "evidence": {
+    "parallel": [
+      {
+        "path": "parallel/agent/claude/.claude/projects/-testbed/4f3114a6-8ccc-4eb9-bbbc-9bce23a278bf.jsonl",
+        "line": 21,
+        "summary_zh": "父模型说明会把代码库映射委派给并行 agents，同时自己阅读核心文件。"
+      },
+      {
+        "path": "parallel/agent/claude/.claude/projects/-testbed/4f3114a6-8ccc-4eb9-bbbc-9bce23a278bf.jsonl",
+        "line": 27,
+        "summary_zh": "父模型发起 Workflow，目标是映射阻碍 Permutation 子类化的所有实例创建位置。"
+      },
+      {
+        "path": "parallel/agent/claude/.claude/projects/-testbed/4f3114a6-8ccc-4eb9-bbbc-9bce23a278bf.jsonl",
+        "line": 96,
+        "summary_zh": "在 workflow 结果可用前，父模型说自己的分析已完成并开始应用修复，之后再交叉检查 workflow。"
+      },
+      {
+        "path": "parallel/agent/claude/.claude/projects/-testbed/4f3114a6-8ccc-4eb9-bbbc-9bce23a278bf.jsonl",
+        "line": 125,
+        "summary_zh": "workflow 完成通知显示 merged 为 null，并只提示可去 journal 查看每个已完成 agent 的返回值。"
+      },
+      {
+        "path": "parallel/agent/claude/.claude/projects/-testbed/4f3114a6-8ccc-4eb9-bbbc-9bce23a278bf/subagents/workflows/wf_5b7e6538-841/agent-a5f3bcd4d88acc4bf.jsonl",
+        "line": 65,
+        "summary_zh": "一个子模型确实产出有用审计，指出 Basic.__new__(Perm, perm) 必须改为 Basic.__new__(cls, perm)，并指出早返回要用 cls._af_new。"
+      },
+      {
+        "path": "parallel/cell/model.patch",
+        "line": 18,
+        "summary_zh": "最终并行补丁包含 isinstance(a, cls) 的复制路径检查，避免无条件返回基类对象。"
+      }
+    ],
+    "serial": [
+      {
+        "path": "serial/agent/claude/.claude/projects/-testbed/16c0c37b-2baa-4c2d-9591-3729667c12ce.jsonl",
+        "line": 6,
+        "summary_zh": "串行模型从单一上下文搜索 _af_new 使用位置，没有启动并行工作。"
+      },
+      {
+        "path": "serial/agent/claude/.claude/projects/-testbed/16c0c37b-2baa-4c2d-9591-3729667c12ce.jsonl",
+        "line": 46,
+        "summary_zh": "串行模型一次性改写内部 _af_new 调用，缺少独立审计或结果选择链。"
+      },
+      {
+        "path": "serial/cell/model.patch",
+        "line": 17,
+        "summary_zh": "串行补丁在 Permutation 输入分支仍保留无条件 return a 和 return Perm(a.array_form, size=size)，未像并行补丁那样使用 cls。"
+      },
+      {
+        "path": "serial/cell/model.patch",
+        "line": 110,
+        "summary_zh": "串行补丁没有把 classmethod 的第一个参数从 self 改为 cls，随后在类方法内使用 self._af_new。"
+      }
+    ],
+    "evaluator": [
+      {
+        "path": "parallel/cell/evaluation/official-run/logs/run_evaluation/formal-claude-parallel-sympy__sympy-12489/uiuc-claude-parallel/sympy__sympy-12489/report.json",
+        "line": 6,
+        "summary_zh": "官方评测显示并行补丁 resolved 为 true。"
+      },
+      {
+        "path": "serial/cell/evaluation/official-run/logs/run_evaluation/formal-claude-serial-sympy__sympy-12489/uiuc-claude-serial/sympy__sympy-12489/report.json",
+        "line": 6,
+        "summary_zh": "官方评测显示串行补丁 resolved 为 false。"
+      },
+      {
+        "path": "serial/cell/evaluation/official-run/logs/run_evaluation/formal-claude-serial-sympy__sympy-12489/uiuc-claude-serial/sympy__sympy-12489/test_output.txt",
+        "line": 486,
+        "summary_zh": "串行官方测试中 subclassing、josephus、ranking、mul、from_sequence 等相关测试失败。"
+      }
+    ]
+  },
+  "case_narrative_zh": "这个任务要求修复 Permutation 内部构造绕过实际子类的问题。并行运行确实启动了 workflow，多个子模型同时审计 _af_new、Perm/Permutation 硬编码和外部调用风险，父模型也在同一时间继续实现；最终并行补丁通过官方评测，而串行补丁失败。关键问题是因果链：父轨迹显示父模型在 workflow 产出可用内容前已经宣布自己的分析完成并开始应用关键修复，workflow 完成通知的 merged 结果为空，之后未看到父模型读取 journal 或采纳某个子模型结果。串行失败来自单一路径实现不完整，但并行优势不能仅由更高分推出，所以本例按普通实现差异排除。",
+  "confidence": "high"
+}
